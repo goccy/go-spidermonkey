@@ -1,7 +1,11 @@
 # go-spidermonkey
 
-Run untrusted JavaScript from Go, on SpiderMonkey — Firefox's engine — with no
-CGo and no WebAssembly runtime.
+**SpiderMonkey in pure Go — run untrusted JavaScript anywhere Go runs. No cgo,
+no WebAssembly runtime, one static binary.**
+
+The engine is Firefox's SpiderMonkey, and every guest script is sandboxed: a
+host watchdog can stop a runaway loop from outside, and the guest gets no
+filesystem, network, or host environment unless you hand it one.
 
 SpiderMonkey is compiled to `wasm32-wasi` by
 [`goccy/spidermonkey-wasm`](https://github.com/goccy/spidermonkey-wasm), then
