@@ -118,6 +118,19 @@ type Config struct {
 	Stdout io.Writer
 	// Stderr, when non-nil, receives the guest's fd 2 writes.
 	Stderr io.Writer
+
+	// FSAccess is the guest filesystem access policy. It is consulted before
+	// every file open with the guest path and whether the open is for writing;
+	// returning false denies the operation (the guest sees EACCES).
+	//
+	// When nil — the default — ALL filesystem access is denied: the guest is
+	// given no filesystem at all. This matters because the underlying WASI host
+	// preopens the real host root ("/"), so without a policy a file open would
+	// pass straight through to the host. SpiderMonkey installs no file API for a
+	// script to reach that with, but denying at the WASI layer as well is the
+	// belt-and-suspenders a sandbox wants. Supply a hook only to grant a script
+	// specific, host-controlled access.
+	FSAccess func(path string, write bool) bool
 }
 
 // Interpreter is one isolated SpiderMonkey runtime.
@@ -175,10 +188,19 @@ func NewInterpreter(cfg Config) (inst *Interpreter, err error) {
 	} else {
 		wasi.SetStderr(io.Discard)
 	}
-	// There is deliberately no filesystem, socket or subprocess surface to
-	// configure: the wasm is built with wasmify's host-sockets and
-	// host-subprocess capabilities OFF, and js.cc installs no builtin that
-	// could reach one. Every import the module has is wasi_snapshot_preview1.
+	// Deny the guest all filesystem access by default. base.DefaultWASI preopens
+	// the host "/", so without a policy a file open would pass straight through
+	// to the host; SpiderMonkey installs no file API for a script to reach it,
+	// but denying at the WASI layer too is the belt-and-suspenders the sandbox
+	// wants. An embedder that needs to grant a script specific access supplies
+	// Config.FSAccess. (Sockets and subprocesses are OFF at the module level —
+	// the wasm is built with those wasmify capabilities disabled, so unlike the
+	// filesystem they are not even imported; every import is wasi_snapshot_preview1.)
+	if cfg.FSAccess != nil {
+		wasi.SetFSAccessHook(cfg.FSAccess)
+	} else {
+		wasi.SetFSAccessHook(func(string, bool) bool { return false })
+	}
 	if cfg.MemoryReserveBytes > 0 {
 		m.g = wasm2go.NewWithWASIReserve(wasi, cfg.MemoryReserveBytes)
 	} else {
