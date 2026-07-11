@@ -15,7 +15,7 @@ BRIDGE_FILE  := spidermonkey.go
 RELEASE_URL       = https://github.com/$(SPIDERMONKEY_WASM_REPO)/releases/download/$(SPIDERMONKEY_WASM_VERSION)
 ATTESTATION_API   = https://api.github.com/repos/$(SPIDERMONKEY_WASM_REPO)/attestations
 
-.PHONY: spidermonkey download verify test
+.PHONY: spidermonkey download verify test test262
 
 ## spidermonkey: refresh the bridge from the upstream release and verify its
 ## GitHub artifact attestation. Run whenever SPIDERMONKEY_WASM_VERSION bumps.
@@ -49,3 +49,10 @@ verify:
 ## test: run the Go test suite.
 test:
 	go test ./...
+
+## test262: run the official ECMAScript conformance suite (tc39/test262,
+## vendored as the test262/suite submodule) against this embedding. Takes
+## minutes; see test262/test262_test.go for the skip policy and knobs.
+test262:
+	git submodule update --init --depth 1 test262/suite
+	TEST262=1 go test ./test262/ -v -timeout 3h
