@@ -1,0 +1,4 @@
+[submodule "test262/suite"]
+	path = test262/suite
+	url = https://github.com/tc39/test262.git
+	shallow = true

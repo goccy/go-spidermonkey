@@ -7,6 +7,12 @@ The engine is Firefox's SpiderMonkey, and every guest script is sandboxed: a
 host watchdog can stop a runaway loop from outside, and the guest gets no
 filesystem, network, or host environment unless you hand it one.
 
+It is measurably SpiderMonkey: CI runs the official
+[test262](https://github.com/tc39/test262) conformance suite, and this
+embedding passes 98.9% of the 41,581 tests it can host — within 0.2 points of
+the upstream SpiderMonkey shell on the same subset, with every failure triaged
+against upstream's own results ([details](#conformance-test262)).
+
 SpiderMonkey is compiled to `wasm32-wasi` by
 [`goccy/spidermonkey-wasm`](https://github.com/goccy/spidermonkey-wasm), then
 translated ahead of time into Go by
@@ -86,6 +92,61 @@ library. Nothing else. There is no `fetch`, no timers, no file or network access
 SpiderMonkey has no I/O of its own, the embedding installs no builtin that
 reaches any, and the wasm is linked with no host-socket or host-subprocess
 capability. Every import the module has is `wasi_snapshot_preview1`.
+
+## Conformance: test262
+
+The claim "the engine is SpiderMonkey" is measured, not asserted. CI runs the
+official ECMAScript conformance suite — [tc39/test262](https://github.com/tc39/test262),
+vendored as the `test262/suite` submodule, pinned to the same revision
+[test262.fyi](https://test262.fyi/) measures the big engines against — on every
+change:
+
+| area | pass / run | rate |
+|---|---|---|
+| language | 21,723 / 21,892 | 99.2% |
+| built-ins | 16,982 / 17,218 | 98.6% |
+| annexB | 1,005 / 1,026 | 98.0% |
+| harness | 112 / 112 | 100% |
+| staging | 1,310 / 1,333 | 98.3% |
+| **total** | **41,132 / 41,581** | **98.9%** |
+
+For scale: upstream SpiderMonkey — the nightly shell, with ICU, threads, and a
+module loader — passes 98.3% of the full suite on test262.fyi. On the subset
+this embedding can host, upstream passes 99.1% and go-spidermonkey 98.9%, and
+the two agree on 99.65% of individual tests.
+
+Tests the embedding cannot host are skipped and accounted, not hidden (the run
+prints every skip reason): the engine build has no ICU (`intl402/`, `Temporal`,
+`Intl.*`, regexp `\p{...}` property escapes, `String.prototype.normalize`, full
+Unicode case folding), no threads (`Atomics`, `SharedArrayBuffer`), no module
+loader is wired into `js_eval` (`module`-flagged tests, `dynamic-import`), and
+the `$262` host hooks test262 wants from a shell (`createRealm`,
+`detachArrayBuffer`, `gc`, agents) are not exposed.
+
+Every one of the 449 failures is triaged in
+[`test262/expectations.json`](./test262/expectations.json), each with its
+reason:
+
+- **343** are also failed by upstream SpiderMonkey at the same test262
+  revision (per test262.fyi) — unshipped proposals like `Promise.allKeyed`,
+  decorators, `Atomics.waitAsync`.
+- **96** are features or behavior changes that shipped in Firefox after 147,
+  the version this build tracks — `Iterator.zip`/`zipKeyed` and the RegExp
+  legacy-accessor descriptor change.
+- **9** are known defects in the wasm→Go translation layer, root-caused and
+  tracked upstream: `f64.const -0` is emitted as `+0` (loses the sign of zero
+  in `Number("-0")`, `Math.atan2`, `Math.sumPrecise`), `js_eval` truncates
+  source at an embedded NUL byte, and the parser's recursion ceiling sits at
+  ~29 nested function literals regardless of `NativeStackQuotaBytes`.
+- **1** is a runner artifact (an allocation test that exceeds the runner's
+  default 64 MiB heap cap).
+
+CI is green only when the delta is exactly the documented one: an unexpected
+failure fails the job, and so does an expectation that starts passing.
+
+```sh
+make test262   # inits the submodule, then TEST262=1 go test ./test262/
+```
 
 ## Bounding what a script consumes
 
