@@ -200,24 +200,16 @@ func skipReason(relPath, src string, m meta) string {
 		if why, ok := featuresUnsupported[f]; ok {
 			return "feature " + f + " (" + why + ")"
 		}
-		if strings.HasPrefix(f, "Intl.") {
-			return "feature " + f + " (no ICU in this build)"
-		}
 	}
 	for _, inc := range m.includes {
-		if inc == "detachArrayBuffer.js" || inc == "atomicsHelper.js" {
-			return "include " + inc + " ($262 host hook)"
+		if inc == "atomicsHelper.js" {
+			return "include " + inc + " (agents need threads)"
 		}
 	}
 	for _, member := range dollar262Unsupported {
 		if strings.Contains(src, member) {
 			return member + " (host hook not exposed)"
 		}
-	}
-	// Regular-expression Unicode property escapes (\p{...}) need the Unicode
-	// property data that ships with ICU; the untagged uses are caught here.
-	if strings.Contains(src, `\p{`) || strings.Contains(src, `\P{`) {
-		return `\p{...} in source (no Unicode property data in the ICU-less build)`
 	}
 	return ""
 }
@@ -244,11 +236,53 @@ func buildSource(src string, m meta, harness map[string]string, strict bool) str
 }
 
 // evalOne runs one assembled script (or module) in a fresh interpreter with a
-// watchdog, converting panics from wasm traps into failures. Module tests
-// resolve fixture imports lazily: "module not registered: X" is the cue to
-// read X from the suite and register it, exactly the retry protocol a host
-// loader implements.
-func evalOne(src string, relPath string, asModule bool, timeout time.Duration) (r spidermonkey.EvalResult, err error) {
+// watchdog, converting panics from wasm traps into failures.
+//
+// Module fixtures resolve lazily, the way a host loader's retry protocol
+// works: a run that fails with "module not registered: X" (in the error, or in
+// captured stdout for async dynamic imports) has X read from the suite and the
+// whole test re-run in a FRESH interpreter with every fixture discovered so
+// far pre-registered — registration is per-interpreter, and re-running a
+// script in a used global would trip redeclaration errors.
+func evalOne(src string, relPath string, asModule bool, timeout time.Duration) (spidermonkey.EvalResult, error) {
+	spec := filepath.ToSlash(relPath)
+	fixtures := map[string]string{}
+	var r spidermonkey.EvalResult
+	var err error
+	for attempt := 0; attempt < 64; attempt++ {
+		r, err = evalOnce(src, spec, asModule, fixtures, timeout)
+		if err != nil {
+			return r, err
+		}
+		missing, ok := missingModule(r.Error)
+		if !ok {
+			missing, ok = missingModule(r.Stdout)
+		}
+		if r.Ok && !ok {
+			return r, nil
+		}
+		if !ok {
+			return r, nil
+		}
+		if _, seen := fixtures[missing]; seen {
+			return r, nil // registered but still failing: report as-is
+		}
+		// A classic script has no referrer private, so its dynamic imports
+		// resolve as bare names with any leading ../ folded away. Try the
+		// suite root, then every ancestor directory of the test.
+		b, rerr := os.ReadFile(filepath.Join(suiteDir, "test", filepath.FromSlash(missing)))
+		for d := filepath.Dir(filepath.FromSlash(spec)); rerr != nil && d != "." && d != "/"; d = filepath.Dir(d) {
+			b, rerr = os.ReadFile(filepath.Join(suiteDir, "test", d, filepath.FromSlash(missing)))
+		}
+		if rerr != nil {
+			return r, nil // unresolvable: report the module error as-is
+		}
+		fixtures[missing] = string(b)
+	}
+	return r, nil
+}
+
+func evalOnce(src, spec string, asModule bool, fixtures map[string]string, timeout time.Duration) (r spidermonkey.EvalResult, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("panic: %v", p)
@@ -262,34 +296,23 @@ func evalOne(src string, relPath string, asModule bool, timeout time.Duration) (
 	if err := i.InstallTest262Hooks(); err != nil {
 		return spidermonkey.EvalResult{}, fmt.Errorf("InstallTest262Hooks: %w", err)
 	}
+	for name, fsrc := range fixtures {
+		// A fixture that fails to compile is left unregistered; the re-run
+		// then reports the real import failure.
+		if _, err := i.RegisterModule(name, fsrc); err != nil {
+			return spidermonkey.EvalResult{}, err
+		}
+	}
 	ip, err := i.PrepareInterrupt()
 	if err != nil {
 		return spidermonkey.EvalResult{}, fmt.Errorf("PrepareInterrupt: %w", err)
 	}
 	watchdog := time.AfterFunc(timeout, ip.Fire)
 	defer watchdog.Stop()
-	if !asModule {
-		return i.Eval(src)
+	if asModule {
+		return i.EvalModule(spec, src)
 	}
-	spec := filepath.ToSlash(relPath)
-	for attempt := 0; attempt < 64; attempt++ {
-		r, err = i.EvalModule(spec, src)
-		if err != nil {
-			return r, err
-		}
-		missing, ok := missingModule(r.Error)
-		if r.Ok || !ok {
-			return r, nil
-		}
-		b, rerr := os.ReadFile(filepath.Join(suiteDir, "test", filepath.FromSlash(missing)))
-		if rerr != nil {
-			return r, nil // unresolvable: report the module error as-is
-		}
-		if reg, rerr := i.RegisterModule(missing, string(b)); rerr != nil || !reg.Ok {
-			return r, nil // fixture itself fails to compile: surface the original error
-		}
-	}
-	return r, nil
+	return i.Eval(src)
 }
 
 // missingModule extracts the specifier from a "module not registered: X"
