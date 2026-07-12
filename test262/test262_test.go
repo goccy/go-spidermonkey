@@ -46,71 +46,31 @@ const (
 // featuresUnsupported are test262 feature tags this embedding cannot run, and
 // why. Feature tags are declared per test in its YAML frontmatter.
 var featuresUnsupported = map[string]string{
-	// This engine build has no ICU: configured --without-intl-api.
-	"Intl":                           "no ICU in this build",
-	"String.prototype.localeCompare": "no ICU in this build",
-	"Temporal":                       "no ICU in this build",
-	"canonical-tz":                   "no ICU in this build",
-
-	// No threads in the wasm build: no agents, no shared memory.
-	"Atomics":           "no threads in the wasm build",
+	// No threads in the wasm build: no agents, no shared-memory *blocking*.
+	// Single-agent SharedArrayBuffer/Atomics themselves work; the tests
+	// skipped here are the ones that spawn agents (they use atomicsHelper.js
+	// / $262.agent, caught below) or require a blocking main agent.
 	"Atomics.pause":     "no threads in the wasm build",
 	"Atomics.waitAsync": "no threads in the wasm build",
-	"SharedArrayBuffer": "no threads in the wasm build",
 
-	// No module loader is wired into the embedding (js_eval compiles classic
-	// scripts), so dynamic import cannot resolve anything.
-	"dynamic-import":       "no module loader",
-	"import-assertions":    "no module loader",
-	"import-attributes":    "no module loader",
-	"import-defer":         "no module loader",
-	"json-modules":         "no module loader",
-	"source-phase-imports": "no module loader",
-	"top-level-await":      "no module loader",
-
-	// Requires $262 host hooks this embedding does not expose.
-	"cross-realm":      "$262.createRealm not exposed",
-	"ShadowRealm":      "not shipped in SpiderMonkey",
-	"IsHTMLDDA":        "host-defined [[IsHTMLDDA]] object not exposed",
-	"host-gc-required": "$262.gc not exposed",
-
-	// Unicode property data comes with ICU, which this build excludes.
-	"regexp-unicode-property-escapes": "no Unicode property data (ICU-less build)",
+	// Not shipped in upstream SpiderMonkey either.
+	"ShadowRealm": "not shipped in SpiderMonkey",
 }
 
 // pathsUnsupported skips tests, by path prefix, that depend on Unicode data
 // the ICU-less engine build does not carry and that no feature tag identifies.
-var pathsUnsupported = map[string]string{
-	"built-ins/String/prototype/normalize/":                           "String.prototype.normalize needs ICU",
-	"built-ins/String/prototype/localeCompare/15.5.4.9_CE.":           "locale-sensitive comparison needs ICU",
-	"built-ins/RegExp/unicode_full_case_folding.js":                   "full Unicode case folding needs ICU",
-	"language/literals/regexp/u-case-mapping.js":                      "full Unicode case folding needs ICU",
-	"built-ins/RegExp/regexp-modifiers/add-ignoreCase-affects-slash-": "full Unicode case folding needs ICU",
-	"built-ins/String/prototype/toLowerCase/Final_Sigma":              "Unicode special casing needs ICU",
-	"built-ins/String/prototype/toLowerCase/special_casing_":          "Unicode special casing needs ICU",
-	"built-ins/String/prototype/toLocaleLowerCase/Final_Sigma":        "Unicode special casing needs ICU",
-	"built-ins/String/prototype/toLocaleLowerCase/special_casing_":    "Unicode special casing needs ICU",
-	"staging/sm/RegExp/unicode-ignoreCase":                            "full Unicode case folding needs ICU",
-	"staging/sm/RegExp/unicode-class-ignoreCase.js":                   "full Unicode case folding needs ICU",
-	"staging/sm/RegExp/ignoreCase-non-latin1-to-latin1.js":            "full Unicode case folding needs ICU",
-}
+var pathsUnsupported = map[string]string{}
 
 // $262 members that require host hooks we do not have. A test whose source
 // touches any of these is skipped (feature tags catch most, this catches the
 // rest).
 var dollar262Unsupported = []string{
-	"$262.createRealm",
-	"$262.detachArrayBuffer",
-	"$262.evalScript",
-	"$262.gc",
 	"$262.agent",
-	"$262.IsHTMLDDA",
 	"$262.AbstractModuleSource",
 }
 
-// prelude is the minimal $262 shim. Only `global` is implementable without
-// host hooks; tests needing the rest are skipped above.
-const prelude = "var $262 = { global: globalThis };\n"
+// $262 is installed natively via Interpreter.InstallTest262Hooks.
+const prelude = ""
 
 type meta struct {
 	flags    map[string]bool
@@ -233,9 +193,6 @@ func skipReason(relPath, src string, m meta) string {
 			return "path " + prefix + " (" + why + ")"
 		}
 	}
-	if m.flags["module"] {
-		return "module (no module loader)"
-	}
 	if m.flags["CanBlockIsTrue"] {
 		return "agent blocking (no threads)"
 	}
@@ -286,9 +243,12 @@ func buildSource(src string, m meta, harness map[string]string, strict bool) str
 	return sb.String()
 }
 
-// evalOne runs one assembled script in a fresh interpreter with a watchdog,
-// converting panics from wasm traps into failures.
-func evalOne(src string, timeout time.Duration) (r spidermonkey.EvalResult, err error) {
+// evalOne runs one assembled script (or module) in a fresh interpreter with a
+// watchdog, converting panics from wasm traps into failures. Module tests
+// resolve fixture imports lazily: "module not registered: X" is the cue to
+// read X from the suite and register it, exactly the retry protocol a host
+// loader implements.
+func evalOne(src string, relPath string, asModule bool, timeout time.Duration) (r spidermonkey.EvalResult, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("panic: %v", p)
@@ -299,13 +259,52 @@ func evalOne(src string, timeout time.Duration) (r spidermonkey.EvalResult, err 
 		return spidermonkey.EvalResult{}, fmt.Errorf("NewInterpreter: %w", err)
 	}
 	defer i.Close()
+	if err := i.InstallTest262Hooks(); err != nil {
+		return spidermonkey.EvalResult{}, fmt.Errorf("InstallTest262Hooks: %w", err)
+	}
 	ip, err := i.PrepareInterrupt()
 	if err != nil {
 		return spidermonkey.EvalResult{}, fmt.Errorf("PrepareInterrupt: %w", err)
 	}
 	watchdog := time.AfterFunc(timeout, ip.Fire)
 	defer watchdog.Stop()
-	return i.Eval(src)
+	if !asModule {
+		return i.Eval(src)
+	}
+	spec := filepath.ToSlash(relPath)
+	for attempt := 0; attempt < 64; attempt++ {
+		r, err = i.EvalModule(spec, src)
+		if err != nil {
+			return r, err
+		}
+		missing, ok := missingModule(r.Error)
+		if r.Ok || !ok {
+			return r, nil
+		}
+		b, rerr := os.ReadFile(filepath.Join(suiteDir, "test", filepath.FromSlash(missing)))
+		if rerr != nil {
+			return r, nil // unresolvable: report the module error as-is
+		}
+		if reg, rerr := i.RegisterModule(missing, string(b)); rerr != nil || !reg.Ok {
+			return r, nil // fixture itself fails to compile: surface the original error
+		}
+	}
+	return r, nil
+}
+
+// missingModule extracts the specifier from a "module not registered: X"
+// error, which may be wrapped in an exception stringification.
+func missingModule(errText string) (string, bool) {
+	const marker = "module not registered: "
+	idx := strings.Index(errText, marker)
+	if idx < 0 {
+		return "", false
+	}
+	rest := errText[idx+len(marker):]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[:nl]
+	}
+	return strings.TrimSpace(rest), true
 }
 
 // judge decides pass/fail for one run's result.
@@ -350,6 +349,13 @@ func runTest(relPath string, src string, m meta, harness map[string]string, time
 	if reason := skipReason(filepath.ToSlash(relPath), src, m); reason != "" {
 		return outcome{path: relPath, status: "skip", reason: reason}
 	}
+	if m.flags["module"] {
+		r, err := evalOne(buildSource(src, m, harness, false), relPath, true, timeout)
+		if ok, detail := judge(m, r, err); !ok {
+			return outcome{path: relPath, status: "fail", reason: "[module] " + detail}
+		}
+		return outcome{path: relPath, status: "pass"}
+	}
 	var modes []bool // strict?
 	switch {
 	case m.flags["raw"], m.flags["noStrict"]:
@@ -360,7 +366,7 @@ func runTest(relPath string, src string, m meta, harness map[string]string, time
 		modes = []bool{false, true}
 	}
 	for _, strict := range modes {
-		r, err := evalOne(buildSource(src, m, harness, strict), timeout)
+		r, err := evalOne(buildSource(src, m, harness, strict), relPath, false, timeout)
 		if ok, detail := judge(m, r, err); !ok {
 			mode := "sloppy"
 			if strict {
@@ -390,8 +396,6 @@ func TestTest262(t *testing.T) {
 	filter := os.Getenv("TEST262_FILTER")
 	harness := loadHarness(t)
 
-	// Collect test files. intl402/ is excluded wholesale: the engine build has
-	// no ICU, so it is not a claim this embedding makes.
 	var paths []string
 	root := filepath.Join(suiteDir, "test")
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -400,9 +404,6 @@ func TestTest262(t *testing.T) {
 		}
 		rel, _ := filepath.Rel(root, path)
 		if d.IsDir() {
-			if rel == "intl402" {
-				return filepath.SkipDir
-			}
 			return nil
 		}
 		if !strings.HasSuffix(rel, ".js") || strings.Contains(rel, "_FIXTURE") {

@@ -24,10 +24,13 @@ import (
 const (
 	midClose            = 0
 	midEval             = 1
-	midInterruptAddr    = 2
-	midInterruptBitsPtr = 3
-	midInterruptBitsVal = 4
-	midNew              = 5
+	midEvalModule       = 2
+	midInstallT262      = 3
+	midInterruptAddr    = 4
+	midInterruptBitsPtr = 5
+	midInterruptBitsVal = 6
+	midModuleRegister   = 7
+	midNew              = 8
 )
 
 // Defaults for Config's zero value. MaxHeapBytes is deliberately a quarter of
@@ -250,6 +253,9 @@ func (i *Interpreter) Eval(src string) (EvalResult, error) {
 	var buf []byte
 	buf = pbAppendUint64(buf, 1, i.h)
 	buf = pbAppendString(buf, 2, src)
+	// src_len rides alongside src: the C++ surface takes const char* + an
+	// explicit length, so embedded NUL bytes in the source survive.
+	buf = pbAppendUint64(buf, 3, uint64(len(src)))
 	resp, err := i.m.invoke(0, midEval, buf, wasm2go.Inv_0_1)
 	if err != nil {
 		return EvalResult{}, err
@@ -263,6 +269,66 @@ func (i *Interpreter) Eval(src string) (EvalResult, error) {
 		return EvalResult{}, fmt.Errorf("decode eval result %q: %w", js, err)
 	}
 	return r, nil
+}
+
+// EvalModule compiles and evaluates src as an ES module registered under
+// specifier, resolving imports from previously registered modules.
+func (i *Interpreter) EvalModule(specifier, src string) (EvalResult, error) {
+	var buf []byte
+	buf = pbAppendUint64(buf, 1, i.h)
+	buf = pbAppendString(buf, 2, specifier)
+	buf = pbAppendUint64(buf, 3, uint64(len(specifier)))
+	buf = pbAppendString(buf, 4, src)
+	buf = pbAppendUint64(buf, 5, uint64(len(src)))
+	resp, err := i.m.invoke(0, midEvalModule, buf, wasm2go.Inv_0_2)
+	if err != nil {
+		return EvalResult{}, err
+	}
+	if e := pbExtractError(resp); e != nil {
+		return EvalResult{}, e
+	}
+	js := readScalarAtField(resp, 1, (*pbReader).readString)
+	var r EvalResult
+	if err := json.Unmarshal([]byte(js), &r); err != nil {
+		return EvalResult{}, fmt.Errorf("decode eval result %q: %w", js, err)
+	}
+	return r, nil
+}
+
+// RegisterModule compiles src as an ES module and registers it under
+// specifier, so later EvalModule calls (and dynamic import) can resolve it.
+func (i *Interpreter) RegisterModule(specifier, src string) (EvalResult, error) {
+	var buf []byte
+	buf = pbAppendUint64(buf, 1, i.h)
+	buf = pbAppendString(buf, 2, specifier)
+	buf = pbAppendUint64(buf, 3, uint64(len(specifier)))
+	buf = pbAppendString(buf, 4, src)
+	buf = pbAppendUint64(buf, 5, uint64(len(src)))
+	resp, err := i.m.invoke(0, midModuleRegister, buf, wasm2go.Inv_0_7)
+	if err != nil {
+		return EvalResult{}, err
+	}
+	if e := pbExtractError(resp); e != nil {
+		return EvalResult{}, e
+	}
+	js := readScalarAtField(resp, 1, (*pbReader).readString)
+	var r EvalResult
+	if err := json.Unmarshal([]byte(js), &r); err != nil {
+		return EvalResult{}, fmt.Errorf("decode eval result %q: %w", js, err)
+	}
+	return r, nil
+}
+
+// InstallTest262Hooks installs the $262 test-support object on the global.
+// Conformance harness use only; not part of the sandbox surface.
+func (i *Interpreter) InstallTest262Hooks() error {
+	var buf []byte
+	buf = pbAppendUint64(buf, 1, i.h)
+	resp, err := i.m.invoke(0, midInstallT262, buf, wasm2go.Inv_0_3)
+	if err != nil {
+		return err
+	}
+	return pbExtractError(resp)
 }
 
 // Close finalizes the interpreter. The Interpreter must not be used afterward.
@@ -281,7 +347,7 @@ func (i *Interpreter) jsNew(maxHeapBytes, stackQuota uint32) (uint64, error) {
 	var buf []byte
 	buf = pbAppendUint64(buf, 1, uint64(maxHeapBytes))
 	buf = pbAppendUint64(buf, 2, uint64(stackQuota))
-	resp, err := i.m.invoke(0, midNew, buf, wasm2go.Inv_0_5)
+	resp, err := i.m.invoke(0, midNew, buf, wasm2go.Inv_0_8)
 	if err != nil {
 		return 0, err
 	}
@@ -346,15 +412,15 @@ type Interrupter struct {
 // PrepareInterrupt resolves the interrupt addresses up front so Fire can run
 // concurrently with a busy Eval (which holds the instance lock).
 func (i *Interpreter) PrepareInterrupt() (*Interrupter, error) {
-	flagAddr, err := i.u32Call(midInterruptAddr, wasm2go.Inv_0_2)
+	flagAddr, err := i.u32Call(midInterruptAddr, wasm2go.Inv_0_4)
 	if err != nil {
 		return nil, err
 	}
-	bitsAddr, err := i.u32Call(midInterruptBitsPtr, wasm2go.Inv_0_3)
+	bitsAddr, err := i.u32Call(midInterruptBitsPtr, wasm2go.Inv_0_5)
 	if err != nil {
 		return nil, err
 	}
-	bitsValue, err := i.u32Call(midInterruptBitsVal, wasm2go.Inv_0_4)
+	bitsValue, err := i.u32Call(midInterruptBitsVal, wasm2go.Inv_0_6)
 	if err != nil {
 		return nil, err
 	}

@@ -726,15 +726,47 @@ func JsClose(h uint64) error {
 // A single JSON string return is used because the bridge generator surfaces
 // only one response value to Go; bundling the outputs keeps one round-trip and
 // one atomic result. The Go wrapper unmarshals it.
-func JsEval(h uint64, src string) (string, error) {
+func JsEval(h uint64, src string, srcLen uint32) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
 	buf = pbAppendString(buf, 2, src)
+	buf = pbAppendUint64(buf, 3, uint64(srcLen))
 	resp, err := invokeMethod(0, 1, buf, wasm2go.Inv_0_1)
 	if err != nil {
 		return "", err
 	}
 	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+// Compile `src` as an ES module registered under `specifier`, load its
+// dependency graph from the registry, link, evaluate, and drain the job queue.
+// Same JSON shape as js_eval: "ok" true when the module (including top-level
+// await) evaluated to completion; "error" carries compile/link/import/runtime
+// failures, or "module not registered: X" when an import misses the registry.
+func JsEvalModule(h uint64, specifier string, specifierLen uint32, src string, srcLen uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	buf = pbAppendString(buf, 2, specifier)
+	buf = pbAppendUint64(buf, 3, uint64(specifierLen))
+	buf = pbAppendString(buf, 4, src)
+	buf = pbAppendUint64(buf, 5, uint64(srcLen))
+	resp, err := invokeMethod(0, 2, buf, wasm2go.Inv_0_2)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+// Install the $262 test-support object (https://github.com/tc39/test262
+// INTERPRETING.md) on this runtime's global: createRealm (same-compartment
+// realm with its own $262), detachArrayBuffer, evalScript, gc, global, and an
+// IsHTMLDDA object ([[IsHTMLDDA]], i.e. document.all emulation). NOT part of
+// the sandbox surface — call it only from conformance harnesses.
+func JsInstallTest262Hooks(h uint64) error {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	_, err := invokeMethod(0, 3, buf, wasm2go.Inv_0_3)
+	return err
 }
 
 // ---- Interruption support ------------------------------------------------
@@ -792,7 +824,7 @@ func JsEval(h uint64, src string) (string, error) {
 func JsInterruptAddr(h uint64) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 2, buf, wasm2go.Inv_0_2)
+	resp, err := invokeMethod(0, 4, buf, wasm2go.Inv_0_4)
 	if err != nil {
 		return 0, err
 	}
@@ -802,7 +834,7 @@ func JsInterruptAddr(h uint64) (uint32, error) {
 func JsInterruptBitsAddr(h uint64) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 3, buf, wasm2go.Inv_0_3)
+	resp, err := invokeMethod(0, 5, buf, wasm2go.Inv_0_5)
 	if err != nil {
 		return 0, err
 	}
@@ -812,11 +844,28 @@ func JsInterruptBitsAddr(h uint64) (uint32, error) {
 func JsInterruptBitsValue(h uint64) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 4, buf, wasm2go.Inv_0_4)
+	resp, err := invokeMethod(0, 6, buf, wasm2go.Inv_0_6)
 	if err != nil {
 		return 0, err
 	}
 	return readScalarAtField(resp, 1, (*pbReader).readUint32), nil
+}
+
+// Compile `src` as an ES module and register it under `specifier`. Returns the
+// usual JSON result; "ok" false carries the compile error. Re-registering a
+// specifier replaces the module (affects future lookups only).
+func JsModuleRegister(h uint64, specifier string, specifierLen uint32, src string, srcLen uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	buf = pbAppendString(buf, 2, specifier)
+	buf = pbAppendUint64(buf, 3, uint64(specifierLen))
+	buf = pbAppendString(buf, 4, src)
+	buf = pbAppendUint64(buf, 5, uint64(srcLen))
+	resp, err := invokeMethod(0, 7, buf, wasm2go.Inv_0_7)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
 }
 
 // Initialize a JS runtime and return an opaque handle (0 on failure). Call once
@@ -840,7 +889,7 @@ func JsNew(maxHeapBytes uint32, nativeStackQuotaBytes uint32) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, uint64(maxHeapBytes))
 	buf = pbAppendUint64(buf, 2, uint64(nativeStackQuotaBytes))
-	resp, err := invokeMethod(0, 5, buf, wasm2go.Inv_0_5)
+	resp, err := invokeMethod(0, 8, buf, wasm2go.Inv_0_8)
 	if err != nil {
 		return 0, err
 	}
