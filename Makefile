@@ -1,5 +1,5 @@
 SPIDERMONKEY_WASM_REPO     ?= goccy/spidermonkey-wasm
-SPIDERMONKEY_WASM_VERSION  ?= v0.1.0
+SPIDERMONKEY_WASM_VERSION  ?= v0.2.1
 # spidermonkey-wasm emits its release attestations from release.yml (the v* tag
 # workflow), NOT build.yml — releasing lives only in release.yml there.
 SPIDERMONKEY_WASM_WORKFLOW ?= goccy/spidermonkey-wasm/.github/workflows/release.yml
@@ -11,7 +11,7 @@ SPIDERMONKEY_WASM_WORKFLOW ?= goccy/spidermonkey-wasm/.github/workflows/release.
 # alongside it — SpiderMonkey's standard library is compiled into the engine,
 # which lives in the spidermonkeywasm2go module, not here.
 BRIDGE_ASSET := spidermonkey_wasm2go.go
-BRIDGE_FILE  := spidermonkey.go
+BRIDGE_FILE  := internal/spidermonkey.go
 RELEASE_URL       = https://github.com/$(SPIDERMONKEY_WASM_REPO)/releases/download/$(SPIDERMONKEY_WASM_VERSION)
 ATTESTATION_API   = https://api.github.com/repos/$(SPIDERMONKEY_WASM_REPO)/attestations
 
@@ -52,7 +52,7 @@ test:
 
 ## test262: run the official ECMAScript conformance suite (tc39/test262,
 ## vendored as the test262/suite submodule) against this embedding. Takes
-## minutes; see test262/test262_test.go for the skip policy and knobs.
+## about 45 minutes; see test262_suite_test.go for the skip policy and knobs.
 test262:
 	git submodule update --init --depth 1 test262/suite
-	TEST262=1 go test ./test262/ -v -timeout 3h
+	TEST262=1 go test -run TestTest262 -v -timeout 3h .

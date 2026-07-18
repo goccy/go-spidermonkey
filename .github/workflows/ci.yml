@@ -39,4 +39,4 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: TEST262=1 go test ./test262/ -v -timeout 3h
+      - run: TEST262=1 go test . -run TestTest262 -v -timeout 3h
