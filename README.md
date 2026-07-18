@@ -8,10 +8,14 @@ host watchdog can stop a runaway loop from outside, and the guest gets no
 filesystem, network, or host environment unless you hand it one.
 
 It is measurably SpiderMonkey: CI runs the official
-[test262](https://github.com/tc39/test262) conformance suite, and this
-embedding passes 98.9% of the 41,581 tests it can host — within 0.2 points of
-the upstream SpiderMonkey shell on the same subset, with every failure triaged
-against upstream's own results ([details](#conformance-test262)).
+[test262](https://github.com/tc39/test262) conformance suite — the full
+suite, ICU, ES modules, `SharedArrayBuffer`/`Atomics` and multi-agent tests
+included — and this embedding passes 52,266 of the 53,406 tests in the
+revision [test262.fyi](https://test262.fyi/) measures the big engines against
+(97.9% counting skips against us; 98.0% of the 53,329 it hosts). That is
+within 0.4 points of the SpiderMonkey nightly shell (98.3% of the same
+revision), and in the core `language` and `built-ins` categories it matches or
+exceeds it — the whole gap is `Intl`/ICU ([details](#conformance-test262)).
 
 SpiderMonkey is compiled to `wasm32-wasi` by
 [`goccy/spidermonkey-wasm`](https://github.com/goccy/spidermonkey-wasm), then
@@ -97,55 +101,69 @@ capability. Every import the module has is `wasi_snapshot_preview1`.
 
 The claim "the engine is SpiderMonkey" is measured, not asserted. CI runs the
 official ECMAScript conformance suite — [tc39/test262](https://github.com/tc39/test262),
-vendored as the `test262/suite` submodule, pinned to the same revision
-[test262.fyi](https://test262.fyi/) measures the big engines against — on every
-change:
+vendored as the `test262/suite` submodule, pinned to revision `f2d1435` — the
+same revision [test262.fyi](https://test262.fyi/) measures the big engines
+against, so the numbers below are directly comparable — on every change:
 
 | area | pass / run | rate |
 |---|---|---|
-| language | 21,723 / 21,892 | 99.2% |
-| built-ins | 16,982 / 17,218 | 98.6% |
-| annexB | 1,005 / 1,026 | 98.0% |
-| harness | 112 / 112 | 100% |
-| staging | 1,310 / 1,333 | 98.3% |
-| **total** | **41,132 / 41,581** | **98.9%** |
+| language | 23,285 / 23,710 | 98.2% |
+| built-ins | 23,316 / 23,594 | 98.8% |
+| intl402 | 3,013 / 3,341 | 90.2% |
+| annexB | 1,058 / 1,086 | 97.4% |
+| harness | 116 / 116 | 100% |
+| staging | 1,478 / 1,482 | 99.7% |
+| **total** | **52,266 / 53,329** | **98.0%** |
 
-For scale: upstream SpiderMonkey — the nightly shell, with ICU, threads, and a
-module loader — passes 98.3% of the full suite on test262.fyi. On the subset
-this embedding can host, upstream passes 99.1% and go-spidermonkey 98.9%, and
-the two agree on 99.65% of individual tests.
+That is the FULL suite: ICU is compiled in (`Intl.*`, `Temporal`, regexp
+`\p{...}`, Unicode normalization and case folding all run), ES modules load
+through the host registry (`module`-flagged tests, `dynamic-import`), and the
+engine is built for wasi-threads, so `SharedArrayBuffer`, the whole `Atomics`
+family including `Atomics.waitAsync`, and test262's multi-agent tests
+(`$262.agent.*`) run for real — every agent is a SpiderMonkey thread that
+wasm2go hosts on a goroutine.
 
-Tests the embedding cannot host are skipped and accounted, not hidden (the run
-prints every skip reason): the engine build has no ICU (`intl402/`, `Temporal`,
-`Intl.*`, regexp `\p{...}` property escapes, `String.prototype.normalize`, full
-Unicode case folding), no threads (`Atomics`, `SharedArrayBuffer`), no module
-loader is wired into `js_eval` (`module`-flagged tests, `dynamic-import`), and
-the `$262` host hooks test262 wants from a shell (`createRealm`,
-`detachArrayBuffer`, `gc`, agents) are not exposed.
+### Measured against SpiderMonkey
 
-Every one of the 449 failures is triaged in
-[`test262/expectations.json`](./test262/expectations.json), each with its
-reason:
+Counting skipped tests against us — the way test262.fyi counts — this
+embedding passes 52,266 of all 53,406 tests (**97.9%**). On the same revision
+the SpiderMonkey nightly shell (154.0a1) passes 52,489 (**98.3%**); with
+experimental flags, 52,640 (98.6%). The 223-test, 0.4-point gap is not spread
+across the suite — it is almost entirely `Intl`:
 
-- **343** are also failed by upstream SpiderMonkey at the same test262
-  revision (per test262.fyi) — unshipped proposals like `Promise.allKeyed`,
-  decorators, `Atomics.waitAsync`.
-- **96** are features or behavior changes that shipped in Firefox after 147,
-  the version this build tracks — `Iterator.zip`/`zipKeyed` and the RegExp
-  legacy-accessor descriptor change.
-- **9** are known defects in the wasm→Go translation layer, root-caused and
-  tracked upstream: `f64.const -0` is emitted as `+0` (loses the sign of zero
-  in `Number("-0")`, `Math.atan2`, `Math.sumPrecise`), `js_eval` truncates
-  source at an embedded NUL byte, and the parser's recursion ceiling sits at
-  ~29 nested function literals regardless of `NativeStackQuotaBytes`.
-- **1** is a runner artifact (an allocation test that exceeds the runner's
-  default 64 MiB heap cap).
+| area | this embedding (FF 147) | SpiderMonkey nightly (154) | Δ |
+|---|---|---|---|
+| built-ins | 23,316 | 23,272 | **+44** |
+| language | 23,285 | 23,230 | **+55** |
+| staging | 1,478 | 1,451 | **+27** |
+| harness | 116 | 116 | 0 |
+| annexB | 1,058 | 1,084 | −26 |
+| intl402 | 3,013 | 3,336 | **−323** |
 
-CI is green only when the delta is exactly the documented one: an unexpected
-failure fails the job, and so does an expectation that starts passing.
+In the core ECMAScript categories this build matches or *exceeds* the nightly
+shell — it does not carry the nightly's regressions — and the only material
+deficit is `intl402`, where the engine is seven Firefox versions behind (147
+vs 154) and its bundled ICU4X data does not yet cover every locale the newer
+Intl proposals exercise. Closing that gap is engine-build work in
+[`goccy/spidermonkey-wasm`](https://github.com/goccy/spidermonkey-wasm), not a
+limit of running SpiderMonkey as Go.
+
+Only 77 tests are skipped, each accounted with its printed reason: 64
+`ShadowRealm` (a proposal off by default in the stock SpiderMonkey shell too),
+11 `$262.AbstractModuleSource` (host hook not exposed), and 2 `CanBlockIsFalse`
+(this embedding's main agent may block, so the premise does not apply). The
+skip set is decided by probing the running engine, so a feature the build
+actually ships is never hidden — `Atomics.pause`, for one, is shipped and runs.
+
+The 1,063 failures are pinned one by one in
+[`test262/expectations.json`](./test262/expectations.json) — CI is green
+exactly when the delta is the documented one, so a regression and a silent
+improvement both fail the run. The negative-test judge matches each expected
+error by its exact constructor name and phase, so a green run cannot be bought
+with a lenient check.
 
 ```sh
-make test262   # inits the submodule, then TEST262=1 go test ./test262/
+make test262   # inits the submodule, then TEST262=1 go test -run TestTest262 .
 ```
 
 ## Bounding what a script consumes
@@ -165,6 +183,15 @@ stay well below the memory cap — the GC needs slack to fail gracefully.
 `NewInterpreter` rejects a ratio above 1:4 rather than let it surface later as a
 dead instance on whichever allocation shape happened to route through an
 infallible path.
+
+`MaxMemoryBytes` sizes the linear-memory allocation itself, so raising it really
+does give the guest more room. Two things follow. Raising it costs interpreter
+*construction time*, not resident memory: the pages are mapped, not touched, and
+a booted interpreter's resident set is the same whatever the cap. And linear
+memory only ever grows — wasm has no shrink, and the guest's allocator reuses
+freed space only when its free list can serve the request — so a script that
+churns large allocations creeps toward the cap even with a small live set. Raise
+the cap before concluding a script leaks.
 
 The zero `Config` is a usable, sandboxed interpreter: 64 MiB heap, 256 MiB wasm
 memory, 512 KiB stack quota, an empty environment, and stdio that goes nowhere.
