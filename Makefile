@@ -1,5 +1,5 @@
 SPIDERMONKEY_WASM_REPO     ?= goccy/spidermonkey-wasm
-SPIDERMONKEY_WASM_VERSION  ?= v0.2.1
+SPIDERMONKEY_WASM_VERSION  ?= v0.2.2
 # spidermonkey-wasm emits its release attestations from release.yml (the v* tag
 # workflow), NOT build.yml — releasing lives only in release.yml there.
 SPIDERMONKEY_WASM_WORKFLOW ?= goccy/spidermonkey-wasm/.github/workflows/release.yml

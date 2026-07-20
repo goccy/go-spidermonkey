@@ -1,5 +1,7 @@
 # go-spidermonkey
 
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/goccy/go-spidermonkey)](https://pkg.go.dev/github.com/goccy/go-spidermonkey)
+
 **SpiderMonkey in pure Go — run untrusted JavaScript anywhere Go runs. No cgo,
 no WebAssembly runtime, one static binary.**
 
@@ -24,66 +26,63 @@ translated ahead of time into Go by
 that builds and links like any other package.
 
 ```go
-i, err := spidermonkey.NewInterpreter(spidermonkey.Config{})
+js, err := spidermonkey.New(spidermonkey.Config{})
 if err != nil {
     log.Fatal(err)
 }
-defer i.Close()
+defer js.Close()
 
-r, err := i.Eval("[1, 2, 3].map(x => x * 2).join(',')")
+r, err := js.Eval(context.Background(), "[1, 2, 3].map(x => x * 2).join(',')")
 if err != nil {
-    log.Fatal(err) // a host/transport failure
+    log.Fatal(err) // a host/transport failure, or ctx cancelled
 }
-fmt.Println(r.Ok, r.Result) // true 2,4,6
+if r.Error != nil {
+    log.Fatal(r.Error) // the script threw
+}
+fmt.Println(r.Value.String()) // 2,4,6
 ```
 
-`Eval` returns an `EvalResult`, not a Go error, for anything the script does
-wrong: `Ok` is false and `Error` carries the exception and its stack. A Go error
-means the host side failed. Output the script writes with `print()` or
-`console.log()` is captured into `Stdout` / `Stderr` rather than reaching the
-host's.
+`Eval` reports anything the script does wrong in the `Result`, not as a Go
+error: `Error` is non-nil and carries the exception and its stack, and `Value`
+is valid only when `Error` is nil. A Go error means the host side failed or
+`ctx` was cancelled. Output a host `console` writes goes to `Config.Stdout` /
+`Stderr` — SpiderMonkey has no I/O of its own, so nothing reaches the host's
+streams unless a host function puts it there.
 
-The global persists across calls, so an `Interpreter` behaves like a REPL.
+The global persists across calls, so one `JS` instance behaves like a REPL.
 Microtasks are drained before `Eval` returns, so a top-level
 `Promise.resolve().then(…)` has run by the time you see the result.
 
 ## Isolation
 
-Each `Interpreter` owns its own wasm instance — its own linear memory, its own
-JavaScript runtime. Two interpreters share nothing and run concurrently. A single
-`Interpreter` serialises its own calls, so it is safe to use from several
-goroutines, but it executes one script at a time.
+Each `JS` instance owns its own wasm instance — its own linear memory, its own
+JavaScript runtime. Two instances share nothing and run concurrently. A single
+instance serialises its own calls, so it is safe to use from several goroutines,
+but it executes one script at a time.
 
 ## Stopping a runaway script
 
-```go
-ip, err := i.PrepareInterrupt()   // resolve the addresses BEFORE the Eval
-if err != nil {
-    log.Fatal(err)
-}
-go func() {
-    time.Sleep(time.Second)
-    ip.Fire()                     // safe from another goroutine
-}()
+Pass a `context` to `Eval`; cancelling it (a timeout, a deadline, an explicit
+`cancel()`) interrupts the running script:
 
-r, _ := i.Eval("while (true) {}")
-// r.Ok == false, r.Error == "JS execution interrupted"
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+
+_, err := js.Eval(ctx, "while (true) {}")
+// err == context.DeadlineExceeded — the loop was interrupted
 ```
 
-`Fire` does not execute any code on the instance — it writes two words into the
-instance's linear memory, and SpiderMonkey's interpreter notices at the next
-bytecode loop head. That matters: running guest code on another goroutine would
-corrupt the instance's C stack.
+Cancellation runs no guest code: the harness sets an interrupt flag in the
+instance's linear memory from another goroutine, and SpiderMonkey's interpreter
+notices it at the next bytecode loop head. That matters — running guest code on
+another goroutine would corrupt the instance's C stack.
 
 The termination is an **uncatchable** exception. A script cannot swallow it:
 
 ```js
 try { while (true) {} } catch (e) { 'swallowed' }   // never yields 'swallowed'
 ```
-
-`PrepareInterrupt` exists because resolving the addresses takes the instance
-lock, which a running `Eval` holds. `Interrupt()` is the convenience form for
-when no `Eval` is in flight.
 
 Interruption only lands at bytecode loop heads, so a single long-running
 primitive — a pathological regex, a huge sort — is not preempted until it returns
@@ -170,31 +169,29 @@ make test262   # inits the submodule, then TEST262=1 go test -run TestTest262 .
 
 | `Config` field | Bounds | On breach |
 |---|---|---|
-| `MaxHeapBytes` | the GC heap | catchable `out of memory`; the interpreter survives |
-| `NativeStackQuotaBytes` | recursion depth | catchable `InternalError: too much recursion` |
-| `MaxMemoryBytes` | the wasm linear memory | the instance traps and is dead |
-| `PrepareInterrupt` / `Fire` | wall-clock time | uncatchable termination; the interpreter survives |
+| `MaxMemoryBytes` | the wasm linear memory — GC heap, engine data and the C stack together | the instance traps and is dead |
 
-`MaxHeapBytes` is the limit to tune. `MaxMemoryBytes` is a backstop that protects
-the *host process*, not a limit the guest recovers from: several SpiderMonkey
-allocation paths are infallible and abort rather than throw, so reaching the wasm
-cap kills the instance. The two are not interchangeable, and the heap cap must
-stay well below the memory cap — the GC needs slack to fail gracefully.
-`NewInterpreter` rejects a ratio above 1:4 rather than let it surface later as a
-dead instance on whichever allocation shape happened to route through an
-infallible path.
+`MaxMemoryBytes` is the one cap. It sizes the wasm linear memory the guest grows
+into, and everything the engine allocates — the GC heap, its own data, the C
+stack — lives inside it. It protects the *host process*, not the script: several
+SpiderMonkey allocation paths are infallible and abort rather than throw, so
+reaching the cap kills the instance rather than surfacing a catchable error.
+Runaway *recursion* is the case the engine still catches on its own — it raises a
+catchable `InternalError: too much recursion` well before the stack exhausts the
+cap.
 
-`MaxMemoryBytes` sizes the linear-memory allocation itself, so raising it really
-does give the guest more room. Two things follow. Raising it costs interpreter
-*construction time*, not resident memory: the pages are mapped, not touched, and
-a booted interpreter's resident set is the same whatever the cap. And linear
-memory only ever grows — wasm has no shrink, and the guest's allocator reuses
-freed space only when its free list can serve the request — so a script that
-churns large allocations creeps toward the cap even with a small live set. Raise
-the cap before concluding a script leaks.
+Raising `MaxMemoryBytes` costs interpreter *construction time*, not resident
+memory: the pages are mapped, not touched, and a booted instance's resident set
+is the same whatever the cap. Linear memory only ever grows — wasm has no shrink,
+and the guest's allocator reuses freed space only when its free list can serve
+the request — so a script that churns large allocations creeps toward the cap
+even with a small live set. Raise the cap before concluding a script leaks.
 
-The zero `Config` is a usable, sandboxed interpreter: 64 MiB heap, 256 MiB wasm
-memory, 512 KiB stack quota, an empty environment, and stdio that goes nowhere.
+To stop a script that runs too *long* rather than allocates too much, cancel the
+`context` you pass to `Eval` (see [Stopping a runaway script](#stopping-a-runaway-script)).
+
+The zero `Config` is a usable, sandboxed instance: 256 MiB wasm memory, an empty
+environment, and stdio that goes nowhere.
 
 ## Performance
 
@@ -202,8 +199,8 @@ memory, 512 KiB stack quota, an empty environment, and stdio that goes nowhere.
 
 | | fib(30) | loop sum (1e6) | boot | allocs on the loop |
 |---|---|---|---|---|
-| go-spidermonkey | 306 ms | 30 ms | 4.5 ms | 12 |
-| [goja](https://github.com/dop251/goja) (pure Go) | 167 ms | 44 ms | 2 µs | 2,000,000 |
+| go-spidermonkey | 321 ms | 33 ms | 0.4 ms | 27 |
+| [goja](https://github.com/dop251/goja) (pure Go) | 167 ms | 45 ms | 2 µs | 2,000,000 |
 | node (V8, JIT) | ~4 ms | ~2 ms | 40 ms | — |
 
 Node's row subtracts its 40 ms process startup, which every one of its iterations
@@ -214,15 +211,17 @@ ceiling is there to be honest about the cost of the sandbox.
 Against goja — the like-for-like comparison, since both interpret — the trade is
 legible. goja is roughly twice as fast on the call-bound `fib`, where every
 JavaScript call crosses go-spidermonkey's extra interpreter-in-Go layer.
-go-spidermonkey is about a third faster on the dispatch-bound loop, and it does
-that with **12 allocations against goja's two million**: the guest's values live
+go-spidermonkey is about a quarter faster on the dispatch-bound loop, and it does
+that with **27 allocations against goja's two million**: the guest's values live
 inside the wasm instance's linear memory, so they never touch the Go heap and
 never enter a Go GC cycle.
 
-Boot costs 4.5 ms and about 21 MiB of Go heap, essentially all of it the
-instance's linear memory. goja boots in microseconds. If you create an
-interpreter per request, that difference is the one to weigh; if you keep a pool
-of them, it disappears.
+Boot costs about 0.4 ms. The instance's 256 MiB linear memory is an mmap'd
+copy-on-write mapping, so it reserves address space but stays almost entirely
+non-resident until the guest writes to it — and it never lands on the Go heap (a
+live instance holds ~0.1 MiB of it). goja boots in microseconds. If you create
+an interpreter per request, that difference is the one to weigh; if you keep a
+pool of them, it disappears.
 
 ```sh
 cd bench && go test -bench . -benchmem ./...

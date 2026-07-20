@@ -19,6 +19,7 @@
 package jsbench
 
 import (
+	"context"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -34,67 +35,69 @@ const (
 	// deep-recursion, call-bound workload that stresses an interpreter's
 	// dispatch and its call machinery rather than its arithmetic.
 	fibDef  = `function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2) }`
-	fibCall = `fib(30)`
+	fibCall = `String(fib(30))`
 	fib30   = "832040"
 
 	// A tight arithmetic loop: dispatch-bound rather than call-bound. Wrapped
 	// in an IIFE because the global persists across iterations, and a re-run
-	// `let` would throw.
-	loopSum    = `(() => { let s = 0; for (let k = 0; k < 1000000; k++) s += k; return s })()`
+	// `let` would throw. String(...) makes the engines agree on the completion
+	// value's text — the workload is the loop, and one final coercion is noise
+	// against a million iterations.
+	loopSum    = `String((() => { let s = 0; for (let k = 0; k < 1000000; k++) s += k; return s })())`
 	loopSumVal = "499999500000"
 )
 
 // ---- go-spidermonkey (wasm2go SpiderMonkey) -------------------------------
 
-func smInterp(tb testing.TB) *spidermonkey.Interpreter {
+func smInstance(tb testing.TB) *spidermonkey.JS {
 	tb.Helper()
-	i, err := spidermonkey.NewInterpreter(spidermonkey.Config{})
+	js, err := spidermonkey.New(spidermonkey.Config{})
 	if err != nil {
-		tb.Fatalf("NewInterpreter: %v", err)
+		tb.Fatalf("New: %v", err)
 	}
-	return i
+	return js
 }
 
-func smEval(tb testing.TB, i *spidermonkey.Interpreter, src, want string) {
+func smEval(tb testing.TB, js *spidermonkey.JS, src, want string) {
 	tb.Helper()
-	r, err := i.Eval(src)
+	r, err := js.Eval(context.Background(), src)
 	if err != nil {
 		tb.Fatalf("eval host error: %v", err)
 	}
-	if !r.Ok {
-		tb.Fatalf("eval js error: %s", r.Error)
+	if r.Error != nil {
+		tb.Fatalf("eval js error: %v", r.Error)
 	}
-	if want != "" && r.Result != want {
-		tb.Fatalf("eval %q = %q, want %q", src, r.Result, want)
+	if want != "" && r.Value.String() != want {
+		tb.Fatalf("eval %q = %q, want %q", src, r.Value.String(), want)
 	}
 }
 
 func BenchmarkFibRecursive_GoSpiderMonkey(b *testing.B) {
-	i := smInterp(b)
-	defer i.Close()
-	smEval(b, i, fibDef, "")
+	js := smInstance(b)
+	defer js.Close()
+	smEval(b, js, fibDef, "")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		smEval(b, i, fibCall, fib30)
+		smEval(b, js, fibCall, fib30)
 	}
 }
 
 func BenchmarkLoopSum_GoSpiderMonkey(b *testing.B) {
-	i := smInterp(b)
-	defer i.Close()
+	js := smInstance(b)
+	defer js.Close()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		smEval(b, i, loopSum, loopSumVal)
+		smEval(b, js, loopSum, loopSumVal)
 	}
 }
 
 func BenchmarkStartup_GoSpiderMonkey(b *testing.B) {
 	b.ReportAllocs()
 	for n := 0; n < b.N; n++ {
-		i := smInterp(b)
-		if err := i.Close(); err != nil {
+		js := smInstance(b)
+		if err := js.Close(); err != nil {
 			b.Fatalf("Close: %v", err)
 		}
 	}
@@ -232,11 +235,11 @@ func TestMemoryFootprint(t *testing.T) {
 	}
 
 	measure("go-spidermonkey", func() any {
-		i := smInterp(t)
-		t.Cleanup(func() { i.Close() })
-		smEval(t, i, fibDef, "")
-		smEval(t, i, fibCall, fib30)
-		return i
+		js := smInstance(t)
+		t.Cleanup(func() { js.Close() })
+		smEval(t, js, fibDef, "")
+		smEval(t, js, fibCall, fib30)
+		return js
 	})
 	measure("goja", func() any {
 		vm := gojaVM(t, fibDef)
