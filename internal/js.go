@@ -69,32 +69,36 @@ const (
 // Method IDs of the bridge service (service 0). Verified against the generated
 // spidermonkey.go; keep in sync on regeneration.
 const (
-	midCall              int32 = 2
-	midClose             int32 = 6
-	midDefineFunction    int32 = 8
-	midDefineConstructor int32 = 7
-	midEval              int32 = 10
-	midEvalModule        int32 = 12
-	midFreeObject        int32 = 13
-	midGet               int32 = 15
-	midGlobal            int32 = 16
-	midInterruptAddr     int32 = 17
-	midInterruptBitsAddr int32 = 18
-	midInterruptBitsVal  int32 = 19
-	midNew               int32 = 20
-	midNewPlainObject    int32 = 22
-	midRunJobs           int32 = 24
-	midSet               int32 = 25
+	midCall              int32 = 4
+	midClose             int32 = 8
+	midDefineFunction    int32 = 11
+	midDefineConstructor int32 = 10
+	midEval              int32 = 13
+	midEvalModule        int32 = 15
+	midFreeObject        int32 = 16
+	midGet               int32 = 18
+	midGlobal            int32 = 19
+	midInterruptAddr     int32 = 20
+	midInterruptBitsAddr int32 = 21
+	midInterruptBitsVal  int32 = 22
+	midNew               int32 = 23
+	midNewPlainObject    int32 = 26
+	midRunJobs           int32 = 28
+	midSet               int32 = 29
 	midAgentSpawn        int32 = 0
 	midAgentWake         int32 = 1
-	midCloneWrite        int32 = 5
-	midCloneRead         int32 = 4
-	midCloneFree         int32 = 3
-	midGc                int32 = 14
-	midDetachArrayBuffer int32 = 9
-	midNewRealm          int32 = 23
-	midEvalIn            int32 = 11
-	midNewHTMLDDA        int32 = 21
+	midBytesNew          int32 = 2
+	midBytesRead         int32 = 3
+	midConstruct         int32 = 9
+	midNewFunction       int32 = 24
+	midCloneWrite        int32 = 7
+	midCloneRead         int32 = 6
+	midCloneFree         int32 = 5
+	midGc                int32 = 17
+	midDetachArrayBuffer int32 = 12
+	midNewRealm          int32 = 27
+	midEvalIn            int32 = 14
+	midNewHTMLDDA        int32 = 25
 )
 
 // JS is one interpreter: its own wasm module and one SpiderMonkey runtime.
@@ -180,7 +184,7 @@ func (js *JS) EvalModule(specifier, src string) (string, error) {
 	buf = pbAppendUint64(buf, 3, uint64(len(specifier)))
 	buf = pbAppendString(buf, 4, src)
 	buf = pbAppendUint64(buf, 5, uint64(len(src)))
-	resp, err := js.invokeMethod(midEvalModule, buf, wasm2go.Inv_0_12)
+	resp, err := js.invokeMethod(midEvalModule, buf, wasm2go.Inv_0_15)
 	if err != nil {
 		return "", err
 	}
@@ -200,7 +204,7 @@ func (js *JS) EvalModuleContext(ctx context.Context, specifier, src string) (str
 func (js *JS) RunJobs() (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midRunJobs, buf, wasm2go.Inv_0_24)
+	resp, err := js.invokeMethod(midRunJobs, buf, wasm2go.Inv_0_28)
 	if err != nil {
 		return "", err
 	}
@@ -225,15 +229,15 @@ func (js *JS) u32(mid int32, call func(*base.Module, int32, int32) (int64, error
 }
 
 func (js *JS) prepareInterrupter() (*interrupter, error) {
-	flagAddr, err := js.u32(midInterruptAddr, wasm2go.Inv_0_17)
+	flagAddr, err := js.u32(midInterruptAddr, wasm2go.Inv_0_20)
 	if err != nil {
 		return nil, err
 	}
-	bitsAddr, err := js.u32(midInterruptBitsAddr, wasm2go.Inv_0_18)
+	bitsAddr, err := js.u32(midInterruptBitsAddr, wasm2go.Inv_0_21)
 	if err != nil {
 		return nil, err
 	}
-	bitsValue, err := js.u32(midInterruptBitsVal, wasm2go.Inv_0_19)
+	bitsValue, err := js.u32(midInterruptBitsVal, wasm2go.Inv_0_22)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +284,7 @@ func (js *JS) CloneWrite(val string) (uint64, error) {
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendString(buf, 2, val)
 	buf = pbAppendUint64(buf, 3, uint64(len(val)))
-	resp, err := js.invokeMethod(midCloneWrite, buf, wasm2go.Inv_0_5)
+	resp, err := js.invokeMethod(midCloneWrite, buf, wasm2go.Inv_0_7)
 	if err != nil {
 		return 0, err
 	}
@@ -297,7 +301,7 @@ func (js *JS) CloneRead(clone uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendUint64(buf, 2, clone)
-	resp, err := js.invokeMethod(midCloneRead, buf, wasm2go.Inv_0_4)
+	resp, err := js.invokeMethod(midCloneRead, buf, wasm2go.Inv_0_6)
 	if err != nil {
 		return "", err
 	}
@@ -308,7 +312,7 @@ func (js *JS) CloneRead(clone uint64) (string, error) {
 func (js *JS) CloneFree(clone uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, clone)
-	_, err := js.invokeMethod(midCloneFree, buf, wasm2go.Inv_0_3)
+	_, err := js.invokeMethod(midCloneFree, buf, wasm2go.Inv_0_5)
 	return err
 }
 
@@ -316,7 +320,7 @@ func (js *JS) CloneFree(clone uint64) error {
 func (js *JS) Gc() error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	_, err := js.invokeMethod(midGc, buf, wasm2go.Inv_0_14)
+	_, err := js.invokeMethod(midGc, buf, wasm2go.Inv_0_17)
 	return err
 }
 
@@ -326,11 +330,93 @@ func (js *JS) DetachArrayBuffer(obj uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendUint64(buf, 2, obj)
-	resp, err := js.invokeMethod(midDetachArrayBuffer, buf, wasm2go.Inv_0_9)
+	resp, err := js.invokeMethod(midDetachArrayBuffer, buf, wasm2go.Inv_0_12)
 	if err != nil {
 		return "", err
 	}
 	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+// NewFunction creates a fresh host-backed guest FUNCTION object (attached to
+// nothing) and returns its handle. Guest calls dispatch to env under `key`;
+// name is the function's name property, nargs its declared arity. The Go-side
+// FuncOf primitive.
+func (js *JS) NewFunction(name, key string, nargs uint32) (uint64, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	buf = pbAppendString(buf, 2, name)
+	buf = pbAppendUint64(buf, 3, uint64(len(name)))
+	buf = pbAppendString(buf, 4, key)
+	buf = pbAppendUint64(buf, 5, uint64(len(key)))
+	buf = pbAppendUint64(buf, 6, uint64(nargs))
+	resp, err := js.invokeMethod(midNewFunction, buf, wasm2go.Inv_0_24)
+	if err != nil {
+		return 0, err
+	}
+	h := readScalarAtField(resp, 1, (*pbReader).readUint64)
+	if h == 0 {
+		return 0, fmt.Errorf("function creation failed")
+	}
+	return h, nil
+}
+
+// Construct runs `new fn(...args)` — Call's [[Construct]] counterpart. fn must
+// be a constructor (a class or function) handle; args is a JSON array of value
+// encodings. The return is the new instance's value encoding.
+func (js *JS) Construct(fn uint64, args string) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	buf = pbAppendUint64(buf, 2, fn)
+	buf = pbAppendString(buf, 3, args)
+	buf = pbAppendUint64(buf, 4, uint64(len(args)))
+	resp, err := js.invokeMethod(midConstruct, buf, wasm2go.Inv_0_9)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+// BytesNew creates a fresh guest Uint8Array holding a copy of data and returns
+// its object handle. The bytes cross the bridge RAW — the protobuf channel is
+// length-delimited and 8-bit clean — with no base64/JSON encoding.
+func (js *JS) BytesNew(data []byte) (uint64, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	buf = pbAppendBytes(buf, 2, data)
+	buf = pbAppendUint64(buf, 3, uint64(len(data)))
+	resp, err := js.invokeMethod(midBytesNew, buf, wasm2go.Inv_0_2)
+	if err != nil {
+		return 0, err
+	}
+	h := readScalarAtField(resp, 1, (*pbReader).readUint64)
+	if h == 0 {
+		return 0, fmt.Errorf("byte array creation failed")
+	}
+	return h, nil
+}
+
+// BytesRead copies the binary contents of the object behind the handle
+// (Uint8Array, any other ArrayBuffer view, ArrayBuffer, SharedArrayBuffer)
+// out of the guest, raw. The reply is 'B' + bytes or 'E' + message.
+func (js *JS) BytesRead(obj uint64) ([]byte, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	buf = pbAppendUint64(buf, 2, obj)
+	resp, err := js.invokeMethod(midBytesRead, buf, wasm2go.Inv_0_3)
+	if err != nil {
+		return nil, err
+	}
+	b := readScalarAtField(resp, 1, (*pbReader).readBytes)
+	if len(b) == 0 {
+		return nil, fmt.Errorf("malformed bytes reply: empty")
+	}
+	switch b[0] {
+	case 'B':
+		return b[1:], nil
+	case 'E':
+		return nil, fmt.Errorf("%s", b[1:])
+	}
+	return nil, fmt.Errorf("malformed bytes reply tag %q", b[0])
 }
 
 // NewRealm creates a fresh same-compartment realm (standard classes, empty
@@ -338,7 +424,7 @@ func (js *JS) DetachArrayBuffer(obj uint64) (string, error) {
 func (js *JS) NewRealm() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midNewRealm, buf, wasm2go.Inv_0_23)
+	resp, err := js.invokeMethod(midNewRealm, buf, wasm2go.Inv_0_27)
 	if err != nil {
 		return 0, err
 	}
@@ -358,7 +444,7 @@ func (js *JS) EvalIn(global uint64, src string) (string, error) {
 	buf = pbAppendUint64(buf, 2, global)
 	buf = pbAppendString(buf, 3, src)
 	buf = pbAppendUint64(buf, 4, uint64(len(src)))
-	resp, err := js.invokeMethod(midEvalIn, buf, wasm2go.Inv_0_11)
+	resp, err := js.invokeMethod(midEvalIn, buf, wasm2go.Inv_0_14)
 	if err != nil {
 		return "", err
 	}
@@ -375,7 +461,7 @@ func (js *JS) EvalInContext(ctx context.Context, global uint64, src string) (str
 func (js *JS) NewHTMLDDA() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midNewHTMLDDA, buf, wasm2go.Inv_0_21)
+	resp, err := js.invokeMethod(midNewHTMLDDA, buf, wasm2go.Inv_0_25)
 	if err != nil {
 		return 0, err
 	}
@@ -419,7 +505,7 @@ func (js *JS) jsNew(maxHeapBytes, nativeStackQuotaBytes uint32) (uint64, error) 
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, uint64(maxHeapBytes))
 	buf = pbAppendUint64(buf, 2, uint64(nativeStackQuotaBytes))
-	resp, err := js.invokeMethod(midNew, buf, wasm2go.Inv_0_20)
+	resp, err := js.invokeMethod(midNew, buf, wasm2go.Inv_0_23)
 	if err != nil {
 		return 0, err
 	}
@@ -431,7 +517,7 @@ func (js *JS) jsNew(maxHeapBytes, nativeStackQuotaBytes uint32) (uint64, error) 
 func (js *JS) Close() error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	_, err := js.invokeMethod(midClose, buf, wasm2go.Inv_0_6)
+	_, err := js.invokeMethod(midClose, buf, wasm2go.Inv_0_8)
 	if js.mmapped != nil {
 		base.UnmapMemory(js.mmapped)
 		js.mmapped = nil
@@ -446,7 +532,7 @@ func (js *JS) Eval(src string) (string, error) {
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendString(buf, 2, src)
 	buf = pbAppendUint64(buf, 3, uint64(len(src)))
-	resp, err := js.invokeMethod(midEval, buf, wasm2go.Inv_0_10)
+	resp, err := js.invokeMethod(midEval, buf, wasm2go.Inv_0_13)
 	if err != nil {
 		return "", err
 	}
@@ -457,7 +543,7 @@ func (js *JS) Eval(src string) (string, error) {
 func (js *JS) Global() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midGlobal, buf, wasm2go.Inv_0_16)
+	resp, err := js.invokeMethod(midGlobal, buf, wasm2go.Inv_0_19)
 	if err != nil {
 		return 0, err
 	}
@@ -468,7 +554,7 @@ func (js *JS) Global() (uint64, error) {
 func (js *JS) NewPlainObject() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midNewPlainObject, buf, wasm2go.Inv_0_22)
+	resp, err := js.invokeMethod(midNewPlainObject, buf, wasm2go.Inv_0_26)
 	if err != nil {
 		return 0, err
 	}
@@ -486,7 +572,7 @@ func (js *JS) Get(obj uint64, name string) (string, error) {
 	buf = pbAppendUint64(buf, 2, obj)
 	buf = pbAppendString(buf, 3, name)
 	buf = pbAppendUint64(buf, 4, uint64(len(name)))
-	resp, err := js.invokeMethod(midGet, buf, wasm2go.Inv_0_15)
+	resp, err := js.invokeMethod(midGet, buf, wasm2go.Inv_0_18)
 	if err != nil {
 		return "", err
 	}
@@ -504,7 +590,7 @@ func (js *JS) Set(obj uint64, name, val string) (string, error) {
 	buf = pbAppendUint64(buf, 4, uint64(len(name)))
 	buf = pbAppendString(buf, 5, val)
 	buf = pbAppendUint64(buf, 6, uint64(len(val)))
-	resp, err := js.invokeMethod(midSet, buf, wasm2go.Inv_0_25)
+	resp, err := js.invokeMethod(midSet, buf, wasm2go.Inv_0_29)
 	if err != nil {
 		return "", err
 	}
@@ -521,7 +607,7 @@ func (js *JS) Call(fn, this uint64, args string) (string, error) {
 	buf = pbAppendUint64(buf, 3, this)
 	buf = pbAppendString(buf, 4, args)
 	buf = pbAppendUint64(buf, 5, uint64(len(args)))
-	resp, err := js.invokeMethod(midCall, buf, wasm2go.Inv_0_2)
+	resp, err := js.invokeMethod(midCall, buf, wasm2go.Inv_0_4)
 	if err != nil {
 		return "", err
 	}
@@ -545,7 +631,7 @@ func (js *JS) DefineFunction(obj uint64, name, key string, nargs uint32) error {
 	buf = pbAppendString(buf, 5, key)
 	buf = pbAppendUint64(buf, 6, uint64(len(key)))
 	buf = pbAppendUint64(buf, 7, uint64(nargs))
-	resp, err := js.invokeMethod(midDefineFunction, buf, wasm2go.Inv_0_8)
+	resp, err := js.invokeMethod(midDefineFunction, buf, wasm2go.Inv_0_11)
 	if err != nil {
 		return err
 	}
@@ -563,7 +649,7 @@ func (js *JS) DefineConstructor(obj uint64, name, key string, nargs uint32) erro
 	buf = pbAppendString(buf, 5, key)
 	buf = pbAppendUint64(buf, 6, uint64(len(key)))
 	buf = pbAppendUint64(buf, 7, uint64(nargs))
-	resp, err := js.invokeMethod(midDefineConstructor, buf, wasm2go.Inv_0_7)
+	resp, err := js.invokeMethod(midDefineConstructor, buf, wasm2go.Inv_0_10)
 	if err != nil {
 		return err
 	}
@@ -574,7 +660,7 @@ func (js *JS) DefineConstructor(obj uint64, name, key string, nargs uint32) erro
 func (js *JS) FreeObject(obj uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, obj)
-	_, err := js.invokeMethod(midFreeObject, buf, wasm2go.Inv_0_13)
+	_, err := js.invokeMethod(midFreeObject, buf, wasm2go.Inv_0_16)
 	return err
 }
 

@@ -733,6 +733,37 @@ func JsAgentWake(h uint64) error {
 	return err
 }
 
+// Create a fresh Uint8Array of data_len bytes initialized with a copy of
+// `data`, and return it as an object handle (0 on failure). The copy happens
+// inside this call, so no engine data pointer ever crosses the bridge.
+func JsBytesNew(h uint64, data string, dataLen uint32) (uint64, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	buf = pbAppendString(buf, 2, data)
+	buf = pbAppendUint64(buf, 3, uint64(dataLen))
+	resp, err := invokeMethod(0, 2, buf, wasm2go.Inv_0_2)
+	if err != nil {
+		return 0, err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
+}
+
+// Copy the binary contents of obj_handle out of the engine: a Uint8Array or
+// any other ArrayBuffer view (read as its raw bytes, honoring offset/length),
+// an ArrayBuffer, or a SharedArrayBuffer. Returns 'B' + the bytes on success,
+// or 'E' + message when the object is not binary (the one-byte tag
+// disambiguates an empty buffer from an error).
+func JsBytesRead(h uint64, objHandle uint64) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	buf = pbAppendUint64(buf, 2, objHandle)
+	resp, err := invokeMethod(0, 3, buf, wasm2go.Inv_0_3)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
 // Call callable fn_handle with this_handle (0 = undefined) and args (a JSON
 // array of value encodings); return the result as a value encoding.
 func JsCall(h uint64, fnHandle uint64, thisHandle uint64, args string, argsLen uint32) (string, error) {
@@ -742,7 +773,7 @@ func JsCall(h uint64, fnHandle uint64, thisHandle uint64, args string, argsLen u
 	buf = pbAppendUint64(buf, 3, thisHandle)
 	buf = pbAppendString(buf, 4, args)
 	buf = pbAppendUint64(buf, 5, uint64(argsLen))
-	resp, err := invokeMethod(0, 2, buf, wasm2go.Inv_0_2)
+	resp, err := invokeMethod(0, 4, buf, wasm2go.Inv_0_4)
 	if err != nil {
 		return "", err
 	}
@@ -753,7 +784,7 @@ func JsCall(h uint64, fnHandle uint64, thisHandle uint64, args string, argsLen u
 func JsCloneFree(cloneHandle uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, cloneHandle)
-	_, err := invokeMethod(0, 3, buf, wasm2go.Inv_0_3)
+	_, err := invokeMethod(0, 5, buf, wasm2go.Inv_0_5)
 	return err
 }
 
@@ -764,7 +795,7 @@ func JsCloneRead(h uint64, cloneHandle uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
 	buf = pbAppendUint64(buf, 2, cloneHandle)
-	resp, err := invokeMethod(0, 4, buf, wasm2go.Inv_0_4)
+	resp, err := invokeMethod(0, 6, buf, wasm2go.Inv_0_6)
 	if err != nil {
 		return "", err
 	}
@@ -779,7 +810,7 @@ func JsCloneWrite(h uint64, val string, valLen uint32) (uint64, error) {
 	buf = pbAppendUint64(buf, 1, h)
 	buf = pbAppendString(buf, 2, val)
 	buf = pbAppendUint64(buf, 3, uint64(valLen))
-	resp, err := invokeMethod(0, 5, buf, wasm2go.Inv_0_5)
+	resp, err := invokeMethod(0, 7, buf, wasm2go.Inv_0_7)
 	if err != nil {
 		return 0, err
 	}
@@ -792,8 +823,25 @@ func JsCloneWrite(h uint64, val string, valLen uint32) (uint64, error) {
 func JsClose(h uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	_, err := invokeMethod(0, 6, buf, wasm2go.Inv_0_6)
+	_, err := invokeMethod(0, 8, buf, wasm2go.Inv_0_8)
 	return err
+}
+
+// Construct `new fn(...args)` — the [[Construct]] counterpart of js_call
+// (fn_handle must be a constructor: a class or function). args is the same
+// JSON array of value encodings; the return is the new instance's value
+// encoding ({"k":"error",...} when construction threw).
+func JsConstruct(h uint64, fnHandle uint64, args string, argsLen uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	buf = pbAppendUint64(buf, 2, fnHandle)
+	buf = pbAppendString(buf, 3, args)
+	buf = pbAppendUint64(buf, 4, uint64(argsLen))
+	resp, err := invokeMethod(0, 9, buf, wasm2go.Inv_0_9)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
 }
 
 // Define a CONSTRUCTABLE host function on obj_handle — like js_define_function
@@ -809,7 +857,7 @@ func JsDefineConstructor(h uint64, objHandle uint64, name string, nameLen uint32
 	buf = pbAppendString(buf, 5, key)
 	buf = pbAppendUint64(buf, 6, uint64(keyLen))
 	buf = pbAppendUint64(buf, 7, uint64(nargs))
-	resp, err := invokeMethod(0, 7, buf, wasm2go.Inv_0_7)
+	resp, err := invokeMethod(0, 10, buf, wasm2go.Inv_0_10)
 	if err != nil {
 		return "", err
 	}
@@ -830,7 +878,7 @@ func JsDefineFunction(h uint64, objHandle uint64, name string, nameLen uint32, k
 	buf = pbAppendString(buf, 5, key)
 	buf = pbAppendUint64(buf, 6, uint64(keyLen))
 	buf = pbAppendUint64(buf, 7, uint64(nargs))
-	resp, err := invokeMethod(0, 8, buf, wasm2go.Inv_0_8)
+	resp, err := invokeMethod(0, 11, buf, wasm2go.Inv_0_11)
 	if err != nil {
 		return "", err
 	}
@@ -843,7 +891,7 @@ func JsDetachArrayBuffer(h uint64, objHandle uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
 	buf = pbAppendUint64(buf, 2, objHandle)
-	resp, err := invokeMethod(0, 9, buf, wasm2go.Inv_0_9)
+	resp, err := invokeMethod(0, 12, buf, wasm2go.Inv_0_12)
 	if err != nil {
 		return "", err
 	}
@@ -894,7 +942,7 @@ func JsEval(h uint64, src string, srcLen uint32) (string, error) {
 	buf = pbAppendUint64(buf, 1, h)
 	buf = pbAppendString(buf, 2, src)
 	buf = pbAppendUint64(buf, 3, uint64(srcLen))
-	resp, err := invokeMethod(0, 10, buf, wasm2go.Inv_0_10)
+	resp, err := invokeMethod(0, 13, buf, wasm2go.Inv_0_13)
 	if err != nil {
 		return "", err
 	}
@@ -910,7 +958,7 @@ func JsEvalIn(h uint64, globalHandle uint64, src string, srcLen uint32) (string,
 	buf = pbAppendUint64(buf, 2, globalHandle)
 	buf = pbAppendString(buf, 3, src)
 	buf = pbAppendUint64(buf, 4, uint64(srcLen))
-	resp, err := invokeMethod(0, 11, buf, wasm2go.Inv_0_11)
+	resp, err := invokeMethod(0, 14, buf, wasm2go.Inv_0_14)
 	if err != nil {
 		return "", err
 	}
@@ -929,7 +977,7 @@ func JsEvalModule(h uint64, specifier string, specifierLen uint32, src string, s
 	buf = pbAppendUint64(buf, 3, uint64(specifierLen))
 	buf = pbAppendString(buf, 4, src)
 	buf = pbAppendUint64(buf, 5, uint64(srcLen))
-	resp, err := invokeMethod(0, 12, buf, wasm2go.Inv_0_12)
+	resp, err := invokeMethod(0, 15, buf, wasm2go.Inv_0_15)
 	if err != nil {
 		return "", err
 	}
@@ -940,7 +988,7 @@ func JsEvalModule(h uint64, specifier string, specifierLen uint32, src string, s
 func JsFreeObject(objHandle uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, objHandle)
-	_, err := invokeMethod(0, 13, buf, wasm2go.Inv_0_13)
+	_, err := invokeMethod(0, 16, buf, wasm2go.Inv_0_16)
 	return err
 }
 
@@ -948,7 +996,7 @@ func JsFreeObject(objHandle uint64) error {
 func JsGc(h uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	_, err := invokeMethod(0, 14, buf, wasm2go.Inv_0_14)
+	_, err := invokeMethod(0, 17, buf, wasm2go.Inv_0_17)
 	return err
 }
 
@@ -960,7 +1008,7 @@ func JsGet(h uint64, objHandle uint64, name string, nameLen uint32) (string, err
 	buf = pbAppendUint64(buf, 2, objHandle)
 	buf = pbAppendString(buf, 3, name)
 	buf = pbAppendUint64(buf, 4, uint64(nameLen))
-	resp, err := invokeMethod(0, 15, buf, wasm2go.Inv_0_15)
+	resp, err := invokeMethod(0, 18, buf, wasm2go.Inv_0_18)
 	if err != nil {
 		return "", err
 	}
@@ -971,7 +1019,7 @@ func JsGet(h uint64, objHandle uint64, name string, nameLen uint32) (string, err
 func JsGlobal(h uint64) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 16, buf, wasm2go.Inv_0_16)
+	resp, err := invokeMethod(0, 19, buf, wasm2go.Inv_0_19)
 	if err != nil {
 		return 0, err
 	}
@@ -1033,7 +1081,7 @@ func JsGlobal(h uint64) (uint64, error) {
 func JsInterruptAddr(h uint64) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 17, buf, wasm2go.Inv_0_17)
+	resp, err := invokeMethod(0, 20, buf, wasm2go.Inv_0_20)
 	if err != nil {
 		return 0, err
 	}
@@ -1043,7 +1091,7 @@ func JsInterruptAddr(h uint64) (uint32, error) {
 func JsInterruptBitsAddr(h uint64) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 18, buf, wasm2go.Inv_0_18)
+	resp, err := invokeMethod(0, 21, buf, wasm2go.Inv_0_21)
 	if err != nil {
 		return 0, err
 	}
@@ -1053,7 +1101,7 @@ func JsInterruptBitsAddr(h uint64) (uint32, error) {
 func JsInterruptBitsValue(h uint64) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 19, buf, wasm2go.Inv_0_19)
+	resp, err := invokeMethod(0, 22, buf, wasm2go.Inv_0_22)
 	if err != nil {
 		return 0, err
 	}
@@ -1081,7 +1129,29 @@ func JsNew(maxHeapBytes uint32, nativeStackQuotaBytes uint32) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, uint64(maxHeapBytes))
 	buf = pbAppendUint64(buf, 2, uint64(nativeStackQuotaBytes))
-	resp, err := invokeMethod(0, 20, buf, wasm2go.Inv_0_20)
+	resp, err := invokeMethod(0, 23, buf, wasm2go.Inv_0_23)
+	if err != nil {
+		return 0, err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
+}
+
+// A fresh host-backed FUNCTION object, attached to nothing: calling it from JS
+// dispatches to the Go function the embedder registered under `key`, exactly
+// like a js_define_function stub, but the function is returned as a handle
+// instead of being defined as a property. This is the Go-side FuncOf: the
+// embedder composes it into any structure (a callback argument, an
+// underlyingSource.pull, an object method) via js_set / js_call /
+// js_construct. Returns 0 on failure.
+func JsNewFunction(h uint64, name string, nameLen uint32, key string, keyLen uint32, nargs uint32) (uint64, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, h)
+	buf = pbAppendString(buf, 2, name)
+	buf = pbAppendUint64(buf, 3, uint64(nameLen))
+	buf = pbAppendString(buf, 4, key)
+	buf = pbAppendUint64(buf, 5, uint64(keyLen))
+	buf = pbAppendUint64(buf, 6, uint64(nargs))
+	resp, err := invokeMethod(0, 24, buf, wasm2go.Inv_0_24)
 	if err != nil {
 		return 0, err
 	}
@@ -1093,7 +1163,7 @@ func JsNew(maxHeapBytes uint32, nativeStackQuotaBytes uint32) (uint64, error) {
 func JsNewHtmldda(h uint64) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 21, buf, wasm2go.Inv_0_21)
+	resp, err := invokeMethod(0, 25, buf, wasm2go.Inv_0_25)
 	if err != nil {
 		return 0, err
 	}
@@ -1104,7 +1174,7 @@ func JsNewHtmldda(h uint64) (uint64, error) {
 func JsNewPlainObject(h uint64) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 22, buf, wasm2go.Inv_0_22)
+	resp, err := invokeMethod(0, 26, buf, wasm2go.Inv_0_26)
 	if err != nil {
 		return 0, err
 	}
@@ -1119,7 +1189,7 @@ func JsNewPlainObject(h uint64) (uint64, error) {
 func JsNewRealm(h uint64) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 23, buf, wasm2go.Inv_0_23)
+	resp, err := invokeMethod(0, 27, buf, wasm2go.Inv_0_27)
 	if err != nil {
 		return 0, err
 	}
@@ -1144,7 +1214,7 @@ func JsNewRealm(h uint64) (uint64, error) {
 func JsRunJobs(h uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, h)
-	resp, err := invokeMethod(0, 24, buf, wasm2go.Inv_0_24)
+	resp, err := invokeMethod(0, 28, buf, wasm2go.Inv_0_28)
 	if err != nil {
 		return "", err
 	}
@@ -1165,7 +1235,7 @@ func JsSet(h uint64, objHandle uint64, name string, nameLen uint32, val string, 
 	buf = pbAppendUint64(buf, 4, uint64(nameLen))
 	buf = pbAppendString(buf, 5, val)
 	buf = pbAppendUint64(buf, 6, uint64(valLen))
-	resp, err := invokeMethod(0, 25, buf, wasm2go.Inv_0_25)
+	resp, err := invokeMethod(0, 29, buf, wasm2go.Inv_0_29)
 	if err != nil {
 		return "", err
 	}
