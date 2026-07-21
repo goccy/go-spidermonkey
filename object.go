@@ -67,10 +67,14 @@ func (js *JS) Global() *Object {
 }
 
 // DefineFunc defines a host-backed function name on the object; calling it from
-// JS runs fn with the interpreter's Config and the call arguments.
+// JS runs fn with the interpreter's Config and the call arguments. Each
+// definition dispatches under its own hidden key, so defining the same name on
+// two objects never makes their Go callbacks collide. Like NewFunction, the
+// Go-side registration lives for the interpreter's lifetime.
 func (o *Object) DefineFunc(name string, fn Func) error {
-	o.js.env.funcs[name] = fn
-	return o.js.raw.DefineFunction(o.handle, name, name, 0)
+	key := nextFnKey()
+	o.js.env.funcs[key] = fn
+	return o.js.raw.DefineFunction(o.handle, name, key, 0)
 }
 
 // DefineConstructor defines a host-backed CONSTRUCTOR name on the object:
@@ -141,6 +145,22 @@ func (o *Object) CallMethod(name string, args ...Value) (Value, error) {
 	}
 	defer fnObj.Free()
 	return fnObj.call(o, args)
+}
+
+// New constructs `new o(args...)` — the Go analogue of syscall/js's
+// Value.New. o must be a constructor (a class or a function); the returned
+// Value is the new instance. A guest throw during construction comes back as
+// a *JSError.
+func (o *Object) New(args ...Value) (Value, error) {
+	encodedArgs, err := encodeArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := o.js.raw.Construct(o.handle, encodedArgs)
+	if err != nil {
+		return nil, err
+	}
+	return decodeValue(o.js, encoded)
 }
 
 // call is the one seam over the raw bridge call: fn = o, this = self (nil for

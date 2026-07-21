@@ -12,7 +12,7 @@ import (
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
 
-func evalValue(t *testing.T, js *spidermonkey.JS, src string) spidermonkey.Value {
+func evalValue(t testing.TB, js *spidermonkey.JS, src string) spidermonkey.Value {
 	t.Helper()
 	r, err := js.Eval(context.Background(), src)
 	if err != nil {
