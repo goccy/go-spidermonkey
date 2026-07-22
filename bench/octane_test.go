@@ -98,9 +98,22 @@ const octaneDriver = `
 })()
 `
 
-// octaneSource assembles base.js + the suite files + the driver.
+// octanePrelude provides the d8-shell surface some suites expect —
+// zlib's emscripten preamble selects its shell environment by
+// `typeof print` and then captures the shell's `read` (under node it
+// selects process.stdout/require instead, so the shims are inert
+// there). Output is benchmark noise, and `read` is only captured, never
+// called — zlib's input data is embedded — so a throwing stub keeps an
+// accidental future call loud.
+const octanePrelude = `var print = typeof print === "undefined" ? function () {} : print;
+var read = typeof read === "undefined" ? function () { throw new Error("shell read() not supported"); } : read;
+` + "\n"
+
+// octaneSource assembles the prelude + base.js + the suite files + the
+// driver.
 func octaneSource(tb testing.TB, files []string) string {
 	var b strings.Builder
+	b.WriteString(octanePrelude)
 	for _, f := range append([]string{"base.js"}, files...) {
 		data, err := os.ReadFile(filepath.Join(octaneDir, f))
 		if err != nil {
