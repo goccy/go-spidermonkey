@@ -199,20 +199,20 @@ environment, and stdio that goes nowhere.
 
 | | fib(30) | loop sum (1e6) | boot | allocs on the loop |
 |---|---|---|---|---|
-| go-spidermonkey | 163 ms | 34 ms | 0.3 ms | 27 |
-| [goja](https://github.com/dop251/goja) (pure Go) | 176 ms | 47 ms | 3 µs | 2,000,000 |
-| node (V8, JIT) | ~5 ms | ~4 ms | 40 ms | — |
+| go-spidermonkey | 171 ms | 37 ms | 0.3 ms | 27 |
+| [goja](https://github.com/dop251/goja) (pure Go) | 182 ms | 48 ms | 2 µs | 2,000,000 |
+| node (V8, JIT) | ~3 ms | ~1 ms | 43 ms | — |
 
-Node's row subtracts its 40 ms process startup, which every one of its iterations
+Node's row subtracts its 43 ms process startup, which every one of its iterations
 pays. It is not a peer: V8 JITs, and a JIT cannot emit machine code from inside a
 wasm sandbox, so this engine runs SpiderMonkey's portable baseline
-interpreter — enabled at runtime since the v0.2.3 bundle (spidermonkey-wasm
-v0.2.4), which also transpiles the engine's atomic accesses to inline Go
+interpreter — enabled at runtime since the v0.2.4 bundle (spidermonkey-wasm
+v0.2.5), which also transpiles the engine's atomic accesses to inline Go
 intrinsics. The ceiling is there to be honest about the cost of the sandbox.
 
 Against goja — the like-for-like comparison, since both interpret —
 go-spidermonkey is now faster on both workloads: a little ahead on the
-call-bound `fib`, about a third faster on the dispatch-bound loop. And it does
+call-bound `fib`, about a quarter faster on the dispatch-bound loop. And it does
 that with **27 allocations against goja's two million**: the guest's values live
 inside the wasm instance's linear memory, so they never touch the Go heap and
 never enter a Go GC cycle.
