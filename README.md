@@ -199,24 +199,25 @@ environment, and stdio that goes nowhere.
 
 | | fib(30) | loop sum (1e6) | boot | allocs on the loop |
 |---|---|---|---|---|
-| go-spidermonkey | 321 ms | 33 ms | 0.4 ms | 27 |
-| [goja](https://github.com/dop251/goja) (pure Go) | 167 ms | 45 ms | 2 µs | 2,000,000 |
-| node (V8, JIT) | ~4 ms | ~2 ms | 40 ms | — |
+| go-spidermonkey | 171 ms | 37 ms | 0.3 ms | 27 |
+| [goja](https://github.com/dop251/goja) (pure Go) | 182 ms | 48 ms | 2 µs | 2,000,000 |
+| node (V8, JIT) | ~3 ms | ~1 ms | 43 ms | — |
 
-Node's row subtracts its 40 ms process startup, which every one of its iterations
+Node's row subtracts its 43 ms process startup, which every one of its iterations
 pays. It is not a peer: V8 JITs, and a JIT cannot emit machine code from inside a
-wasm sandbox, so this engine is SpiderMonkey's portable baseline interpreter. The
-ceiling is there to be honest about the cost of the sandbox.
+wasm sandbox, so this engine runs SpiderMonkey's portable baseline
+interpreter — enabled at runtime since the v0.2.4 bundle (spidermonkey-wasm
+v0.2.5), which also transpiles the engine's atomic accesses to inline Go
+intrinsics. The ceiling is there to be honest about the cost of the sandbox.
 
-Against goja — the like-for-like comparison, since both interpret — the trade is
-legible. goja is roughly twice as fast on the call-bound `fib`, where every
-JavaScript call crosses go-spidermonkey's extra interpreter-in-Go layer.
-go-spidermonkey is about a quarter faster on the dispatch-bound loop, and it does
+Against goja — the like-for-like comparison, since both interpret —
+go-spidermonkey is now faster on both workloads: a little ahead on the
+call-bound `fib`, about a quarter faster on the dispatch-bound loop. And it does
 that with **27 allocations against goja's two million**: the guest's values live
 inside the wasm instance's linear memory, so they never touch the Go heap and
 never enter a Go GC cycle.
 
-Boot costs about 0.4 ms. The instance's 256 MiB linear memory is an mmap'd
+Boot costs about 0.3 ms. The instance's 256 MiB linear memory is an mmap'd
 copy-on-write mapping, so it reserves address space but stays almost entirely
 non-resident until the guest writes to it — and it never lands on the Go heap (a
 live instance holds ~0.1 MiB of it). goja boots in microseconds. If you create
