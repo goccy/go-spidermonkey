@@ -3,6 +3,7 @@ package spidermonkey
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,10 +39,11 @@ type Func func(cfg Config, args []Value) (Value, error)
 // lock) and, for the agent keys, on AGENT goroutines concurrently — so the
 // oversized-reply stash is keyed by the calling thread's module instance.
 type hostEnv struct {
-	js     *JS // back-reference for decoding object handles; set by New
-	cfg    Config
-	funcs  map[string]Func
-	loader func(cfg Config, specifier, referrer string) (string, error)
+	js        *JS // back-reference for decoding object handles; set by New
+	cfg       Config
+	funcs     map[string]Func
+	loader    ModuleLoader     // fallback when no prefix resolver matches
+	resolvers []prefixResolver // sorted longest-prefix-first
 
 	stashMu sync.Mutex
 	stash   map[*base.Module][]byte
@@ -172,9 +174,6 @@ func (e *hostEnv) dispatch(key string, argsJSON []byte) []byte {
 }
 
 func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
-	if e.loader == nil {
-		return nil // no loader → total==0 → C++ falls back to missing-modules
-	}
 	var a []string
 	_ = json.Unmarshal(argsJSON, &a)
 	spec, ref := "", ""
@@ -184,7 +183,18 @@ func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
 	if len(a) > 1 {
 		ref = a[1]
 	}
-	src, err := e.loader(e.cfg, spec, ref)
+	// Longest registered prefix wins; the fallback loader takes the rest.
+	load := e.loader
+	for _, r := range e.resolvers {
+		if strings.HasPrefix(spec, r.prefix) {
+			load = r.load
+			break
+		}
+	}
+	if load == nil {
+		return nil // no loader → total==0 → C++ falls back to missing-modules
+	}
+	src, err := load(e.cfg, spec, ref)
 	if err != nil {
 		return append([]byte{'E'}, err.Error()...)
 	}
