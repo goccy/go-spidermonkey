@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Octane benchmark sources (fetched by bench/testdata/fetch-octane.sh)
+bench/testdata/octane/
