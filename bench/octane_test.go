@@ -20,7 +20,13 @@
 // are reported per suite instead of failing the harness — this is a
 // measurement, not a conformance gate.
 //
-//	go test -run TestOctane -v -timeout 4h .
+//	GOARCH=arm64 go test -c -o octane.test . && ./octane.test \
+//	  -test.run TestOctane -test.v -test.timeout 4h
+//
+// RUN THE HARNESS NATIVELY and record the arch: on Apple Silicon hosts
+// whose default Go toolchain is darwin/amd64, a plain `go test` runs
+// every Go engine under Rosetta and understates them all (goja most) —
+// while external lanes (node) stay native, silently skewing ratios.
 //
 // OCTANE_SUITES=name1,name2 | all   selects suites (default: the classic
 // nine that avoid multi-megabyte parse workloads); OCTANE_ENGINES
