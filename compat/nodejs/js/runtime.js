@@ -1,0 +1,265 @@
+// compat/nodejs runtime builtins: process, Buffer, the nextTick queue, and
+// the core-module registry. Evaluated after compat/web's builtins (so
+// TextEncoder/TextDecoder/atob/btoa/console exist) and before corelibs.js.
+// __node_ops stays global until nodejs.Install deletes it.
+(() => {
+	"use strict";
+	const ops = globalThis.__node_ops;
+
+	// ------------------------------------------------------ core registry
+
+	const core = {};
+	globalThis.__node_core = (name) => {
+		const m = core[String(name).replace(/^node:/, "")];
+		if (!m) throw new Error(`Unknown builtin module: ${name}`);
+		return m;
+	};
+	// corelibs.js populates this; hidden under a stable key.
+	globalThis.__node_core_registry = core;
+
+	// -------------------------------------------------- process.nextTick
+
+	// The nextTick queue drains as an ENGINE microtask scheduled the moment
+	// the queue becomes non-empty. Ticks therefore run before promise jobs
+	// registered after them and before any macrotask; a tick queued BY a
+	// promise job runs after the current promise batch (Node proper
+	// interleaves per-job — a documented deviation, see the plan).
+	const tickQueue = [];
+	let tickScheduled = false;
+	const runTicks = () => {
+		tickScheduled = false;
+		let n = 0;
+		while (tickQueue.length) {
+			const cb = tickQueue.shift();
+			n++;
+			cb(); // a throw propagates as an unhandled microtask exception
+		}
+		return n;
+	};
+	const scheduleTicks = () => {
+		if (!tickScheduled) {
+			tickScheduled = true;
+			Promise.resolve().then(runTicks);
+		}
+	};
+	globalThis.__node_run_ticks = runTicks;
+	globalThis.__node_ticks_pending = () => tickQueue.length;
+	globalThis.__node_schedule_ticks = scheduleTicks;
+
+	// ------------------------------------------------------------ process
+
+	const env = ops.node_env();
+	const process = {
+		env,
+		argv: ops.node_argv(),
+		argv0: "node",
+		execArgv: [],
+		platform: ops.node_platform(),
+		arch: "x64",
+		version: "v20.0.0",
+		versions: { node: "20.0.0", "go-spidermonkey": "0.2" },
+		pid: 1,
+		ppid: 0,
+		title: "node",
+		exitCode: undefined,
+		cwd: () => "/",
+		chdir: () => { throw new Error("process.chdir is not supported in this runtime"); },
+		umask: () => 0o022,
+		nextTick(cb, ...args) {
+			if (typeof cb !== "function") throw new TypeError("callback is not a function");
+			tickQueue.push(args.length ? () => cb(...args) : cb);
+			scheduleTicks();
+		},
+		exit(code) {
+			if (code !== undefined) process.exitCode = Number(code);
+			const e = new Error(`process.exit(${process.exitCode ?? 0})`);
+			e.__nodeExit = true;
+			throw e;
+		},
+		stdout: {
+			isTTY: false,
+			write: (s) => { ops.raw_write(0, String(s)); return true; },
+			end: () => {},
+			columns: 80,
+		},
+		stderr: {
+			isTTY: false,
+			write: (s) => { ops.raw_write(1, String(s)); return true; },
+			end: () => {},
+			columns: 80,
+		},
+		stdin: { isTTY: false },
+		hrtime: Object.assign(
+			(prev) => {
+				const ms = performance.now();
+				let s = Math.floor(ms / 1000), ns = Math.round((ms % 1000) * 1e6);
+				if (prev) { s -= prev[0]; ns -= prev[1]; if (ns < 0) { s--; ns += 1e9; } }
+				return [s, ns];
+			},
+			{ bigint: () => BigInt(Math.round(performance.now() * 1e6)) },
+		),
+		uptime: () => performance.now() / 1000,
+		memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
+		emitWarning: (w) => { console.error("Warning:", w); },
+		// EventEmitter surface is grafted on by corelibs.js once node:events
+		// exists; give inert fallbacks meanwhile.
+		on() { return this; }, once() { return this; }, off() { return this; },
+		emit() { return false; }, removeListener() { return this; },
+	};
+	globalThis.process = process;
+
+	// ------------------------------------------------------------- Buffer
+
+	function latin1Of(u8) {
+		let s = "";
+		for (let i = 0; i < u8.length; i += 0x8000) {
+			s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+		}
+		return s;
+	}
+	const normEnc = (enc) => {
+		const e = String(enc || "utf8").toLowerCase();
+		if (e === "utf-8") return "utf8";
+		if (e === "binary") return "latin1";
+		return e;
+	};
+
+	class Buffer extends Uint8Array {
+		static from(value, encodingOrOffset, length) {
+			if (typeof value === "string") return encodeString(value, encodingOrOffset);
+			if (value instanceof ArrayBuffer) {
+				return wrap(new Uint8Array(value, encodingOrOffset ?? 0, length ?? undefined));
+			}
+			if (ArrayBuffer.isView(value)) {
+				return wrap(new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)));
+			}
+			if (Array.isArray(value) || (value && typeof value.length === "number")) {
+				return wrap(Uint8Array.from(value));
+			}
+			throw new TypeError("Buffer.from: unsupported input");
+		}
+		static alloc(size, fill, encoding) {
+			const b = wrap(new Uint8Array(size));
+			if (fill !== undefined && fill !== 0) {
+				if (typeof fill === "number") b.fill(fill);
+				else {
+					const f = Buffer.from(fill, encoding);
+					for (let i = 0; i < b.length; i++) b[i] = f[i % f.length];
+				}
+			}
+			return b;
+		}
+		static allocUnsafe(size) { return Buffer.alloc(size); }
+		static allocUnsafeSlow(size) { return Buffer.alloc(size); }
+		static isBuffer(v) { return v instanceof Buffer; }
+		static isEncoding(enc) {
+			return ["utf8", "hex", "base64", "base64url", "latin1", "ascii", "utf-8", "binary"].includes(String(enc).toLowerCase());
+		}
+		static byteLength(v, encoding) {
+			if (typeof v === "string") return encodeString(v, encoding).length;
+			return v.byteLength ?? 0;
+		}
+		static concat(list, totalLength) {
+			let len = totalLength ?? list.reduce((n, b) => n + b.length, 0);
+			const out = wrap(new Uint8Array(len));
+			let off = 0;
+			for (const b of list) {
+				const chunk = off + b.length > len ? b.subarray(0, len - off) : b;
+				out.set(chunk, off);
+				off += chunk.length;
+				if (off >= len) break;
+			}
+			return out;
+		}
+		static compare(a, b) { return compareBytes(a, b); }
+
+		toString(encoding = "utf8", start = 0, end = this.length) {
+			const sub = start !== 0 || end !== this.length ? this.subarray(start, end) : this;
+			switch (normEnc(encoding)) {
+				case "utf8": return new TextDecoder().decode(sub);
+				case "hex": return [...sub].map((b) => b.toString(16).padStart(2, "0")).join("");
+				case "base64": return btoa(latin1Of(sub));
+				case "base64url":
+					return btoa(latin1Of(sub)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+				case "latin1": return latin1Of(sub);
+				case "ascii": return [...sub].map((b) => String.fromCharCode(b & 0x7f)).join("");
+			}
+			throw new TypeError(`Unknown encoding: ${encoding}`);
+		}
+		toJSON() { return { type: "Buffer", data: [...this] }; }
+		slice(start, end) { return this.subarray(start, end); } // Node slice shares memory
+		equals(other) { return compareBytes(this, other) === 0; }
+		compare(other) { return compareBytes(this, other); }
+		copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
+			const chunk = this.subarray(sourceStart, sourceEnd);
+			target.set(chunk, targetStart);
+			return chunk.length;
+		}
+		write(string, offset = 0, encoding) {
+			if (typeof offset === "string") { encoding = offset; offset = 0; }
+			const bytes = encodeString(String(string), encoding);
+			const n = Math.min(bytes.length, this.length - offset);
+			this.set(bytes.subarray(0, n), offset);
+			return n;
+		}
+		indexOf(value, byteOffset = 0) {
+			if (typeof value === "number") return Uint8Array.prototype.indexOf.call(this, value, byteOffset);
+			const needle = typeof value === "string" ? encodeString(value, "utf8") : value;
+			if (needle.length === 0) return byteOffset;
+			outer: for (let i = byteOffset; i <= this.length - needle.length; i++) {
+				for (let j = 0; j < needle.length; j++) {
+					if (this[i + j] !== needle[j]) continue outer;
+				}
+				return i;
+			}
+			return -1;
+		}
+		includes(value, byteOffset) { return this.indexOf(value, byteOffset) !== -1; }
+		readUInt8(off = 0) { return this[off]; }
+		writeUInt8(v, off = 0) { this[off] = v; return off + 1; }
+	}
+
+	function wrap(u8) { return Object.setPrototypeOf(u8, Buffer.prototype); }
+
+	function compareBytes(a, b) {
+		const len = Math.min(a.length, b.length);
+		for (let i = 0; i < len; i++) {
+			if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+		}
+		return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+	}
+
+	function encodeString(s, encoding) {
+		switch (normEnc(encoding)) {
+			case "utf8": return wrap(new TextEncoder().encode(s));
+			case "hex": {
+				const clean = s.length % 2 ? s.slice(0, -1) : s;
+				const out = wrap(new Uint8Array(clean.length / 2));
+				for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16) || 0;
+				return out;
+			}
+			case "base64": case "base64url": {
+				const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, ""));
+				const out = wrap(new Uint8Array(bin.length));
+				for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+				return out;
+			}
+			case "latin1": case "ascii": {
+				const out = wrap(new Uint8Array(s.length));
+				for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+				return out;
+			}
+		}
+		throw new TypeError(`Unknown encoding: ${encoding}`);
+	}
+
+	globalThis.Buffer = Buffer;
+	core.buffer = {
+		Buffer,
+		kMaxLength: 0x7fffffff,
+		constants: { MAX_LENGTH: 0x7fffffff, MAX_STRING_LENGTH: 0x1fffffe8 },
+		atob: globalThis.atob,
+		btoa: globalThis.btoa,
+	};
+	core.process = process;
+})();

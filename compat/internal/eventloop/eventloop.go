@@ -1,0 +1,329 @@
+// Package eventloop provides the macro-task loop the compat packages share:
+// host-side timers (setTimeout/setInterval), completions posted from other
+// goroutines (async ops like fetch), and the microtask drain between tasks.
+//
+// One Loop owns one *spidermonkey.JS. All calls into the guest happen on the
+// goroutine running Run; other goroutines interact with the loop only through
+// Post and the pending counter. Host functions invoked DURING guest execution
+// (setTimeout registering a timer) may call SetTimer/ClearTimer directly —
+// they only mutate Go-side state.
+package eventloop
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	spidermonkey "github.com/goccy/go-spidermonkey"
+)
+
+// Loop is the shared macro-task loop. Create with New; drive with Run.
+type Loop struct {
+	js *spidermonkey.JS
+
+	mu         sync.Mutex
+	nextID     int64
+	timers     map[int64]*timer
+	immediates []*immediate
+	batch      []*immediate // check-phase snapshot currently executing
+	posts      []func() error
+	pending    int
+
+	// microDrain replaces the engine-only microtask drain when set
+	// (compat/nodejs interleaves the process.nextTick queue here).
+	microDrain func(context.Context) error
+
+	wake chan struct{}
+}
+
+type immediate struct {
+	id      int64
+	fn      *spidermonkey.Object
+	cleared bool
+}
+
+type timer struct {
+	id       int64
+	due      time.Time
+	interval time.Duration // 0 for one-shot
+	fn       *spidermonkey.Object
+	running  bool // callback currently executing (the loop owns the free)
+	cleared  bool
+}
+
+// New creates a loop bound to js.
+func New(js *spidermonkey.JS) *Loop {
+	return &Loop{js: js, timers: map[int64]*timer{}, wake: make(chan struct{}, 1)}
+}
+
+// SetTimer schedules fn after delay; repeat re-arms it every delay. The
+// returned id cancels it via ClearTimer. The loop owns fn's handle and frees
+// it when the timer is cleared or (for one-shots) has fired.
+func (l *Loop) SetTimer(fn *spidermonkey.Object, delay time.Duration, repeat bool) int64 {
+	if delay < 0 {
+		delay = 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.nextID++
+	t := &timer{id: l.nextID, due: time.Now().Add(delay), fn: fn}
+	if repeat {
+		t.interval = delay
+	}
+	l.timers[t.id] = t
+	l.wakeup()
+	return t.id
+}
+
+// ClearTimer cancels the timer; unknown ids are ignored (a cleared or fired
+// timer's id clears as a no-op, like clearTimeout). A timer clearing itself
+// from its own callback is safe: the loop frees the callback handle exactly
+// once, after the call returns.
+func (l *Loop) ClearTimer(id int64) {
+	l.mu.Lock()
+	t, ok := l.timers[id]
+	if ok {
+		t.cleared = true
+		delete(l.timers, id)
+	}
+	free := ok && !t.running
+	l.mu.Unlock()
+	if free {
+		t.fn.Free()
+	}
+}
+
+// SetMicroDrain replaces the between-callback microtask drain. The default
+// pumps only the engine job queue; compat/nodejs installs a hook that
+// interleaves the process.nextTick queue with it. fn should call
+// DrainEngineJobs itself. Not safe to call concurrently with Run.
+func (l *Loop) SetMicroDrain(fn func(context.Context) error) { l.microDrain = fn }
+
+// DrainEngineJobs pumps the engine's own job queue to exhaustion — the
+// building block a SetMicroDrain hook composes with its host-side queues.
+func (l *Loop) DrainEngineJobs(ctx context.Context) error { return l.drainJobs(ctx) }
+
+// PostImmediate schedules fn for the check phase of the current loop turn —
+// after due timers, before sleeping (setImmediate). The loop owns fn's
+// handle. The returned id cancels it via ClearImmediate.
+func (l *Loop) PostImmediate(fn *spidermonkey.Object) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.nextID++
+	l.immediates = append(l.immediates, &immediate{id: l.nextID, fn: fn})
+	l.wakeup()
+	return l.nextID
+}
+
+// ClearImmediate cancels a PostImmediate; unknown ids are ignored. It only
+// marks the entry — the loop's check phase frees the handle exactly once,
+// which keeps clearing an immediate from another immediate's callback safe.
+func (l *Loop) ClearImmediate(id int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, list := range [][]*immediate{l.immediates, l.batch} {
+		for _, im := range list {
+			if im.id == id {
+				im.cleared = true
+				return
+			}
+		}
+	}
+}
+
+// Post queues f to run on the loop goroutine — the only safe way for another
+// goroutine (an async op's completion) to touch the guest. Safe to call
+// concurrently.
+func (l *Loop) Post(f func() error) {
+	l.mu.Lock()
+	l.posts = append(l.posts, f)
+	l.mu.Unlock()
+	l.wakeup()
+}
+
+// AddPending marks an in-flight async op: the loop stays alive until a
+// matching DonePending, even with no timers due. Safe to call concurrently.
+func (l *Loop) AddPending() {
+	l.mu.Lock()
+	l.pending++
+	l.mu.Unlock()
+}
+
+// DonePending releases an AddPending.
+func (l *Loop) DonePending() {
+	l.mu.Lock()
+	l.pending--
+	l.mu.Unlock()
+	l.wakeup()
+}
+
+// Run processes timers, posts and microtasks until the loop is idle — no
+// timers armed, no pending ops, nothing posted — or ctx is done. A JS
+// exception thrown by a timer callback (or an error from a posted completion)
+// stops the loop and is returned, mirroring Node's uncaught-exception
+// behavior.
+func (l *Loop) Run(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Drain microtasks left over from work that ran before (or between)
+		// loop turns — an Eval or host Call may have queued promise jobs the
+		// engine has not pumped yet. Without this, a loop with no timers or
+		// posts would declare idle over an unpumped job queue.
+		if err := l.drainMicro(ctx); err != nil {
+			return err
+		}
+
+		// Posted completions first: they represent finished work whose
+		// callbacks unblock the guest.
+		for {
+			l.mu.Lock()
+			if len(l.posts) == 0 {
+				l.mu.Unlock()
+				break
+			}
+			f := l.posts[0]
+			l.posts = l.posts[1:]
+			l.mu.Unlock()
+			if err := f(); err != nil {
+				return err
+			}
+			if err := l.drainMicro(ctx); err != nil {
+				return err
+			}
+		}
+
+		// Due timers, in due order; microtasks drain after each callback.
+		for _, t := range l.takeDue(time.Now()) {
+			_, err := t.fn.Call()
+			l.mu.Lock()
+			t.running = false
+			free := t.interval == 0 || t.cleared
+			l.mu.Unlock()
+			if free {
+				t.fn.Free()
+			}
+			if err != nil {
+				return err
+			}
+			if err := l.drainMicro(ctx); err != nil {
+				return err
+			}
+		}
+
+		// Check phase: run the immediates queued when this turn started;
+		// ones their callbacks queue run next turn (setImmediate semantics).
+		l.mu.Lock()
+		batch := l.immediates
+		l.immediates = nil
+		l.batch = batch
+		l.mu.Unlock()
+		for _, im := range batch {
+			l.mu.Lock()
+			skip := im.cleared
+			l.mu.Unlock()
+			if skip {
+				im.fn.Free()
+				continue
+			}
+			_, err := im.fn.Call()
+			im.fn.Free()
+			if err != nil {
+				return err
+			}
+			if err := l.drainMicro(ctx); err != nil {
+				return err
+			}
+		}
+		l.mu.Lock()
+		l.batch = nil
+		l.mu.Unlock()
+
+		l.mu.Lock()
+		var next time.Time
+		for _, t := range l.timers {
+			if next.IsZero() || t.due.Before(next) {
+				next = t.due
+			}
+		}
+		idle := next.IsZero() && l.pending == 0 && len(l.posts) == 0 && len(l.immediates) == 0
+		l.mu.Unlock()
+		if idle {
+			return nil
+		}
+
+		var due <-chan time.Time
+		var tm *time.Timer
+		if !next.IsZero() {
+			tm = time.NewTimer(time.Until(next))
+			due = tm.C
+		}
+		select {
+		case <-ctx.Done():
+			if tm != nil {
+				tm.Stop()
+			}
+			return ctx.Err()
+		case <-l.wake:
+		case <-due:
+		}
+		if tm != nil {
+			tm.Stop()
+		}
+	}
+}
+
+// takeDue removes and returns the timers due at now, earliest first;
+// repeating timers are re-armed in place.
+func (l *Loop) takeDue(now time.Time) []*timer {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var due []*timer
+	for _, t := range l.timers {
+		if !t.due.After(now) {
+			due = append(due, t)
+		}
+	}
+	// Insertion sort: the due set is tiny and mostly ordered already.
+	for i := 1; i < len(due); i++ {
+		for j := i; j > 0 && due[j].due.Before(due[j-1].due); j-- {
+			due[j], due[j-1] = due[j-1], due[j]
+		}
+	}
+	for _, t := range due {
+		t.running = true
+		if t.interval > 0 {
+			t.due = now.Add(t.interval)
+		} else {
+			delete(l.timers, t.id)
+		}
+	}
+	return due
+}
+
+// drainMicro is the between-callback microtask checkpoint: the installed
+// hook when set, the engine job queue otherwise.
+func (l *Loop) drainMicro(ctx context.Context) error {
+	if l.microDrain != nil {
+		return l.microDrain(ctx)
+	}
+	return l.drainJobs(ctx)
+}
+
+func (l *Loop) drainJobs(ctx context.Context) error {
+	for _, err := range l.js.RunJobs(ctx) {
+		if err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func (l *Loop) wakeup() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+}
