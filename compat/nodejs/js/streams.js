@@ -35,25 +35,48 @@
 		this.encoding = String(encoding || "utf8").toLowerCase().replace("utf-8", "utf8");
 		this._pending = null;
 	}
+	// unitSize returns the byte width that must not be split across chunks for a
+	// non-utf8 encoding: 2 for utf16le (a code unit), 3 for base64 (a group that
+	// encodes to 4 chars). Byte-independent encodings (hex/latin1/ascii) return 1.
+	function unitSize(enc) {
+		if (enc === "utf16le" || enc === "utf-16le" || enc === "ucs2" || enc === "ucs-2") return 2;
+		if (enc === "base64" || enc === "base64url") return 3;
+		return 1;
+	}
 	StringDecoder.prototype.write = function write(buf) {
 		if (typeof buf === "string") return buf;
 		let data = Buffer.from(buf.buffer ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : buf);
-		if (this.encoding !== "utf8") return data.toString(this.encoding);
 		if (this._pending) {
 			data = Buffer.concat([this._pending, data]);
 			this._pending = null;
 		}
-		const tail = utf8TailLength(data);
-		if (tail > 0) {
-			this._pending = Buffer.from(data.subarray(data.length - tail));
-			data = data.subarray(0, data.length - tail);
+		if (this.encoding === "utf8") {
+			const tail = utf8TailLength(data);
+			if (tail > 0) {
+				this._pending = Buffer.from(data.subarray(data.length - tail));
+				data = data.subarray(0, data.length - tail);
+			}
+			return new TextDecoder().decode(data);
 		}
-		return new TextDecoder().decode(data);
+		// Multi-byte encodings: hold back the incomplete trailing unit/group so a
+		// code unit (utf16le) or base64 group isn't decoded across the boundary,
+		// which would corrupt or drop characters.
+		const unit = unitSize(this.encoding);
+		if (unit > 1) {
+			const rem = data.length % unit;
+			if (rem > 0) {
+				this._pending = Buffer.from(data.subarray(data.length - rem));
+				data = data.subarray(0, data.length - rem);
+			}
+		}
+		return data.toString(this.encoding);
 	};
 	StringDecoder.prototype.end = function end(buf) {
 		let out = buf ? this.write(buf) : "";
 		if (this._pending) {
-			out += new TextDecoder().decode(this._pending); // incomplete -> U+FFFD
+			out += this.encoding === "utf8"
+				? new TextDecoder().decode(this._pending) // incomplete -> U+FFFD
+				: this._pending.toString(this.encoding);
 			this._pending = null;
 		}
 		return out;

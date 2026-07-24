@@ -59,6 +59,58 @@ func TestNetClientEchoesGoServer(t *testing.T) {
 	}
 }
 
+// TestNetClientBackpressureLargeStream drives a payload far larger than a single
+// read chunk through the read-flow-control path (Socket._read → net_read_resume),
+// verifying that a slow guest reader still receives every byte with no loss or
+// deadlock across the many resume cycles.
+func TestNetClientBackpressureLargeStream(t *testing.T) {
+	const total = 4 << 20 // 4 MiB, ~128 read chunks
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload := make([]byte, total)
+		for i := range payload {
+			payload[i] = byte(i)
+		}
+		conn.Write(payload)
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	js.Global().Set("PORT", spidermonkey.ValueOf(port))
+	runScript(t, rt, `
+		const net = require("net");
+		globalThis.r = {};
+		const sock = net.connect(PORT, "127.0.0.1");
+		let bytes = 0, ok = true;
+		sock.on("data", (d) => {
+			for (let i = 0; i < d.length; i++) {
+				if (d[i] !== ((bytes + i) & 0xff)) ok = false;
+			}
+			bytes += d.length;
+		});
+		sock.on("end", () => { r.bytes = bytes; r.ok = ok; });
+		sock.on("error", (e) => { r.err = String(e); });
+	`)
+	if got := evalStr(t, js, `r.err ?? ""`); got != "" {
+		t.Fatalf("socket error: %s", got)
+	}
+	if got := evalVal(t, js, `r.bytes ?? -1`).Int(); got != total {
+		t.Fatalf("received %d bytes, want %d", got, total)
+	}
+	if !evalVal(t, js, `r.ok`).Bool() {
+		t.Error("payload content mismatch")
+	}
+}
+
 func TestNetServerAcceptsGoClient(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
 

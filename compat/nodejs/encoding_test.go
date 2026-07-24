@@ -33,3 +33,24 @@ func TestBufferEncodings(t *testing.T) {
 		}
 	}
 }
+
+// TestStringDecoderMultiByteSplit verifies StringDecoder holds back an incomplete
+// trailing unit for multi-byte encodings, so a utf16le code unit split across two
+// writes is decoded correctly instead of dropping/garbling the character.
+func TestStringDecoderMultiByteSplit(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	runScript(t, rt, `
+		const { StringDecoder } = require("string_decoder");
+		globalThis.r = {};
+		// "AB" in utf16le is 41 00 42 00; split so the second unit straddles the
+		// chunk boundary: [41 00 42] then [00].
+		const d = new StringDecoder("utf16le");
+		let out = d.write(Buffer.from([0x41, 0x00, 0x42]));
+		out += d.write(Buffer.from([0x00]));
+		out += d.end();
+		r.utf16 = out;
+	`)
+	if got := evalStr(t, js, "r.utf16"); got != "AB" {
+		t.Errorf("StringDecoder utf16le split = %q, want %q", got, "AB")
+	}
+}

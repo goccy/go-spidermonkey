@@ -228,7 +228,12 @@
 		equals(other) { return compareBytes(this, other) === 0; }
 		compare(other) { return compareBytes(this, other); }
 		copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
-			const chunk = this.subarray(sourceStart, sourceEnd);
+			// Node copies only what fits in the target's remaining space and
+			// returns that count, rather than throwing when the source is larger.
+			const room = target.length - targetStart;
+			if (room <= 0) return 0;
+			let chunk = this.subarray(sourceStart, sourceEnd);
+			if (chunk.length > room) chunk = chunk.subarray(0, room);
 			target.set(chunk, targetStart);
 			return chunk.length;
 		}

@@ -217,6 +217,11 @@ func TestBuffer(t *testing.T) {
 		r.cmp = Buffer.compare(Buffer.from("a"), Buffer.from("b"));
 		r.idx = Buffer.from("hello world").indexOf("world");
 		r.json = JSON.stringify(Buffer.from([1, 2]));
+		// copy() clamps to the target's remaining room and returns the count
+		// copied, rather than throwing when the source is larger (Node semantics).
+		const dst = Buffer.alloc(4);
+		r.copyN = String(Buffer.from("hello world").copy(dst));
+		r.copyDst = dst.toString();
 	`)
 	for expr, want := range map[string]string{
 		"r.len":       "6",
@@ -232,6 +237,8 @@ func TestBuffer(t *testing.T) {
 		"r.cmp":       "-1",
 		"r.idx":       "6",
 		"r.json":      `{"type":"Buffer","data":[1,2]}`,
+		"r.copyN":     "4",
+		"r.copyDst":   "hell",
 	} {
 		if got := evalStr(t, js, expr); got != want {
 			t.Errorf("%s = %q, want %q", expr, got, want)

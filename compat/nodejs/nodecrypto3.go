@@ -20,6 +20,12 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// maxDHModulusBits bounds any Diffie-Hellman modulus (generated or caller-
+// supplied). It comfortably covers standard MODP groups up to 8192 bits while
+// rejecting the pathologically large primes that would turn a single modexp
+// into a multi-minute, uninterruptible CPU hog on the shared host process.
+const maxDHModulusBits = 8192
+
 func (rt *Runtime) crypto3Ops() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
 		"crypto_rsa_public":          rt.opRSAPublicEncrypt,
@@ -216,6 +222,12 @@ func (rt *Runtime) opDHGenerate(cfg spidermonkey.Config, args []spidermonkey.Val
 		if !ok {
 			return cryptoErr("bad prime hex"), nil
 		}
+		// A caller-supplied prime bypasses the numeric-bits cap below, so bound it
+		// here too: g^priv mod p is an uninterruptible host modexp, and a huge p
+		// (hundreds of kbits) would pin the shared host process for minutes.
+		if p.BitLen() < 512 || p.BitLen() > maxDHModulusBits {
+			return cryptoErr("unsupported DH modulus"), nil
+		}
 		prime = p
 	} else {
 		bits := args[0].Int()
@@ -283,6 +295,11 @@ func (rt *Runtime) opDHCompute(cfg spidermonkey.Config, args []spidermonkey.Valu
 	otherPub, ok3 := new(big.Int).SetString(args[2].String(), 16)
 	if !ok1 || !ok2 || !ok3 {
 		return cryptoErr("bad DH hex value"), nil
+	}
+	// Bound the modulus: otherPub^priv mod p is an uninterruptible host modexp, so
+	// an oversized prime would pin the shared host process for minutes.
+	if prime.BitLen() < 512 || prime.BitLen() > maxDHModulusBits {
+		return cryptoErr("unsupported DH modulus"), nil
 	}
 	// Reject a peer public key outside (1, p-1): the endpoints 0, 1 and p-1
 	// force the shared secret to a known constant (a small-subgroup / invalid

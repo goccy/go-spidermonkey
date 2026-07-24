@@ -107,6 +107,18 @@ func TestStructuredCloneFull(t *testing.T) {
 	`); got != "DataCloneError" {
 		t.Errorf("structuredClone function = %s", got)
 	}
+	// Error objects clone their (non-enumerable) message/name and subtype,
+	// rather than collapsing to an empty {}.
+	if got := evalString(t, js, `(() => {
+		const e = new TypeError("boom");
+		e.detail = { code: 42 };
+		const c = structuredClone(e);
+		return [
+			c instanceof TypeError, c.name, c.message, c.detail.code,
+		].join("|")
+	})()`); got != "true|TypeError|boom|42" {
+		t.Errorf("structuredClone Error = %s", got)
+	}
 }
 
 func TestWebStreams(t *testing.T) {

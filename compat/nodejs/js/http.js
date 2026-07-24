@@ -213,11 +213,27 @@
 	// reqId -> IncomingMessage, for streaming the request body in.
 	const openRequests = new Map();
 
-	// The host streams request-body chunks here (Buffer, or null at EOF).
+	// The host streams request-body chunks here: a Buffer for data, null for a
+	// clean end-of-body, or false when the client disconnected before the full
+	// declared body arrived (a truncated/aborted request).
 	globalThis.__node_http_body = (reqId, chunk) => {
 		const req = openRequests.get(reqId);
 		if (!req) return;
-		if (chunk === null || chunk === undefined) {
+		if (chunk === false) {
+			// Aborted: do NOT mark complete or emit 'end'; surface the abort like
+			// Node so a handler doesn't treat a truncated body as whole. Emit the
+			// error only when a listener exists — an unhandled 'error' would throw
+			// out of this host callback and take down the loop for what is a normal
+			// client disconnect; a handler that only cares about 'end' still sees
+			// req.aborted === true and req.complete === false.
+			req.aborted = true;
+			openRequests.delete(reqId);
+			req.emit("aborted");
+			const err = new Error("aborted");
+			err.code = "ECONNRESET";
+			if (req.listenerCount("error") > 0) req.destroy(err);
+			else req.destroy();
+		} else if (chunk === null || chunk === undefined) {
 			req.complete = true;
 			req.push(null);
 			openRequests.delete(reqId);

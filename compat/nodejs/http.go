@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -370,8 +371,18 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 				if rerr != nil {
+					// io.EOF is a clean end-of-body (all Content-Length bytes
+					// received). Anything else — ErrUnexpectedEOF, a reset, a read
+					// deadline — means the body was truncated; signal that to the
+					// guest as an abort (false) rather than a clean end (null) so a
+					// handler doesn't persist a partial upload as if it were whole.
+					aborted := rerr != io.EOF
 					rt.loop.Post(func() error {
-						rt.httpBody.Call(spidermonkey.ValueOf(reqID), spidermonkey.Null())
+						if aborted {
+							rt.httpBody.Call(spidermonkey.ValueOf(reqID), spidermonkey.ValueOf(false))
+						} else {
+							rt.httpBody.Call(spidermonkey.ValueOf(reqID), spidermonkey.Null())
+						}
 						return nil
 					})
 					return

@@ -395,7 +395,10 @@
 		// slow peer backpressures the socket instead of an unbounded queue.
 		ops.net_write(this._id, chunk, callback);
 	};
-	Socket.prototype._read = function _read() {}; // pushed by the host reader
+	// _read is the read-backpressure signal: the Readable calls it when its buffer
+	// drains, releasing one more host read (net_read_resume). Without this a fast
+	// peer would stream unbounded data into the host regardless of guest demand.
+	Socket.prototype._read = function _read() { if (this._id !== null) ops.net_read_resume(this._id); };
 	Socket.prototype.destroy = function destroy(err) {
 		if (this._id !== null) { ops.net_close(this._id); this._id = null; }
 		core.stream.Duplex.prototype.destroy.call(this, err);
@@ -888,7 +891,7 @@
 	Object.setPrototypeOf(TLSSocket.prototype, core.stream.Duplex.prototype);
 	Object.setPrototypeOf(TLSSocket, core.stream.Duplex);
 	TLSSocket.prototype._write = function (chunk, enc, cb) { if (this._id !== null) ops.net_write(this._id, chunk, cb); else cb(); };
-	TLSSocket.prototype._read = function () {};
+	TLSSocket.prototype._read = function () { if (this._id !== null) ops.net_read_resume(this._id); };
 	TLSSocket.prototype.destroy = function (err) { if (this._id !== null) { ops.net_close(this._id); this._id = null; } core.stream.Duplex.prototype.destroy.call(this, err); return this; };
 	TLSSocket.prototype.setEncoding = core.stream.Readable.prototype.setEncoding;
 	TLSSocket.prototype.end = core.stream.Writable.prototype.end;

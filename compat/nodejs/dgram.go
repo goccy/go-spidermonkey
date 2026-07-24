@@ -57,14 +57,32 @@ func (rt *Runtime) opUDPBind(cfg spidermonkey.Config, args []spidermonkey.Value)
 	return spidermonkey.ValueOf(map[string]any{"id": id, "port": conn.LocalAddr().(*net.UDPAddr).Port}), nil
 }
 
+// maxUDPInFlight bounds datagrams read from the socket but not yet delivered to
+// the guest. UDP is connectionless — once a port is bound, ANY remote can flood
+// it — and message events have no pull-based backpressure, so without this a
+// flood would post datagrams onto the loop faster than the guest drains them and
+// grow host/guest memory without bound. When the cap is hit we drop, which is
+// exactly what the kernel receive buffer does under load (UDP is unreliable).
+const maxUDPInFlight = 1024
+
 func (rt *Runtime) pumpUDP(id int64, conn *net.UDPConn, onMessage *spidermonkey.Object) {
 	buf := make([]byte, 64<<10)
+	credit := make(chan struct{}, maxUDPInFlight)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
+		if n > 0 {
+			select {
+			case credit <- struct{}{}:
+			default:
+				// Too many undelivered datagrams in flight: drop this one.
+				n = 0
+			}
+		}
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
 			rinfo := map[string]any{"address": addr.IP.String(), "port": addr.Port, "family": "IPv4", "size": n}
 			rt.loop.Post(func() error {
+				defer func() { <-credit }() // release the in-flight slot
 				if onMessage != nil {
 					u8, uerr := rt.js.NewBytes(data)
 					if uerr != nil {

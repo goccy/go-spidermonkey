@@ -168,6 +168,23 @@
 			for (let i = 0; i < value.length; i++) out[i] = fullClone(value[i], seen);
 			return out;
 		}
+		if (value instanceof Error) {
+			// Error is a structured-cloneable type, but message/name/stack are
+			// non-enumerable, so the plain-object path below would drop them and
+			// yield an empty {}. Reconstruct the matching error subtype instead.
+			const Ctor = { Error, TypeError, RangeError, ReferenceError, SyntaxError, EvalError, URIError }[value.name] || Error;
+			const out = new Ctor(value.message);
+			seen.set(value, out);
+			if (value.name !== out.name) { try { out.name = value.name; } catch (_e) { /* read-only name */ } }
+			out.stack = value.stack;
+			if ("cause" in value) out.cause = fullClone(value.cause, seen);
+			for (const k of Object.keys(value)) {
+				if (k === "message" || k === "stack" || k === "cause") continue;
+				out[k] = fullClone(value[k], seen);
+			}
+			return out;
+		}
+
 		// Plain object (reject exotic platform objects with methods only).
 		const out = {};
 		seen.set(value, out);

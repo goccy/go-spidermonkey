@@ -24,12 +24,45 @@ import (
 func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) }
 
 type netState struct {
-	mu        sync.Mutex
-	nextID    int64
-	conns     map[int64]net.Conn
-	writers   map[int64]*connWriter
-	listeners map[int64]net.Listener
-	udp       map[int64]*net.UDPConn
+	mu         sync.Mutex
+	nextID     int64
+	conns      map[int64]net.Conn
+	writers    map[int64]*connWriter
+	listeners  map[int64]net.Listener
+	udp        map[int64]*net.UDPConn
+	readResume map[int64]chan struct{} // per-conn read flow-control (see armRead)
+}
+
+// armRead creates and primes the read flow-control channel for a connection and
+// returns it. The reader pump waits on this channel before each read, so it only
+// pulls the next chunk when the guest asked for more (its Socket._read →
+// net_read_resume). The single primed token lets the pump read the first chunk
+// before any _read fires; thereafter a guest that stops reading bounds in-flight
+// host buffering to ~one chunk, instead of letting a fast peer stream unbounded
+// data into the host and (via posted chunks) the guest heap.
+func (st *netState) armRead(id int64) chan struct{} {
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
+	st.mu.Lock()
+	st.readResume[id] = ch
+	st.mu.Unlock()
+	return ch
+}
+
+// pokeRead releases one read on a connection's flow-control channel (no-op if it
+// is unknown or already has a pending token). Used both by the guest's
+// net_read_resume and by close/teardown paths to wake a pump parked on the
+// channel so it observes the now-closed conn and unwinds.
+func (st *netState) pokeRead(id int64) {
+	st.mu.Lock()
+	ch := st.readResume[id]
+	st.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // connWriter serializes socket writes on the connection's OWN goroutine so a
@@ -106,7 +139,7 @@ func (w *connWriter) run(onErr func(error)) {
 		closeReq := w.closeReq
 		w.mu.Unlock()
 
-		for _, item := range q {
+		for i, item := range q {
 			_, err := conn.Write(item.data)
 			if item.onDone != nil {
 				item.onDone() // ack this chunk (backpressure), even on error
@@ -114,6 +147,14 @@ func (w *connWriter) run(onErr func(error)) {
 			if err != nil {
 				if onErr != nil {
 					onErr(err)
+				}
+				// The conn is dead; we won't write the rest of this batch, but we
+				// must still ack every already-dequeued chunk or the guest Writable
+				// that is awaiting those write callbacks hangs forever.
+				for _, rest := range q[i+1:] {
+					if rest.onDone != nil {
+						rest.onDone()
+					}
 				}
 				break
 			}
@@ -140,10 +181,11 @@ func (w *connWriter) run(onErr func(error)) {
 
 func newNetState() *netState {
 	return &netState{
-		conns:     map[int64]net.Conn{},
-		writers:   map[int64]*connWriter{},
-		listeners: map[int64]net.Listener{},
-		udp:       map[int64]*net.UDPConn{},
+		conns:      map[int64]net.Conn{},
+		writers:    map[int64]*connWriter{},
+		listeners:  map[int64]net.Listener{},
+		udp:        map[int64]*net.UDPConn{},
+		readResume: map[int64]chan struct{}{},
 	}
 }
 
@@ -163,6 +205,7 @@ func (rt *Runtime) netOps() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
 		"net_connect":     rt.opNetConnect,
 		"net_write":       rt.opNetWrite,
+		"net_read_resume": rt.opNetReadResume,
 		"net_close":       rt.opNetClose,
 		"net_listen":      rt.opNetListen,
 		"net_close_srv":   rt.opNetCloseServer,
@@ -327,8 +370,13 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 // pumpConn reads the socket on a goroutine, posting data/end/error onto the
 // loop and freeing the callback handles when the connection closes.
 func (rt *Runtime) pumpConn(id int64, conn net.Conn, onData, onEnd, onError *spidermonkey.Object) {
+	resume := rt.net.armRead(id)
 	buf := make([]byte, 32<<10)
 	for {
+		// Flow control: read the next chunk only when the guest asked for more
+		// (Socket._read → net_read_resume) or a close poked us; a guest that stops
+		// reading can't force a fast peer's stream into unbounded host memory.
+		<-resume
 		n, err := conn.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
@@ -350,6 +398,7 @@ func (rt *Runtime) pumpConn(id int64, conn net.Conn, onData, onEnd, onError *spi
 			delete(rt.net.conns, id)
 			w := rt.net.writers[id]
 			delete(rt.net.writers, id)
+			delete(rt.net.readResume, id)
 			rt.net.mu.Unlock()
 			if w != nil {
 				w.requestClose() // stop the write actor for this closed conn
@@ -419,6 +468,16 @@ func (rt *Runtime) fireNetCallback(cb *spidermonkey.Object) {
 	})
 }
 
+// opNetReadResume(id) releases one read on the connection's flow-control channel
+// — the guest Socket's _read calling for the next chunk (see armRead).
+func (rt *Runtime) opNetReadResume(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 1 {
+		return spidermonkey.Undefined(), nil
+	}
+	rt.net.pokeRead(int64(args[0].Float()))
+	return spidermonkey.Undefined(), nil
+}
+
 func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 1 {
 		return spidermonkey.Undefined(), nil
@@ -438,6 +497,9 @@ func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value
 	} else if conn != nil {
 		conn.Close()
 	}
+	// If the pump is parked waiting for the guest to ask for more, wake it so it
+	// observes the closed conn and unwinds (frees handles, DonePending).
+	rt.net.pokeRead(id)
 	return spidermonkey.Undefined(), nil
 }
 
@@ -640,11 +702,24 @@ func (rt *Runtime) closeNet() {
 	for _, w := range st.writers {
 		writers = append(writers, w)
 	}
+	resumes := make([]chan struct{}, 0, len(st.readResume))
+	for _, ch := range st.readResume {
+		resumes = append(resumes, ch)
+	}
 	st.conns = map[int64]net.Conn{}
 	st.writers = map[int64]*connWriter{}
 	st.listeners = map[int64]net.Listener{}
 	st.udp = map[int64]*net.UDPConn{}
+	st.readResume = map[int64]chan struct{}{}
 	st.mu.Unlock()
+	// Wake any pump parked on its flow-control channel so it sees the closed conn
+	// and releases its AddPending; otherwise the loop can't reach idle to exit.
+	for _, ch := range resumes {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 	for _, w := range writers {
 		w.requestClose()
 	}

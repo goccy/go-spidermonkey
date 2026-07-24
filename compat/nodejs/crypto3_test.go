@@ -43,6 +43,29 @@ func TestCryptoDiffieHellman(t *testing.T) {
 	}
 }
 
+// TestCryptoDHModulusCapped verifies a caller-supplied Diffie-Hellman prime that
+// is absurdly large is rejected rather than driving a multi-minute, uninterrupt-
+// ible modexp that would pin the shared host process.
+func TestCryptoDHModulusCapped(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	runScript(t, rt, `
+		const crypto = require("crypto");
+		globalThis.r = {};
+		// ~40000-bit prime (10000 hex 'f' digits) — far above maxDHModulusBits.
+		const huge = "f".repeat(10000);
+		try {
+			const dh = crypto.createDiffieHellman(huge, "02");
+			dh.generateKeys();
+			r.threw = false;
+		} catch (e) {
+			r.threw = true;
+		}
+	`)
+	if got := evalStr(t, js, "String(r.threw)"); got != "true" {
+		t.Error("oversized DH modulus was not rejected")
+	}
+}
+
 func TestCryptoChaCha(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
 	runScript(t, rt, `

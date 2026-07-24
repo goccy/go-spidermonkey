@@ -1,11 +1,14 @@
 package nodejs_test
 
 import (
-	spidermonkey "github.com/goccy/go-spidermonkey"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 	"time"
+
+	spidermonkey "github.com/goccy/go-spidermonkey"
 )
 
 // streamingReader emits N chunks with a small delay, so the server sees them
@@ -54,5 +57,50 @@ func TestHTTPServerStreamsRequestBody(t *testing.T) {
 	// a buffered impl would deliver exactly 1.
 	if got := evalStr(t, js, "String(r.chunkSizes.length)"); got == "1" {
 		t.Errorf("request body was buffered, not streamed (1 chunk)")
+	}
+}
+
+// TestHTTPServerAbortedRequestBody verifies a client that declares a body length
+// but disconnects mid-body is surfaced to the handler as an abort — NOT as a
+// clean 'end' — so a handler can't persist a truncated request as if it were
+// whole.
+func TestHTTPServerAbortedRequestBody(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	port, _ := startServer(t, js, rt, `
+		const http = require("http");
+		globalThis.r = {};
+		const server = http.createServer((req, res) => {
+			let got = 0;
+			req.on("data", (c) => { got += c.length; });
+			req.on("error", () => {});          // swallow ECONNRESET
+			req.on("aborted", () => { r.aborted = true; r.bytes = got; });
+			req.on("end", () => { r.ended = true; });
+		});
+		server.listen(0);
+		globalThis.__server = server;
+		globalThis.PORT = server.address().port;
+	`)
+
+	conn, err := net.Dial("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Declare 1000 bytes, send 10, then abruptly close the socket.
+	fmt.Fprint(conn, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n")
+	conn.Write([]byte("0123456789"))
+	conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if evalStr(t, js, `String(r.aborted ?? false)`) == "true" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if evalStr(t, js, `String(r.aborted ?? false)`) != "true" {
+		t.Fatal("handler did not observe the request abort")
+	}
+	if evalStr(t, js, `String(r.ended ?? false)`) == "true" {
+		t.Error("handler saw a clean 'end' for a truncated request body")
 	}
 }

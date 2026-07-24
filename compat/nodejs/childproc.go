@@ -114,6 +114,14 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
+		// Start failed (ENOENT/EACCES/bad cwd, …): the success path frees these
+		// four callback handles in the onExit Post, which never runs here, so free
+		// them now or every allowed-but-failed spawn leaks guest handle slots.
+		for _, o := range []*spidermonkey.Object{onStdout, onStderr, onExit, onError} {
+			if o != nil {
+				o.Free()
+			}
+		}
 		return childErr(err), nil
 	}
 
