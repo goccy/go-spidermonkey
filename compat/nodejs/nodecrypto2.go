@@ -66,7 +66,13 @@ func (rt *Runtime) opCipher(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	}
 	switch {
 	case strings.HasSuffix(algo, "-gcm"):
-		gcm, err := cipher.NewGCM(block)
+		// The IV length is caller-controlled; NewGCMWithNonceSize accepts any
+		// non-empty length, whereas Seal/Open on a fixed-nonce AEAD PANIC on a
+		// mismatch. Node defaults to 12 but allows a configured IV length.
+		if len(iv) == 0 {
+			return cryptoErr("Invalid IV length"), nil
+		}
+		gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 		if err != nil {
 			return cryptoErr(err.Error()), nil
 		}
@@ -81,11 +87,17 @@ func (rt *Runtime) opCipher(cfg spidermonkey.Config, args []spidermonkey.Value) 
 		}
 		return rt.cipherResult(pt, nil)
 	case strings.HasSuffix(algo, "-ctr"):
+		if len(iv) != block.BlockSize() {
+			return cryptoErr("Invalid IV length"), nil
+		}
 		out := make([]byte, len(data))
 		cipher.NewCTR(block, iv).XORKeyStream(out, data)
 		return rt.cipherResult(out, nil)
 	case strings.HasSuffix(algo, "-cbc"):
 		bs := block.BlockSize()
+		if len(iv) != bs {
+			return cryptoErr("Invalid IV length"), nil
+		}
 		if encrypt {
 			padded := pkcs7Pad(data, bs)
 			out := make([]byte, len(padded))
@@ -308,6 +320,9 @@ func (rt *Runtime) opPBKDF2(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	pw, _ := valueBytes(args[0])
 	salt, _ := valueBytes(args[1])
 	iter := args[2].Int()
+	if iter < 1 {
+		return cryptoErr("iterations must be at least 1"), nil
+	}
 	keylen := args[3].Int()
 	h, err := nodeHashByName(args[4].String())
 	if err != nil {

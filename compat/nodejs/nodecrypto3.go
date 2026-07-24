@@ -162,7 +162,11 @@ func (rt *Runtime) opDHGenerate(cfg spidermonkey.Config, args []spidermonkey.Val
 		if bits < 512 || bits > 4096 {
 			return cryptoErr("unsupported DH modulus"), nil
 		}
-		p, err := rand.Prime(rand.Reader, bits)
+		// A SAFE prime p = 2q+1 (q prime) with generator 2 generates a
+		// large-order subgroup, so the shared secret cannot collapse into a
+		// small subgroup — what Node's createDiffieHellman produces. A plain
+		// random prime can have smooth order and leak the secret.
+		p, err := generateSafePrime(bits)
 		if err != nil {
 			return cryptoErr(err.Error()), nil
 		}
@@ -190,6 +194,25 @@ func (rt *Runtime) opDHGenerate(cfg spidermonkey.Config, args []spidermonkey.Val
 
 func evenHex(n *big.Int) string { return hex.EncodeToString(n.Bytes()) }
 
+// generateSafePrime returns a prime p of the requested bit length such that
+// (p-1)/2 is also prime (a "safe prime"), so a generator of 2 spans a
+// large-order subgroup. It samples a prime q of bits-1 length and tests
+// p = 2q+1, which is the standard construction.
+func generateSafePrime(bits int) (*big.Int, error) {
+	one := big.NewInt(1)
+	for {
+		q, err := rand.Prime(rand.Reader, bits-1)
+		if err != nil {
+			return nil, err
+		}
+		p := new(big.Int).Lsh(q, 1) // 2q
+		p.Add(p, one)               // 2q+1
+		if p.BitLen() == bits && p.ProbablyPrime(20) {
+			return p, nil
+		}
+	}
+}
+
 // opDHCompute(primeHex, privHex, otherPubHex) -> secret hex.
 func (rt *Runtime) opDHCompute(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 3 {
@@ -200,6 +223,14 @@ func (rt *Runtime) opDHCompute(cfg spidermonkey.Config, args []spidermonkey.Valu
 	otherPub, ok3 := new(big.Int).SetString(args[2].String(), 16)
 	if !ok1 || !ok2 || !ok3 {
 		return cryptoErr("bad DH hex value"), nil
+	}
+	// Reject a peer public key outside (1, p-1): the endpoints 0, 1 and p-1
+	// force the shared secret to a known constant (a small-subgroup / invalid
+	// key confinement attack).
+	one := big.NewInt(1)
+	pMinus1 := new(big.Int).Sub(prime, one)
+	if otherPub.Cmp(one) <= 0 || otherPub.Cmp(pMinus1) >= 0 {
+		return cryptoErr("invalid DH public key"), nil
 	}
 	secret := new(big.Int).Exp(otherPub, priv, prime)
 	return spidermonkey.ValueOf(evenHex(secret)), nil
@@ -220,6 +251,9 @@ func (rt *Runtime) opChaCha(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	}
 	if len(args) > 5 {
 		tag, _ = valueBytes(args[5])
+	}
+	if len(nonce) != chacha20poly1305.NonceSize {
+		return cryptoErr("Invalid IV length"), nil
 	}
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {

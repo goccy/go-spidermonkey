@@ -275,6 +275,7 @@
 		},
 
 		async deriveBits(alg, baseKey, length) {
+			need(baseKey, "deriveBits");
 			const name = algName(alg).toUpperCase();
 			if (name === "ECDH") {
 				const privJWK = jwkOf(baseKey);
@@ -291,6 +292,7 @@
 		},
 
 		async deriveKey(alg, baseKey, derivedKeyAlg, extractable, usages) {
+			need(baseKey, "deriveKey");
 			const derivedName = algName(derivedKeyAlg).toUpperCase();
 			const length = Number(derivedKeyAlg.length) || (AES_NAMES.includes(derivedName) ? 256 : 256);
 			const bits = await subtle.deriveBits(alg, baseKey, length);

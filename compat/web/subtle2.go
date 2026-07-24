@@ -88,9 +88,23 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 	}
 	switch mode {
 	case "AES-GCM":
-		gcm, err := cipher.NewGCMWithTagSize(block, tagBytes)
+		// WebCrypto permits any non-empty IV length. Go fixes the nonce size,
+		// and Seal/Open PANIC on a mismatch, so pick the AEAD by the actual IV
+		// length instead of hard-coding 12. Non-default tag sizes only compose
+		// with the standard 96-bit nonce in the stdlib, so require 12 there.
+		if len(iv) == 0 {
+			return subtleErr("OperationError: AES-GCM IV must not be empty"), nil
+		}
+		var gcm cipher.AEAD
+		if tagBytes == 16 {
+			gcm, err = cipher.NewGCMWithNonceSize(block, len(iv))
+		} else if len(iv) == 12 {
+			gcm, err = cipher.NewGCMWithTagSize(block, tagBytes)
+		} else {
+			return subtleErr("OperationError: AES-GCM with a non-default tag length requires a 12-byte IV"), nil
+		}
 		if err != nil {
-			return subtleErr(err.Error()), nil
+			return subtleErr("OperationError: " + err.Error()), nil
 		}
 		if encrypt {
 			return bytesValue(gcm.Seal(nil, iv, data, aad)), nil
@@ -102,6 +116,9 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 		return bytesValue(pt), nil
 	case "AES-CBC":
 		bs := block.BlockSize()
+		if len(iv) != bs {
+			return subtleErr("OperationError: AES-CBC IV must be 16 bytes"), nil
+		}
 		if encrypt {
 			padded := pad7(data, bs)
 			out := make([]byte, len(padded))
@@ -119,6 +136,9 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 		}
 		return bytesValue(unpadded), nil
 	case "AES-CTR":
+		if len(iv) != block.BlockSize() {
+			return subtleErr("OperationError: AES-CTR counter block must be 16 bytes"), nil
+		}
 		out := make([]byte, len(data))
 		cipher.NewCTR(block, iv).XORKeyStream(out, data)
 		return bytesValue(out), nil
@@ -170,9 +190,15 @@ func (s *subtleAPI) opECDHDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	if err != nil {
 		return subtleErr(err.Error()), nil
 	}
+	// A requested length longer than the shared secret is an OperationError in
+	// WebCrypto, not a silently-shortened (weaker) key.
 	bits := args[2].Int()
-	if bits > 0 && bits/8 < len(secret) {
-		secret = secret[:bits/8]
+	if bits > 0 {
+		want := bits / 8
+		if want > len(secret) {
+			return subtleErr("OperationError: requested length exceeds the ECDH shared secret"), nil
+		}
+		secret = secret[:want]
 	}
 	return bytesValue(secret), nil
 }
@@ -260,6 +286,11 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 	pw, _ := argBytes(args[1])
 	salt, _ := argBytes(args[2])
 	iter := args[3].Int()
+	// iterations < 1 would silently degrade to a one-round KDF (no stretching);
+	// WebCrypto requires iterations >= 1.
+	if iter < 1 {
+		return subtleErr("OperationError: PBKDF2 iterations must be at least 1"), nil
+	}
 	length := args[4].Int() / 8
 	return bytesValue(pbkdf2.Key(pw, salt, iter, length, newHash)), nil
 }
