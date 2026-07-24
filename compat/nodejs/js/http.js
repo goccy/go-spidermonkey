@@ -139,8 +139,14 @@
 		}
 		_write(chunk, encoding, callback) {
 			this._ensureHead();
-			if (this._reqId !== undefined && chunk.length) ops.http_write(this._reqId, chunk);
-			callback();
+			if (this._reqId !== undefined && chunk.length) {
+				// The op fires our callback only once the chunk has been flushed
+				// to the socket (off the loop goroutine), so a slow client
+				// naturally backpressures the guest Writable.
+				ops.http_write(this._reqId, chunk, callback);
+			} else {
+				callback();
+			}
 		}
 		_final(callback) {
 			this._ensureHead();
