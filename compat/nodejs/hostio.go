@@ -120,12 +120,14 @@ func (rt *Runtime) opSignalWatch(cfg spidermonkey.Config, args []spidermonkey.Va
 			sigs = append(sigs, s)
 		}
 		signal.Notify(ch, sigs...)
-		// A registered signal handler does NOT keep the event loop alive (Node
-		// lets a program with only a signal handler exit), so no AddPending. The
-		// goroutine ends when closeIO signals stop; sigCh is never closed (the
-		// signal runtime could still deliver into it after Stop — closing would
-		// panic), it's just left for GC.
+		// The handler keeps the loop alive (so a delivered signal is actually
+		// dispatched); the pending is released when closeIO signals stop. The
+		// goroutine ends there too — sigCh is never closed (a late delivery
+		// after Stop would panic on a closed channel), it's left for GC, and no
+		// handle is freed here (js.Close frees everything at teardown).
+		rt.loop.AddPending()
 		go func() {
+			defer rt.loop.DonePending()
 			for {
 				select {
 				case s := <-ch:
@@ -137,9 +139,6 @@ func (rt *Runtime) opSignalWatch(cfg spidermonkey.Config, args []spidermonkey.Va
 						return nil
 					})
 				case <-stop:
-					// Just exit — closeIO runs at Runtime teardown, where
-					// js.Close() frees all handles. Posting a Free here would
-					// race the engine shutdown and can fault.
 					return
 				}
 			}

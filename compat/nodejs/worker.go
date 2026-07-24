@@ -63,6 +63,7 @@ type workerManager struct {
 	deadSeen map[spidermonkey.AgentID]int
 	reaping  map[spidermonkey.AgentID]bool // a crash-exit reap has been posted
 	stop     chan struct{}
+	pumpDone chan struct{} // closed when the pump goroutine exits
 	started  bool
 }
 
@@ -74,6 +75,7 @@ func newWorkerManager(rt *Runtime) *workerManager {
 		deadSeen: map[spidermonkey.AgentID]int{},
 		reaping:  map[spidermonkey.AgentID]bool{},
 		stop:     make(chan struct{}),
+		pumpDone: make(chan struct{}),
 		nextTID:  1,
 	}
 }
@@ -182,6 +184,7 @@ func (rt *Runtime) opWorkerTerminate(cfg spidermonkey.Config, args []spidermonke
 // no message is waiting it also reaps agents that ended without posting a
 // farewell (an uncaught error during evaluation), firing 'exit' with code 1.
 func (wm *workerManager) pump() {
+	defer close(wm.pumpDone)
 	for {
 		select {
 		case <-wm.stop:
@@ -311,10 +314,22 @@ func (wm *workerManager) emit(inst *spidermonkey.Object, event string, v spiderm
 }
 
 func (wm *workerManager) close() {
+	wm.mu.Lock()
+	started := wm.started
+	wm.mu.Unlock()
 	select {
 	case <-wm.stop:
 	default:
 		close(wm.stop)
+	}
+	// Join the pump BEFORE the caller tears down the interpreter: the pump makes
+	// engine calls (agents.Receive → clone read/decode) off the loop goroutine,
+	// so letting js.Close() run while it's mid-Receive risks a use-after-free.
+	if started {
+		select {
+		case <-wm.pumpDone:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	wm.mu.Lock()
 	for id, inst := range wm.insts {

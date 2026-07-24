@@ -2,6 +2,7 @@ package nodejs_test
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -231,5 +232,27 @@ func TestNetCleanCloseNoError(t *testing.T) {
 	`)
 	if evalStr(t, js, `String(r.errored)`) == "true" {
 		t.Fatalf("clean socket.destroy() emitted a spurious 'error'")
+	}
+}
+
+// A write issued before an async connect that then FAILS must still fire its
+// _write callback (draining the queued write), so the socket's Writable doesn't
+// hang forever.
+func TestNetWriteBeforeFailedConnectAcked(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	// Port 1 is (almost) always refused.
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.r = { wroteCb: false, errored: false, finished: false };
+		const net = require("net");
+		const sock = net.connect(1, "127.0.0.1");
+		sock.write("early", () => { r.wroteCb = true; });
+		sock.on("error", () => { r.errored = true; });
+		sock.on("finish", () => { r.finished = true; });
+		sock.end();
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if evalStr(t, js, `String(r.wroteCb)`) != "true" {
+		t.Fatalf("write callback never fired after a failed connect (stranded → Writable hang)")
 	}
 }

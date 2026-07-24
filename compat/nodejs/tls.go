@@ -76,6 +76,9 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			delete(st.writers, id)
 			st.mu.Unlock()
 			w.requestClose()
+			// ACK any writes queued before the handshake failed (else the
+			// socket's Writable hangs on a stranded _write callback).
+			go w.run(func(error) {})
 			rt.loop.Post(func() error {
 				defer rt.loop.DonePending()
 				if onError != nil {

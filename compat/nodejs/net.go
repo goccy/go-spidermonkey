@@ -292,6 +292,11 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			delete(st.writers, id)
 			st.mu.Unlock()
 			w.requestClose()
+			// Run the actor once to ACK any writes queued before the connect
+			// failed (their _write callbacks would otherwise strand, hanging the
+			// socket's Writable). With no conn it just fires the leftover onDone
+			// callbacks and exits.
+			go w.run(func(error) {})
 			rt.loop.Post(func() error {
 				defer rt.loop.DonePending()
 				if onError != nil {
