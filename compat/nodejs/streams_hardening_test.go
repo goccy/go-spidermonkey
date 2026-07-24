@@ -106,3 +106,47 @@ func TestNextTickUncaughtExceptionHandler(t *testing.T) {
 		t.Fatalf("ticks ran = %q, want bad,good", got)
 	}
 }
+
+// An async Transform must emit output in write order (Node serializes
+// _transform: the next chunk waits for the previous callback).
+func TestTransformSerializesAsyncOutput(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { out: [] };
+		const { Transform } = require("stream");
+		let delay = 30;
+		const t = new Transform({
+			transform(c, e, cb) { const d = delay; delay -= 10; setTimeout(() => { this.push(c); cb(); }, d); }
+		});
+		t.on("data", (d) => { __r.out.push(String(d)); });
+		t.write("1"); t.write("2"); t.write("3"); t.end();
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `__r.out.join(",")`); got != "1,2,3" {
+		t.Fatalf("async transform order = %q, want 1,2,3 (must serialize)", got)
+	}
+}
+
+// read(size) returns null when fewer than size bytes are buffered and the
+// stream hasn't ended (Node's framing-parser contract).
+func TestReadableReadSizeReturnsNullWhenShort(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = {};
+		const { Readable } = require("stream");
+		const rs = new Readable({ read() {} });
+		rs.push(Buffer.from("abc")); // only 3 bytes, not ended
+		__r.short = rs.read(8);           // want null
+		rs.push(Buffer.from("defghij")); // now 10 total
+		__r.full = rs.read(8);            // want 8 bytes
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `String(__r.short)`); got != "null" {
+		t.Fatalf("read(8) with 3 buffered = %q, want null", got)
+	}
+	if got := evalStr(t, js, `__r.full && __r.full.length`); got != "8" {
+		t.Fatalf("read(8) with 10 buffered length = %q, want 8", got)
+	}
+}

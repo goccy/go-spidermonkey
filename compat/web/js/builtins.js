@@ -97,6 +97,26 @@
 		return new Uint8Array(out);
 	}
 
+	// incompleteUtf8Tail returns how many trailing bytes of `bytes` form an
+	// as-yet-incomplete UTF-8 sequence (0 if the buffer ends on a boundary), so
+	// a streaming decoder can hold them back for the next chunk.
+	function incompleteUtf8Tail(bytes) {
+		const n = bytes.length;
+		let i = n - 1;
+		let cont = 0;
+		while (i >= 0 && (bytes[i] & 0xc0) === 0x80 && cont < 3) { i--; cont++; }
+		if (i < 0) return 0;
+		const lead = bytes[i];
+		let need;
+		if (lead < 0x80) need = 1;
+		else if ((lead & 0xe0) === 0xc0) need = 2;
+		else if ((lead & 0xf0) === 0xe0) need = 3;
+		else if ((lead & 0xf8) === 0xf0) need = 4;
+		else return 0; // invalid lead — let the decoder emit a replacement now
+		const have = n - i;
+		return have < need ? have : 0;
+	}
+
 	function utf8Decode(bytes, fatal) {
 		let out = "";
 		const bad = () => {
@@ -147,18 +167,33 @@
 			this.ignoreBOM = !!options.ignoreBOM;
 		}
 		get encoding() { return this._enc === "utf8" ? "utf-8" : this._enc === "utf16le" ? "utf-16le" : "windows-1252"; }
-		decode(input) {
-			if (input === undefined) return "";
+		decode(input, options = {}) {
+			const stream = !!options.stream;
 			let bytes;
-			if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+			if (input === undefined) bytes = new Uint8Array(0);
+			else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
 			else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
 			else throw new TypeError("TextDecoder.decode: expected an ArrayBuffer or ArrayBufferView");
+			// Prepend bytes held back from a previous streaming call (an
+			// incomplete multi-byte sequence at the last chunk boundary).
+			if (this._pending && this._pending.length) {
+				const merged = new Uint8Array(this._pending.length + bytes.length);
+				merged.set(this._pending, 0);
+				merged.set(bytes, this._pending.length);
+				bytes = merged;
+			}
+			this._pending = null;
 			if (this._enc === "latin1") {
 				let s = "";
 				for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
 				return s;
 			}
 			if (this._enc === "utf16le") {
+				// A trailing odd byte can't form a code unit yet — hold it.
+				if (stream && bytes.length % 2 === 1) {
+					this._pending = bytes.slice(bytes.length - 1);
+					bytes = bytes.subarray(0, bytes.length - 1);
+				}
 				let start = 0;
 				if (!this.ignoreBOM && bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) start = 2;
 				let s = "";
@@ -167,6 +202,15 @@
 			}
 			if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
 				bytes = bytes.subarray(3);
+			}
+			// Hold back an incomplete trailing UTF-8 sequence so a code point
+			// split across chunks isn't turned into U+FFFD.
+			if (stream) {
+				const keep = incompleteUtf8Tail(bytes);
+				if (keep > 0) {
+					this._pending = bytes.slice(bytes.length - keep);
+					bytes = bytes.subarray(0, bytes.length - keep);
+				}
 			}
 			return utf8Decode(bytes, this.fatal);
 		}
@@ -695,6 +739,10 @@
 		async pipeTo(destination, options = {}) {
 			const reader = this.getReader();
 			const writer = destination.getWriter();
+			// The abort path below rejects the writer's `closed` promise; this
+			// writer is internal to pipeTo and nobody else observes it, so mark
+			// it handled to avoid a spurious unhandled rejection.
+			writer.closed.catch(() => {});
 			try {
 				for (;;) {
 					const { value, done } = await reader.read();
@@ -868,9 +916,10 @@
 
 	class Headers {
 		constructor(init) {
-			this._map = new Map(); // lowercased name -> combined value
+			this._map = new Map(); // lowercased name -> array of values
 			if (init instanceof Headers) {
-				for (const [k, v] of init) this.append(k, v);
+				// Copy raw values, preserving each Set-Cookie separately.
+				for (const [k, arr] of init._map) this._map.set(k, [...arr]);
 			} else if (Array.isArray(init)) {
 				for (const pair of init) {
 					if (!pair || pair.length !== 2) throw new TypeError("Headers: each init pair needs 2 items");
@@ -882,15 +931,19 @@
 		}
 		append(name, value) {
 			const k = String(name).toLowerCase();
-			const prev = this._map.get(k);
-			this._map.set(k, prev === undefined ? String(value) : prev + ", " + String(value));
+			const arr = this._map.get(k);
+			if (arr) arr.push(String(value));
+			else this._map.set(k, [String(value)]);
 		}
-		set(name, value) { this._map.set(String(name).toLowerCase(), String(value)); }
-		get(name) { const v = this._map.get(String(name).toLowerCase()); return v === undefined ? null : v; }
+		set(name, value) { this._map.set(String(name).toLowerCase(), [String(value)]); }
+		// get combines multiple values with ", " per WHATWG (including Set-Cookie);
+		// getSetCookie is the only way to recover individual Set-Cookie values.
+		get(name) { const a = this._map.get(String(name).toLowerCase()); return a ? a.join(", ") : null; }
+		getSetCookie() { return [...(this._map.get("set-cookie") || [])]; }
 		has(name) { return this._map.has(String(name).toLowerCase()); }
 		delete(name) { this._map.delete(String(name).toLowerCase()); }
 		forEach(cb, thisArg) { for (const [k, v] of this.entries()) cb.call(thisArg, v, k, this); }
-		*entries() { for (const k of [...this._map.keys()].sort()) yield [k, this._map.get(k)]; }
+		*entries() { for (const k of [...this._map.keys()].sort()) yield [k, this._map.get(k).join(", ")]; }
 		*keys() { for (const [k] of this.entries()) yield k; }
 		*values() { for (const [, v] of this.entries()) yield v; }
 		[Symbol.iterator]() { return this.entries(); }

@@ -143,3 +143,40 @@ func TestReadableCancelSettlesPendingRead(t *testing.T) {
 		t.Fatalf("cancel() did not settle the pending read with done:true")
 	}
 }
+
+// Multiple Set-Cookie values are kept separate (getSetCookie), not comma-joined.
+func TestHeadersSetCookieSeparate(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	eval(t, js, `
+		globalThis.__c = {};
+		const h = new Headers();
+		h.append("Set-Cookie", "a=1; Path=/");
+		h.append("Set-Cookie", "b=2; Path=/");
+		__c.count = h.getSetCookie().length;
+		__c.first = h.getSetCookie()[0];
+		__c.second = h.getSetCookie()[1];
+	`)
+	if got := evalString(t, js, `String(__c.count)`); got != "2" {
+		t.Fatalf("getSetCookie length = %s, want 2 (Set-Cookie must not be merged)", got)
+	}
+	if a, b := evalString(t, js, `__c.first`), evalString(t, js, `__c.second`); a != "a=1; Path=/" || b != "b=2; Path=/" {
+		t.Fatalf("cookies = %q / %q", a, b)
+	}
+}
+
+// TextDecoder streaming keeps a multi-byte char split across chunks intact.
+func TestTextDecoderStreamMultibyteBoundary(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	eval(t, js, `
+		globalThis.__c = {};
+		const dec = new TextDecoder("utf-8");
+		// "é" is 0xC3 0xA9; split across two chunks.
+		const p1 = dec.decode(new Uint8Array([0xC3]), { stream: true });
+		const p2 = dec.decode(new Uint8Array([0xA9]), { stream: true });
+		const p3 = dec.decode(); // flush
+		__c.combined = p1 + p2 + p3;
+	`)
+	if got := evalString(t, js, `__c.combined`); got != "é" {
+		t.Fatalf("streamed decode = %q, want é (multi-byte across chunks corrupted)", got)
+	}
+}

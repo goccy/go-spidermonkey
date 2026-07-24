@@ -160,10 +160,21 @@
 			|| !r.headers || typeof r.headers.entries !== "function") {
 			throw new TypeError("handler did not return a Response");
 		}
+		// entries() combines multiple Set-Cookie into one comma-joined value,
+		// which corrupts cookies on the wire — emit each Set-Cookie as its own
+		// header pair instead.
+		const pairs = [];
+		for (const [k, v] of r.headers.entries()) {
+			if (k === "set-cookie") continue;
+			pairs.push([k, v]);
+		}
+		if (typeof r.headers.getSetCookie === "function") {
+			for (const c of r.headers.getSetCookie()) pairs.push(["set-cookie", c]);
+		}
 		return JSON.stringify({
 			status: r.status,
 			statusText: String(r.statusText || ""),
-			headers: [...r.headers.entries()],
+			headers: pairs,
 		});
 	};
 

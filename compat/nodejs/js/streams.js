@@ -158,8 +158,16 @@
 				if (st.ended && st.buffer.length === 0) this._scheduleFlow();
 				return out;
 			}
+			const avail = totalLength(st.buffer);
+			// Node contract: if `size` bytes aren't buffered and the stream
+			// hasn't ended, read(size) returns null (wait for more) — length-
+			// prefixed / fixed-header parsers depend on this.
+			if (size !== undefined && size > avail && !st.ended) {
+				this._callRead(); // nudge the source to produce more
+				return null;
+			}
 			let out;
-			if (size === undefined || size >= totalLength(st.buffer)) {
+			if (size === undefined || size >= avail) {
 				out = st.buffer.length === 1 ? st.buffer[0] : Buffer.concat(st.buffer);
 				st.buffer = [];
 				st.length = 0;
@@ -356,7 +364,25 @@
 			const size = st.objectMode ? 1 : (payload.length ?? 0);
 			st.pending++;
 			st.buffered += size;
-			this._write(payload, encoding || "utf8", (err) => {
+			// Queue and process one at a time: Node calls _write for the next
+			// chunk only after the previous callback fires, so an async _write /
+			// _transform can't run concurrently and reorder output.
+			(st.writeQueue || (st.writeQueue = [])).push({ payload, size, encoding: encoding || "utf8", callback });
+			this._processWriteQueue();
+			// Real backpressure: false once the in-flight buffer reaches hwm.
+			if (st.buffered >= st.highWaterMark) {
+				st.needDrain = true;
+				return false;
+			}
+			return true;
+		},
+		_processWriteQueue() {
+			const st = this._ws;
+			if (st.writing || !st.writeQueue || st.writeQueue.length === 0 || st.destroyed) return;
+			st.writing = true;
+			const { payload, size, encoding, callback } = st.writeQueue.shift();
+			this._write(payload, encoding, (err) => {
+				st.writing = false;
 				st.pending--;
 				st.buffered -= size;
 				if (err) { this.destroy(err); if (callback) callback(err); return; }
@@ -366,13 +392,8 @@
 					this.emit("drain");
 				}
 				this._maybeFinish();
+				this._processWriteQueue(); // next queued chunk, in order
 			});
-			// Real backpressure: false once the in-flight buffer reaches hwm.
-			if (st.buffered >= st.highWaterMark) {
-				st.needDrain = true;
-				return false;
-			}
-			return true;
 		},
 		end(chunk, encoding, callback) {
 			if (typeof chunk === "function") { callback = chunk; chunk = null; }
