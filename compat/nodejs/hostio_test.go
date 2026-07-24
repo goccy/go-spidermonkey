@@ -89,28 +89,22 @@ func TestProcessSignal(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
+	// Deliver the signal from a separate goroutine, but that goroutine only
+	// touches the OS (p.Signal) — never the wasm instance. A single SpiderMonkey
+	// instance is NOT safe for concurrent cross-goroutine entry (one JSContext /
+	// linear memory / set of globals), so ONLY the main goroutine may enter it:
+	// drive the loop here with rt.Wait and assert after it returns. The signal
+	// handler keeps the loop alive (AddPending), so Wait blocks until the context
+	// deadline; by then the posted handler has run and set r.got.
 	go func() {
 		time.Sleep(200 * time.Millisecond)
 		p, _ := osFindProcess()
 		p.Signal(sigUSR1())
 	}()
-	done := make(chan struct{})
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		rt.Wait(ctx)
-		close(done)
-	}()
-	deadline := time.After(4 * time.Second)
-	for {
-		if evalStr(t, js, "String(r.got ?? '')") == "SIGUSR1" {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatal("SIGUSR1 handler did not fire")
-			return
-		case <-time.After(50 * time.Millisecond):
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rt.Wait(ctx)
+	if got := evalStr(t, js, "String(r.got ?? '')"); got != "SIGUSR1" {
+		t.Fatalf("SIGUSR1 handler did not fire; got %q", got)
 	}
 }
