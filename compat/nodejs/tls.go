@@ -93,9 +93,29 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			})
 			return
 		}
+		// The guest may have destroyed the socket while the handshake was in
+		// flight (opNetClose deleted writers[id]); don't resurrect it — that would
+		// emit spurious connect/error/end on an abandoned socket.
 		st.mu.Lock()
-		st.conns[id] = conn
+		_, stillOpen := st.writers[id]
+		if stillOpen {
+			st.conns[id] = conn
+		}
 		st.mu.Unlock()
+		if !stillOpen {
+			conn.Close()
+			go w.run(func(error) {}) // ack any writes queued before destroy
+			rt.loop.Post(func() error {
+				defer rt.loop.DonePending()
+				for _, o := range []*spidermonkey.Object{onData, onEnd, onError, onConnect} {
+					if o != nil {
+						o.Free()
+					}
+				}
+				return nil
+			})
+			return
+		}
 		w.attach(conn)
 		go w.run(func(error) {})
 		if onConnect != nil {

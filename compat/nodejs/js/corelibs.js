@@ -231,11 +231,22 @@
 	// caller (runTicks) rethrows so it surfaces to the host instead of vanishing
 	// as an unobserved rejection. Returns true iff handled.
 	globalThis.__node_emit_uncaught = (e) => {
+		// The process.exit() sentinel must always propagate to unwind to the host;
+		// a user uncaughtException handler must not be able to swallow it.
+		if (e && e.__nodeExit) return false;
 		if (process.listenerCount && process.listenerCount("uncaughtException") > 0) {
 			process.emit("uncaughtException", e, "uncaughtException");
 			return true;
 		}
 		return false;
+	};
+	// The generic hook the shared (web-layer) timer wrapper routes a callback
+	// throw to, so a throw in a setTimeout/setInterval callback reaches the
+	// uncaughtException handler and does not tear down the loop. process.exit()'s
+	// sentinel is never "handled" here — it must propagate to terminate the loop.
+	globalThis.__emit_uncaught = (e) => {
+		if (e && e.__nodeExit) return false;
+		return globalThis.__node_emit_uncaught(e);
 	};
 
 	// --------------------------------------------------------------- util
@@ -671,10 +682,17 @@
 			return r.bytesRead;
 		},
 		writeSync(fd, buffer, offset, length, position) {
-			let data;
-			if (typeof buffer === "string") data = Buffer.from(buffer);
-			else data = Buffer.from(buffer.buffer ? new Uint8Array(buffer.buffer, buffer.byteOffset + (offset || 0), length ?? buffer.length) : buffer);
-			const r = ops.fs_write_fd(fd, data);
+			let data, pos;
+			if (typeof buffer === "string") {
+				// writeSync(fd, string[, position[, encoding]])
+				data = Buffer.from(buffer, typeof length === "string" ? length : undefined);
+				pos = typeof offset === "number" ? offset : null;
+			} else {
+				// writeSync(fd, buffer[, offset[, length[, position]]])
+				data = Buffer.from(buffer.buffer ? new Uint8Array(buffer.buffer, buffer.byteOffset + (offset || 0), length ?? buffer.length) : buffer);
+				pos = typeof position === "number" ? position : null;
+			}
+			const r = ops.fs_write_fd(fd, data, pos);
 			if (isErr(r)) throw fsError(r, "write", fd);
 			return r;
 		},

@@ -25,6 +25,21 @@ import (
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
 
+// maxRSAModulusBits bounds any caller-supplied RSA modulus. Every RSA operation
+// (import Precompute/Validate, sign, verify, encrypt) runs an uninterruptible
+// big-integer modexp on the shared host, so an oversized attacker-chosen modulus
+// would pin a core (and, on the pooled cfworkers surface, a whole request slot)
+// for minutes. 8192 covers every legitimate RSA key; larger is rejected.
+const maxRSAModulusBits = 8192
+
+// checkRSAModulus rejects a modulus above the cap before any modexp/Precompute.
+func checkRSAModulus(n *big.Int) error {
+	if n == nil || n.BitLen() > maxRSAModulusBits {
+		return fmt.Errorf("RSA modulus too large (max %d bits)", maxRSAModulusBits)
+	}
+	return nil
+}
+
 type subtleKey struct {
 	hmac    []byte
 	rsaPriv *rsa.PrivateKey
@@ -517,6 +532,14 @@ func (s *subtleAPI) opRSAImportJWK(cfg spidermonkey.Config, args []spidermonkey.
 	if err != nil {
 		return nil, fmt.Errorf("bad JWK e: %w", err)
 	}
+	if err := checkRSAModulus(n); err != nil {
+		return nil, err
+	}
+	// A public exponent must fit an int and be a sane odd value >= 3; a huge e
+	// would both overflow int(e.Int64()) and drive an oversized modexp.
+	if !e.IsInt64() || e.Int64() < 3 || e.BitLen() > 32 {
+		return nil, fmt.Errorf("invalid RSA public exponent")
+	}
 	pub := rsa.PublicKey{N: n, E: int(e.Int64())}
 	if j.D == "" {
 		return spidermonkey.ValueOf(map[string]any{
@@ -563,6 +586,9 @@ func (s *subtleAPI) opRSAImportDER(cfg spidermonkey.Config, args []spidermonkey.
 		if !ok {
 			return nil, fmt.Errorf("pkcs8 key is not RSA")
 		}
+		if err := checkRSAModulus(priv.N); err != nil {
+			return nil, err
+		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{rsaPriv: priv}), "type": "private", "bits": priv.N.BitLen(),
 		}), nil
@@ -574,6 +600,9 @@ func (s *subtleAPI) opRSAImportDER(cfg spidermonkey.Config, args []spidermonkey.
 		pub, ok := key.(*rsa.PublicKey)
 		if !ok {
 			return nil, fmt.Errorf("spki key is not RSA")
+		}
+		if err := checkRSAModulus(pub.N); err != nil {
+			return nil, err
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{rsaPub: pub}), "type": "public", "bits": pub.N.BitLen(),

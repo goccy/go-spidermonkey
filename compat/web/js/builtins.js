@@ -1038,25 +1038,39 @@
 
 	// A Timeout-like handle: a lot of ecosystem code does `const t =
 	// setTimeout(...); t.unref()`. The handle coerces to its numeric id (via
-	// Symbol.toPrimitive), so clearTimeout(handle) still works. unref/ref are
-	// no-ops here (the loop already exits once no async work remains).
+	// Symbol.toPrimitive), so clearTimeout(handle) still works. unref/ref toggle
+	// whether the timer keeps the loop alive (idempotently, so repeated calls
+	// don't skew the loop's ref accounting).
 	const makeTimer = (id) => ({
 		_id: id,
-		unref() { return this; },
-		ref() { return this; },
-		hasRef() { return true; },
+		_reffed: true,
+		unref() { if (this._reffed) { this._reffed = false; ops.timer_ref(id, false); } return this; },
+		ref() { if (!this._reffed) { this._reffed = true; ops.timer_ref(id, true); } return this; },
+		hasRef() { return this._reffed; },
 		refresh() { return this; },
 		close() { globalThis.clearTimeout(id); return this; },
 		[Symbol.toPrimitive]() { return id; },
 	});
+	// runTimerCb isolates a timer callback throw: a throw in one timer must not
+	// tear down the whole event loop. Route it to the platform's uncaught-
+	// exception channel (installed by the Node layer); only if unhandled does it
+	// rethrow so a genuine uncaught exception still surfaces to the host.
+	const runTimerCb = (fn) => {
+		try {
+			fn();
+		} catch (e) {
+			const emit = globalThis.__emit_uncaught;
+			if (!(emit && emit(e))) throw e;
+		}
+	};
 	globalThis.setTimeout = function setTimeout(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
-		const cb = args.length ? () => fn(...args) : fn;
+		const cb = () => runTimerCb(args.length ? () => fn(...args) : fn);
 		return makeTimer(ops.timer_set(cb, Number(delay) || 0, false));
 	};
 	globalThis.setInterval = function setInterval(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
-		const cb = args.length ? () => fn(...args) : fn;
+		const cb = () => runTimerCb(args.length ? () => fn(...args) : fn);
 		return makeTimer(ops.timer_set(cb, Number(delay) || 0, true));
 	};
 	globalThis.clearTimeout = globalThis.clearInterval = (id) => {

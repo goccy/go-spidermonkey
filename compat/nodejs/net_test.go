@@ -111,6 +111,48 @@ func TestNetClientBackpressureLargeStream(t *testing.T) {
 	}
 }
 
+// TestNetDestroyDuringConnect verifies destroying a socket while its async
+// connect is still in flight does NOT later emit spurious connect/error/end
+// events when the dial finally completes.
+func TestNetDestroyDuringConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	js.Global().Set("PORT", spidermonkey.ValueOf(port))
+	runScript(t, rt, `
+		const net = require("net");
+		globalThis.r = { connect: false, error: false, end: false };
+		const sock = net.connect(PORT, "127.0.0.1", () => { r.connect = true; });
+		sock.on("error", () => { r.error = true; });
+		sock.on("end", () => { r.end = true; });
+		sock.on("connect", () => { r.connect = true; });
+		sock.destroy(); // abandon before the async dial completes
+	`)
+	if evalVal(t, js, "r.connect").Bool() {
+		t.Error("destroyed-during-connect socket still emitted 'connect'")
+	}
+	if evalVal(t, js, "r.error").Bool() {
+		t.Error("destroyed-during-connect socket emitted a spurious 'error'")
+	}
+	if evalVal(t, js, "r.end").Bool() {
+		t.Error("destroyed-during-connect socket emitted a spurious 'end'")
+	}
+}
+
 func TestNetServerAcceptsGoClient(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
 

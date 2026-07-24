@@ -354,9 +354,34 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			})
 			return
 		}
+		// The guest may have destroyed the socket while the dial was in flight;
+		// opNetClose then deleted writers[id] to mark the close intentional. If so,
+		// do NOT resurrect it — closing conn, freeing the handles and releasing the
+		// pending, without firing connect/pump (which would emit spurious
+		// connect/error/end on a socket the guest already abandoned).
 		st.mu.Lock()
-		st.conns[id] = conn
+		_, stillOpen := st.writers[id]
+		if stillOpen {
+			st.conns[id] = conn
+		}
 		st.mu.Unlock()
+		if !stillOpen {
+			conn.Close()
+			// opNetClose already requested close; run the actor (conn was never
+			// attached to it) so any writes queued before destroy get their onDone
+			// acked instead of stranding a guest awaiting them.
+			go w.run(func(error) {})
+			rt.loop.Post(func() error {
+				defer rt.loop.DonePending()
+				for _, o := range []*spidermonkey.Object{onData, onEnd, onError, onConnect} {
+					if o != nil {
+						o.Free()
+					}
+				}
+				return nil
+			})
+			return
+		}
 		w.attach(conn)
 		go w.run(func(error) {}) // write failures surface via the read side (onError/onEnd)
 		if onConnect != nil {

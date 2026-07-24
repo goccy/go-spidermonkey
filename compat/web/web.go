@@ -61,6 +61,7 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		"perf_now":      w.opPerfNow,
 		"timer_set":     w.opTimerSet,
 		"timer_clear":   w.opTimerClear,
+		"timer_ref":     w.opTimerRef,
 	}
 	subtle := newSubtleAPI()
 	for name, fn := range subtle.ops() {
@@ -173,6 +174,15 @@ func (w *Web) opTimerSet(cfg spidermonkey.Config, args []spidermonkey.Value) (sp
 func (w *Web) opTimerClear(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) >= 1 {
 		w.loop.ClearTimer(int64(args[0].Float()))
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// opTimerRef(id, ref) sets whether a timer keeps the loop alive — the Go half of
+// Timeout.ref()/unref().
+func (w *Web) opTimerRef(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) >= 2 {
+		w.loop.SetTimerRef(int64(args[0].Float()), args[1].Bool())
 	}
 	return spidermonkey.Undefined(), nil
 }

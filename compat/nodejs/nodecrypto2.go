@@ -261,6 +261,9 @@ func (rt *Runtime) opSign(cfg spidermonkey.Config, args []spidermonkey.Value) (s
 	ch, _, _ := hashForSign(args[0].String())
 	switch k := key.(type) {
 	case *rsa.PrivateKey:
+		if err := checkRSAModulus(k.N); err != nil {
+			return cryptoErr(err.Error()), nil
+		}
 		sig, err := rsa.SignPKCS1v15(rand.Reader, k, ch, digest)
 		if err != nil {
 			return cryptoErr(err.Error()), nil
@@ -314,6 +317,9 @@ func (rt *Runtime) opVerify(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	digest := hh.Sum(nil)
 	switch k := key.(type) {
 	case *rsa.PublicKey:
+		if err := checkRSAModulus(k.N); err != nil {
+			return spidermonkey.ValueOf(false), nil // reject oversized modulus (DoS guard) rather than run the modexp
+		}
 		return spidermonkey.ValueOf(rsa.VerifyPKCS1v15(k, ch, digest, sig) == nil), nil
 	case *ecdsa.PublicKey:
 		return spidermonkey.ValueOf(ecdsa.VerifyASN1(k, digest, sig)), nil

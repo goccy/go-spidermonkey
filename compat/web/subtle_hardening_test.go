@@ -53,6 +53,32 @@ func TestSubtleCryptoInputHardening(t *testing.T) {
 	}
 }
 
+// TestSubtleRSAModulusCapped verifies importing a JWK with an absurdly large RSA
+// modulus is rejected, so a guest can't drive an uninterruptible multi-minute
+// modexp (via Precompute/verify) that would pin the shared host.
+func TestSubtleRSAModulusCapped(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			// A ~40000-bit modulus: 5000 base64url 'A' chars ≈ 30000 bits of value
+			// with a leading set byte pushes it well past the 8192-bit cap.
+			const n = "_".repeat(6000); // base64url; decodes to ~36000 bits, all 1s
+			try {
+				await crypto.subtle.importKey("jwk",
+					{ kty: "RSA", n, e: "AQAB" },
+					{ name: "RSA-PSS", hash: "SHA-256" }, false, ["verify"]);
+				__c.rsa = "no-throw";
+			} catch (e) { __c.rsa = "rejected"; }
+		})().catch((e) => { __c.err = String(e && e.stack || e); });
+	`)
+	if got := evalString(t, js, `__c.err ?? ""`); got != "" {
+		t.Fatalf("unexpected error: %s", got)
+	}
+	if got := evalString(t, js, `__c.rsa`); got != "rejected" {
+		t.Errorf("oversized RSA modulus import = %q, want rejected", got)
+	}
+}
+
 // deriveKey must work with a base key imported with ONLY ["deriveKey"] usage
 // (the canonical PBKDF2 password pattern); it must not also require deriveBits.
 func TestDeriveKeyWithDeriveKeyUsageOnly(t *testing.T) {

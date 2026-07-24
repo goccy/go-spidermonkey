@@ -196,6 +196,10 @@
 		}
 		close(callback) {
 			if (this._id !== undefined) {
+				// Rebalance the loop ref accounting before dropping the listen's
+				// AddPending, so an unref'd-then-closed server leaves no stray
+				// unref offset behind.
+				if (this._unreffed) { ops.loop_ref(true); this._unreffed = false; }
 				ops.http_close(this._id);
 				servers.delete(this._id);
 				this._id = undefined;
@@ -206,8 +210,8 @@
 			return this;
 		}
 		setTimeout() { return this; }
-		ref() { return this; }
-		unref() { return this; }
+		ref() { if (this._unreffed) { ops.loop_ref(true); this._unreffed = false; } return this; }
+		unref() { if (!this._unreffed && this._id !== undefined) { ops.loop_ref(false); this._unreffed = true; } return this; }
 	}
 
 	// reqId -> IncomingMessage, for streaming the request body in.

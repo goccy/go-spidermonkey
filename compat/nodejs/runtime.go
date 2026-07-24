@@ -70,6 +70,22 @@ type Runtime struct {
 	pendingReturns []*spidermonkey.Object // handles returned to the guest, freed on release_pending
 	fds            map[int64]*openFile    // fd table for fs.openSync
 	nextFD         int64
+	exited         bool // process.exit() was called; the exit sentinel is not a crash
+	exitCode       int
+}
+
+// ExitCode reports the code passed to process.exit() (0 if it exited without an
+// explicit code); Exited reports whether process.exit() was called at all.
+func (rt *Runtime) Exited() bool  { rt.mu.Lock(); defer rt.mu.Unlock(); return rt.exited }
+func (rt *Runtime) ExitCode() int { rt.mu.Lock(); defer rt.mu.Unlock(); return rt.exitCode }
+
+// exitFilter converts the process.exit() unwind sentinel into a clean return: a
+// script that calls process.exit(0) is a normal termination, not an error.
+func (rt *Runtime) exitFilter(err error) error {
+	if err != nil && rt.Exited() {
+		return nil
+	}
+	return err
 }
 
 // openFile is one fs.openSync handle: the whole file loaded into memory,
@@ -171,8 +187,9 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 }
 
 // Wait runs the event loop until timers, immediates, nextTicks and pending
-// ops are exhausted, or ctx is done.
-func (rt *Runtime) Wait(ctx context.Context) error { return rt.web.Wait(ctx) }
+// ops are exhausted, or ctx is done. A process.exit() during the loop stops it
+// and returns cleanly (Exited/ExitCode report the outcome).
+func (rt *Runtime) Wait(ctx context.Context) error { return rt.exitFilter(rt.web.Wait(ctx)) }
 
 // Web returns the underlying compat/web installation.
 func (rt *Runtime) Web() *web.Web { return rt.web }
@@ -199,8 +216,17 @@ func (rt *Runtime) Close() error {
 // runs the event loop to completion.
 func (rt *Runtime) RunScript(ctx context.Context, src string) (spidermonkey.Result, error) {
 	r, err := rt.js.Eval(ctx, src)
-	if err != nil || r.Error != nil {
+	if err != nil {
 		return r, err
+	}
+	if r.Error != nil {
+		// A top-level process.exit() surfaces as the unwind sentinel; report it as
+		// a clean exit rather than an evaluation error, and don't run the loop.
+		if rt.Exited() {
+			r.Error = nil
+			return r, nil
+		}
+		return r, nil
 	}
 	return r, rt.Wait(ctx)
 }
@@ -209,8 +235,15 @@ func (rt *Runtime) RunScript(ctx context.Context, src string) (spidermonkey.Resu
 // then runs the event loop to completion.
 func (rt *Runtime) RunModule(ctx context.Context, specifier, src string) (spidermonkey.ModuleResult, error) {
 	r, err := rt.js.EvalModule(ctx, specifier, src)
-	if err != nil || r.Error != nil {
+	if err != nil {
 		return r, err
+	}
+	if r.Error != nil {
+		if rt.Exited() {
+			r.Error = nil
+			return r, nil
+		}
+		return r, nil
 	}
 	return r, rt.Wait(ctx)
 }
@@ -280,7 +313,7 @@ func (rt *Runtime) esmLoader(cfg spidermonkey.Config, specifier, referrer string
 	}
 	switch r.Kind {
 	case kindJSON:
-		return "export default (" + string(src) + ");", nil
+		return jsonModuleSource(src)
 	case kindCJS:
 		return fmt.Sprintf("const m = globalThis.__node_require_path(%q);\nexport default m;\n", r.Path), nil
 	}
@@ -300,6 +333,8 @@ func (rt *Runtime) ops() map[string]spidermonkey.Func {
 		"raw_write":       rt.opRawWrite,
 		"immediate_set":   rt.opImmediateSet,
 		"immediate_clear": rt.opImmediateClear,
+		"loop_ref":        rt.opLoopRef,
+		"node_exit":       rt.opNodeExit,
 		"node_resolve":    rt.opResolve,
 		"node_read":       rt.opRead,
 		"fs_read_file":    rt.opFSReadFile,
@@ -374,6 +409,32 @@ func (rt *Runtime) opImmediateSet(cfg spidermonkey.Config, args []spidermonkey.V
 func (rt *Runtime) opImmediateClear(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) >= 1 {
 		rt.loop.ClearImmediate(int64(args[0].Float()))
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// opNodeExit(code) records a process.exit() request. process.exit then throws
+// an unwind sentinel to stop execution; the host boundaries (RunScript/Wait)
+// consult this flag to report the exit as a clean termination rather than a
+// crash. It also stops the loop from running further work.
+func (rt *Runtime) opNodeExit(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	rt.mu.Lock()
+	rt.exited = true
+	if len(args) >= 1 {
+		rt.exitCode = args[0].Int()
+	}
+	rt.mu.Unlock()
+	return spidermonkey.Undefined(), nil
+}
+
+// opLoopRef(ref) toggles whether an AddPending handle (a listening server, etc.)
+// keeps the loop alive — the Go half of server.ref()/unref(). The JS caller
+// guards it so ref state stays balanced.
+func (rt *Runtime) opLoopRef(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) >= 1 && args[0].Bool() {
+		rt.loop.Ref()
+	} else {
+		rt.loop.Unref()
 	}
 	return spidermonkey.Undefined(), nil
 }

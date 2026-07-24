@@ -29,6 +29,11 @@ type Loop struct {
 	batch      []*immediate // check-phase snapshot currently executing
 	posts      []func() error
 	pending    int
+	// unrefPending is the number of AddPending handles that have been unref'd
+	// (server.unref() etc.). Unref'd work still runs, but it does not by itself
+	// keep the loop alive: the idle check uses pending-unrefPending. Kept
+	// balanced by Ref/Unref and rebalanced by the handle's owner on close.
+	unrefPending int
 
 	// microDrain replaces the engine-only microtask drain when set
 	// (compat/nodejs interleaves the process.nextTick queue here).
@@ -61,6 +66,7 @@ type timer struct {
 	fn       *spidermonkey.Object
 	running  bool // callback currently executing (the loop owns the free)
 	cleared  bool
+	unref    bool // does not keep the loop alive, but still fires if it stays alive
 }
 
 func (t *timer) freeFn() {
@@ -195,6 +201,7 @@ func (l *Loop) Reset() {
 	l.batch = nil
 	l.posts = nil
 	l.pending = 0
+	l.unrefPending = 0
 	l.mu.Unlock()
 	// The loop is idle here (Run has returned), so nothing is mid-callback and
 	// every handle is safe to free. freeFn is idempotent, so timers that also
@@ -235,6 +242,46 @@ func (l *Loop) AddPending() {
 func (l *Loop) DonePending() {
 	l.mu.Lock()
 	l.pending--
+	l.mu.Unlock()
+	l.wakeup()
+}
+
+// Unref marks one AddPending handle as not keeping the loop alive (Node's
+// handle.unref()). It does not release the pending — the op still completes and
+// its callbacks still fire — it only stops that handle from, on its own, keeping
+// the process from exiting. Balanced by Ref. The handle's owner must Ref again
+// on close if it was unref'd, so unrefPending never outlives its pending.
+func (l *Loop) Unref() {
+	l.mu.Lock()
+	l.unrefPending++
+	l.mu.Unlock()
+	l.wakeup()
+}
+
+// Ref undoes an Unref.
+func (l *Loop) Ref() {
+	l.mu.Lock()
+	if l.unrefPending > 0 {
+		l.unrefPending--
+	}
+	l.mu.Unlock()
+}
+
+// SetTimerRef sets whether a timer keeps the loop alive. An unref'd timer still
+// fires while the loop runs for other reasons, but a loop with ONLY unref'd
+// timers left is idle and exits (Node's timer.unref()). Unknown ids are ignored.
+func (l *Loop) SetTimerRef(id int64, ref bool) {
+	l.mu.Lock()
+	if t, ok := l.timers[id]; ok {
+		t.unref = !ref
+	} else {
+		for _, dt := range l.dueBatch {
+			if dt.id == id {
+				dt.unref = !ref
+				break
+			}
+		}
+	}
 	l.mu.Unlock()
 	l.wakeup()
 }
@@ -339,13 +386,22 @@ func (l *Loop) Run(ctx context.Context) error {
 		l.mu.Unlock()
 
 		l.mu.Lock()
+		// next is the earliest of ALL armed timers (so unref'd timers still fire
+		// on time while the loop is alive); hasRefTimer tracks whether any armed
+		// timer keeps the loop alive. A loop with only unref'd timers (and no
+		// other ref'd work) is idle and exits without firing them, like Node.
 		var next time.Time
+		hasRefTimer := false
 		for _, t := range l.timers {
 			if next.IsZero() || t.due.Before(next) {
 				next = t.due
 			}
+			if !t.unref {
+				hasRefTimer = true
+			}
 		}
-		idle := next.IsZero() && l.pending == 0 && len(l.posts) == 0 && len(l.immediates) == 0
+		activePending := l.pending - l.unrefPending
+		idle := !hasRefTimer && activePending <= 0 && len(l.posts) == 0 && len(l.immediates) == 0
 		l.mu.Unlock()
 		if idle {
 			return nil

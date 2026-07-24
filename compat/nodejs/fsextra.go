@@ -190,9 +190,11 @@ func (rt *Runtime) opFSReadFD(cfg spidermonkey.Config, args []spidermonkey.Value
 	// Only a NUMBER position seeks; null/undefined mean "read from the current
 	// position and advance" (Node's readSync sentinel). Previously a JS null
 	// coerced to 0, so a chunked read loop re-read the first bytes forever.
+	explicitPos := false
 	if len(args) > 2 {
 		if n, ok := args[2].Export().(float64); ok {
 			pos = int64(n)
+			explicitPos = true
 		}
 	}
 	length := int64(len(f.data)) - pos
@@ -205,7 +207,11 @@ func (rt *Runtime) opFSReadFD(cfg spidermonkey.Config, args []spidermonkey.Value
 		return rt.readFDResult(nil, 0)
 	}
 	chunk := f.data[pos : pos+length]
-	f.pos = pos + length
+	// A positioned read (Node: numeric position) leaves the file position
+	// unchanged, like pread; only a current-position read advances it.
+	if !explicitPos {
+		f.pos = pos + length
+	}
 	return rt.readFDResult(chunk, len(chunk))
 }
 
@@ -238,16 +244,33 @@ func (rt *Runtime) opFSWriteFD(cfg spidermonkey.Config, args []spidermonkey.Valu
 	if err != nil {
 		return nil, err
 	}
-	if f.append || f.pos >= int64(len(f.data)) {
+	// A numeric position (Node's writeSync 5th arg) writes at that offset like
+	// pwrite and leaves the current position unchanged; null/undefined writes at
+	// the current position and advances it.
+	writeAt := f.pos
+	explicitPos := false
+	if len(args) > 2 {
+		if n, ok := args[2].Export().(float64); ok {
+			writeAt = int64(n)
+			explicitPos = true
+		}
+	}
+	if f.append || (!explicitPos && f.pos >= int64(len(f.data))) {
 		f.data = append(f.data, data...)
+		f.pos = int64(len(f.data))
 	} else {
-		grow := f.pos + int64(len(data)) - int64(len(f.data))
+		if writeAt < 0 {
+			writeAt = 0
+		}
+		grow := writeAt + int64(len(data)) - int64(len(f.data))
 		if grow > 0 {
 			f.data = append(f.data, make([]byte, grow)...)
 		}
-		copy(f.data[f.pos:], data)
+		copy(f.data[writeAt:], data)
+		if !explicitPos {
+			f.pos = writeAt + int64(len(data))
+		}
 	}
-	f.pos += int64(len(data))
 	f.dirty = true
 	return spidermonkey.ValueOf(len(data)), nil
 }

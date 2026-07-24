@@ -101,6 +101,9 @@ func (rt *Runtime) opRSAPrivateDecrypt(cfg spidermonkey.Config, args []spidermon
 	if !ok {
 		return cryptoErr("not an RSA private key"), nil
 	}
+	if err := checkRSAModulus(priv.N); err != nil {
+		return cryptoErr(err.Error()), nil
+	}
 	switch padding {
 	case "oaep":
 		h, herr := oaepHash("sha1")
@@ -143,6 +146,9 @@ func (rt *Runtime) opRSAPrivateEncrypt(cfg spidermonkey.Config, args []spidermon
 	if !ok {
 		return cryptoErr("not an RSA private key"), nil
 	}
+	if err := checkRSAModulus(priv.N); err != nil {
+		return cryptoErr(err.Error()), nil
+	}
 	out, e := rsa.SignPKCS1v15(rand.Reader, priv, crypto.Hash(0), data)
 	if e != nil {
 		return cryptoErr(e.Error()), nil
@@ -183,7 +189,31 @@ func (rt *Runtime) opRSAPublicDecrypt(cfg spidermonkey.Config, args []spidermonk
 	return rt.bytesReturn(em[i+1:])
 }
 
+// maxRSAModulusBits bounds any caller-supplied RSA modulus. Every RSA operation
+// is an uninterruptible big-integer modexp on the shared host, so an oversized
+// attacker-chosen modulus would pin a core for minutes; 8192 covers every
+// legitimate key. checkRSAModulus enforces it before any modexp runs.
+const maxRSAModulusBits = 8192
+
+func checkRSAModulus(n *big.Int) error {
+	if n == nil || n.BitLen() > maxRSAModulusBits {
+		return fmt.Errorf("RSA modulus too large (max %d bits)", maxRSAModulusBits)
+	}
+	return nil
+}
+
 func parseAnyRSAPublic(pemBytes []byte) (*rsa.PublicKey, error) {
+	pub, err := parseAnyRSAPublicUncapped(pemBytes)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkRSAModulus(pub.N); err != nil {
+		return nil, err
+	}
+	return pub, nil
+}
+
+func parseAnyRSAPublicUncapped(pemBytes []byte) (*rsa.PublicKey, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
 		return nil, fmt.Errorf("no PEM block")

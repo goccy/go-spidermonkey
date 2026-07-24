@@ -87,6 +87,11 @@
 		},
 		exit(code) {
 			if (code !== undefined) process.exitCode = Number(code);
+			// Record the exit on the host so RunScript/Wait report it as a clean
+			// termination, then throw an unwind sentinel to stop execution. The
+			// sentinel is never treated as "handled" by uncaughtException, so it
+			// can't be swallowed by a user handler.
+			ops.node_exit(process.exitCode ?? 0);
 			const e = new Error(`process.exit(${process.exitCode ?? 0})`);
 			e.__nodeExit = true;
 			throw e;

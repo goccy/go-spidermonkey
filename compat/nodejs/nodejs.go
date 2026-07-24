@@ -13,12 +13,28 @@
 package nodejs
 
 import (
+	"encoding/json"
 	"fmt"
 	"path"
 	"strings"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
+
+// jsonModuleSource wraps raw .json file bytes as an ES module that parses them
+// at runtime with JSON.parse. Interpolating the bytes into `export default (…)`
+// would EVALUATE the file as a JavaScript expression — any executable content
+// (or a `__proto__` key) would run/apply on import, turning an attacker-
+// influenced data file into code execution. JSON.parse keeps the data inert and
+// matches Node's JSON-module semantics. The source is embedded as a JS string
+// literal via json.Marshal so it is safely escaped.
+func jsonModuleSource(src []byte) (string, error) {
+	lit, err := json.Marshal(string(src))
+	if err != nil {
+		return "", err
+	}
+	return "export default JSON.parse(" + string(lit) + ");", nil
+}
 
 // ESMLoader is a spidermonkey.ModuleLoader for PURE-ESM resolution over
 // Config.FS: relative/absolute paths (with extension fallbacks) and bare npm
@@ -44,7 +60,7 @@ func ESMLoader(cfg spidermonkey.Config, specifier, referrer string) (string, err
 	}
 	switch r.Kind {
 	case kindJSON:
-		return "export default (" + string(src) + ");", nil
+		return jsonModuleSource(src)
 	case kindCJS:
 		return "", fmt.Errorf("cannot import %q: CommonJS module %q needs nodejs.Install", specifier, r.Path)
 	}
