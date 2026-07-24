@@ -25,24 +25,26 @@ import (
 var workerJS string
 
 type workerManager struct {
-	rt      *Runtime
-	agents  *spidermonkey.Agents
-	stdout  io.Writer
-	stderr  io.Writer
-	mu      sync.Mutex
-	nextTID int
-	insts   map[spidermonkey.AgentID]*spidermonkey.Object // worker id -> JS Worker instance
-	stop    chan struct{}
-	started bool
+	rt       *Runtime
+	agents   *spidermonkey.Agents
+	stdout   io.Writer
+	stderr   io.Writer
+	mu       sync.Mutex
+	nextTID  int
+	insts    map[spidermonkey.AgentID]*spidermonkey.Object // worker id -> JS Worker instance
+	deadSeen map[spidermonkey.AgentID]int
+	stop     chan struct{}
+	started  bool
 }
 
 func newWorkerManager(rt *Runtime) *workerManager {
 	return &workerManager{
-		rt:      rt,
-		agents:  rt.js.Agents(),
-		insts:   map[spidermonkey.AgentID]*spidermonkey.Object{},
-		stop:    make(chan struct{}),
-		nextTID: 1,
+		rt:       rt,
+		agents:   rt.js.Agents(),
+		insts:    map[spidermonkey.AgentID]*spidermonkey.Object{},
+		deadSeen: map[spidermonkey.AgentID]int{},
+		stop:     make(chan struct{}),
+		nextTID:  1,
 	}
 }
 
@@ -174,21 +176,29 @@ func (wm *workerManager) pump() {
 }
 
 // reapDead fires a crash exit(1) for any tracked worker whose agent has ended
-// without a clean __wt_exit (which would already have removed it).
+// without a clean __wt_exit (which removes the inst via dispatch). A clean
+// process.exit(0) posts __wt_exit BEFORE leaving, so the message is already in
+// the queue when the agent dies — but the pump may observe "dead" before it
+// has Received that message. To avoid racing a clean exit into a crash exit,
+// an agent must be seen dead for TWO consecutive empty-queue cycles (a Receive
+// drain happens between them, so any queued __wt_exit is dispatched first).
 func (wm *workerManager) reapDead() {
 	wm.mu.Lock()
-	var dead []spidermonkey.AgentID
+	var reap []spidermonkey.AgentID
 	for id := range wm.insts {
-		if !wm.agents.IsAlive(id) {
-			dead = append(dead, id)
+		if wm.agents.IsAlive(id) {
+			delete(wm.deadSeen, id)
+			continue
+		}
+		wm.deadSeen[id]++
+		if wm.deadSeen[id] >= 2 {
+			reap = append(reap, id)
 		}
 	}
-	wm.mu.Unlock()
-	for _, id := range dead {
-		wm.mu.Lock()
+	for _, id := range reap {
 		inst := wm.insts[id]
 		delete(wm.insts, id)
-		wm.mu.Unlock()
+		delete(wm.deadSeen, id)
 		if inst != nil {
 			instCopy := inst
 			wm.rt.loop.Post(func() error {
@@ -199,6 +209,7 @@ func (wm *workerManager) reapDead() {
 			wm.rt.loop.DonePending()
 		}
 	}
+	wm.mu.Unlock()
 }
 
 // dispatch routes one worker->main message on the loop goroutine.
