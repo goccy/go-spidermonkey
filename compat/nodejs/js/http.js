@@ -208,7 +208,7 @@
 		unref() { return this; }
 	}
 
-	globalThis.__node_http_dispatch = (serverId, reqId, method, url, rawHeaders, body, remoteAddr) => {
+	globalThis.__node_http_dispatch = (serverId, reqId, method, url, rawHeaders, body, remoteAddr, encrypted) => {
 		const server = servers.get(serverId);
 		if (!server) {
 			ops.http_respond(reqId, 503, "[]");
@@ -222,6 +222,7 @@
 			remotePort = Number(remoteAddr.slice(i + 1)) || 0;
 		}
 		const socket = makeSocket(remoteAddress, remotePort);
+		socket.encrypted = !!encrypted;
 		const req = new IncomingMessage({
 			method, url, rawHeaders, socket,
 			body: body === null || body === undefined ? null : Object.setPrototypeOf(body, Buffer.prototype),
@@ -349,11 +350,44 @@
 		validateHeaderValue: (name, value) => { if (value === undefined) throw new TypeError(`Invalid value for header ${name}`); },
 	};
 
+	// HTTPS server: an http Server that binds a TLS listener (https_listen)
+	// instead of the plaintext http_listen. The dispatch machinery is shared.
+	class HttpsServer extends Server {
+		constructor(options, handler) {
+			super(typeof options === "function" ? options : handler);
+			this._tls = typeof options === "object" ? options : {};
+		}
+		listen(...args) {
+			let port = 0, host = "127.0.0.1", callback;
+			if (typeof args[args.length - 1] === "function") callback = args.pop();
+			if (typeof args[0] === "object" && args[0] !== null) { port = args[0].port ?? 0; host = args[0].host ?? host; }
+			else { if (args[0] !== undefined) port = args[0]; if (typeof args[1] === "string") host = args[1]; }
+			if (!this._tls.cert || !this._tls.key) {
+				const err = new Error("https.createServer requires { cert, key }");
+				process.nextTick(() => this.emit("error", err));
+				return this;
+			}
+			const r = ops.https_listen(this._httpId(), String(host), Number(port) || 0, this._tls.cert, this._tls.key);
+			if (r && r.code) { const e = Object.assign(new Error(r.message), { code: r.code }); process.nextTick(() => this.emit("error", e)); return this; }
+			this._id = r.id; this._port = r.port; this._host = host;
+			servers.set(r.id, this);
+			this.listening = true;
+			if (callback) this.once("listening", callback);
+			process.nextTick(() => this.emit("listening"));
+			return this;
+		}
+		_httpId() {
+			// Reuse the same server-id space the http dispatch keys on.
+			if (this.__id === undefined) this.__id = (globalThis.__node_next_https = (globalThis.__node_next_https || 900000) + 1);
+			return this.__id;
+		}
+	}
+
 	core.https = {
-		Server,
+		Server: HttpsServer,
 		Agent,
 		globalAgent: new Agent(),
-		createServer: (options, handler) => new Server(typeof options === "function" ? options : handler),
+		createServer: (options, handler) => new HttpsServer(options, handler),
 		request: httpRequest,
 		get: httpGet,
 	};

@@ -726,12 +726,76 @@
 		},
 	};
 
+	// node:tls over the tls_* host ops. TLSSocket is a Socket-shaped Duplex
+	// whose reads come from an encrypted connection; the server side accepts
+	// TLS connections and hands each to a TLSSocket.
+	function TLSSocket() {
+		core.stream.Duplex.call(this, {});
+		this._id = null;
+		this.encrypted = true;
+		this.authorized = true;
+	}
+	Object.setPrototypeOf(TLSSocket.prototype, core.stream.Duplex.prototype);
+	Object.setPrototypeOf(TLSSocket, core.stream.Duplex);
+	TLSSocket.prototype._write = function (chunk, enc, cb) { if (this._id !== null) ops.net_write(this._id, chunk); cb(); };
+	TLSSocket.prototype._read = function () {};
+	TLSSocket.prototype.destroy = function (err) { if (this._id !== null) { ops.net_close(this._id); this._id = null; } core.stream.Duplex.prototype.destroy.call(this, err); return this; };
+	TLSSocket.prototype.setEncoding = core.stream.Readable.prototype.setEncoding;
+	TLSSocket.prototype.end = core.stream.Writable.prototype.end;
+	TLSSocket.prototype.setTimeout = function () { return this; };
+	TLSSocket.prototype.setNoDelay = function () { return this; };
+
+	function tlsConnect(options, cb) {
+		if (typeof options === "number") { options = { port: options, host: arguments[1] }; cb = arguments[2]; }
+		const sock = new TLSSocket();
+		if (cb) sock.once("secureConnect", cb);
+		const onData = (chunk) => sock.push(Buffer.from(chunk));
+		const onEnd = () => sock.push(null);
+		const onError = (msg) => sock.emit("error", new Error(msg));
+		const onConnect = () => { sock.emit("secureConnect"); sock.emit("connect"); };
+		const r = ops.tls_connect(String(options.host || "127.0.0.1"), Number(options.port), options.rejectUnauthorized !== false, onData, onEnd, onError, onConnect);
+		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => sock.emit("error", e)); return sock; }
+		sock._id = r;
+		return sock;
+	}
+
+	function TLSServer(options, listener) {
+		if (typeof options === "function") { listener = options; options = {}; }
+		core.events.call(this);
+		this._opts = options || {};
+		this._id = null;
+		if (listener) this.on("secureConnection", listener);
+	}
+	Object.setPrototypeOf(TLSServer.prototype, core.events.prototype);
+	Object.setPrototypeOf(TLSServer, core.events);
+	TLSServer.prototype.listen = function (port, host, cb) {
+		if (typeof host === "function") { cb = host; host = undefined; }
+		host = host || "127.0.0.1";
+		const onConnection = (id, remote) => {
+			const sock = new TLSSocket();
+			sock._id = id;
+			ops.net_attach(id, (chunk) => sock.push(Buffer.from(chunk)), () => sock.push(null), (msg) => sock.emit("error", new Error(msg)));
+			this.emit("secureConnection", sock);
+		};
+		const r = ops.tls_listen(String(host), Number(port) || 0, this._opts.cert, this._opts.key, onConnection);
+		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); return this; }
+		this._id = r.id; this._port = r.port;
+		if (cb) this.once("listening", cb);
+		process.nextTick(() => this.emit("listening"));
+		return this;
+	};
+	TLSServer.prototype.address = function () { return this._id !== null ? { address: "127.0.0.1", port: this._port, family: "IPv4" } : null; };
+	TLSServer.prototype.close = function (cb) { if (this._id !== null) { ops.net_close_srv(this._id); this._id = null; } if (cb) process.nextTick(cb); process.nextTick(() => this.emit("close")); return this; };
+
 	core.tls = {
-		connect: notSupported("tls.connect"),
-		createServer: notSupported("tls.createServer"),
-		createSecureContext: () => ({}),
-		TLSSocket: class TLSSocket {},
+		connect: tlsConnect,
+		createServer: (options, listener) => new TLSServer(options, listener),
+		createSecureContext: (opts) => opts || {},
+		TLSSocket,
+		Server: TLSServer,
 		rootCertificates: [],
+		// A convenience (not in Node): a self-signed cert for quick servers.
+		generateSelfSigned: (host) => ops.tls_selfsigned(host),
 	};
 
 	core.http2 = {

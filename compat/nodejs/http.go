@@ -156,6 +156,7 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			spidermonkey.ValueOf(headerPairs),
 			bodyVal,
 			spidermonkey.ValueOf(r.RemoteAddr),
+			spidermonkey.ValueOf(r.TLS != nil),
 		)
 		if cerr != nil {
 			// Engine-level failure: answer 500 and keep the loop alive.
