@@ -107,3 +107,39 @@ func TestTimerHandleUnref(t *testing.T) {
 		t.Fatalf("timer handle unref/ref/clearTimeout did not complete")
 	}
 }
+
+// Two concurrent reads on one tee branch must both settle (the second must not
+// be dropped by the single-read guard).
+func TestTeeConcurrentReadsOnOneBranch(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const src = new ReadableStream({ start(c) { c.enqueue("x"); c.enqueue("y"); c.close(); } });
+			const [a] = src.tee();
+			const r = a.getReader();
+			const [r1, r2] = await Promise.all([r.read(), r.read()]);
+			__c.vals = [r1.value, r2.value].join(",");
+		})().catch((e) => { __c.err = String(e && e.stack || e); });
+	`)
+	if got := evalString(t, js, `__c.vals`); got != "x,y" {
+		t.Fatalf("concurrent tee reads = %q, want x,y (second read must not hang)", got)
+	}
+}
+
+// A read pending when cancel() is called must resolve with {done:true}.
+func TestReadableCancelSettlesPendingRead(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const src = new ReadableStream({ start() {} }); // never enqueues
+			const r = src.getReader();
+			const p = r.read();
+			await r.cancel("done");
+			const res = await p;
+			__c.done = res.done === true && res.value === undefined;
+		})().catch((e) => { __c.err = String(e && e.stack || e); });
+	`)
+	if evalString(t, js, `String(__c.done)`) != "true" {
+		t.Fatalf("cancel() did not settle the pending read with done:true")
+	}
+}

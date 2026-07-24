@@ -666,6 +666,10 @@
 		cancel(reason) {
 			this._queue = [];
 			this._closed = true;
+			// Resolve any read pending at cancel time with {done:true}; a later
+			// controller.close() would now no-op (closed guard), so cancel must
+			// flush the waiters itself.
+			for (const w of this._waiters.splice(0)) w.resolve({ value: undefined, done: true });
 			if (this._source.cancel) this._source.cancel(reason);
 			return Promise.resolve(undefined);
 		}
@@ -719,16 +723,21 @@
 			const reader = this.getReader();
 			let c1, c2;
 			let reading = false;
+			let pullAgain = false;
 			let cancelled1 = false;
 			let cancelled2 = false;
 			const pump = () => {
-				if (reading) return;
+				// One source read at a time; a pull arriving mid-read (e.g. two
+				// reads on the same branch) sets pullAgain so we read again once
+				// the current one lands, instead of silently dropping the demand.
+				if (reading) { pullAgain = true; return; }
 				reading = true;
 				reader.read().then(({ value, done }) => {
 					reading = false;
 					if (done) { c1.close(); c2.close(); return; }
 					if (!cancelled1) c1.enqueue(value);
 					if (!cancelled2) c2.enqueue(value);
+					if (pullAgain) { pullAgain = false; pump(); }
 				}).catch((e) => { c1.error(e); c2.error(e); });
 			};
 			const maybeCancel = (reason) => { if (cancelled1 && cancelled2) reader.cancel(reason); };
@@ -761,9 +770,13 @@
 			if (!s || s._state !== "writable") return Promise.reject(new TypeError("cannot write to this stream"));
 			// Serialize writes: chaining on the previous one keeps two un-awaited
 			// write() calls from running the sink concurrently (which for a
-			// TransformStream would interleave transform/enqueue).
-			s._writeChain = (s._writeChain || Promise.resolve()).then(() =>
-				s._sink.write ? s._sink.write(chunk, s._controller) : undefined);
+			// TransformStream would interleave transform/enqueue). A queued write
+			// re-checks state, so an abort/close between enqueue and execution
+			// stops it from still reaching the sink.
+			s._writeChain = (s._writeChain || Promise.resolve()).then(() => {
+				if (!s || s._state !== "writable") return undefined;
+				return s._sink.write ? s._sink.write(chunk, s._controller) : undefined;
+			});
 			return s._writeChain;
 		}
 		async close() {
