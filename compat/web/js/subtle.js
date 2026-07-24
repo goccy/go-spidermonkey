@@ -50,6 +50,25 @@
 	};
 	const unsupported = (what) => { throw new DOMException(`unsupported ${what}`, "NotSupportedError"); };
 
+	// deriveBitsRaw is the ungated core of deriveBits (no usage check), shared by
+	// the public deriveBits (which gates "deriveBits") and deriveKey (which gates
+	// only "deriveKey", per spec).
+	function deriveBitsRaw(alg, baseKey, length) {
+		const name = algName(alg).toUpperCase();
+		if (name === "ECDH") {
+			const privJWK = jwkOf(baseKey);
+			const pubJWK = jwkOf(alg.public);
+			return toBuf(subtleFail(ops.subtle_ecdh(privJWK, pubJWK, length ?? 0)));
+		}
+		if (name === "HKDF") {
+			return toBuf(subtleFail(ops.subtle_hkdf(hashName(alg.hash), baseKey._raw, toU8(alg.salt), toU8(alg.info), length)));
+		}
+		if (name === "PBKDF2") {
+			return toBuf(subtleFail(ops.subtle_pbkdf2(hashName(alg.hash), baseKey._raw, toU8(alg.salt), Number(alg.iterations), length)));
+		}
+		unsupported(`deriveBits algorithm ${algName(alg)}`);
+	}
+
 	const RSA_NAMES = ["RSASSA-PKCS1-V1_5", "RSA-PSS"];
 	const RSA_ALL = ["RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP"];
 	const rsaScheme = (name) => (name === "RSA-PSS" ? "pss" : "pkcs1");
@@ -276,26 +295,18 @@
 
 		async deriveBits(alg, baseKey, length) {
 			need(baseKey, "deriveBits");
-			const name = algName(alg).toUpperCase();
-			if (name === "ECDH") {
-				const privJWK = jwkOf(baseKey);
-				const pubJWK = jwkOf(alg.public);
-				return toBuf(subtleFail(ops.subtle_ecdh(privJWK, pubJWK, length ?? 0)));
-			}
-			if (name === "HKDF") {
-				return toBuf(subtleFail(ops.subtle_hkdf(hashName(alg.hash), baseKey._raw, toU8(alg.salt), toU8(alg.info), length)));
-			}
-			if (name === "PBKDF2") {
-				return toBuf(subtleFail(ops.subtle_pbkdf2(hashName(alg.hash), baseKey._raw, toU8(alg.salt), Number(alg.iterations), length)));
-			}
-			unsupported(`deriveBits algorithm ${algName(alg)}`);
+			return deriveBitsRaw(alg, baseKey, length);
 		},
 
 		async deriveKey(alg, baseKey, derivedKeyAlg, extractable, usages) {
+			// Gate on deriveKey only — WebCrypto does NOT require the base key to
+			// also carry deriveBits. Use the internal ungated deriveBitsRaw so a
+			// key imported with just ["deriveKey"] (the canonical PBKDF2 pattern)
+			// works, mirroring how wrapKey uses rawCrypt.
 			need(baseKey, "deriveKey");
 			const derivedName = algName(derivedKeyAlg).toUpperCase();
 			const length = Number(derivedKeyAlg.length) || (AES_NAMES.includes(derivedName) ? 256 : 256);
-			const bits = await subtle.deriveBits(alg, baseKey, length);
+			const bits = await deriveBitsRaw(alg, baseKey, length);
 			if (AES_NAMES.includes(derivedName)) {
 				return subtle.importKey("raw", bits, { name: derivedName }, extractable, usages);
 			}

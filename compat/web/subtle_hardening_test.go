@@ -52,3 +52,25 @@ func TestSubtleCryptoInputHardening(t *testing.T) {
 		t.Errorf("PBKDF2 iterations=0 = %q, want OperationError", got)
 	}
 }
+
+// deriveKey must work with a base key imported with ONLY ["deriveKey"] usage
+// (the canonical PBKDF2 password pattern); it must not also require deriveBits.
+func TestDeriveKeyWithDeriveKeyUsageOnly(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const pw = await crypto.subtle.importKey("raw", new TextEncoder().encode("pw"),
+				{ name: "PBKDF2" }, false, ["deriveKey"]); // deriveKey only
+			const key = await crypto.subtle.deriveKey(
+				{ name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array(16), iterations: 1000 },
+				pw, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+			__c.type = key && key.type;
+		})().catch((e) => { __c.err = String(e && (e.name + ": " + e.message) || e); });
+	`)
+	if got := evalString(t, js, `__c.err ?? ""`); got != "" {
+		t.Fatalf("deriveKey with deriveKey-only usage failed: %s", got)
+	}
+	if got := evalString(t, js, `__c.type`); got != "secret" {
+		t.Fatalf("derived key type = %q, want secret", got)
+	}
+}
