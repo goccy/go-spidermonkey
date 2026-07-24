@@ -1,0 +1,171 @@
+package nodejs_test
+
+import (
+	"context"
+	"testing"
+
+	spidermonkey "github.com/goccy/go-spidermonkey"
+)
+
+// push() after push(null) is a producer bug; the stream must error rather than
+// deliver a chunk after 'end'.
+func TestReadablePushAfterEOFErrors(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = {};
+		const { Readable } = require("stream");
+		const rs = new Readable({ read() {} });
+		rs.on("data", () => {});
+		rs.on("error", (e) => { __r.code = e.code; });
+		rs.push("a");
+		rs.push(null);
+		rs.push("late"); // after EOF
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `__r.code ?? ""`); got != "ERR_STREAM_PUSH_AFTER_EOF" {
+		t.Fatalf("push-after-EOF code = %q, want ERR_STREAM_PUSH_AFTER_EOF", got)
+	}
+}
+
+// write() after end() must not throw synchronously; the error arrives on a
+// later tick so a listener still catches it.
+func TestWritableWriteAfterEndAsyncError(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { threw: false };
+		const { Writable } = require("stream");
+		const ws = new Writable({ write(c, e, cb) { cb(); } });
+		ws.on("error", (e) => { __r.code = e.code; });
+		ws.end();
+		try { ws.write("x"); } catch (e) { __r.threw = true; }
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if evalStr(t, js, `String(__r.threw)`) == "true" {
+		t.Fatalf("write() after end() threw synchronously; must emit async")
+	}
+	if got := evalStr(t, js, `__r.code ?? ""`); got != "ERR_STREAM_WRITE_AFTER_END" {
+		t.Fatalf("write-after-end code = %q, want ERR_STREAM_WRITE_AFTER_END", got)
+	}
+}
+
+// Destroying a Transform stops its readable side too: no 'data'/'end' after
+// 'close'.
+func TestTransformDestroyStopsReadable(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__order = [];
+		const { Transform } = require("stream");
+		const ts = new Transform({ transform(c, e, cb) { setTimeout(() => cb(null, c), 5); } });
+		ts.on("data", () => { __order.push("data"); });
+		ts.on("end", () => { __order.push("end"); });
+		ts.on("close", () => { __order.push("close"); });
+		ts.write("a");
+		ts.destroy();
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	// close must appear and no data/end after it.
+	order := evalStr(t, js, `__order.join(",")`)
+	if order != "close" {
+		t.Fatalf("events = %q, want just close (no data/end after destroy)", order)
+	}
+}
+
+// A throw in one nextTick callback must not drop the ticks queued after it.
+func TestNextTickExceptionIsolation(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	// The propagated error is expected; we only care that "good" still ran.
+	rt.RunScript(context.Background(), `
+		globalThis.__ran = [];
+		process.nextTick(() => { __ran.push("bad"); throw new Error("boom"); });
+		process.nextTick(() => { __ran.push("good"); });
+	`)
+	if got := evalStr(t, js, `(__ran||[]).join(",")`); got != "bad,good" {
+		t.Fatalf("ticks ran = %q, want bad,good (a throw must not drop later ticks)", got)
+	}
+}
+
+// An error thrown in a process.nextTick callback is delivered to a
+// process.on('uncaughtException') handler, and later ticks still run.
+func TestNextTickUncaughtExceptionHandler(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { ran: [], caught: "" };
+		process.on("uncaughtException", (e) => { __r.caught = e.message; });
+		process.nextTick(() => { __r.ran.push("bad"); throw new Error("kaboom"); });
+		process.nextTick(() => { __r.ran.push("good"); });
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `__r.caught`); got != "kaboom" {
+		t.Fatalf("uncaughtException handler caught %q, want kaboom", got)
+	}
+	if got := evalStr(t, js, `__r.ran.join(",")`); got != "bad,good" {
+		t.Fatalf("ticks ran = %q, want bad,good", got)
+	}
+}
+
+// An async Transform must emit output in write order (Node serializes
+// _transform: the next chunk waits for the previous callback).
+func TestTransformSerializesAsyncOutput(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { out: [] };
+		const { Transform } = require("stream");
+		let delay = 30;
+		const t = new Transform({
+			transform(c, e, cb) { const d = delay; delay -= 10; setTimeout(() => { this.push(c); cb(); }, d); }
+		});
+		t.on("data", (d) => { __r.out.push(String(d)); });
+		t.write("1"); t.write("2"); t.write("3"); t.end();
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `__r.out.join(",")`); got != "1,2,3" {
+		t.Fatalf("async transform order = %q, want 1,2,3 (must serialize)", got)
+	}
+}
+
+// read(size) returns null when fewer than size bytes are buffered and the
+// stream hasn't ended (Node's framing-parser contract).
+func TestReadableReadSizeReturnsNullWhenShort(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = {};
+		const { Readable } = require("stream");
+		const rs = new Readable({ read() {} });
+		rs.push(Buffer.from("abc")); // only 3 bytes, not ended
+		__r.short = rs.read(8);           // want null
+		rs.push(Buffer.from("defghij")); // now 10 total
+		__r.full = rs.read(8);            // want 8 bytes
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `String(__r.short)`); got != "null" {
+		t.Fatalf("read(8) with 3 buffered = %q, want null", got)
+	}
+	if got := evalStr(t, js, `__r.full && __r.full.length`); got != "8" {
+		t.Fatalf("read(8) with 10 buffered length = %q, want 8", got)
+	}
+}
+
+// destroy() must invoke the callbacks of still-queued writes (with an error),
+// not strand them — otherwise a "wait for N write callbacks" barrier hangs.
+func TestWritableDestroyFlushesQueuedCallbacks(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { calls: 0 };
+		const { Writable } = require("stream");
+		// A slow async _write so chunks queue behind the first.
+		const ws = new Writable({ write(c, e, cb) { setTimeout(() => cb(new Error("boom")), 5); } });
+		ws.on("error", () => {});
+		for (let i = 0; i < 3; i++) ws.write("x" + i, () => { __r.calls++; });
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `String(__r.calls)`); got != "3" {
+		t.Fatalf("write callbacks fired = %s, want 3 (queued callbacks stranded)", got)
+	}
+}

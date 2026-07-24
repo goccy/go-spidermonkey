@@ -2,7 +2,9 @@ package spidermonkey
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,10 +40,11 @@ type Func func(cfg Config, args []Value) (Value, error)
 // lock) and, for the agent keys, on AGENT goroutines concurrently — so the
 // oversized-reply stash is keyed by the calling thread's module instance.
 type hostEnv struct {
-	js     *JS // back-reference for decoding object handles; set by New
-	cfg    Config
-	funcs  map[string]Func
-	loader func(cfg Config, specifier, referrer string) (string, error)
+	js        *JS // back-reference for decoding object handles; set by New
+	cfg       Config
+	funcs     map[string]Func
+	loader    ModuleLoader     // fallback when no prefix resolver matches
+	resolvers []prefixResolver // sorted longest-prefix-first
 
 	stashMu sync.Mutex
 	stash   map[*base.Module][]byte
@@ -50,11 +53,23 @@ type hostEnv struct {
 func (e *hostEnv) Go_host_call(m *base.Module, keyPtr, keyLen, argsPtr, argsLen int32, thisID int64, outPtr, outCap int32) int32 {
 	var key string
 	var argsJSON []byte
+	var badBounds bool
 	base.AccessMemory(m, func(mem []byte) {
+		// The pointers/lengths come from the guest; a forged or overflowing
+		// range must not slice out of bounds and panic the whole host process.
+		n := int64(len(mem))
+		if keyPtr < 0 || keyLen < 0 || int64(keyPtr)+int64(keyLen) > n ||
+			argsPtr < 0 || argsLen < 0 || int64(argsPtr)+int64(argsLen) > n {
+			badBounds = true
+			return
+		}
 		key = string(mem[keyPtr : keyPtr+keyLen])
 		argsJSON = append([]byte(nil), mem[argsPtr:argsPtr+argsLen]...)
 	})
-	payload := e.dispatch(key, argsJSON)
+	if badBounds {
+		return 0 // an empty reply; the guest sees a failed host call
+	}
+	payload := e.safeDispatch(key, argsJSON)
 	if int32(len(payload)) <= outCap {
 		base.AccessMemory(m, func(mem []byte) { copy(mem[outPtr:], payload) })
 	} else {
@@ -74,6 +89,24 @@ func (e *hostEnv) Go_host_result(m *base.Module, outPtr int32) {
 	delete(e.stash, m)
 	e.stashMu.Unlock()
 	base.AccessMemory(m, func(mem []byte) { copy(mem[outPtr:], p) })
+}
+
+// safeDispatch runs dispatch under a recover so a panic in ANY host op — a
+// crypto primitive rejecting a malformed argument, a structured-clone decode on
+// an agent goroutine, a map mutation in a facade — surfaces to the guest as a
+// catchable thrown Error instead of tearing down the whole host process (and
+// with it every other instance sharing it). The guest is a sandbox; a bad call
+// from it must never crash the embedder.
+func (e *hostEnv) safeDispatch(key string, argsJSON []byte) (payload []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Do NOT leak the panic value to the sandboxed guest — Go runtime
+			// panics embed host paths/internals. A generic, catchable error is
+			// enough for the guest; the key identifies which op for the embedder.
+			payload = append([]byte{'E'}, fmt.Sprintf("host call %q failed", key)...)
+		}
+	}()
+	return e.dispatch(key, argsJSON)
 }
 
 // dispatch builds the reply the C++ side expects: 'R' + one value encoding on
@@ -172,9 +205,6 @@ func (e *hostEnv) dispatch(key string, argsJSON []byte) []byte {
 }
 
 func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
-	if e.loader == nil {
-		return nil // no loader → total==0 → C++ falls back to missing-modules
-	}
 	var a []string
 	_ = json.Unmarshal(argsJSON, &a)
 	spec, ref := "", ""
@@ -184,7 +214,18 @@ func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
 	if len(a) > 1 {
 		ref = a[1]
 	}
-	src, err := e.loader(e.cfg, spec, ref)
+	// Longest registered prefix wins; the fallback loader takes the rest.
+	load := e.loader
+	for _, r := range e.resolvers {
+		if strings.HasPrefix(spec, r.prefix) {
+			load = r.load
+			break
+		}
+	}
+	if load == nil {
+		return nil // no loader → total==0 → C++ falls back to missing-modules
+	}
+	src, err := load(e.cfg, spec, ref)
 	if err != nil {
 		return append([]byte{'E'}, err.Error()...)
 	}

@@ -1,0 +1,11 @@
+{
+  "name": "nodejs-example",
+  "private": true,
+  "description": "compat/nodejs flagships: unmodified lodash (CJS), chalk (pure ESM), commander (dual) on the Node runtime",
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "commander": "^12.1.0",
+    "express": "^4.22.2",
+    "lodash": "^4.17.21"
+  }
+}
