@@ -26,10 +26,15 @@ type netState struct {
 	nextID    int64
 	conns     map[int64]net.Conn
 	listeners map[int64]net.Listener
+	udp       map[int64]*net.UDPConn
 }
 
 func newNetState() *netState {
-	return &netState{conns: map[int64]net.Conn{}, listeners: map[int64]net.Listener{}}
+	return &netState{
+		conns:     map[int64]net.Conn{},
+		listeners: map[int64]net.Listener{},
+		udp:       map[int64]*net.UDPConn{},
+	}
 }
 
 func (rt *Runtime) netOps() map[string]spidermonkey.Func {
@@ -344,13 +349,21 @@ func (rt *Runtime) closeNet() {
 	for _, l := range st.listeners {
 		lns = append(lns, l)
 	}
+	udps := make([]*net.UDPConn, 0, len(st.udp))
+	for _, u := range st.udp {
+		udps = append(udps, u)
+	}
 	st.conns = map[int64]net.Conn{}
 	st.listeners = map[int64]net.Listener{}
+	st.udp = map[int64]*net.UDPConn{}
 	st.mu.Unlock()
 	for _, c := range conns {
 		c.Close()
 	}
 	for _, l := range lns {
 		l.Close()
+	}
+	for _, u := range udps {
+		u.Close()
 	}
 }

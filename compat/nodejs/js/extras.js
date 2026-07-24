@@ -356,6 +356,61 @@
 		connect: (...args) => new Socket().connect(...args),
 	};
 
+	// --------------------------------------------------------------- dgram
+	// UDP sockets over the udp_* host ops.
+
+	function Dgram(type) {
+		core.events.call(this);
+		this._id = null;
+		this.type = type || "udp4";
+	}
+	Object.setPrototypeOf(Dgram.prototype, core.events.prototype);
+	Object.setPrototypeOf(Dgram, core.events);
+	Dgram.prototype.bind = function bind(port, address, cb) {
+		if (typeof port === "object") { const o = port; cb = address; address = o.address; port = o.port; }
+		if (typeof address === "function") { cb = address; address = undefined; }
+		const onMessage = (data, rinfo) => this.emit("message", Buffer.from(data), rinfo);
+		const r = ops.udp_bind(String(address || ""), Number(port) || 0, onMessage);
+		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); return this; }
+		this._id = r.id;
+		this._port = r.port;
+		if (cb) this.once("listening", cb);
+		process.nextTick(() => this.emit("listening"));
+		return this;
+	};
+	Dgram.prototype.send = function send(msg, ...rest) {
+		// send(msg, [offset, length,] port, address, [callback])
+		let cb;
+		if (typeof rest[rest.length - 1] === "function") cb = rest.pop();
+		let port, address;
+		if (rest.length >= 3) { port = rest[2]; address = rest[3]; } // offset, length ignored (whole buffer)
+		else { port = rest[0]; address = rest[1]; }
+		const buf = typeof msg === "string" ? Buffer.from(msg) : Buffer.from(msg);
+		const r = ops.udp_send(this._id, buf, Number(port), String(address || "127.0.0.1"));
+		if (cb) process.nextTick(() => cb(isErr(r) ? Object.assign(new Error(r.message), { code: r.code }) : null));
+		return this;
+	};
+	Dgram.prototype.address = function () { return { address: "127.0.0.1", port: this._port, family: "IPv4" }; };
+	Dgram.prototype.close = function (cb) {
+		if (this._id !== null) { ops.udp_close(this._id); this._id = null; }
+		if (cb) process.nextTick(cb);
+		process.nextTick(() => this.emit("close"));
+		return this;
+	};
+	Dgram.prototype.setBroadcast = function () { return this; };
+	Dgram.prototype.ref = function () { return this; };
+	Dgram.prototype.unref = function () { return this; };
+	core.dgram = {
+		Socket: Dgram,
+		createSocket: (type, listener) => {
+			const t = typeof type === "object" ? type.type : type;
+			const s = new Dgram(t);
+			if (typeof listener === "function") s.on("message", listener);
+			else if (type && typeof type.recvBufferSize === "undefined" && typeof listener === "function") s.on("message", listener);
+			return s;
+		},
+	};
+
 	// ---------------------------------------------------------------- zlib
 	// One-shot transforms over the zlib_transform host op; the *Sync forms
 	// are direct, the async forms defer to the microtask queue, and the

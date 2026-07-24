@@ -29,7 +29,7 @@ test guaranteeing behavior (new AND previously-existing modules).
 
 Legend: [x] done+tested  [ ] deferred
 
-Status 2026-07-24: node/web items below implemented and covered by
+Status 2026-07-24: ALL in-scope items below implemented (incl. dgram + cfworkers) and covered by
 per-module unit tests (compat/nodejs: crypto2_test, zlib_test, net_test,
 fsextra_test, modules_test; compat/web: extended_test, subtle2_test).
 
@@ -77,9 +77,9 @@ Host-op-backed:
       copyFile(Sync), rm(Sync), cp(Sync), mkdtemp(Sync), realpath,
       chmod/chown (no-op-ish), symlink/readlink, Stats/Dirent classes,
       ReadStream/WriteStream classes, watch (poll or unsupported)
-- [ ] dgram: UDP sockets (Go net UDPConn) — Dial/Listen gated
+- [x] dgram: UDP sockets (Go net UDPConn) — Dial/Listen gated
 
-cfworkers (next batch):
-- [ ] scheduled + queue handler dispatch
-- [ ] Cache API (in-memory caches.default / caches.open)
-- [ ] WebSocketPair (in-process pair; no external upgrade yet)
+cfworkers:
+- [x] scheduled + queue handler dispatch (Pool.Scheduled / Pool.Queue)
+- [x] Cache API (in-memory caches.default / caches.open)
+- [x] WebSocketPair (in-process pair; no external upgrade yet)

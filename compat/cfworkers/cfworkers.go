@@ -134,16 +134,74 @@ func (p *Pool) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// Scheduled fires the worker's scheduled() (cron) handler on a pooled
+// instance and drives the loop until it settles. cron is the schedule
+// expression; scheduledTimeMs is the trigger time in Unix ms.
+func (p *Pool) Scheduled(ctx context.Context, cron string, scheduledTimeMs int64) error {
+	w := <-p.workers
+	defer func() { p.workers <- w }()
+	return w.runNonFetch(ctx, w.runScheduled, p.drainTimeout,
+		spidermonkey.ValueOf(cron), spidermonkey.ValueOf(scheduledTimeMs))
+}
+
+// Queue fires the worker's queue() handler with a batch. queueName names the
+// queue; bodies are the message payloads (any JSON-encodable values).
+func (p *Pool) Queue(ctx context.Context, queueName string, bodies []any) error {
+	w := <-p.workers
+	defer func() { p.workers <- w }()
+	messages := make([]map[string]any, len(bodies))
+	for i, b := range bodies {
+		messages[i] = map[string]any{"id": fmt.Sprint(i), "timestamp": 0, "body": b}
+	}
+	batch, err := json.Marshal(map[string]any{"queue": queueName, "messages": messages})
+	if err != nil {
+		return err
+	}
+	return w.runNonFetch(ctx, w.runQueue, p.drainTimeout, spidermonkey.ValueOf(string(batch)))
+}
+
+// runNonFetch drives a scheduled/queue handler to completion.
+func (wk *worker) runNonFetch(ctx context.Context, entry *spidermonkey.Object, drain time.Duration, args ...spidermonkey.Value) error {
+	if _, err := entry.Call(args...); err != nil {
+		return fmt.Errorf("invoking handler: %w", err)
+	}
+	for {
+		st, err := wk.status.Call()
+		if err != nil {
+			return err
+		}
+		if st.String() != "pending" {
+			break
+		}
+		if err := wk.web.Wait(ctx); err != nil {
+			return err
+		}
+		if st2, _ := wk.status.Call(); st2 != nil && st2.String() == "pending" {
+			return fmt.Errorf("handler never settled")
+		}
+	}
+	if st, _ := wk.status.Call(); st != nil && st.String() == "error" {
+		msg, _ := wk.errMsg.Call()
+		return fmt.Errorf("worker error: %s", msg.String())
+	}
+	dctx, cancel := context.WithTimeout(context.Background(), drain)
+	wk.web.Wait(dctx)
+	cancel()
+	return nil
+}
+
 // worker is one warmed engine instance plus its resolved glue functions.
 type worker struct {
-	js      *spidermonkey.JS
-	web     *web.Web
-	makeReq *spidermonkey.Object
-	run     *spidermonkey.Object
-	status  *spidermonkey.Object
-	errMsg  *spidermonkey.Object
-	meta    *spidermonkey.Object
-	body    *spidermonkey.Object
+	js           *spidermonkey.JS
+	web          *web.Web
+	makeReq      *spidermonkey.Object
+	run          *spidermonkey.Object
+	runScheduled *spidermonkey.Object
+	runQueue     *spidermonkey.Object
+	status       *spidermonkey.Object
+	errMsg       *spidermonkey.Object
+	meta         *spidermonkey.Object
+	body         *spidermonkey.Object
 }
 
 func newWorker(cfg PoolConfig) (*worker, error) {
@@ -216,6 +274,8 @@ func newWorker(cfg PoolConfig) (*worker, error) {
 	for name, dst := range map[string]**spidermonkey.Object{
 		"__cfw_make_request":  &wk.makeReq,
 		"__cfw_run":           &wk.run,
+		"__cfw_run_scheduled": &wk.runScheduled,
+		"__cfw_run_queue":     &wk.runQueue,
 		"__cfw_status":        &wk.status,
 		"__cfw_error":         &wk.errMsg,
 		"__cfw_response_meta": &wk.meta,
