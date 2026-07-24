@@ -121,6 +121,14 @@
 				this._scheduleFlow();
 				return false;
 			}
+			if (st.ended) {
+				// A chunk after push(null) is a producer bug; Node errors the
+				// stream rather than silently delivering data after 'end'.
+				const err = new Error("stream.push() after EOF");
+				err.code = "ERR_STREAM_PUSH_AFTER_EOF";
+				this.destroy(err);
+				return false;
+			}
 			const item = st.objectMode ? chunk : toChunk(chunk, encoding);
 			st.buffer.push(item);
 			st.length += chunkSize(st, item);
@@ -335,8 +343,13 @@
 			if (st.ending || st.destroyed) {
 				const err = new Error("write after end");
 				err.code = "ERR_STREAM_WRITE_AFTER_END";
-				if (callback) process.nextTick(() => callback(err));
-				this.emit("error", err);
+				// Node emits this error asynchronously so a listener attached on
+				// the same tick still catches it (and it can't throw out of the
+				// synchronous write() call).
+				process.nextTick(() => {
+					if (callback) callback(err);
+					this.emit("error", err);
+				});
 				return false;
 			}
 			const payload = st.objectMode ? chunk : toChunk(chunk, encoding);
@@ -428,8 +441,26 @@
 		if (name !== "destroy") Duplex.prototype[name] = fn;
 	}
 	Object.defineProperties(Duplex.prototype, writableGetters);
+	// A Duplex/Transform destroy must stop BOTH halves. Marking only the
+	// writable side (writableMethods.destroy) left the readable side flowing —
+	// _flowNow guards on _rs.destroyed — so a scheduled flow could still emit
+	// 'data'/'end' after 'error'/'close'.
 	Duplex.prototype.destroy = function destroy(err) {
-		return writableMethods.destroy.call(this, err);
+		const rs = this._rs;
+		const ws = this._ws;
+		if ((rs && rs.destroyed) || (ws && ws.destroyed)) return this;
+		if (rs) rs.destroyed = true;
+		if (ws) ws.destroyed = true;
+		this.readable = false;
+		this.writable = false;
+		this.destroyed = true;
+		const done = (e) => {
+			if (e) this.emit("error", e);
+			this.emit("close");
+		};
+		if (this._destroy) this._destroy(err, done);
+		else done(err);
+		return this;
 	};
 
 	function Transform(options = {}) {

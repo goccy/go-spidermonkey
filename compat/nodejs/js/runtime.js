@@ -32,11 +32,21 @@
 	const runTicks = () => {
 		tickScheduled = false;
 		let n = 0;
+		let firstErr;
+		let threw = false;
 		while (tickQueue.length) {
 			const cb = tickQueue.shift();
 			n++;
-			cb(); // a throw propagates as an unhandled microtask exception
+			// Isolate each tick: a throw in one must not drop the ticks queued
+			// after it (Node runs them all). The first error is re-thrown once
+			// the queue has drained so it still surfaces.
+			try {
+				cb();
+			} catch (e) {
+				if (!threw) { firstErr = e; threw = true; }
+			}
 		}
+		if (threw) throw firstErr;
 		return n;
 	};
 	const scheduleTicks = () => {
