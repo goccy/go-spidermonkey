@@ -75,6 +75,20 @@ Status: in progress (2026-07-23).
   use that name on IncomingMessage).
   Still open in Phase 4: http.request client, node:net raw sockets,
   serve-static/sendFile demo, fastify stretch target.
+- STRETCH FLAGSHIP PASSED (2026-07-24): the unmodified **Next.js 14.2**
+  production server (pages router; app built on host Node — SWC natives
+  are build-time only) serves SSR pages, SSG pages, API routes and .next
+  static assets via the custom-server API (examples/nextjs). What it
+  forced: Module as a real class so Next's require-hook patches work,
+  function-style ctors for EventEmitter/streams/StringDecoder (legacy
+  `.call(this)` packages), V8 captureStackTrace + prepareStackTrace
+  protocol, WHATWG Writable/TransformStream + async ReadableStream reads,
+  Readable 'end' only after a consumer exists, naive-but-serialized
+  AsyncLocalStorage, fs.Stats duck-type fields, Timeout objects with
+  unref, file: URL handling, and a raft of load-only stubs (v8, vm,
+  inspector, worker_threads, dns, tls, http2, ...). All additions are
+  REAL node: core-module names — the strategy stays demand-driven
+  subsetting of Node's stdlib, not invention beyond it.
 
 This document is the working plan for building
 Node.js / Web / Cloudflare-Workers compatible runtimes on top of the
