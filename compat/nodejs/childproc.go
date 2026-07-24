@@ -217,7 +217,7 @@ func (rt *Runtime) opChildStdin(cfg spidermonkey.Config, args []spidermonkey.Val
 	if err != nil {
 		return nil, err
 	}
-	return spidermonkey.ValueOf(w.enqueue(data)), nil
+	return spidermonkey.ValueOf(w.enqueue(data, nil)), nil
 }
 
 func (rt *Runtime) opChildKill(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {

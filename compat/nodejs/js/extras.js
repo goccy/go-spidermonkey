@@ -391,8 +391,9 @@
 	};
 	Socket.prototype._write = function _write(chunk, encoding, callback) {
 		if (this._id === null) return callback(new Error("not connected"));
-		ops.net_write(this._id, chunk);
-		callback();
+		// The op fires our callback once the chunk is flushed off-loop, so a
+		// slow peer backpressures the socket instead of an unbounded queue.
+		ops.net_write(this._id, chunk, callback);
 	};
 	Socket.prototype._read = function _read() {}; // pushed by the host reader
 	Socket.prototype.destroy = function destroy(err) {
@@ -886,7 +887,7 @@
 	}
 	Object.setPrototypeOf(TLSSocket.prototype, core.stream.Duplex.prototype);
 	Object.setPrototypeOf(TLSSocket, core.stream.Duplex);
-	TLSSocket.prototype._write = function (chunk, enc, cb) { if (this._id !== null) ops.net_write(this._id, chunk); cb(); };
+	TLSSocket.prototype._write = function (chunk, enc, cb) { if (this._id !== null) ops.net_write(this._id, chunk, cb); else cb(); };
 	TLSSocket.prototype._read = function () {};
 	TLSSocket.prototype.destroy = function (err) { if (this._id !== null) { ops.net_close(this._id); this._id = null; } core.stream.Duplex.prototype.destroy.call(this, err); return this; };
 	TLSSocket.prototype.setEncoding = core.stream.Readable.prototype.setEncoding;

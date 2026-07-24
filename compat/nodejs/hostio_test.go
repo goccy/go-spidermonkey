@@ -86,6 +86,9 @@ func TestProcessSignal(t *testing.T) {
 	if _, err := js.Eval(context.Background(), `
 		globalThis.r = {};
 		process.on("SIGUSR1", () => { r.got = "SIGUSR1"; });
+		// A signal handler alone does NOT keep the loop alive (Node semantics),
+		// so hold it open with a pending timer while we wait for the signal.
+		globalThis.__keepAlive = setTimeout(() => {}, 2000);
 	`); err != nil {
 		t.Fatal(err)
 	}

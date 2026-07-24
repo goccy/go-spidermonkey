@@ -23,6 +23,7 @@ type ioState struct {
 	nextWatch   int64
 	sigOnce     sync.Once
 	sigCh       chan os.Signal
+	sigStop     chan struct{}
 	stdinOnce   sync.Once
 	stdinActive bool
 }
@@ -108,24 +109,40 @@ func (rt *Runtime) opSignalWatch(cfg spidermonkey.Config, args []spidermonkey.Va
 	}
 	onSignal := args[0].Object()
 	rt.io.sigOnce.Do(func() {
-		rt.io.sigCh = make(chan os.Signal, 4)
+		ch := make(chan os.Signal, 4)
+		stop := make(chan struct{})
+		rt.io.mu.Lock()
+		rt.io.sigCh = ch
+		rt.io.sigStop = stop
+		rt.io.mu.Unlock()
 		sigs := make([]os.Signal, 0, len(signalNumbers))
 		for _, s := range signalNumbers {
 			sigs = append(sigs, s)
 		}
-		signal.Notify(rt.io.sigCh, sigs...)
-		rt.loop.AddPending()
+		signal.Notify(ch, sigs...)
+		// A registered signal handler does NOT keep the event loop alive (Node
+		// lets a program with only a signal handler exit), so no AddPending. The
+		// goroutine ends when closeIO signals stop; sigCh is never closed (the
+		// signal runtime could still deliver into it after Stop — closing would
+		// panic), it's just left for GC.
 		go func() {
-			for s := range rt.io.sigCh {
-				name := signalToName(s)
-				rt.loop.Post(func() error {
-					if onSignal != nil {
-						onSignal.Call(spidermonkey.ValueOf(name))
-					}
-					return nil
-				})
+			for {
+				select {
+				case s := <-ch:
+					name := signalToName(s)
+					rt.loop.Post(func() error {
+						if onSignal != nil {
+							onSignal.Call(spidermonkey.ValueOf(name))
+						}
+						return nil
+					})
+				case <-stop:
+					// Just exit — closeIO runs at Runtime teardown, where
+					// js.Close() frees all handles. Posting a Free here would
+					// race the engine shutdown and can fault.
+					return
+				}
 			}
-			rt.loop.DonePending()
 		}()
 	})
 	return spidermonkey.Undefined(), nil
@@ -246,9 +263,16 @@ func (rt *Runtime) closeIO() {
 		delete(rt.io.watchers, id)
 		close(stop)
 	}
+	ch := rt.io.sigCh
+	stop := rt.io.sigStop
+	rt.io.sigCh = nil
+	rt.io.sigStop = nil
 	rt.io.mu.Unlock()
-	if rt.io.sigCh != nil {
-		signal.Stop(rt.io.sigCh)
+	if ch != nil {
+		signal.Stop(ch) // stop delivery (do NOT close ch — a late send would panic)
+	}
+	if stop != nil {
+		close(stop) // end the select goroutine, which frees its callback
 	}
 }
 

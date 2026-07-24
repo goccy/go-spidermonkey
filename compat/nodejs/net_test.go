@@ -201,3 +201,35 @@ func TestNetWriteBeforeConnectBuffered(t *testing.T) {
 		t.Fatalf("reply = %q, want GOT:early\\n (pre-connect write lost?)", got)
 	}
 }
+
+// A clean local socket close (socket.destroy()) must NOT emit a spurious
+// 'error' event.
+func TestNetCleanCloseNoError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, e := ln.Accept()
+		if e == nil {
+			io.Copy(io.Discard, c)
+			c.Close()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	js.Global().Set("PORT", spidermonkey.ValueOf(port))
+	runScript(t, rt, `
+		const net = require("net");
+		globalThis.r = { errored: false };
+		const sock = net.connect(PORT, "127.0.0.1", () => {
+			sock.write("hi");
+			sock.destroy(); // clean local close
+		});
+		sock.on("error", () => { r.errored = true; });
+	`)
+	if evalStr(t, js, `String(r.errored)`) == "true" {
+		t.Fatalf("clean socket.destroy() emitted a spurious 'error'")
+	}
+}

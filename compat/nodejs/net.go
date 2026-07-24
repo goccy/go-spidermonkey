@@ -38,10 +38,15 @@ type netState struct {
 // until it attaches, preserving order.
 // connWriter drives an io.WriteCloser (a socket, or a child's stdin pipe) — any
 // destination whose Write can block on a full buffer.
+type connWrite struct {
+	data   []byte
+	onDone func() // fired (on the writer goroutine) once this chunk is written; drives backpressure
+}
+
 type connWriter struct {
 	mu       sync.Mutex
 	conn     io.WriteCloser // nil until attached
-	queue    [][]byte
+	queue    []connWrite
 	closeReq bool
 	wake     chan struct{}
 }
@@ -55,14 +60,19 @@ func (w *connWriter) signal() {
 	}
 }
 
-// enqueue adds a write; false once the writer is closing. Never blocks.
-func (w *connWriter) enqueue(data []byte) bool {
+// enqueue adds a write; false once the writer is closing. Never blocks. onDone
+// (may be nil) fires once the chunk is written (or dropped on close), so the
+// guest Writable can pace itself instead of queueing unboundedly.
+func (w *connWriter) enqueue(data []byte, onDone func()) bool {
 	w.mu.Lock()
 	if w.closeReq {
 		w.mu.Unlock()
+		if onDone != nil {
+			onDone()
+		}
 		return false
 	}
-	w.queue = append(w.queue, data)
+	w.queue = append(w.queue, connWrite{data: data, onDone: onDone})
 	w.mu.Unlock()
 	w.signal()
 	return true
@@ -88,7 +98,7 @@ func (w *connWriter) run(onErr func(error)) {
 	for {
 		w.mu.Lock()
 		conn := w.conn
-		var q [][]byte
+		var q []connWrite
 		if conn != nil { // hold writes until the conn attaches (async connect)
 			q = w.queue
 			w.queue = nil
@@ -96,8 +106,12 @@ func (w *connWriter) run(onErr func(error)) {
 		closeReq := w.closeReq
 		w.mu.Unlock()
 
-		for _, data := range q {
-			if _, err := conn.Write(data); err != nil {
+		for _, item := range q {
+			_, err := conn.Write(item.data)
+			if item.onDone != nil {
+				item.onDone() // ack this chunk (backpressure), even on error
+			}
+			if err != nil {
 				if onErr != nil {
 					onErr(err)
 				}
@@ -107,6 +121,16 @@ func (w *connWriter) run(onErr func(error)) {
 		if closeReq {
 			if conn != nil {
 				conn.Close()
+			}
+			// Ack any writes still queued so the guest Writable isn't stranded.
+			w.mu.Lock()
+			leftover := w.queue
+			w.queue = nil
+			w.mu.Unlock()
+			for _, item := range leftover {
+				if item.onDone != nil {
+					item.onDone()
+				}
 			}
 			return
 		}
@@ -354,16 +378,40 @@ func (rt *Runtime) opNetWrite(cfg spidermonkey.Config, args []spidermonkey.Value
 	rt.net.mu.Lock()
 	w := rt.net.writers[int64(args[0].Float())]
 	rt.net.mu.Unlock()
+	// onWritten (args[2], optional) is the guest Writable's _write callback:
+	// firing it only once the chunk is flushed paces the guest (backpressure).
+	var onWritten *spidermonkey.Object
+	if len(args) > 2 {
+		onWritten = args[2].Object()
+	}
 	if w == nil {
+		rt.fireNetCallback(onWritten)
 		return spidermonkey.ValueOf(false), nil
 	}
 	data, err := valueBytes(args[1])
 	if err != nil {
+		rt.fireNetCallback(onWritten)
 		return nil, err
+	}
+	onDone := func() {}
+	if onWritten != nil {
+		onDone = func() { rt.fireNetCallback(onWritten) }
 	}
 	// Enqueue on the connection's write actor (off-loop). Buffered even before
 	// an async connect lands; false only once the socket is closing.
-	return spidermonkey.ValueOf(w.enqueue(data)), nil
+	return spidermonkey.ValueOf(w.enqueue(data, onDone)), nil
+}
+
+// fireNetCallback invokes a write-completion callback on the loop and frees it.
+func (rt *Runtime) fireNetCallback(cb *spidermonkey.Object) {
+	if cb == nil {
+		return
+	}
+	rt.loop.Post(func() error {
+		cb.Call()
+		cb.Free()
+		return nil
+	})
 }
 
 func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -374,6 +422,11 @@ func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value
 	id := int64(args[0].Float())
 	w := rt.net.writers[id]
 	conn := rt.net.conns[id]
+	// Remove the entry NOW so the pump's imminent read error (from the writer
+	// closing the conn) is seen as an intentional local close (live == false)
+	// rather than surfaced to the guest as a spurious 'error'.
+	delete(rt.net.conns, id)
+	delete(rt.net.writers, id)
 	rt.net.mu.Unlock()
 	if w != nil {
 		w.requestClose() // flush queued writes, then close the conn

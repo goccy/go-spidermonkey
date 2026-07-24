@@ -61,6 +61,7 @@ type workerManager struct {
 	nextTID  int
 	insts    map[spidermonkey.AgentID]*spidermonkey.Object // worker id -> JS Worker instance
 	deadSeen map[spidermonkey.AgentID]int
+	reaping  map[spidermonkey.AgentID]bool // a crash-exit reap has been posted
 	stop     chan struct{}
 	started  bool
 }
@@ -71,6 +72,7 @@ func newWorkerManager(rt *Runtime) *workerManager {
 		agents:   rt.js.Agents(),
 		insts:    map[spidermonkey.AgentID]*spidermonkey.Object{},
 		deadSeen: map[spidermonkey.AgentID]int{},
+		reaping:  map[spidermonkey.AgentID]bool{},
 		stop:     make(chan struct{}),
 		nextTID:  1,
 	}
@@ -223,25 +225,36 @@ func (wm *workerManager) reapDead() {
 			continue
 		}
 		wm.deadSeen[id]++
-		if wm.deadSeen[id] >= 2 {
+		if wm.deadSeen[id] >= 2 && !wm.reaping[id] {
+			wm.reaping[id] = true
 			reap = append(reap, id)
 		}
 	}
-	for _, id := range reap {
-		inst := wm.insts[id]
-		delete(wm.insts, id)
-		delete(wm.deadSeen, id)
-		if inst != nil {
-			instCopy := inst
-			wm.rt.loop.Post(func() error {
-				wm.emit(instCopy, "exit", spidermonkey.ValueOf(1))
-				instCopy.Free()
-				return nil
-			})
-			wm.rt.loop.DonePending()
-		}
-	}
 	wm.mu.Unlock()
+
+	// The crash-exit is delivered via a POST so it runs AFTER any __wt_exit
+	// message the pump already posted for this agent. On the loop, if the inst
+	// is still present the clean exit never handled it — so it crashed
+	// (exit 1); if a clean __wt_exit already removed it, this is a no-op. This
+	// ordering is what keeps a clean exit(0) from racing into a bogus exit(1)
+	// when the loop is busy during the reap window.
+	for _, id := range reap {
+		idCopy := id
+		wm.rt.loop.Post(func() error {
+			wm.mu.Lock()
+			inst := wm.insts[idCopy]
+			delete(wm.insts, idCopy)
+			delete(wm.deadSeen, idCopy)
+			delete(wm.reaping, idCopy)
+			wm.mu.Unlock()
+			if inst != nil {
+				wm.emit(inst, "exit", spidermonkey.ValueOf(1))
+				inst.Free()
+				wm.rt.loop.DonePending()
+			}
+			return nil
+		})
+	}
 }
 
 // dispatch routes one worker->main message on the loop goroutine.
