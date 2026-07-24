@@ -27,6 +27,14 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
+// KDF guardrails: a guest-supplied output length or scrypt cost must not drive
+// an unbounded host allocation (a Go OOM is fatal and un-recoverable). These
+// caps are generous relative to any real key-derivation use.
+const (
+	maxKDFBytes  = 1 << 24  // 16 MiB derived-key ceiling
+	maxScryptMem = 32 << 20 // 32 MiB, matching Node's default scrypt maxmem
+)
+
 func (rt *Runtime) crypto2Ops() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
 		"crypto_cipher":      rt.opCipher,
@@ -324,6 +332,9 @@ func (rt *Runtime) opPBKDF2(cfg spidermonkey.Config, args []spidermonkey.Value) 
 		return cryptoErr("iterations must be at least 1"), nil
 	}
 	keylen := args[3].Int()
+	if keylen < 0 || keylen > maxKDFBytes {
+		return cryptoErr("invalid key length"), nil
+	}
 	h, err := nodeHashByName(args[4].String())
 	if err != nil {
 		return cryptoErr(err.Error()), nil
@@ -351,6 +362,16 @@ func (rt *Runtime) opScrypt(cfg spidermonkey.Config, args []spidermonkey.Value) 
 			p = v.Int()
 		}
 	}
+	// Bound cost/output before scrypt.Key allocates 128*N*r bytes.
+	if keylen < 0 || keylen > maxKDFBytes {
+		return cryptoErr("invalid key length"), nil
+	}
+	if N <= 1 || N&(N-1) != 0 || r <= 0 || p <= 0 {
+		return cryptoErr("invalid scrypt parameters"), nil
+	}
+	if int64(128)*int64(N)*int64(r) > maxScryptMem {
+		return cryptoErr("scrypt parameters exceed the memory limit"), nil
+	}
 	out, err := scrypt.Key(pw, salt, N, r, p, keylen)
 	if err != nil {
 		return cryptoErr(err.Error()), nil
@@ -370,6 +391,9 @@ func (rt *Runtime) opHKDF(cfg spidermonkey.Config, args []spidermonkey.Value) (s
 	salt, _ := valueBytes(args[2])
 	info, _ := valueBytes(args[3])
 	keylen := args[4].Int()
+	if keylen < 0 || keylen > maxKDFBytes {
+		return cryptoErr("invalid key length"), nil
+	}
 	r := hkdf.New(h.New, ikm, salt, info)
 	out := make([]byte, keylen)
 	if _, err := r.Read(out); err != nil {

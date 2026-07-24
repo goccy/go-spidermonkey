@@ -22,6 +22,10 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
+// maxSubtleKDFBytes bounds a guest-requested derived-key length so it can't
+// drive an unbounded host allocation (a fatal Go OOM).
+const maxSubtleKDFBytes = 1 << 24 // 16 MiB
+
 func rsaEncryptOAEP(newHash func() hash.Hash, pub *rsa.PublicKey, data, label []byte) ([]byte, error) {
 	return rsa.EncryptOAEP(newHash(), rand.Reader, pub, data, label)
 }
@@ -266,6 +270,9 @@ func (s *subtleAPI) opHKDFDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	salt, _ := argBytes(args[2])
 	info, _ := argBytes(args[3])
 	length := args[4].Int() / 8
+	if length < 0 || length > maxSubtleKDFBytes {
+		return subtleErr("OperationError: invalid derived-bits length"), nil
+	}
 	r := hkdf.New(newHash, ikm, salt, info)
 	out := make([]byte, length)
 	if _, err := r.Read(out); err != nil {
@@ -292,6 +299,9 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 		return subtleErr("OperationError: PBKDF2 iterations must be at least 1"), nil
 	}
 	length := args[4].Int() / 8
+	if length < 0 || length > maxSubtleKDFBytes {
+		return subtleErr("OperationError: invalid derived-bits length"), nil
+	}
 	return bytesValue(pbkdf2.Key(pw, salt, iter, length, newHash)), nil
 }
 
