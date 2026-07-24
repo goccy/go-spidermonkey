@@ -2,6 +2,7 @@ package spidermonkey
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,11 +53,23 @@ type hostEnv struct {
 func (e *hostEnv) Go_host_call(m *base.Module, keyPtr, keyLen, argsPtr, argsLen int32, thisID int64, outPtr, outCap int32) int32 {
 	var key string
 	var argsJSON []byte
+	var badBounds bool
 	base.AccessMemory(m, func(mem []byte) {
+		// The pointers/lengths come from the guest; a forged or overflowing
+		// range must not slice out of bounds and panic the whole host process.
+		n := int64(len(mem))
+		if keyPtr < 0 || keyLen < 0 || int64(keyPtr)+int64(keyLen) > n ||
+			argsPtr < 0 || argsLen < 0 || int64(argsPtr)+int64(argsLen) > n {
+			badBounds = true
+			return
+		}
 		key = string(mem[keyPtr : keyPtr+keyLen])
 		argsJSON = append([]byte(nil), mem[argsPtr:argsPtr+argsLen]...)
 	})
-	payload := e.dispatch(key, argsJSON)
+	if badBounds {
+		return 0 // an empty reply; the guest sees a failed host call
+	}
+	payload := e.safeDispatch(key, argsJSON)
 	if int32(len(payload)) <= outCap {
 		base.AccessMemory(m, func(mem []byte) { copy(mem[outPtr:], payload) })
 	} else {
@@ -76,6 +89,21 @@ func (e *hostEnv) Go_host_result(m *base.Module, outPtr int32) {
 	delete(e.stash, m)
 	e.stashMu.Unlock()
 	base.AccessMemory(m, func(mem []byte) { copy(mem[outPtr:], p) })
+}
+
+// safeDispatch runs dispatch under a recover so a panic in ANY host op — a
+// crypto primitive rejecting a malformed argument, a structured-clone decode on
+// an agent goroutine, a map mutation in a facade — surfaces to the guest as a
+// catchable thrown Error instead of tearing down the whole host process (and
+// with it every other instance sharing it). The guest is a sandbox; a bad call
+// from it must never crash the embedder.
+func (e *hostEnv) safeDispatch(key string, argsJSON []byte) (payload []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			payload = append([]byte{'E'}, fmt.Sprintf("host call %q panicked: %v", key, r)...)
+		}
+	}()
+	return e.dispatch(key, argsJSON)
 }
 
 // dispatch builds the reply the C++ side expects: 'R' + one value encoding on

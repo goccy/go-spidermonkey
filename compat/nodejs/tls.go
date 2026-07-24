@@ -43,10 +43,13 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	host := args[0].String()
 	port := args[1].Int()
 	insecure := !args[2].Bool()
-	if err := dialAllowed(cfg, host, port); err != nil {
+	addr, err := resolveDialAddr(cfg, "tcp", host, port)
+	if err != nil {
 		return netErr(err), nil
 	}
-	conn, err := tls.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)), &tls.Config{
+	// Dial the exact authorized IP (addr), but keep ServerName = host so TLS
+	// SNI and certificate verification still validate against the hostname.
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: insecure,
 	})
@@ -80,7 +83,7 @@ func (rt *Runtime) opTLSListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 		return netErr(err), nil
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	if cfg.Listen != nil && !cfg.Listen("tcp", addr) {
+	if cfg.Listen == nil || !cfg.Listen("tcp", addr) {
 		return spidermonkey.ValueOf(map[string]any{"code": "EACCES", "message": "listen " + addr + ": permission denied"}), nil
 	}
 	ln, err := tls.Listen("tcp", addr, tlsCfg)
@@ -133,7 +136,7 @@ func (rt *Runtime) opHTTPSListen(cfg spidermonkey.Config, args []spidermonkey.Va
 		return netErr(err), nil
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	if cfg.Listen != nil && !cfg.Listen("tcp", addr) {
+	if cfg.Listen == nil || !cfg.Listen("tcp", addr) {
 		return spidermonkey.ValueOf(map[string]any{"code": "EACCES", "message": "listen " + addr + ": permission denied"}), nil
 	}
 	ln, err := tls.Listen("tcp", addr, tlsCfg)

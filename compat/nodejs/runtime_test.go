@@ -14,6 +14,19 @@ import (
 
 func newRuntime(t *testing.T, cfg spidermonkey.Config, opts ...nodejs.Options) (*spidermonkey.JS, *nodejs.Runtime) {
 	t.Helper()
+	// The network/listen hooks are fail-closed (nil denies). Functionality
+	// tests exercise real sockets, so default the unset hooks to allow-all;
+	// a test that wants to verify denial sets its own returning-false hook,
+	// which (being non-nil) overrides these defaults.
+	if cfg.Dial == nil {
+		cfg.Dial = func(network, host, ip string, port int) bool { return true }
+	}
+	if cfg.Resolve == nil {
+		cfg.Resolve = func(host string) bool { return true }
+	}
+	if cfg.Listen == nil {
+		cfg.Listen = func(network, addr string) bool { return true }
+	}
 	js, err := spidermonkey.New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)

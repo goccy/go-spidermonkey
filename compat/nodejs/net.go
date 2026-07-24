@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
@@ -69,33 +70,63 @@ func (rt *Runtime) opNetAttach(cfg spidermonkey.Config, args []spidermonkey.Valu
 	return spidermonkey.Undefined(), nil
 }
 
-// dialAllowed enforces Config.Resolve (per hostname) and Config.Dial (per
-// resolved IP, WITH the requested host so a host-scoped policy can match host
-// and port jointly). A literal-IP dial resolves no name, so host is passed as
-// "". For a hostname, at least one resolved address must be permitted.
-func dialAllowed(cfg spidermonkey.Config, host string, port int) error {
+// resolveDialAddr enforces the outbound-connection policy fail-closed and
+// returns the exact "ip:port" to dial. It resolves a hostname ONCE here and
+// returns the specific authorized address, so the connection lands on the same
+// IP that was checked — a later independent lookup cannot smuggle a different
+// (e.g. internal) address past Config.Dial (DNS-rebinding TOCTOU).
+//
+// Fail-closed, matching Config.Exec: a nil hook denies. A literal-IP dial needs
+// Config.Dial (host is passed as "" since no name was resolved). A hostname
+// dial needs both Config.Resolve (to permit the lookup) and Config.Dial (to
+// permit at least one resolved address, WITH the requested host so a policy can
+// match host and port jointly).
+func resolveDialAddr(cfg spidermonkey.Config, network, host string, port int) (string, error) {
+	portStr := strconv.Itoa(port)
 	if ip := net.ParseIP(host); ip != nil {
-		if cfg.Dial != nil && !cfg.Dial("tcp", "", ip.String(), port) {
-			return fmt.Errorf("dial %s:%d: permission denied", host, port)
+		if cfg.Dial == nil || !cfg.Dial(network, "", ip.String(), port) {
+			return "", fmt.Errorf("dial %s:%d: permission denied", host, port)
 		}
-		return nil
+		return net.JoinHostPort(ip.String(), portStr), nil
 	}
-	if cfg.Resolve != nil && !cfg.Resolve(host) {
-		return fmt.Errorf("resolve %q: permission denied", host)
+	if cfg.Resolve == nil || !cfg.Resolve(host) {
+		return "", fmt.Errorf("resolve %q: permission denied", host)
 	}
-	if cfg.Dial != nil {
-		ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
-		if err != nil {
-			return fmt.Errorf("resolve %q: %w", host, err)
+	if cfg.Dial == nil {
+		return "", fmt.Errorf("dial %s:%d: permission denied (no Dial policy)", host, port)
+	}
+	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if cfg.Dial(network, host, ip.String(), port) {
+			return net.JoinHostPort(ip.String(), portStr), nil
 		}
-		for _, ip := range ips {
-			if cfg.Dial("tcp", host, ip.String(), port) {
-				return nil
+	}
+	return "", fmt.Errorf("dial %s:%d: permission denied", host, port)
+}
+
+// gatedHTTPClient builds an http.Client whose DialContext enforces the same
+// resolve-once, dial-the-approved-IP policy as compat/web's fetch, so the
+// node:http/https client cannot be DNS-rebound past Config.Dial and connects
+// only to addresses the policy approved. Redirects reuse the same DialContext.
+func gatedHTTPClient(cfg spidermonkey.Config) *http.Client {
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	return &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
 			}
-		}
-		return fmt.Errorf("dial %s:%d: permission denied", host, port)
-	}
-	return nil
+			port, _ := strconv.Atoi(portStr)
+			dialAddr, err := resolveDialAddr(cfg, network, host, port)
+			if err != nil {
+				return nil, err
+			}
+			return dialer.DialContext(ctx, network, dialAddr)
+		},
+	}}
 }
 
 // opNetConnect(host, port, onData, onEnd, onError, onConnect) -> id | err.
@@ -112,10 +143,11 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	onError := args[4].Object()
 	onConnect := args[5].Object()
 
-	if err := dialAllowed(cfg, host, port); err != nil {
+	addr, err := resolveDialAddr(cfg, "tcp", host, port)
+	if err != nil {
 		return netErr(err), nil
 	}
-	conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return netErr(err), nil
 	}
@@ -231,7 +263,7 @@ func (rt *Runtime) opNetListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 	port := args[1].Int()
 	onConn := args[2].Object()
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	if cfg.Listen != nil && !cfg.Listen("tcp", addr) {
+	if cfg.Listen == nil || !cfg.Listen("tcp", addr) {
 		return spidermonkey.ValueOf(map[string]any{"code": "EACCES", "message": "listen " + addr + ": permission denied"}), nil
 	}
 	ln, err := net.Listen("tcp", addr)
@@ -309,10 +341,9 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 			req.Header.Set(k, v)
 		}
 	}
-	if err := checkClientPermission(cfg, req); err != nil {
-		return netErr(err), nil
-	}
-	resp, err := http.DefaultClient.Do(req)
+	// The gated client enforces Config.Resolve/Dial in its DialContext and
+	// connects only to the approved IP (no DNS-rebinding window).
+	resp, err := gatedHTTPClient(cfg).Do(req)
 	if err != nil {
 		return netErr(err), nil
 	}
@@ -339,19 +370,6 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 	defer u8.Free()
 	obj.Set("body", u8)
 	return rt.trackReturn(obj), nil
-}
-
-func checkClientPermission(cfg spidermonkey.Config, req *http.Request) error {
-	host := req.URL.Hostname()
-	port, _ := strconv.Atoi(req.URL.Port())
-	if port == 0 {
-		if req.URL.Scheme == "https" {
-			port = 443
-		} else {
-			port = 80
-		}
-	}
-	return dialAllowed(cfg, host, port)
 }
 
 func (rt *Runtime) closeNet() {

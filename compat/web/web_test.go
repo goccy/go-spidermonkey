@@ -19,6 +19,15 @@ import (
 
 func newWeb(t *testing.T, cfg spidermonkey.Config) (*spidermonkey.JS, *web.Web) {
 	t.Helper()
+	// fetch's Resolve/Dial hooks are fail-closed (nil denies). Default the
+	// unset ones to allow-all so a test exercising one hook (or none) still
+	// reaches the network; a test verifying denial sets its own hook.
+	if cfg.Dial == nil {
+		cfg.Dial = func(network, host, ip string, port int) bool { return true }
+	}
+	if cfg.Resolve == nil {
+		cfg.Resolve = func(host string) bool { return true }
+	}
 	js, err := spidermonkey.New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)

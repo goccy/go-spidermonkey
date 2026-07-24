@@ -34,7 +34,7 @@ func (rt *Runtime) opUDPBind(cfg spidermonkey.Config, args []spidermonkey.Value)
 	onMessage := args[2].Object()
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	if cfg.Listen != nil && !cfg.Listen("udp", addr) {
+	if cfg.Listen == nil || !cfg.Listen("udp", addr) {
 		return spidermonkey.ValueOf(map[string]any{"code": "EACCES", "message": "bind " + addr + ": permission denied"}), nil
 	}
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -105,10 +105,12 @@ func (rt *Runtime) opUDPSend(cfg spidermonkey.Config, args []spidermonkey.Value)
 	}
 	port := args[2].Int()
 	host := args[3].String()
-	if err := dialAllowed(cfg, host, port); err != nil {
+	// Resolve+authorize once, then send only to the approved IP.
+	dialAddr, err := resolveDialAddr(cfg, "udp", host, port)
+	if err != nil {
 		return netErr(err), nil
 	}
-	dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	dst, err := net.ResolveUDPAddr("udp", dialAddr)
 	if err != nil {
 		return netErr(err), nil
 	}
