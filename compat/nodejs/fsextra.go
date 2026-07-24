@@ -187,8 +187,13 @@ func (rt *Runtime) opFSReadFD(cfg spidermonkey.Config, args []spidermonkey.Value
 		return fsErrValue(fmt.Errorf("EBADF")), nil
 	}
 	pos := f.pos
-	if len(args) > 2 && args[2].Object() == nil && !args[2].IsUndefined() {
-		pos = int64(args[2].Float())
+	// Only a NUMBER position seeks; null/undefined mean "read from the current
+	// position and advance" (Node's readSync sentinel). Previously a JS null
+	// coerced to 0, so a chunked read loop re-read the first bytes forever.
+	if len(args) > 2 {
+		if n, ok := args[2].Export().(float64); ok {
+			pos = int64(n)
+		}
 	}
 	length := int64(len(f.data)) - pos
 	if len(args) > 1 && !args[1].IsUndefined() {

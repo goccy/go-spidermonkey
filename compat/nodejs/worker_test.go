@@ -2,6 +2,7 @@ package nodejs_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +179,30 @@ func TestWorkerThreadsTerminate(t *testing.T) {
 	}
 	if !evalVal(t, js, `r.exited`).Bool() {
 		t.Error("terminate did not fire exit")
+	}
+}
+
+func TestWorkerTopLevelThrowEmitsError(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	r, err := js.Eval(context.Background(), `
+		const { Worker } = require("worker_threads");
+		globalThis.r = {};
+		const w = new Worker("throw new Error('boom in worker')", { eval: true });
+		w.on("error", (e) => { r.errMsg = String(e && e.message || e); });
+		w.on("exit", (code) => { r.exitCode = code; });
+	`)
+	if err != nil || r.Error != nil {
+		t.Fatalf("eval: %v %v", err, r.Error)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := rt.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := evalStr(t, js, `r.errMsg ?? ""`); !strings.Contains(got, "boom in worker") {
+		t.Errorf("worker 'error' event missing/incorrect: %q", got)
+	}
+	if got := evalStr(t, js, `String(r.exitCode)`); got != "1" {
+		t.Errorf("worker exit code = %q, want 1 after an uncaught throw", got)
 	}
 }

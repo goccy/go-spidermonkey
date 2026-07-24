@@ -83,7 +83,13 @@ func (rt *Runtime) opWorkerSpawn(cfg spidermonkey.Config, args []spidermonkey.Va
 	}
 	wm.mu.Unlock()
 
-	id, err := wm.agents.Spawn(workerJS, source)
+	// Wrap the user source so a top-level throw is reported to the main thread
+	// as the Worker's 'error' event (then exit 1) instead of silently killing
+	// the agent with only a bare exit. The wrapper is a block, so top-level
+	// var/function still hoist to the worker global and let/const closures
+	// (message handlers) still capture correctly.
+	wrapped := "try {\n" + source + "\n} catch (__wt_e) { __wt_reportError(__wt_e); }"
+	id, err := wm.agents.Spawn(workerJS, wrapped)
 	if err != nil {
 		return nil, err
 	}

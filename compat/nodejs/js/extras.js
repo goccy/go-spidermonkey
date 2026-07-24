@@ -752,9 +752,18 @@
 	// eval-a-manifest / evaluate-config pattern work.
 	function runInSandbox(code, sandbox) {
 		const ctx = sandbox || {};
-		const fn = new Function("globalThis", "self", "global", "exports", "module", String(code));
-		fn(ctx, ctx, ctx, ctx.exports, ctx.module);
-		return ctx;
+		// `with (this)` routes free identifier reads/writes to the sandbox, and
+		// the direct eval returns the code's COMPLETION VALUE — so
+		// runInNewContext("1+1") yields 2, not the sandbox object.
+		// globalThis/self/global are also bound to the sandbox so an explicit
+		// `globalThis.x = ...` (e.g. Next's App Router manifest) lands there.
+		// Caveat: a top-level `var`/`function` DECLARATION binds to this wrapper,
+		// not the sandbox — true per-context binding needs a realm we don't have.
+		const runner = new Function(
+			"globalThis", "self", "global", "exports", "module", "__vmCode__",
+			"with (this) { return eval(__vmCode__); }",
+		);
+		return runner.call(ctx, ctx, ctx, ctx, ctx.exports, ctx.module, String(code));
 	}
 	core.vm = {
 		createContext: (o = {}) => o,

@@ -162,6 +162,15 @@
 	};
 	parentPort.close = () => exitWorker(0);
 
+	// An uncaught throw during top-level evaluation of the worker source is
+	// reported to the main thread as the Worker's 'error' event, then the
+	// worker exits with code 1 — matching Node (error first, then exit 1). The
+	// spawn harness wraps the user source in a try/catch that calls this.
+	globalThis.__wt_reportError = (e) => {
+		A.post({ __wt_error: e instanceof Error ? `${e.name}: ${e.message}\n${e.stack || ""}` : String(e) });
+		exitWorker(1);
+	};
+
 	globalThis.__wt_parentPort = parentPort;
 	globalThis.__wt_workerData = workerData;
 	globalThis.__wt_threadId = threadId;
