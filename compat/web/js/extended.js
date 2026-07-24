@@ -209,7 +209,14 @@
 					const s = dec.decode(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk), { stream: true });
 					if (s) this._rc.enqueue(s);
 				},
-				close: () => this._rc.close(),
+				close: () => {
+					// Final non-stream decode flushes any bytes held from an
+					// incomplete trailing sequence (emits U+FFFD, or throws in
+					// fatal mode), per the WHATWG flush-on-end contract.
+					const tail = dec.decode();
+					if (tail) this._rc.enqueue(tail);
+					this._rc.close();
+				},
 			});
 		}
 	};

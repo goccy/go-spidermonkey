@@ -150,3 +150,22 @@ func TestReadableReadSizeReturnsNullWhenShort(t *testing.T) {
 		t.Fatalf("read(8) with 10 buffered length = %q, want 8", got)
 	}
 }
+
+// destroy() must invoke the callbacks of still-queued writes (with an error),
+// not strand them — otherwise a "wait for N write callbacks" barrier hangs.
+func TestWritableDestroyFlushesQueuedCallbacks(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { calls: 0 };
+		const { Writable } = require("stream");
+		// A slow async _write so chunks queue behind the first.
+		const ws = new Writable({ write(c, e, cb) { setTimeout(() => cb(new Error("boom")), 5); } });
+		ws.on("error", () => {});
+		for (let i = 0; i < 3; i++) ws.write("x" + i, () => { __r.calls++; });
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `String(__r.calls)`); got != "3" {
+		t.Fatalf("write callbacks fired = %s, want 3 (queued callbacks stranded)", got)
+	}
+}

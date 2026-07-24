@@ -118,6 +118,12 @@
 			const st = this._rs;
 			if (chunk === null) {
 				st.ended = true;
+				// In paused mode, wake a read(size) consumer so it drains a
+				// trailing residual smaller than its last requested size (which
+				// read now withholds as null) before 'end'.
+				if (st.flowing !== true && st.buffer.length > 0) {
+					process.nextTick(() => { if (!st.endEmitted && !st.destroyed) this.emit("readable"); });
+				}
 				this._scheduleFlow();
 				return false;
 			}
@@ -385,7 +391,15 @@
 				st.writing = false;
 				st.pending--;
 				st.buffered -= size;
-				if (err) { this.destroy(err); if (callback) callback(err); return; }
+				if (err) {
+					if (callback) callback(err);
+					// Node fails ALL still-pending writes when a writable errors
+					// out — don't strand the callbacks of chunks queued behind
+					// this one (which would hang a "wait for N callbacks" barrier).
+					this._failWriteQueue(err);
+					this.destroy(err);
+					return;
+				}
 				if (callback) callback();
 				if (st.needDrain && st.buffered < st.highWaterMark && !st.ending) {
 					st.needDrain = false;
@@ -394,6 +408,17 @@
 				this._maybeFinish();
 				this._processWriteQueue(); // next queued chunk, in order
 			});
+		},
+		_failWriteQueue(err) {
+			const st = this._ws;
+			if (!st.writeQueue || st.writeQueue.length === 0) return;
+			const q = st.writeQueue;
+			st.writeQueue = [];
+			for (const item of q) {
+				st.pending--;
+				st.buffered -= item.size;
+				if (item.callback) item.callback(err);
+			}
 		},
 		end(chunk, encoding, callback) {
 			if (typeof chunk === "function") { callback = chunk; chunk = null; }
@@ -428,6 +453,9 @@
 			st.destroyed = true;
 			this.writable = false;
 			this.destroyed = true;
+			// Invoke the callbacks of any still-queued writes with an error
+			// rather than stranding them.
+			this._failWriteQueue(err || new Error("stream destroyed"));
 			const done = (e) => {
 				if (e) this.emit("error", e);
 				this.emit("close");
@@ -475,6 +503,7 @@
 		this.readable = false;
 		this.writable = false;
 		this.destroyed = true;
+		if (this._failWriteQueue) this._failWriteQueue(err || new Error("stream destroyed"));
 		const done = (e) => {
 			if (e) this.emit("error", e);
 			this.emit("close");
