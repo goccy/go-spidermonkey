@@ -11,6 +11,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -179,11 +180,15 @@ func (rt *Runtime) opDHGenerate(cfg spidermonkey.Config, args []spidermonkey.Val
 	}
 	priv.Add(priv, big.NewInt(1))
 	pub := new(big.Int).Exp(g, priv, prime)
+	// Even-length hex (byte-aligned) so Buffer.from(hex) round-trips without
+	// dropping a trailing nibble.
 	return spidermonkey.ValueOf(map[string]any{
-		"prime": prime.Text(16), "generator": g.Text(16),
-		"priv": priv.Text(16), "pub": pub.Text(16),
+		"prime": evenHex(prime), "generator": evenHex(g),
+		"priv": evenHex(priv), "pub": evenHex(pub),
 	}), nil
 }
+
+func evenHex(n *big.Int) string { return hex.EncodeToString(n.Bytes()) }
 
 // opDHCompute(primeHex, privHex, otherPubHex) -> secret hex.
 func (rt *Runtime) opDHCompute(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -197,7 +202,7 @@ func (rt *Runtime) opDHCompute(cfg spidermonkey.Config, args []spidermonkey.Valu
 		return cryptoErr("bad DH hex value"), nil
 	}
 	secret := new(big.Int).Exp(otherPub, priv, prime)
-	return spidermonkey.ValueOf(secret.Text(16)), nil
+	return spidermonkey.ValueOf(evenHex(secret)), nil
 }
 
 // opChaCha(encrypt, key, nonce, data, aad) -> {data, tag} | plaintext.
