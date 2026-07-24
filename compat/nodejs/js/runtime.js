@@ -334,9 +334,9 @@
 		writeUIntBE(v, o = 0, len = 1) { let n = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
 		writeIntLE(v, o = 0, len = 1) { return this.writeUIntLE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
 		writeIntBE(v, o = 0, len = 1) { return this.writeUIntBE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
-		swap16() { for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }
-		swap32() { for (let i = 0; i < this.length; i += 4) { let a = this[i], b = this[i + 1]; this[i] = this[i + 3]; this[i + 1] = this[i + 2]; this[i + 2] = b; this[i + 3] = a; } return this; }
-		swap64() { for (let i = 0; i < this.length; i += 8) { for (let j = 0; j < 4; j++) { const t = this[i + j]; this[i + j] = this[i + 7 - j]; this[i + 7 - j] = t; } } return this; }
+		swap16() { if (this.length % 2) throw new RangeError("Buffer size must be a multiple of 16-bits"); for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }
+		swap32() { if (this.length % 4) throw new RangeError("Buffer size must be a multiple of 32-bits"); for (let i = 0; i < this.length; i += 4) { let a = this[i], b = this[i + 1]; this[i] = this[i + 3]; this[i + 1] = this[i + 2]; this[i + 2] = b; this[i + 3] = a; } return this; }
+		swap64() { if (this.length % 8) throw new RangeError("Buffer size must be a multiple of 64-bits"); for (let i = 0; i < this.length; i += 8) { for (let j = 0; j < 4; j++) { const t = this[i + j]; this[i + j] = this[i + 7 - j]; this[i + 7 - j] = t; } } return this; }
 	}
 
 	function wrap(u8) { return Object.setPrototypeOf(u8, Buffer.prototype); }

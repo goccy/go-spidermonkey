@@ -335,8 +335,10 @@
 		return { next, [Symbol.asyncIterator]() { return this; } };
 	};
 
-	Readable.from = (iterable) => {
-		const rs = new Readable({ read() {} });
+	Readable.from = (iterable, options = {}) => {
+		// Node's Readable.from defaults to objectMode, so string/number/object
+		// items pass through unchanged (not coerced to Buffer).
+		const rs = new Readable({ objectMode: true, ...options, read() {} });
 		(async () => {
 			try {
 				for await (const chunk of iterable) rs.push(chunk);
@@ -590,12 +592,26 @@
 
 	function pipeline(...args) {
 		const callback = typeof args[args.length - 1] === "function" ? args.pop() : () => {};
-		let current = args[0];
-		for (let i = 1; i < args.length; i++) {
-			args[i - 1].once("error", (e) => callback(e));
-			current = args[i - 1].pipe(args[i]);
+		const all = args.slice();
+		let done = false;
+		const finish = (err) => {
+			if (done) return;
+			done = true;
+			// On error, destroy EVERY stream in the chain so none is left open
+			// (Node cleans them all up; otherwise the source's fd/socket leaks).
+			if (err) {
+				for (const s of all) {
+					try { if (s && typeof s.destroy === "function" && !s.destroyed) s.destroy(); } catch (_e) { /* best effort */ }
+				}
+			}
+			callback(err || null);
+		};
+		let current = all[0];
+		for (let i = 1; i < all.length; i++) {
+			all[i - 1].once("error", finish);
+			current = all[i - 1].pipe(all[i]);
 		}
-		finished(current, callback);
+		finished(current, finish);
 		return current;
 	}
 

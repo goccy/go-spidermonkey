@@ -200,16 +200,26 @@
 	});
 	EventEmitter.defaultMaxListeners = 10;
 	EventEmitter.EventEmitter = EventEmitter;
-	EventEmitter.once = (emitter, type) =>
+	EventEmitter.once = (emitter, type, options = {}) =>
 		new Promise((resolve, reject) => {
-			let errHandler;
-			const onEvent = (...args) => {
+			const signal = options.signal;
+			if (signal && signal.aborted) {
+				return reject(signal.reason || Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+			}
+			let errHandler, onAbort;
+			const cleanup = () => {
+				emitter.off(type, onEvent);
 				if (errHandler) emitter.off("error", errHandler);
-				resolve(args);
+				if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 			};
+			const onEvent = (...args) => { cleanup(); resolve(args); };
 			if (type !== "error") {
-				errHandler = (e) => { emitter.off(type, onEvent); reject(e); };
+				errHandler = (e) => { cleanup(); reject(e); };
 				emitter.once("error", errHandler);
+			}
+			if (signal) {
+				onAbort = () => { cleanup(); reject(signal.reason || Object.assign(new Error("The operation was aborted"), { name: "AbortError" })); };
+				signal.addEventListener("abort", onAbort, { once: true });
 			}
 			emitter.once(type, onEvent);
 		});
@@ -220,10 +230,32 @@
 		const emitter = new EventEmitter();
 		for (const m of ["on", "addListener", "once", "off", "removeListener",
 			"removeAllListeners", "emit", "listeners", "listenerCount", "eventNames",
-			"prependListener", "setMaxListeners", "getMaxListeners"]) {
+			"prependListener", "prependOnceListener", "rawListeners",
+			"setMaxListeners", "getMaxListeners"]) {
 			process[m] = EventEmitter.prototype[m].bind(emitter);
 		}
 	}
+
+	// beforeExit/exit lifecycle, driven by the host loop (rt.Wait). beforeExit
+	// fires when the loop has drained (a handler may schedule more work); exit
+	// fires once on termination (natural drain or process.exit). Return whether a
+	// beforeExit listener exists so the host knows to drain again.
+	globalThis.__node_emit_before_exit = () => {
+		if (process.listenerCount && process.listenerCount("beforeExit") > 0) {
+			process.emit("beforeExit", process.exitCode ?? 0);
+			return true;
+		}
+		return false;
+	};
+	let __exitEmitted = false;
+	globalThis.__node_emit_exit = () => {
+		if (__exitEmitted) return;
+		__exitEmitted = true;
+		if (process.listenerCount && process.listenerCount("exit") > 0) {
+			process.emit("exit", process.exitCode ?? 0);
+		}
+	};
+	globalThis.__node_reset_exit_emitted = () => { __exitEmitted = false; };
 
 	// The uncaughtException channel: an error escaping a process.nextTick
 	// callback (or a stream 'error' with no listener) routes here. If a handler
@@ -380,20 +412,20 @@
 			// Node caps at 1000 keys by default (maxKeys) as a DoS guard against a
 			// hostile query string; 0 means unlimited.
 			const maxKeys = options.maxKeys === undefined ? 1000 : options.maxKeys;
-			let keyCount = 0;
+			let pairCount = 0;
 			for (const part of String(str ?? "").split(sep)) {
 				if (!part) continue;
+				// Node counts EVERY pair against maxKeys (duplicates included), so a
+				// repeated key can't bypass the DoS guard.
+				if (maxKeys > 0 && pairCount >= maxKeys) break;
+				pairCount++;
 				const i = part.indexOf(eq);
 				const k = qsUnescape(i < 0 ? part : part.slice(0, i));
 				const v = i < 0 ? "" : qsUnescape(part.slice(i + eq.length));
 				if (k in out) {
 					if (Array.isArray(out[k])) out[k].push(v);
 					else out[k] = [out[k], v];
-				} else {
-					if (maxKeys > 0 && keyCount >= maxKeys) break;
-					keyCount++;
-					out[k] = v;
-				}
+				} else out[k] = v;
 			}
 			return out;
 		},

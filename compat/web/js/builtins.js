@@ -871,11 +871,23 @@
 			// TransformStream would interleave transform/enqueue). A queued write
 			// re-checks state, so an abort/close between enqueue and execution
 			// stops it from still reaching the sink.
-			s._writeChain = (s._writeChain || Promise.resolve()).then(() => {
+			const p = (s._writeChain || Promise.resolve()).then(() => {
 				if (!s || s._state !== "writable") return undefined;
 				return s._sink.write ? s._sink.write(chunk, s._controller) : undefined;
 			});
-			return s._writeChain;
+			// A sink-write failure errors the whole stream: reject `closed` and move
+			// to "errored" so later writes reject at the guard above (WHATWG). Node
+			// left the stream writable and `closed` pending (a hang on await closed).
+			p.catch((e) => {
+				if (s._state === "writable") {
+					s._state = "errored";
+					if (s._closedReject) s._closedReject(e);
+				}
+			});
+			// The sequencing chain swallows the error so it doesn't poison the next
+			// write's continuation; the caller still sees the real rejection via p.
+			s._writeChain = p.catch(() => {});
+			return p;
 		}
 		async close() {
 			const s = this._stream;

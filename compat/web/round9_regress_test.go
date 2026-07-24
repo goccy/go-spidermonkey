@@ -61,6 +61,34 @@ func TestFormDataBody(t *testing.T) {
 	}
 }
 
+// TestWritableStreamSinkErrorState verifies a sink write() failure errors the
+// stream: writer.closed rejects (no hang) and further writes are refused.
+func TestWritableStreamSinkErrorState(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const ws = new WritableStream({ write() { throw new Error("boom"); } });
+			const w = ws.getWriter();
+			let closedRejected = false;
+			w.closed.catch(() => { closedRejected = true; });
+			try { await w.write("x"); } catch { __c.firstThrew = true; }
+			// closed must settle (reject), not hang.
+			await Promise.race([w.closed.catch(() => {}), new Promise((r) => setTimeout(r, 100))]);
+			__c.closedRejected = closedRejected;
+			try { await w.write("y"); __c.secondThrew = false; } catch { __c.secondThrew = true; }
+		})().catch((e) => { __c.err = String(e && e.stack || e); });
+	`)
+	if got := evalString(t, js, `String(__c.firstThrew)`); got != "true" {
+		t.Errorf("first write did not reject: %q", got)
+	}
+	if got := evalString(t, js, `String(__c.closedRejected)`); got != "true" {
+		t.Errorf("writer.closed did not reject after a sink error (hang): %q", got)
+	}
+	if got := evalString(t, js, `String(__c.secondThrew)`); got != "true" {
+		t.Errorf("second write after error did not reject: %q", got)
+	}
+}
+
 // TestFormDataHeaderInjection verifies a FormData field name containing quotes /
 // CRLF is escaped in the multipart Content-Disposition (no header injection), and
 // the boundary is not the old predictable counter.

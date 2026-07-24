@@ -96,6 +96,8 @@ func (rt *Runtime) resetExit() {
 	rt.exited = false
 	rt.exitCode = 0
 	rt.mu.Unlock()
+	// Allow 'exit' to fire again for this run on a reused Runtime.
+	_, _ = rt.js.Eval(context.Background(), "globalThis.__node_reset_exit_emitted && globalThis.__node_reset_exit_emitted()")
 }
 
 // openFile is one fs.openSync handle: the whole file loaded into memory,
@@ -198,8 +200,28 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 
 // Wait runs the event loop until timers, immediates, nextTicks and pending
 // ops are exhausted, or ctx is done. A process.exit() during the loop stops it
-// and returns cleanly (Exited/ExitCode report the outcome).
-func (rt *Runtime) Wait(ctx context.Context) error { return rt.exitFilter(rt.web.Wait(ctx)) }
+// and returns cleanly (Exited/ExitCode report the outcome). When the loop
+// drains naturally it fires process 'beforeExit' (draining again if a handler
+// scheduled work), and it fires 'exit' once on termination.
+func (rt *Runtime) Wait(ctx context.Context) error {
+	err := rt.web.Wait(ctx)
+	if err == nil && !rt.Exited() {
+		// Loop drained without error or process.exit: fire 'beforeExit'. If a
+		// listener exists (and may have scheduled work), drain once more.
+		if r, e := rt.js.Eval(ctx, "!!(globalThis.__node_emit_before_exit && globalThis.__node_emit_before_exit())"); e != nil {
+			err = e
+		} else if r.Value.Bool() {
+			err = rt.web.Wait(ctx)
+		}
+	}
+	err = rt.exitFilter(err)
+	// Fire 'exit' exactly once (the JS side guards re-entry). Best-effort on the
+	// teardown path; a ctx error still returns below.
+	if _, e := rt.js.Eval(context.Background(), "globalThis.__node_emit_exit && globalThis.__node_emit_exit()"); e != nil && err == nil {
+		err = e
+	}
+	return err
+}
 
 // Web returns the underlying compat/web installation.
 func (rt *Runtime) Web() *web.Web { return rt.web }
