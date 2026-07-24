@@ -52,6 +52,12 @@
 
 	const RSA_NAMES = ["RSASSA-PKCS1-V1_5", "RSA-PSS"];
 	const rsaScheme = (name) => (name === "RSA-PSS" ? "pss" : "pkcs1");
+	const AES_NAMES = ["AES-GCM", "AES-CBC", "AES-CTR"];
+
+	const subtleFail = (r) => {
+		if (r && r.__subtleError) throw new DOMException(r.message, "OperationError");
+		return r;
+	};
 
 	const subtle = {
 		async digest(alg, data) {
@@ -86,6 +92,21 @@
 					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
+			if (AES_NAMES.includes(name)) {
+				const length = Number(alg.length) || 256;
+				const raw = crypto.getRandomValues(new Uint8Array(length / 8));
+				const key = new CryptoKey("secret", extractable, { name, length }, usages, null);
+				key._raw = raw;
+				return key;
+			}
+			if (name === "ECDH") {
+				const crv = String(alg.namedCurve);
+				const r = ops.subtle_ec_generate(crv); // reuse EC keygen (same curves)
+				const algo = { name: "ECDH", namedCurve: crv };
+				const priv = new CryptoKey("private", extractable, algo, usages, r.priv);
+				const pub = new CryptoKey("public", true, algo, [], r.pub);
+				return { privateKey: priv, publicKey: pub };
+			}
 			unsupported(`algorithm ${algName(alg)}`);
 		},
 
@@ -119,6 +140,32 @@
 				const algo = { name: algName(alg), hash: { name: hashName(alg.hash) }, modulusLength: r.bits, publicExponent: new Uint8Array([1, 0, 1]) };
 				return new CryptoKey(r.type, extractable, algo, usages, r.id);
 			}
+			if (AES_NAMES.includes(name)) {
+				let raw;
+				if (format === "raw") raw = toU8(keyData);
+				else if (format === "jwk") raw = b64uDecode(keyData.k);
+				else unsupported(`AES key format ${format}`);
+				const key = new CryptoKey("secret", extractable, { name, length: raw.length * 8 }, usages, null);
+				key._raw = raw;
+				return key;
+			}
+			if (name === "ECDH") {
+				if (format !== "jwk") {
+					if (format === "raw") {
+						// raw public point: keep as JWK-less handle via EC import DER path unsupported; require jwk
+					}
+					unsupported(`ECDH key format ${format}`);
+				}
+				const key = new CryptoKey(keyData.d ? "private" : "public", extractable, { name: "ECDH", namedCurve: keyData.crv }, usages, null);
+				key._jwk = { ...keyData, crv: keyData.crv };
+				return key;
+			}
+			if (name === "HKDF" || name === "PBKDF2") {
+				if (format !== "raw") unsupported(`${name} key format ${format}`);
+				const key = new CryptoKey("secret", false, { name }, usages, null);
+				key._raw = toU8(keyData);
+				return key;
+			}
 			unsupported(`algorithm ${algName(alg)}`);
 		},
 
@@ -141,6 +188,11 @@
 				if (format === "jwk") return JSON.parse(ops.subtle_rsa_export_jwk(key._h));
 				if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_rsa_export_der(format, key._h));
 				unsupported(`RSA export format ${format}`);
+			}
+			if (AES_NAMES.includes(name)) {
+				if (format === "raw") return key._raw.slice().buffer;
+				if (format === "jwk") return { kty: "oct", k: b64uEncode(key._raw), alg: name === "AES-GCM" ? "A256GCM" : undefined, ext: true, key_ops: [...key.usages] };
+				unsupported(`AES export format ${format}`);
 			}
 			unsupported(`algorithm ${key.algorithm.name}`);
 		},
@@ -166,7 +218,68 @@
 			}
 			unsupported(`algorithm ${algName(alg)}`);
 		},
+
+		async encrypt(alg, key, data) {
+			need(key, "encrypt");
+			const name = algName(alg).toUpperCase();
+			if (AES_NAMES.includes(name)) {
+				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
+				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+				const tagLen = alg.tagLength ?? 128;
+				return toBuf(subtleFail(ops.subtle_aes_encrypt(name, key._raw, iv, toU8(data), aad, tagLen)));
+			}
+			unsupported(`encrypt algorithm ${algName(alg)}`);
+		},
+
+		async decrypt(alg, key, data) {
+			need(key, "decrypt");
+			const name = algName(alg).toUpperCase();
+			if (AES_NAMES.includes(name)) {
+				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
+				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+				const tagLen = alg.tagLength ?? 128;
+				return toBuf(subtleFail(ops.subtle_aes_decrypt(name, key._raw, iv, toU8(data), aad, tagLen)));
+			}
+			unsupported(`decrypt algorithm ${algName(alg)}`);
+		},
+
+		async deriveBits(alg, baseKey, length) {
+			const name = algName(alg).toUpperCase();
+			if (name === "ECDH") {
+				const privJWK = jwkOf(baseKey);
+				const pubJWK = jwkOf(alg.public);
+				return toBuf(subtleFail(ops.subtle_ecdh(privJWK, pubJWK, length ?? 0)));
+			}
+			if (name === "HKDF") {
+				return toBuf(subtleFail(ops.subtle_hkdf(hashName(alg.hash), baseKey._raw, toU8(alg.salt), toU8(alg.info), length)));
+			}
+			if (name === "PBKDF2") {
+				return toBuf(subtleFail(ops.subtle_pbkdf2(hashName(alg.hash), baseKey._raw, toU8(alg.salt), Number(alg.iterations), length)));
+			}
+			unsupported(`deriveBits algorithm ${algName(alg)}`);
+		},
+
+		async deriveKey(alg, baseKey, derivedKeyAlg, extractable, usages) {
+			const derivedName = algName(derivedKeyAlg).toUpperCase();
+			const length = Number(derivedKeyAlg.length) || (AES_NAMES.includes(derivedName) ? 256 : 256);
+			const bits = await subtle.deriveBits(alg, baseKey, length);
+			if (AES_NAMES.includes(derivedName)) {
+				return subtle.importKey("raw", bits, { name: derivedName }, extractable, usages);
+			}
+			if (derivedName === "HMAC") {
+				return subtle.importKey("raw", bits, { name: "HMAC", hash: derivedKeyAlg.hash }, extractable, usages);
+			}
+			unsupported(`deriveKey derived algorithm ${derivedName}`);
+		},
 	};
+
+	// jwkOf returns a key's JWK JSON string, whether it was imported (has
+	// _jwk) or generated (has an EC handle to export).
+	function jwkOf(key) {
+		if (key._jwk) return JSON.stringify(key._jwk);
+		if (key._h != null) return ops.subtle_ec_export_jwk(key._h);
+		throw new DOMException("key has no derivable material", "InvalidAccessError");
+	}
 
 	globalThis.crypto.subtle = subtle;
 })();

@@ -7,8 +7,7 @@
 (() => {
 	"use strict";
 	const ops = globalThis.__node_ops;
-	const core = globalThis.__node_core_registry;
-	delete globalThis.__node_core_registry;
+	const core = globalThis.__node_core_registry; // extended.js (after) deletes it
 
 	const EventEmitter = core.events;
 	const { Readable, Writable } = core.stream;
@@ -249,8 +248,62 @@
 		});
 	};
 
-	const notSupported = (what) => () => { throw new Error(`${what} is not supported yet in this runtime`); };
 	class Agent { constructor() { this.options = {}; } destroy() {} }
+	const isErr = (r) => r !== null && typeof r === "object" && typeof r.code === "string" && !(r instanceof Uint8Array);
+
+	// ClientRequest: a Writable that buffers the body, then runs the
+	// synchronous http_client_req op and delivers an IncomingMessage-shaped
+	// response through the 'response' event.
+	class ClientRequest extends Writable {
+		constructor(options, cb) {
+			super();
+			const o = typeof options === "string" ? parseRequestURL(options) : options;
+			this.method = (o.method || "GET").toUpperCase();
+			this._headers = {};
+			for (const [k, v] of Object.entries(o.headers || {})) this._headers[k] = v;
+			const scheme = o.protocol ? o.protocol.replace(":", "") : "http";
+			const host = o.hostname || o.host || "127.0.0.1";
+			const port = o.port ? ":" + o.port : "";
+			this._url = o.href || `${scheme}://${host}${port}${o.path || "/"}`;
+			this._chunks = [];
+			if (cb) this.once("response", cb);
+		}
+		setHeader(name, value) { this._headers[name] = value; return this; }
+		getHeader(name) { return this._headers[name]; }
+		removeHeader(name) { delete this._headers[name]; }
+		_write(chunk, encoding, callback) { this._chunks.push(chunk); callback(); }
+		_final(callback) {
+			const body = this._chunks.length ? Buffer.concat(this._chunks.map((c) => (typeof c === "string" ? Buffer.from(c) : c))) : Buffer.alloc(0);
+			const r = ops.http_client_req(this.method, this._url, JSON.stringify(this._headers), body);
+			ops.release_pending();
+			if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); callback(); return; }
+			const res = new IncomingMessage({ method: this.method, url: this._url, rawHeaders: r.headers });
+			res.statusCode = r.status;
+			res.statusMessage = r.statusText;
+			const bodyBuf = Object.setPrototypeOf(r.body, Buffer.prototype);
+			process.nextTick(() => {
+				this.emit("response", res);
+				process.nextTick(() => { if (bodyBuf.length) res.push(bodyBuf); res.push(null); });
+			});
+			callback();
+		}
+		abort() { this.destroy(); }
+		setTimeout() { return this; }
+	}
+
+	function parseRequestURL(url) {
+		const u = new URL(url);
+		return { protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname + u.search, href: u.href };
+	}
+	function httpRequest(options, cb) {
+		const req = new ClientRequest(options, cb);
+		return req;
+	}
+	function httpGet(options, cb) {
+		const req = httpRequest(options, cb);
+		req.end();
+		return req;
+	}
 
 	core.http = {
 		METHODS,
@@ -259,19 +312,23 @@
 		IncomingMessage,
 		ServerResponse,
 		OutgoingMessage: ServerResponse,
+		ClientRequest,
 		createServer: (options, handler) => new Server(typeof options === "function" ? options : handler),
-		request: notSupported("http.request (use fetch)"),
-		get: notSupported("http.get (use fetch)"),
+		request: httpRequest,
+		get: httpGet,
 		Agent,
 		globalAgent: new Agent(),
+		maxHeaderSize: 16384,
+		validateHeaderName: (name) => { if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) throw new TypeError(`Invalid header name: ${name}`); },
+		validateHeaderValue: (name, value) => { if (value === undefined) throw new TypeError(`Invalid value for header ${name}`); },
 	};
 
 	core.https = {
 		Server,
 		Agent,
 		globalAgent: new Agent(),
-		createServer: notSupported("https.createServer"),
-		request: notSupported("https.request (use fetch)"),
-		get: notSupported("https.get (use fetch)"),
+		createServer: (options, handler) => new Server(typeof options === "function" ? options : handler),
+		request: httpRequest,
+		get: httpGet,
 	};
 })();

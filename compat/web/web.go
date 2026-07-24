@@ -34,6 +34,9 @@ var builtinsJS string
 //go:embed js/subtle.js
 var subtleJS string
 
+//go:embed js/extended.js
+var extendedJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js    *spidermonkey.JS
@@ -59,7 +62,11 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		"timer_set":     w.opTimerSet,
 		"timer_clear":   w.opTimerClear,
 	}
-	for name, fn := range newSubtleAPI().ops() {
+	subtle := newSubtleAPI()
+	for name, fn := range subtle.ops() {
+		opTable[name] = fn
+	}
+	for name, fn := range subtle.ops2() {
 		opTable[name] = fn
 	}
 	for name, fn := range opTable {
@@ -71,7 +78,7 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)

@@ -41,6 +41,9 @@ var extrasJS string
 //go:embed js/http.js
 var httpJS string
 
+//go:embed js/extended.js
+var extendedJS string
+
 // Options configures Install.
 type Options struct {
 	// Argv becomes process.argv. Empty means ["node", "main"].
@@ -57,9 +60,24 @@ type Runtime struct {
 	coreExports  map[string][]string // core module -> identifier export names
 	http         *httpState
 	httpDispatch *spidermonkey.Object // __node_http_dispatch
+	net          *netState
 
 	mu             sync.Mutex
 	pendingReturns []*spidermonkey.Object // handles returned to the guest, freed on release_pending
+	fds            map[int64]*openFile    // fd table for fs.openSync
+	nextFD         int64
+}
+
+// openFile is one fs.openSync handle: the whole file loaded into memory,
+// position-tracked; writes flush back on close.
+type openFile struct {
+	path   string
+	data   []byte
+	pos    int64
+	write  bool
+	append bool
+	dirty  bool
+	cfg    spidermonkey.Config
 }
 
 // Install sets up the Node runtime on js (installing compat/web itself — do
@@ -69,6 +87,9 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 		js:          js,
 		coreExports: map[string][]string{},
 		http:        &httpState{servers: map[int64]*httpServer{}, reqs: map[int64]*httpPending{}},
+		net:         newNetState(),
+		fds:         map[int64]*openFile{},
+		nextFD:      3, // 0,1,2 reserved for stdio
 	}
 	if len(opts) > 0 {
 		rt.opts = opts[0]
@@ -99,7 +120,7 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	}
 
 	ctx := context.Background()
-	for _, src := range []string{runtimeJS, corelibsJS, streamsJS, extrasJS, httpJS, `delete globalThis.__node_ops;`} {
+	for _, src := range []string{runtimeJS, corelibsJS, streamsJS, extrasJS, httpJS, extendedJS, `delete globalThis.__node_ops;`} {
 		r, err := js.Eval(ctx, src)
 		if err != nil {
 			return nil, fmt.Errorf("nodejs: evaluating builtins: %w", err)
@@ -144,6 +165,7 @@ func (rt *Runtime) Web() *web.Web { return rt.web }
 // interpreter stays usable.
 func (rt *Runtime) Close() error {
 	rt.closeHTTP()
+	rt.closeNet()
 	rt.mu.Lock()
 	pending := rt.pendingReturns
 	rt.pendingReturns = nil
@@ -273,8 +295,12 @@ func (rt *Runtime) ops() map[string]spidermonkey.Func {
 		"crypto_hash":     rt.opCryptoHash,
 		"crypto_hmac":     rt.opCryptoHMAC,
 	}
-	for name, fn := range rt.httpOps() {
-		table[name] = fn
+	for _, group := range []map[string]spidermonkey.Func{
+		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.netOps(), rt.fsExtraOps(),
+	} {
+		for name, fn := range group {
+			table[name] = fn
+		}
 	}
 	return table
 }

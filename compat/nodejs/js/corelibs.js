@@ -558,6 +558,70 @@
 			if (isErr(r)) throw fsError(r, "rename", oldP);
 		},
 		realpathSync: (p) => path.resolve(String(p)),
+		copyFileSync(src, dest) {
+			const r = ops.fs_copyfile(String(src), String(dest));
+			if (isErr(r)) throw fsError(r, "copyfile", src);
+		},
+		rmSync(p, options = {}) {
+			const r = ops.fs_rm(String(p), !!options.recursive, !!options.force);
+			if (isErr(r)) throw fsError(r, "rm", p);
+		},
+		rmdirSync(p, options = {}) {
+			const r = ops.fs_rm(String(p), !!(options && options.recursive), false);
+			if (isErr(r)) throw fsError(r, "rmdir", p);
+		},
+		mkdtempSync(prefix) {
+			const r = ops.fs_mkdtemp(String(prefix));
+			if (isErr(r)) throw fsError(r, "mkdtemp", prefix);
+			return r;
+		},
+		cpSync(src, dest, options = {}) {
+			// Recursive directory copy over the primitive ops.
+			const st = fsSync.statSync(src);
+			if (st.isDirectory()) {
+				fsSync.mkdirSync(dest, { recursive: true });
+				for (const name of fsSync.readdirSync(src)) {
+					fsSync.cpSync(path.join(String(src), name), path.join(String(dest), name), options);
+				}
+			} else {
+				fsSync.copyFileSync(src, dest);
+			}
+		},
+		openSync(p, flags = "r") {
+			const r = ops.fs_open(String(p), String(flags));
+			if (isErr(r)) throw fsError(r, "open", p);
+			return r;
+		},
+		closeSync(fd) {
+			const r = ops.fs_close_fd(fd);
+			if (isErr(r)) throw fsError(r, "close", fd);
+		},
+		readSync(fd, buffer, offset = 0, length = buffer.length, position = null) {
+			const r = ops.fs_read_fd(fd, length, position);
+			ops.release_pending();
+			if (isErr(r)) throw fsError(r, "read", fd);
+			const data = new Uint8Array(r.data);
+			buffer.set(data.subarray(0, Math.min(data.length, length)), offset);
+			return r.bytesRead;
+		},
+		writeSync(fd, buffer, offset, length, position) {
+			let data;
+			if (typeof buffer === "string") data = Buffer.from(buffer);
+			else data = Buffer.from(buffer.buffer ? new Uint8Array(buffer.buffer, buffer.byteOffset + (offset || 0), length ?? buffer.length) : buffer);
+			const r = ops.fs_write_fd(fd, data);
+			if (isErr(r)) throw fsError(r, "write", fd);
+			return r;
+		},
+		fstatSync(fd) {
+			const r = ops.fs_fstat(fd);
+			if (isErr(r)) throw fsError(r, "fstat", fd);
+			return statsOf(r);
+		},
+		chmodSync() {}, // no-op: the FS abstraction has no mode bits to set
+		chownSync() {},
+		utimesSync() {},
+		symlinkSync() { throw fsError({ code: "ENOSYS", message: "symlink not supported" }, "symlink", ""); },
+		readlinkSync(p) { throw fsError({ code: "EINVAL", message: "not a symlink" }, "readlink", p); },
 	};
 
 	// Callback flavors run the sync op and deliver on the microtask queue.
@@ -580,9 +644,15 @@
 		readdir: callbackify1(fsSync.readdirSync),
 		mkdir: callbackify1(fsSync.mkdirSync),
 		rmdir: callbackify1(fsSync.rmdirSync),
+		rm: callbackify1(fsSync.rmSync),
 		unlink: callbackify1(fsSync.unlinkSync),
 		rename: callbackify1(fsSync.renameSync),
 		realpath: callbackify1(fsSync.realpathSync),
+		copyFile: callbackify1(fsSync.copyFileSync),
+		mkdtemp: callbackify1(fsSync.mkdtempSync),
+		cp: callbackify1(fsSync.cpSync),
+		chmod: (p, mode, cb) => queueMicrotask(() => (cb || mode)(null)),
+		chown: (p, uid, gid, cb) => queueMicrotask(() => cb(null)),
 		exists: (p, cb) => queueMicrotask(() => cb(fsSync.existsSync(p))),
 		access: (p, mode, cb) => {
 			const done = typeof mode === "function" ? mode : cb;
@@ -599,9 +669,10 @@
 		["readFile", "readFileSync"], ["writeFile", "writeFileSync"],
 		["appendFile", "appendFileSync"], ["stat", "statSync"],
 		["lstat", "lstatSync"], ["readdir", "readdirSync"],
-		["mkdir", "mkdirSync"], ["rmdir", "rmdirSync"],
+		["mkdir", "mkdirSync"], ["rmdir", "rmdirSync"], ["rm", "rmSync"],
 		["unlink", "unlinkSync"], ["rename", "renameSync"],
-		["realpath", "realpathSync"],
+		["realpath", "realpathSync"], ["copyFile", "copyFileSync"],
+		["mkdtemp", "mkdtempSync"], ["cp", "cpSync"],
 	]) {
 		promisified[name] = (...args) => {
 			try { return Promise.resolve(fsSync[syncName](...args)); } catch (e) { return Promise.reject(e); }
