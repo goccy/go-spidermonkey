@@ -77,6 +77,9 @@
 		EventEmitter.call(this);
 		this._rs = {
 			buffer: [],
+			length: 0, // objectMode: item count; byte mode: total bytes
+			highWaterMark: options.highWaterMark ?? (options.objectMode ? 16 : 16384),
+			objectMode: !!(options.objectMode || options.readableObjectMode),
 			flowing: null,
 			ended: false,
 			endEmitted: false,
@@ -84,6 +87,7 @@
 			decoder: null,
 			flowScheduled: false,
 			consumed: false,
+			needReadable: false,
 			pipes: [],
 		};
 		this.readable = true;
@@ -95,6 +99,19 @@
 	Object.setPrototypeOf(Readable.prototype, EventEmitter.prototype);
 	Object.setPrototypeOf(Readable, EventEmitter);
 
+	function chunkSize(st, chunk) {
+		return st.objectMode ? 1 : (chunk.length ?? 0);
+	}
+
+	// Getters must be defined with defineProperties, not Object.assign (which
+	// would invoke them during the copy).
+	Object.defineProperties(Readable.prototype, {
+		readableHighWaterMark: { get() { return this._rs.highWaterMark; }, configurable: true },
+		readableLength: { get() { return this._rs.length; }, configurable: true },
+		readableObjectMode: { get() { return this._rs.objectMode; }, configurable: true },
+		readableFlowing: { get() { return this._rs.flowing; }, configurable: true },
+	});
+
 	Object.assign(Readable.prototype, {
 		_read(size) {},
 		push(chunk, encoding) {
@@ -104,13 +121,19 @@
 				this._scheduleFlow();
 				return false;
 			}
-			st.buffer.push(toChunk(chunk, encoding));
+			const item = st.objectMode ? chunk : toChunk(chunk, encoding);
+			st.buffer.push(item);
+			st.length += chunkSize(st, item);
 			if (st.flowing) this._scheduleFlow();
 			else this.emit("readable");
-			return true;
+			// Backpressure signal: false tells the producer to stop until read.
+			return st.length < st.highWaterMark;
 		},
 		unshift(chunk, encoding) {
-			this._rs.buffer.unshift(toChunk(chunk, encoding));
+			const st = this._rs;
+			const item = st.objectMode ? chunk : toChunk(chunk, encoding);
+			st.buffer.unshift(item);
+			st.length += chunkSize(st, item);
 		},
 		read(size) {
 			const st = this._rs;
@@ -120,14 +143,23 @@
 				else this._callRead();
 				if (st.buffer.length === 0) return null;
 			}
+			if (st.objectMode) {
+				// One object per read (size is ignored in objectMode).
+				const out = st.buffer.shift();
+				st.length -= 1;
+				if (st.ended && st.buffer.length === 0) this._scheduleFlow();
+				return out;
+			}
 			let out;
 			if (size === undefined || size >= totalLength(st.buffer)) {
 				out = st.buffer.length === 1 ? st.buffer[0] : Buffer.concat(st.buffer);
 				st.buffer = [];
+				st.length = 0;
 			} else {
 				const joined = Buffer.concat(st.buffer);
 				out = joined.subarray(0, size);
 				st.buffer = [joined.subarray(size)];
+				st.length = joined.length - size;
 			}
 			if (st.ended && st.buffer.length === 0) this._scheduleFlow();
 			return st.decoder ? st.decoder.write(out) : out;
@@ -176,7 +208,8 @@
 			if (st.destroyed) return;
 			while (st.flowing && st.buffer.length) {
 				let chunk = st.buffer.shift();
-				if (st.decoder) chunk = st.decoder.write(chunk);
+				st.length -= chunkSize(st, chunk);
+				if (st.decoder && !st.objectMode) chunk = st.decoder.write(chunk);
 				this.emit("data", chunk);
 			}
 			if (st.flowing && st.buffer.length === 0 && !st.ended) this._callRead();
@@ -273,7 +306,13 @@
 	// ------------------------------------------------------------ Writable
 
 	function initWritable(self, options = {}) {
-		self._ws = { ending: false, finished: false, pending: 0, destroyed: false };
+		self._ws = {
+			ending: false, finished: false, pending: 0, destroyed: false,
+			buffered: 0, // bytes/items awaiting their write callback
+			needDrain: false,
+			highWaterMark: options.highWaterMark ?? (options.objectMode || options.writableObjectMode ? 16 : 16384),
+			objectMode: !!(options.objectMode || options.writableObjectMode),
+		};
 		self.writable = true;
 		self.writableEnded = false;
 		self.writableFinished = false;
@@ -281,6 +320,12 @@
 		if (typeof options.final === "function") self._final = options.final;
 		if (typeof options.destroy === "function" && !self._destroy) self._destroy = options.destroy;
 	}
+
+	const writableGetters = {
+		writableHighWaterMark: { get() { return this._ws.highWaterMark; }, configurable: true },
+		writableLength: { get() { return this._ws.buffered; }, configurable: true },
+		writableObjectMode: { get() { return this._ws.objectMode; }, configurable: true },
+	};
 
 	const writableMethods = {
 		_write(chunk, encoding, callback) { callback(); },
@@ -294,14 +339,26 @@
 				this.emit("error", err);
 				return false;
 			}
+			const payload = st.objectMode ? chunk : toChunk(chunk, encoding);
+			const size = st.objectMode ? 1 : (payload.length ?? 0);
 			st.pending++;
-			this._write(toChunk(chunk, encoding), encoding || "utf8", (err) => {
+			st.buffered += size;
+			this._write(payload, encoding || "utf8", (err) => {
 				st.pending--;
+				st.buffered -= size;
 				if (err) { this.destroy(err); if (callback) callback(err); return; }
 				if (callback) callback();
-				if (st.pending === 0 && !st.ending) this.emit("drain");
+				if (st.needDrain && st.buffered < st.highWaterMark && !st.ending) {
+					st.needDrain = false;
+					this.emit("drain");
+				}
 				this._maybeFinish();
 			});
+			// Real backpressure: false once the in-flight buffer reaches hwm.
+			if (st.buffered >= st.highWaterMark) {
+				st.needDrain = true;
+				return false;
+			}
 			return true;
 		},
 		end(chunk, encoding, callback) {
@@ -357,6 +414,7 @@
 	Object.setPrototypeOf(Writable.prototype, EventEmitter.prototype);
 	Object.setPrototypeOf(Writable, EventEmitter);
 	Object.assign(Writable.prototype, writableMethods);
+	Object.defineProperties(Writable.prototype, writableGetters);
 
 	// --------------------------------------- Duplex / Transform / PassThrough
 
@@ -369,6 +427,7 @@
 	for (const [name, fn] of Object.entries(writableMethods)) {
 		if (name !== "destroy") Duplex.prototype[name] = fn;
 	}
+	Object.defineProperties(Duplex.prototype, writableGetters);
 	Duplex.prototype.destroy = function destroy(err) {
 		return writableMethods.destroy.call(this, err);
 	};

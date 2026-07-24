@@ -138,6 +138,7 @@
 		const e = String(enc || "utf8").toLowerCase();
 		if (e === "utf-8") return "utf8";
 		if (e === "binary") return "latin1";
+		if (e === "ucs2" || e === "ucs-2" || e === "utf-16le") return "utf16le";
 		return e;
 	};
 
@@ -200,6 +201,11 @@
 					return btoa(latin1Of(sub)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 				case "latin1": return latin1Of(sub);
 				case "ascii": return [...sub].map((b) => String.fromCharCode(b & 0x7f)).join("");
+				case "utf16le": {
+					let s = "";
+					for (let i = 0; i + 1 < sub.length; i += 2) s += String.fromCharCode(sub[i] | (sub[i + 1] << 8));
+					return s;
+				}
 			}
 			throw new TypeError(`Unknown encoding: ${encoding}`);
 		}
@@ -282,6 +288,15 @@
 			case "latin1": case "ascii": {
 				const out = wrap(new Uint8Array(s.length));
 				for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
+				return out;
+			}
+			case "utf16le": {
+				const out = wrap(new Uint8Array(s.length * 2));
+				for (let i = 0; i < s.length; i++) {
+					const c = s.charCodeAt(i);
+					out[i * 2] = c & 0xff;
+					out[i * 2 + 1] = c >> 8;
+				}
 				return out;
 			}
 		}

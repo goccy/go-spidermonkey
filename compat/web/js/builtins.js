@@ -131,22 +131,40 @@
 		encode(input = "") { return utf8Encode(String(input)); }
 	};
 
+	// Encodings supported without ICU tables: utf-8, latin1 (1:1 code points),
+	// and utf-16le (fixed 2-byte). Others still throw (need engine ICU).
+	const DECODER_LABELS = {
+		"utf-8": "utf8", "utf8": "utf8", "unicode-1-1-utf-8": "utf8",
+		"latin1": "latin1", "iso-8859-1": "latin1", "windows-1252": "latin1",
+		"utf-16le": "utf16le", "utf-16": "utf16le", "ucs-2": "utf16le", "ucs2": "utf16le",
+	};
 	globalThis.TextDecoder = class TextDecoder {
 		constructor(label = "utf-8", options = {}) {
-			const l = String(label).toLowerCase();
-			if (l !== "utf-8" && l !== "utf8" && l !== "unicode-1-1-utf-8") {
-				throw new RangeError(`TextDecoder: unsupported encoding ${label}`);
-			}
+			const enc = DECODER_LABELS[String(label).toLowerCase()];
+			if (!enc) throw new RangeError(`TextDecoder: unsupported encoding ${label}`);
+			this._enc = enc;
 			this.fatal = !!options.fatal;
 			this.ignoreBOM = !!options.ignoreBOM;
 		}
-		get encoding() { return "utf-8"; }
+		get encoding() { return this._enc === "utf8" ? "utf-8" : this._enc === "utf16le" ? "utf-16le" : "windows-1252"; }
 		decode(input) {
 			if (input === undefined) return "";
 			let bytes;
 			if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
 			else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
 			else throw new TypeError("TextDecoder.decode: expected an ArrayBuffer or ArrayBufferView");
+			if (this._enc === "latin1") {
+				let s = "";
+				for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+				return s;
+			}
+			if (this._enc === "utf16le") {
+				let start = 0;
+				if (!this.ignoreBOM && bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) start = 2;
+				let s = "";
+				for (let i = start; i + 1 < bytes.length; i += 2) s += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
+				return s;
+			}
 			if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
 				bytes = bytes.subarray(3);
 			}

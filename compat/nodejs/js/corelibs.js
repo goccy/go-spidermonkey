@@ -683,24 +683,150 @@
 	fsMod.promises = promisified;
 
 	// ------------------------------------------------------ child_process
-	// Present so packages that require() it load (commander, ...); actually
-	// spawning arrives with the os/exec-backed implementation (plan Phase 5,
-	// gated by Config.Exec).
+	// Real subprocesses over the child_* host ops (Go os/exec), gated by
+	// Config.Exec. Async spawns stream stdout/stderr as 'data' events and
+	// fire 'exit'/'close'; the sync forms block and return the result.
 
-	{
-		const notSupported = (name) => (...args) => {
-			throw new Error(`child_process.${name} is not supported yet in this runtime`);
+	const cpErr = (r, cmd) => { const e = new Error(r.message + (cmd ? " " + cmd : "")); e.code = r.code; return e; };
+	const envToArray = (env) => env ? Object.keys(env).map((k) => `${k}=${env[k]}`) : undefined;
+
+	class ChildProcess extends EventEmitter {
+		constructor() {
+			super();
+			this.pid = undefined;
+			this.exitCode = null;
+			this.signalCode = null;
+			this.killed = false;
+			this.stdout = new core.stream.Readable({ read() {} });
+			this.stderr = new core.stream.Readable({ read() {} });
+			this.stdin = new core.stream.Writable({
+				write: (chunk, enc, cb) => { ops.child_stdin(this.pid, Buffer.from(chunk)); cb(); },
+				final: (cb) => { if (this.pid !== undefined) ops.child_stdin(this.pid, null); cb(); },
+			});
+		}
+		kill(signal) {
+			this.killed = true;
+			if (this.pid !== undefined) ops.child_kill(this.pid);
+			return true;
+		}
+	}
+
+	function spawn(file, args, options) {
+		if (!Array.isArray(args)) { options = args; args = []; }
+		options = options || {};
+		const cp = new ChildProcess();
+		const onStdout = (chunk) => cp.stdout.push(Buffer.from(chunk));
+		const onStderr = (chunk) => cp.stderr.push(Buffer.from(chunk));
+		let exited = false;
+		const onExit = (code, signal) => {
+			exited = true;
+			cp.exitCode = code;
+			cp.signalCode = signal || null;
+			cp.stdout.push(null);
+			cp.stderr.push(null);
+			cp.emit("exit", code, signal || null);
+			process.nextTick(() => cp.emit("close", code, signal || null));
 		};
-		core.child_process = {
-			spawn: notSupported("spawn"),
-			spawnSync: notSupported("spawnSync"),
-			exec: notSupported("exec"),
-			execSync: notSupported("execSync"),
-			execFile: notSupported("execFile"),
-			execFileSync: notSupported("execFileSync"),
-			fork: notSupported("fork"),
+		const onError = (msg) => cp.emit("error", new Error(String(msg)));
+		const r = ops.child_spawn(
+			{ file: String(file), args: (args || []).map(String), cwd: options.cwd, envArray: envToArray(options.env) },
+			onStdout, onStderr, onExit, onError);
+		if (isErr(r)) { process.nextTick(() => cp.emit("error", cpErr(r, file))); return cp; }
+		cp.pid = r.pid;
+		return cp;
+	}
+
+	function normalizeExec(command, options, callback) {
+		if (typeof options === "function") { callback = options; options = {}; }
+		return { options: options || {}, callback };
+	}
+
+	function exec(command, options, callback) {
+		const { options: o, callback: cb } = normalizeExec(command, options, callback);
+		// exec runs the command through a shell.
+		const cp = spawn("/bin/sh", ["-c", String(command)], o);
+		collectAndCallback(cp, cb, o);
+		return cp;
+	}
+
+	function execFile(file, args, options, callback) {
+		if (typeof args === "function") { callback = args; args = []; options = {}; }
+		else if (typeof options === "function") { callback = options; options = {}; }
+		const cp = spawn(file, args || [], options || {});
+		collectAndCallback(cp, callback, options || {});
+		return cp;
+	}
+
+	function collectAndCallback(cp, callback, options) {
+		if (!callback) return;
+		const enc = options.encoding === "buffer" ? null : (options.encoding || "utf8");
+		const out = [], err = [];
+		cp.stdout.on("data", (c) => out.push(c));
+		cp.stderr.on("data", (c) => err.push(c));
+		cp.on("error", (e) => callback(e, decodeChunks(out, enc), decodeChunks(err, enc)));
+		cp.on("close", (code) => {
+			const e = code === 0 ? null : Object.assign(new Error(`Command failed`), { code });
+			callback(e, decodeChunks(out, enc), decodeChunks(err, enc));
+		});
+	}
+	const decodeChunks = (chunks, enc) => {
+		const buf = Buffer.concat(chunks);
+		return enc ? buf.toString(enc) : buf;
+	};
+
+	function spawnSync(file, args, options) {
+		if (!Array.isArray(args)) { options = args; args = []; }
+		options = options || {};
+		const input = options.input !== undefined ? Buffer.from(options.input) : undefined;
+		const r = ops.child_spawnsync(
+			{ file: String(file), args: (args || []).map(String), cwd: options.cwd, envArray: envToArray(options.env) },
+			input);
+		ops.release_pending();
+		if (isErr(r)) return { pid: 0, status: null, signal: null, error: cpErr(r, file), stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+		const enc = options.encoding && options.encoding !== "buffer" ? options.encoding : null;
+		const stdout = Buffer.from(r.stdout), stderr = Buffer.from(r.stderr);
+		return {
+			pid: r.pid,
+			status: r.status,
+			signal: r.signal || null,
+			error: r.error ? Object.assign(new Error(r.error), { code: "ENOENT" }) : undefined,
+			stdout: enc ? stdout.toString(enc) : stdout,
+			stderr: enc ? stderr.toString(enc) : stderr,
+			output: [null, enc ? stdout.toString(enc) : stdout, enc ? stderr.toString(enc) : stderr],
 		};
 	}
+
+	function execSync(command, options = {}) {
+		const r = spawnSync("/bin/sh", ["-c", String(command)], options);
+		if (r.error) throw r.error;
+		if (r.status !== 0) {
+			const e = new Error(`Command failed: ${command}\n${r.stderr}`);
+			e.status = r.status;
+			e.stderr = r.stderr;
+			e.stdout = r.stdout;
+			throw e;
+		}
+		return r.stdout;
+	}
+
+	function execFileSync(file, args, options) {
+		if (!Array.isArray(args)) { options = args; args = []; }
+		const r = spawnSync(file, args || [], options || {});
+		if (r.error) throw r.error;
+		if (r.status !== 0) { const e = new Error(`Command failed`); e.status = r.status; throw e; }
+		return r.stdout;
+	}
+
+	core.child_process = {
+		spawn,
+		spawnSync,
+		exec,
+		execSync,
+		execFile,
+		execFileSync,
+		fork: () => { throw new Error("child_process.fork is not supported (no node executable to re-spawn)"); },
+		ChildProcess,
+	};
 
 	// ---------------------------------------------------- CommonJS require
 
