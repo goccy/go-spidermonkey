@@ -38,12 +38,14 @@
 			const cb = tickQueue.shift();
 			n++;
 			// Isolate each tick: a throw in one must not drop the ticks queued
-			// after it (Node runs them all). The first error is re-thrown once
-			// the queue has drained so it still surfaces.
+			// after it (Node runs them all). Route it to the uncaughtException
+			// channel; only if unhandled is the first error re-thrown once the
+			// queue drains, so it surfaces to the host instead of vanishing.
 			try {
 				cb();
 			} catch (e) {
-				if (!threw) { firstErr = e; threw = true; }
+				const handled = globalThis.__node_emit_uncaught && globalThis.__node_emit_uncaught(e);
+				if (!handled && !threw) { firstErr = e; threw = true; }
 			}
 		}
 		if (threw) throw firstErr;

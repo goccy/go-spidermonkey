@@ -225,6 +225,19 @@
 		}
 	}
 
+	// The uncaughtException channel: an error escaping a process.nextTick
+	// callback (or a stream 'error' with no listener) routes here. If a handler
+	// is registered it runs and the error is considered handled; otherwise the
+	// caller (runTicks) rethrows so it surfaces to the host instead of vanishing
+	// as an unobserved rejection. Returns true iff handled.
+	globalThis.__node_emit_uncaught = (e) => {
+		if (process.listenerCount && process.listenerCount("uncaughtException") > 0) {
+			process.emit("uncaughtException", e, "uncaughtException");
+			return true;
+		}
+		return false;
+	};
+
 	// --------------------------------------------------------------- util
 
 	function inspect(v, opts = {}, depth = 0, seen = new Set()) {

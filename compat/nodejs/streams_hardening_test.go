@@ -86,3 +86,23 @@ func TestNextTickExceptionIsolation(t *testing.T) {
 		t.Fatalf("ticks ran = %q, want bad,good (a throw must not drop later ticks)", got)
 	}
 }
+
+// An error thrown in a process.nextTick callback is delivered to a
+// process.on('uncaughtException') handler, and later ticks still run.
+func TestNextTickUncaughtExceptionHandler(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = { ran: [], caught: "" };
+		process.on("uncaughtException", (e) => { __r.caught = e.message; });
+		process.nextTick(() => { __r.ran.push("bad"); throw new Error("kaboom"); });
+		process.nextTick(() => { __r.ran.push("good"); });
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `__r.caught`); got != "kaboom" {
+		t.Fatalf("uncaughtException handler caught %q, want kaboom", got)
+	}
+	if got := evalStr(t, js, `__r.ran.join(",")`); got != "bad,good" {
+		t.Fatalf("ticks ran = %q, want bad,good", got)
+	}
+}
