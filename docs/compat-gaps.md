@@ -38,7 +38,9 @@ Module class), punycode (real RFC 3492 + IDNA), readline, async_hooks
 Host-op-backed:
 - fs: read/write/stat/readdir/mkdir/rm/cp/copyFile/mkdtemp/rename, fd APIs,
   createReadStream/createWriteStream, watch/watchFile (mtime polling),
-  Stats/Dirent. Gated by Config.FSAccess; writes need WritableFS.
+  Stats/Dirent. Access control lives in Config.FS itself (a policy FS — e.g.
+  a sheena Volume via a small adapter — enforces its own rules in its
+  Open/OpenFile/… methods); writes need WritableFS.
 - crypto: hash/hmac, AES-GCM/CBC/CTR + ChaCha20-Poly1305 cipheriv, sign/verify
   (RSA/ECDSA), pbkdf2/scrypt/hkdf, generateKeyPair, publicEncrypt/
   privateDecrypt (RSA-OAEP/PKCS1), DiffieHellman, X509Certificate parse,
