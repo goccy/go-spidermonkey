@@ -23,8 +23,12 @@ import (
 )
 
 // maxSubtleKDFBytes bounds a guest-requested derived-key length so it can't
-// drive an unbounded host allocation (a fatal Go OOM).
-const maxSubtleKDFBytes = 1 << 24 // 16 MiB
+// drive an unbounded host allocation (a fatal Go OOM). maxSubtlePBKDF2Iter
+// bounds the iteration count (uninterruptible host CPU guard).
+const (
+	maxSubtleKDFBytes   = 1 << 24 // 16 MiB
+	maxSubtlePBKDF2Iter = 100_000_000
+)
 
 func rsaEncryptOAEP(newHash func() hash.Hash, pub *rsa.PublicKey, data, label []byte) ([]byte, error) {
 	return rsa.EncryptOAEP(newHash(), rand.Reader, pub, data, label)
@@ -341,8 +345,8 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 	iter := args[3].Int()
 	// iterations < 1 would silently degrade to a one-round KDF (no stretching);
 	// WebCrypto requires iterations >= 1.
-	if iter < 1 {
-		return subtleErr("OperationError: PBKDF2 iterations must be at least 1"), nil
+	if iter < 1 || iter > maxSubtlePBKDF2Iter {
+		return subtleErr("OperationError: PBKDF2 iterations out of range"), nil
 	}
 	length := args[4].Int() / 8
 	if length < 0 || length > maxSubtleKDFBytes {

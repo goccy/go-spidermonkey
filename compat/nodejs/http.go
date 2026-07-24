@@ -65,7 +65,8 @@ type httpPending struct {
 
 	done        chan struct{}
 	closeOnce   sync.Once
-	wroteHeader bool // only touched by the serving goroutine
+	wroteHeader bool          // only touched by the serving goroutine
+	resume      chan struct{} // buffered(1): the guest asks the body pump for the next chunk
 }
 
 func (p *httpPending) finish() { p.closeOnce.Do(func() { close(p.done) }) }
@@ -192,12 +193,28 @@ func (p *httpPending) shutdown(_ error) {
 
 func (rt *Runtime) httpOps() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
-		"http_listen":  rt.opHTTPListen,
-		"http_close":   rt.opHTTPClose,
-		"http_respond": rt.opHTTPRespond,
-		"http_write":   rt.opHTTPWrite,
-		"http_end":     rt.opHTTPEnd,
+		"http_listen":      rt.opHTTPListen,
+		"http_close":       rt.opHTTPClose,
+		"http_respond":     rt.opHTTPRespond,
+		"http_write":       rt.opHTTPWrite,
+		"http_end":         rt.opHTTPEnd,
+		"http_body_resume": rt.opHTTPBodyResume,
 	}
+}
+
+// opHTTPBodyResume lets the guest request the next request-body chunk (called
+// from IncomingMessage._read), driving the pump's flow control.
+func (rt *Runtime) opHTTPBodyResume(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 1 {
+		return spidermonkey.Undefined(), nil
+	}
+	if p := rt.pendingReq(args[0]); p != nil && p.resume != nil {
+		select {
+		case p.resume <- struct{}{}:
+		default: // already primed; the pump will read on the next turn
+		}
+	}
+	return spidermonkey.Undefined(), nil
 }
 
 func (rt *Runtime) opHTTPListen(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -290,6 +307,13 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rt := s.rt
 	hasBody := r.ContentLength != 0 || r.Header.Get("Transfer-Encoding") != ""
+	if hasBody {
+		// Allocate the flow-control channel BEFORE dispatch: the guest's _read can
+		// fire (and call http_body_resume) as soon as the dispatch Post runs on the
+		// loop, which races the pump-goroutine setup below if p.resume isn't set yet.
+		p.resume = make(chan struct{}, 1)
+		p.resume <- struct{}{} // prime: allow the first read
+	}
 	rt.loop.Post(func() error {
 		// Dispatch immediately with NO buffered body; the request body streams
 		// in via __node_http_body chunks (below).
@@ -321,6 +345,18 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer close(pumpDone)
 			buf := make([]byte, 32<<10)
 			for {
+				// Flow control: read the next chunk only when the guest
+				// IncomingMessage asked for more (its _read → http_body_resume),
+				// so a handler that stops (or never) reads the body can't force
+				// the whole body into guest memory (which, at MaxMemoryBytes,
+				// would abort the entire instance). Bounds in-flight to ~1 chunk.
+				select {
+				case <-p.resume:
+				case <-p.done: // response finished (handler didn't drain the body)
+					return
+				case <-r.Context().Done():
+					return
+				}
 				n, rerr := r.Body.Read(buf)
 				if n > 0 {
 					chunk := append([]byte(nil), buf[:n]...)

@@ -419,13 +419,20 @@ func (st *fetchStream) cancel(cfg spidermonkey.Config, args []spidermonkey.Value
 	return spidermonkey.Undefined(), nil
 }
 
+// maxFetchBody caps a buffered fetch response body so an allow-listed but
+// hostile/huge endpoint can't OOM the host via r.text()/json()/bytes().
+const maxFetchBody = 100 << 20 // 100 MiB
+
 // readAll drains the remaining body to EOF (the bytes/text/json path).
 func (st *fetchStream) readAll() ([]byte, error) {
 	if st.done {
 		return nil, nil
 	}
-	data, err := io.ReadAll(st.body)
+	data, err := io.ReadAll(io.LimitReader(st.body, maxFetchBody+1))
 	st.finish()
+	if err == nil && int64(len(data)) > maxFetchBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxFetchBody)
+	}
 	return data, err
 }
 

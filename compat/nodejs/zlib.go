@@ -46,6 +46,23 @@ func (rt *Runtime) opZlibTransform(cfg spidermonkey.Config, args []spidermonkey.
 	return rt.trackReturn(u8), nil
 }
 
+// maxZlibOutput caps decompressed output so a small "zip bomb" can't expand to
+// gigabytes on the host heap before it reaches the (capped) guest memory.
+const maxZlibOutput = 256 << 20 // 256 MiB
+
+// readCapped reads r but errors past maxZlibOutput instead of allocating without
+// bound.
+func readCapped(r io.Reader) ([]byte, error) {
+	out, err := io.ReadAll(io.LimitReader(r, maxZlibOutput+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(out)) > maxZlibOutput {
+		return nil, fmt.Errorf("decompressed output exceeds %d bytes", maxZlibOutput)
+	}
+	return out, nil
+}
+
 func zlibRun(method string, data []byte) ([]byte, error) {
 	switch method {
 	case "gzip":
@@ -63,7 +80,7 @@ func zlibRun(method string, data []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return io.ReadAll(r)
+		return readCapped(r)
 	case "deflate":
 		var buf bytes.Buffer
 		w := zlib.NewWriter(&buf)
@@ -79,7 +96,7 @@ func zlibRun(method string, data []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return io.ReadAll(r)
+		return readCapped(r)
 	case "deflateRaw":
 		var buf bytes.Buffer
 		w, _ := flate.NewWriter(&buf, flate.DefaultCompression)
@@ -93,7 +110,7 @@ func zlibRun(method string, data []byte) ([]byte, error) {
 	case "inflateRaw":
 		r := flate.NewReader(bytes.NewReader(data))
 		defer r.Close()
-		return io.ReadAll(r)
+		return readCapped(r)
 	case "brotliCompress":
 		var buf bytes.Buffer
 		w := brotli.NewWriter(&buf)
@@ -105,7 +122,7 @@ func zlibRun(method string, data []byte) ([]byte, error) {
 		}
 		return buf.Bytes(), nil
 	case "brotliDecompress":
-		return io.ReadAll(brotli.NewReader(bytes.NewReader(data)))
+		return readCapped(brotli.NewReader(bytes.NewReader(data)))
 	}
 	return nil, fmt.Errorf("unsupported zlib method %q", method)
 }

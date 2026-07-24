@@ -242,6 +242,9 @@
 		const socket = makeSocket(remoteAddress, remotePort);
 		socket.encrypted = !!encrypted;
 		const req = new IncomingMessage({ method, url, rawHeaders, socket });
+		// _read is the backpressure signal: the Readable calls it when it wants
+		// more, which tells the host body pump to send the next chunk.
+		req._read = () => { if (hasBody) ops.http_body_resume(reqId); };
 		// Body chunks arrive via __node_http_body; register for routing.
 		openRequests.set(reqId, req);
 		const res = new ServerResponse({ reqId, socket, req });
