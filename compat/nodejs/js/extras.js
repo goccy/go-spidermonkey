@@ -267,7 +267,7 @@
 		host = host || "127.0.0.1";
 		this.connecting = true;
 		if (connectListener) this.once("connect", connectListener);
-		const onData = (chunk) => this.push(chunk);
+		const onData = (chunk) => this.push(Buffer.from(chunk));
 		const onEnd = () => this.push(null);
 		const onError = (msg) => { const e = new Error(msg); e.code = "ECONNRESET"; this.emit("error", e); };
 		const onConnect = () => {
@@ -318,7 +318,7 @@
 			const at = remote.lastIndexOf(":");
 			sock.remoteAddress = remote.slice(0, at);
 			sock.remotePort = Number(remote.slice(at + 1));
-			const onData = (chunk) => sock.push(chunk);
+			const onData = (chunk) => sock.push(Buffer.from(chunk));
 			const onEnd = () => sock.push(null);
 			const onError = (msg) => sock.emit("error", new Error(msg));
 			ops.net_attach(id, onData, onEnd, onError);

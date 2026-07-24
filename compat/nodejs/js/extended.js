@@ -41,14 +41,27 @@
 	const counts = new Map();
 	const timers = new Map();
 	let groupIndent = "";
-	const writeOut = (s) => con.log(groupIndent + String(s).replace(/\n/g, "\n" + groupIndent));
+	// Keep the raw sinks; the public log/info/warn/error/debug re-apply the
+	// current group indent to every line.
+	const rawLog = con.log.bind(con);
+	const rawErr = con.error.bind(con);
+	const indent = (args) => {
+		const text = args.map((a) => (typeof a === "string" ? a : core.util.inspect(a, { raw: true }))).join(" ");
+		return groupIndent ? groupIndent + text.replace(/\n/g, "\n" + groupIndent) : text;
+	};
+	const writeOut = (s) => rawLog(groupIndent + String(s).replace(/\n/g, "\n" + groupIndent));
 
 	Object.assign(con, {
+		log: (...a) => rawLog(indent(a)),
+		info: (...a) => rawLog(indent(a)),
+		debug: (...a) => rawLog(indent(a)),
+		warn: (...a) => rawErr(indent(a)),
+		error: (...a) => rawErr(indent(a)),
 		dir: (obj, opts) => writeOut(core.util.inspect(obj, opts || {})),
 		dirxml: (...a) => con.log(...a),
 		trace: (...a) => con.error("Trace:", ...a),
-		group: (...a) => { if (a.length) con.log(...a); groupIndent += "  "; },
-		groupCollapsed: (...a) => { if (a.length) con.log(...a); groupIndent += "  "; },
+		group: (...a) => { if (a.length) rawLog(indent(a)); groupIndent += "  "; },
+		groupCollapsed: (...a) => { if (a.length) rawLog(indent(a)); groupIndent += "  "; },
 		groupEnd: () => { groupIndent = groupIndent.slice(0, -2); },
 		count: (label = "default") => {
 			const n = (counts.get(label) || 0) + 1;

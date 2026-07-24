@@ -319,13 +319,15 @@
 			const st = this._ws;
 			if (!st.ending || st.finished || st.pending > 0 || st.destroyed) return;
 			st.finished = true;
-			const done = () => {
+			// Node emits 'finish' on a later tick, so listeners attached right
+			// after end() still fire.
+			const done = () => process.nextTick(() => {
 				this.finished = true;
 				this.writable = false;
 				this.writableFinished = true;
 				this.emit("finish");
 				this.emit("close");
-			};
+			});
 			if (this._final) this._final((err) => { if (err) this.destroy(err); else done(); });
 			else done();
 		},

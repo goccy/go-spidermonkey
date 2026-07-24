@@ -34,17 +34,20 @@ type resolution struct {
 
 // coreModules are the node: builtins compat/nodejs implements (js/corelibs.js).
 var coreModules = map[string]bool{
-	"assert": true, "async_hooks": true, "buffer": true,
-	"child_process": true, "cluster": true, "console": true,
-	"constants": true, "crypto": true, "diagnostics_channel": true,
-	"dns": true, "events": true, "fs": true, "fs/promises": true,
-	"http": true, "http2": true, "https": true, "inspector": true,
-	"module": true, "net": true, "os": true, "path": true,
+	"assert": true, "assert/strict": true, "async_hooks": true,
+	"buffer": true, "child_process": true, "cluster": true,
+	"console": true, "constants": true, "crypto": true,
+	"diagnostics_channel": true, "dns": true, "dns/promises": true,
+	"events": true, "fs": true, "fs/promises": true, "http": true,
+	"http2": true, "https": true, "inspector": true,
+	"inspector/promises": true, "module": true, "net": true, "os": true,
+	"path": true, "path/posix": true, "path/win32": true,
 	"perf_hooks": true, "process": true, "punycode": true,
-	"querystring": true, "readline": true, "stream": true,
-	"stream/promises": true, "stream/web": true, "string_decoder": true,
+	"querystring": true, "readline": true, "readline/promises": true,
+	"stream": true, "stream/consumers": true, "stream/promises": true,
+	"stream/web": true, "string_decoder": true, "sys": true,
 	"timers": true, "timers/promises": true, "tls": true, "tty": true,
-	"url": true, "util": true, "v8": true, "vm": true,
+	"url": true, "util": true, "util/types": true, "v8": true, "vm": true,
 	"worker_threads": true, "zlib": true,
 }
 

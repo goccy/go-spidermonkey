@@ -29,6 +29,11 @@ func newRuntime(t *testing.T, cfg spidermonkey.Config, opts ...nodejs.Options) (
 
 func evalStr(t *testing.T, js *spidermonkey.JS, src string) string {
 	t.Helper()
+	return evalVal(t, js, src).String()
+}
+
+func evalVal(t *testing.T, js *spidermonkey.JS, src string) spidermonkey.Value {
+	t.Helper()
 	r, err := js.Eval(context.Background(), src)
 	if err != nil {
 		t.Fatalf("Eval(%s): %v", src, err)
@@ -36,7 +41,7 @@ func evalStr(t *testing.T, js *spidermonkey.JS, src string) string {
 	if r.Error != nil {
 		t.Fatalf("Eval(%s) threw: %v", src, r.Error)
 	}
-	return r.Value.String()
+	return r.Value
 }
 
 func runScript(t *testing.T, rt *nodejs.Runtime, src string) {

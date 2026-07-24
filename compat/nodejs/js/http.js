@@ -257,7 +257,15 @@
 	class ClientRequest extends Writable {
 		constructor(options, cb) {
 			super();
-			const o = typeof options === "string" ? parseRequestURL(options) : options;
+			// Node accepts (url), (url, options), (options); url may be a string
+			// or URL, and options may add/override method/headers/path.
+			let o;
+			if (typeof options === "string" || options instanceof URL) {
+				o = parseRequestURL(String(options));
+			} else {
+				o = { ...options };
+				if (o.headers) o.headers = { ...o.headers };
+			}
 			this.method = (o.method || "GET").toUpperCase();
 			this._headers = {};
 			for (const [k, v] of Object.entries(o.headers || {})) this._headers[k] = v;
@@ -295,12 +303,30 @@
 		const u = new URL(url);
 		return { protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname + u.search, href: u.href };
 	}
-	function httpRequest(options, cb) {
-		const req = new ClientRequest(options, cb);
-		return req;
+	// Normalize Node's (url), (url, cb), (url, options, cb), (options, cb)
+	// call shapes into a single {options, cb}.
+	function normalizeRequestArgs(args) {
+		let url, options, cb;
+		if (typeof args[0] === "string" || args[0] instanceof URL) {
+			url = args[0];
+			if (typeof args[1] === "function") { cb = args[1]; }
+			else { options = args[1]; cb = args[2]; }
+		} else {
+			options = args[0]; cb = args[1];
+		}
+		if (url !== undefined) {
+			const base = parseRequestURL(String(url));
+			options = { ...base, ...(options || {}) };
+		}
+		return { options: options || {}, cb };
 	}
-	function httpGet(options, cb) {
-		const req = httpRequest(options, cb);
+	function httpRequest(...args) {
+		const { options, cb } = normalizeRequestArgs(args);
+		return new ClientRequest(options, cb);
+	}
+	function httpGet(...args) {
+		const req = httpRequest(...args);
+		req.method = "GET";
 		req.end();
 		return req;
 	}
