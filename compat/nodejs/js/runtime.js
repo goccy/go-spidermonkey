@@ -300,14 +300,43 @@
 		readInt16LE(o = 0) { return this._dv().getInt16(o, true); }
 		readInt32BE(o = 0) { return this._dv().getInt32(o, false); }
 		readInt32LE(o = 0) { return this._dv().getInt32(o, true); }
+		readFloatBE(o = 0) { return this._dv().getFloat32(o, false); }
+		readFloatLE(o = 0) { return this._dv().getFloat32(o, true); }
 		readDoubleBE(o = 0) { return this._dv().getFloat64(o, false); }
 		readDoubleLE(o = 0) { return this._dv().getFloat64(o, true); }
 		readBigUInt64BE(o = 0) { return this._dv().getBigUint64(o, false); }
+		readBigUInt64LE(o = 0) { return this._dv().getBigUint64(o, true); }
+		readBigInt64BE(o = 0) { return this._dv().getBigInt64(o, false); }
+		readBigInt64LE(o = 0) { return this._dv().getBigInt64(o, true); }
+		writeInt8(v, o = 0) { this._dv().setInt8(o, v); return o + 1; }
 		writeUInt16BE(v, o = 0) { this._dv().setUint16(o, v, false); return o + 2; }
 		writeUInt16LE(v, o = 0) { this._dv().setUint16(o, v, true); return o + 2; }
 		writeUInt32BE(v, o = 0) { this._dv().setUint32(o, v, false); return o + 4; }
 		writeUInt32LE(v, o = 0) { this._dv().setUint32(o, v, true); return o + 4; }
+		writeInt16BE(v, o = 0) { this._dv().setInt16(o, v, false); return o + 2; }
+		writeInt16LE(v, o = 0) { this._dv().setInt16(o, v, true); return o + 2; }
 		writeInt32BE(v, o = 0) { this._dv().setInt32(o, v, false); return o + 4; }
+		writeInt32LE(v, o = 0) { this._dv().setInt32(o, v, true); return o + 4; }
+		writeFloatBE(v, o = 0) { this._dv().setFloat32(o, v, false); return o + 4; }
+		writeFloatLE(v, o = 0) { this._dv().setFloat32(o, v, true); return o + 4; }
+		writeDoubleBE(v, o = 0) { this._dv().setFloat64(o, v, false); return o + 8; }
+		writeDoubleLE(v, o = 0) { this._dv().setFloat64(o, v, true); return o + 8; }
+		writeBigUInt64BE(v, o = 0) { this._dv().setBigUint64(o, BigInt(v), false); return o + 8; }
+		writeBigUInt64LE(v, o = 0) { this._dv().setBigUint64(o, BigInt(v), true); return o + 8; }
+		writeBigInt64BE(v, o = 0) { this._dv().setBigInt64(o, BigInt(v), false); return o + 8; }
+		writeBigInt64LE(v, o = 0) { this._dv().setBigInt64(o, BigInt(v), true); return o + 8; }
+		// Variable-width LE/BE integer accessors (1..6 bytes).
+		readUIntLE(o = 0, len = 1) { let v = 0, m = 1; for (let i = 0; i < len; i++) { v += this[o + i] * m; m *= 256; } return v; }
+		readUIntBE(o = 0, len = 1) { let v = 0; for (let i = 0; i < len; i++) v = v * 256 + this[o + i]; return v; }
+		readIntLE(o = 0, len = 1) { let v = this.readUIntLE(o, len); const s = Math.pow(2, 8 * len - 1); if (v >= s) v -= s * 2; return v; }
+		readIntBE(o = 0, len = 1) { let v = this.readUIntBE(o, len); const s = Math.pow(2, 8 * len - 1); if (v >= s) v -= s * 2; return v; }
+		writeUIntLE(v, o = 0, len = 1) { let n = v; for (let i = 0; i < len; i++) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
+		writeUIntBE(v, o = 0, len = 1) { let n = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
+		writeIntLE(v, o = 0, len = 1) { return this.writeUIntLE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
+		writeIntBE(v, o = 0, len = 1) { return this.writeUIntBE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
+		swap16() { for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }
+		swap32() { for (let i = 0; i < this.length; i += 4) { let a = this[i], b = this[i + 1]; this[i] = this[i + 3]; this[i + 1] = this[i + 2]; this[i + 2] = b; this[i + 3] = a; } return this; }
+		swap64() { for (let i = 0; i < this.length; i += 8) { for (let j = 0; j < 4; j++) { const t = this[i + j]; this[i + j] = this[i + 7 - j]; this[i + 7 - j] = t; } } return this; }
 	}
 
 	function wrap(u8) { return Object.setPrototypeOf(u8, Buffer.prototype); }
@@ -324,16 +353,32 @@
 		switch (normEnc(encoding)) {
 			case "utf8": return wrap(new TextEncoder().encode(s));
 			case "hex": {
-				const clean = s.length % 2 ? s.slice(0, -1) : s;
-				const out = wrap(new Uint8Array(clean.length / 2));
-				for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16) || 0;
-				return out;
+				// Node stops at the first non-hex character (no zero-fill), and a
+				// trailing odd nibble is dropped.
+				const isHex = (c) => (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F");
+				const bytes = [];
+				for (let i = 0; i + 1 < s.length + 1; i += 2) {
+					const hi = s[i], lo = s[i + 1];
+					if (hi === undefined || lo === undefined || !isHex(hi) || !isHex(lo)) break;
+					bytes.push(parseInt(hi + lo, 16));
+				}
+				return wrap(Uint8Array.from(bytes));
 			}
 			case "base64": case "base64url": {
-				const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, ""));
-				const out = wrap(new Uint8Array(bin.length));
-				for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-				return out;
+				// Node's base64 decoder is lenient: it ignores characters outside the
+				// alphabet rather than throwing (unlike atob), decoding what it can.
+				const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+				const clean = s.replace(/-/g, "+").replace(/_/g, "/");
+				const out = [];
+				let buf = 0, bits = 0;
+				for (let i = 0; i < clean.length; i++) {
+					const v = B64.indexOf(clean[i]);
+					if (v < 0) continue; // skip whitespace/padding/invalid
+					buf = (buf << 6) | v;
+					bits += 6;
+					if (bits >= 8) { bits -= 8; out.push((buf >> bits) & 0xff); }
+				}
+				return wrap(Uint8Array.from(out));
 			}
 			case "latin1": case "ascii": {
 				const out = wrap(new Uint8Array(s.length));

@@ -298,6 +298,9 @@
 	}
 
 	function format(f, ...args) {
+		// util.format() with no args is "" (so console.log() prints a blank line,
+		// not "undefined").
+		if (arguments.length === 0) return "";
 		if (typeof f !== "string") {
 			return [f, ...args].map((a) => inspect(a, { raw: true })).join(" ");
 		}
@@ -372,8 +375,12 @@
 	core.querystring = {
 		escape: qsEscape,
 		unescape: qsUnescape,
-		parse(str, sep = "&", eq = "=") {
+		parse(str, sep = "&", eq = "=", options = {}) {
 			const out = Object.create(null);
+			// Node caps at 1000 keys by default (maxKeys) as a DoS guard against a
+			// hostile query string; 0 means unlimited.
+			const maxKeys = options.maxKeys === undefined ? 1000 : options.maxKeys;
+			let keyCount = 0;
 			for (const part of String(str ?? "").split(sep)) {
 				if (!part) continue;
 				const i = part.indexOf(eq);
@@ -382,7 +389,11 @@
 				if (k in out) {
 					if (Array.isArray(out[k])) out[k].push(v);
 					else out[k] = [out[k], v];
-				} else out[k] = v;
+				} else {
+					if (maxKeys > 0 && keyCount >= maxKeys) break;
+					keyCount++;
+					out[k] = v;
+				}
 			}
 			return out;
 		},

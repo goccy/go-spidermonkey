@@ -355,7 +355,13 @@
 		}
 		if (url !== undefined) {
 			const base = parseRequestURL(String(url));
-			options = { ...base, ...(options || {}) };
+			const override = options || {};
+			options = { ...base, ...override };
+			// A URL-component override (path/hostname/host/port/protocol) makes the
+			// base href stale; drop it so ClientRequest rebuilds from components.
+			if (["path", "hostname", "host", "port", "protocol"].some((k) => k in override)) {
+				delete options.href;
+			}
 		}
 		return { options: options || {}, cb };
 	}
