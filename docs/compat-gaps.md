@@ -20,10 +20,15 @@ test guaranteeing behavior (new AND previously-existing modules).
   across the wasm bridge; `runInThisContext` (indirect eval) is provided,
   separate-realm variants throw.
 - cfworkers `HTMLRewriter` — a large streaming HTML transformer; deferred.
-- Real preemptive `worker_threads` / `cluster` — the engine is single
-  linear-memory per instance; the Agents cluster is message-passing, not
-  shared-heap threads. worker_threads stays a main-thread-only surface
-  (isMainThread true) + throwing Worker ctor.
+- `cluster` — models forking the *whole process* to share a listening
+  socket; there is no process to fork here. Load-only stub.
+
+Note: `worker_threads` was previously listed here as impossible. That was
+WRONG — Node's workers are separate isolates with their own heap that
+communicate by structured-clone messaging (sharing only SharedArrayBuffer),
+which is EXACTLY the engine's agent cluster (js.Agents(): goroutine thread +
+separate realm + clone transport). It is now implemented as REAL preemptive
+parallelism (see below).
 
 ## In scope — implementing
 
@@ -78,6 +83,14 @@ Host-op-backed:
       chmod/chown (no-op-ish), symlink/readlink, Stats/Dirent classes,
       ReadStream/WriteStream classes, watch (poll or unsupported)
 - [x] dgram: UDP sockets (Go net UDPConn) — Dial/Listen gated
+
+worker_threads (real parallelism over js.Agents()):
+- [x] Worker (eval + file), postMessage both ways, workerData, threadId,
+      parentPort, 'online'/'message'/'exit'/'error', terminate(),
+      SharedArrayBuffer sharing (Atomics across threads). Limitation:
+      worker code is self-contained — inside a worker only require
+      ('worker_threads'|'buffer') is available (other node: ops live on the
+      main interpreter).
 
 cfworkers:
 - [x] scheduled + queue handler dispatch (Pool.Scheduled / Pool.Queue)

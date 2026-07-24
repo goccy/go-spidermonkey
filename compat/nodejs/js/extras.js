@@ -570,21 +570,63 @@
 		},
 	};
 
+	// worker_threads over the engine's agent cluster (real goroutine threads,
+	// separate realms, structured-clone messaging, SharedArrayBuffer sharing).
+	// In a worker realm the bootstrap (js/worker.js) sets __wt_parentPort etc.
+	const inWorker = globalThis.__wt_isMainThread === false;
+
+	class Worker extends core.events {
+		constructor(filename, options = {}) {
+			super();
+			let source;
+			if (options.eval) {
+				source = String(filename);
+			} else {
+				// Main reads the worker file; workers run as scripts in their
+				// own realm (self-contained — see js/worker.js).
+				const fs = core.fs;
+				let p = filename;
+				if (filename && typeof filename === "object" && filename.href) {
+					p = decodeURIComponent(new URL(filename.href).pathname);
+				}
+				source = fs.readFileSync(String(p), "utf8");
+			}
+			const r = ops.worker_spawn(source, options.workerData ?? null, this);
+			this._id = r.id;
+			this.threadId = r.threadId;
+		}
+		postMessage(value) { ops.worker_post(this._id, value); return this; }
+		terminate() { ops.worker_terminate(this._id); return Promise.resolve(0); }
+		ref() { return this; }
+		unref() { return this; }
+		// The host pump calls this to deliver an event.
+		_emit(type, value) {
+			if (type === "message") this.emit("message", value);
+			else if (type === "error") this.emit("error", value instanceof Error ? value : new Error(String(value)));
+			else this.emit(type, value);
+		}
+		addEventListener(type, fn) { return this.on(type, (v) => fn({ data: v })); }
+		removeEventListener() { return this; }
+	}
+
 	core.worker_threads = {
-		isMainThread: true,
-		threadId: 0,
-		workerData: null,
-		parentPort: null,
+		isMainThread: !inWorker,
+		threadId: inWorker ? globalThis.__wt_threadId : 0,
+		workerData: inWorker ? globalThis.__wt_workerData : null,
+		parentPort: inWorker ? globalThis.__wt_parentPort : null,
 		resourceLimits: {},
 		SHARE_ENV: Symbol.for("nodejs.worker_threads.SHARE_ENV"),
-		Worker: class Worker {
-			constructor() { notSupported("worker_threads.Worker")(); }
-		},
+		Worker,
 		MessageChannel: class MessageChannel {
 			constructor() { notSupported("worker_threads.MessageChannel")(); }
 		},
 		MessagePort: class MessagePort {},
+		BroadcastChannel: class BroadcastChannel {
+			constructor() { notSupported("worker_threads.BroadcastChannel")(); }
+		},
 		markAsUntransferable: () => {},
+		getEnvironmentData: () => undefined,
+		setEnvironmentData: () => {},
 	};
 
 	const dnsErr = (cb) => queueMicrotask(() => cb(Object.assign(new Error("dns is not supported yet in this runtime"), { code: "ENOTSUP" })));

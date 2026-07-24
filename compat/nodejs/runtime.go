@@ -61,6 +61,7 @@ type Runtime struct {
 	http         *httpState
 	httpDispatch *spidermonkey.Object // __node_http_dispatch
 	net          *netState
+	workers      *workerManager
 
 	mu             sync.Mutex
 	pendingReturns []*spidermonkey.Object // handles returned to the guest, freed on release_pending
@@ -104,6 +105,7 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	}
 	rt.web = w
 	rt.loop = w.Loop()
+	rt.workers = newWorkerManager(rt)
 
 	ops, err := js.NewObject()
 	if err != nil {
@@ -166,6 +168,7 @@ func (rt *Runtime) Web() *web.Web { return rt.web }
 func (rt *Runtime) Close() error {
 	rt.closeHTTP()
 	rt.closeNet()
+	rt.workers.close()
 	rt.mu.Lock()
 	pending := rt.pendingReturns
 	rt.pendingReturns = nil
@@ -296,7 +299,7 @@ func (rt *Runtime) ops() map[string]spidermonkey.Func {
 		"crypto_hmac":     rt.opCryptoHMAC,
 	}
 	for _, group := range []map[string]spidermonkey.Func{
-		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(),
+		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.workerOps(),
 	} {
 		for name, fn := range group {
 			table[name] = fn
