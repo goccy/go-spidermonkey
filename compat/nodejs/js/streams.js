@@ -1,9 +1,12 @@
 // compat/nodejs: node:stream (compact behavioral implementation —
 // Readable/Writable/Duplex/Transform/PassThrough, pipe, finished/pipeline),
 // node:string_decoder, and the fs stream constructors. Evaluated after
-// corelibs.js. Sized for the Express dependency tree (body parsing reads
-// 'data'/'end'; responses write/end; send pipes file streams), not spec
-// completeness.
+// corelibs.js.
+//
+// Every constructor here is FUNCTION-style, never class syntax: the
+// util.inherits generation of npm packages (send, iconv-lite, ...) calls
+// `Stream.call(this)` / `Transform.call(this, opts)`, which class
+// constructors reject.
 (() => {
 	"use strict";
 	const core = globalThis.__node_core_registry;
@@ -28,8 +31,6 @@
 		return 0;
 	}
 
-	// A function-style constructor on purpose: iconv-lite invokes it as
-	// `StringDecoder.call(this, enc)`, which a class constructor rejects.
 	function StringDecoder(encoding) {
 		this.encoding = String(encoding || "utf8").toLowerCase().replace("utf-8", "utf8");
 		this._pending = null;
@@ -66,26 +67,36 @@
 		return chunk;
 	}
 
-	class Readable extends EventEmitter {
-		constructor(options = {}) {
-			super();
-			this._rs = {
-				buffer: [],
-				flowing: null,
-				ended: false,
-				endEmitted: false,
-				destroyed: false,
-				decoder: null,
-				flowScheduled: false,
-				pipes: [],
-			};
-			this.readable = true;
-			this.readableEnded = false;
-			if (typeof options.read === "function") this._read = options.read;
-			if (typeof options.destroy === "function") this._destroy = options.destroy;
-			if (options.encoding) this.setEncoding(options.encoding);
-		}
-		_read(size) {}
+	function totalLength(chunks) {
+		let n = 0;
+		for (const c of chunks) n += c.length;
+		return n;
+	}
+
+	function Readable(options = {}) {
+		EventEmitter.call(this);
+		this._rs = {
+			buffer: [],
+			flowing: null,
+			ended: false,
+			endEmitted: false,
+			destroyed: false,
+			decoder: null,
+			flowScheduled: false,
+			consumed: false,
+			pipes: [],
+		};
+		this.readable = true;
+		this.readableEnded = false;
+		if (typeof options.read === "function") this._read = options.read;
+		if (typeof options.destroy === "function") this._destroy = options.destroy;
+		if (options.encoding) this.setEncoding(options.encoding);
+	}
+	Object.setPrototypeOf(Readable.prototype, EventEmitter.prototype);
+	Object.setPrototypeOf(Readable, EventEmitter);
+
+	Object.assign(Readable.prototype, {
+		_read(size) {},
 		push(chunk, encoding) {
 			const st = this._rs;
 			if (chunk === null) {
@@ -97,12 +108,13 @@
 			if (st.flowing) this._scheduleFlow();
 			else this.emit("readable");
 			return true;
-		}
+		},
 		unshift(chunk, encoding) {
 			this._rs.buffer.unshift(toChunk(chunk, encoding));
-		}
+		},
 		read(size) {
 			const st = this._rs;
+			st.consumed = true; // paused-mode consumer exists: 'end' may emit
 			if (st.buffer.length === 0) {
 				if (st.ended) this._scheduleFlow(); // deliver 'end'
 				else this._callRead();
@@ -119,17 +131,17 @@
 			}
 			if (st.ended && st.buffer.length === 0) this._scheduleFlow();
 			return st.decoder ? st.decoder.write(out) : out;
-		}
+		},
 		setEncoding(enc) {
 			this._rs.decoder = new StringDecoder(enc);
 			return this;
-		}
+		},
 		on(type, fn) {
-			super.on(type, fn);
+			EventEmitter.prototype.on.call(this, type, fn);
 			if (type === "data" && this._rs.flowing === null) this.resume();
 			return this;
-		}
-		addListener(type, fn) { return this.on(type, fn); }
+		},
+		addListener(type, fn) { return this.on(type, fn); },
 		resume() {
 			const st = this._rs;
 			if (st.flowing !== true) {
@@ -138,18 +150,18 @@
 				this._scheduleFlow();
 			}
 			return this;
-		}
+		},
 		pause() {
 			if (this._rs.flowing !== false) {
 				this._rs.flowing = false;
 				this.emit("pause");
 			}
 			return this;
-		}
-		isPaused() { return this._rs.flowing === false; }
+		},
+		isPaused() { return this._rs.flowing === false; },
 		_callRead() {
 			try { this._read(16384); } catch (e) { this.destroy(e); }
-		}
+		},
 		_scheduleFlow() {
 			const st = this._rs;
 			if (st.flowScheduled) return;
@@ -158,7 +170,7 @@
 				st.flowScheduled = false;
 				this._flowNow();
 			});
-		}
+		},
 		_flowNow() {
 			const st = this._rs;
 			if (st.destroyed) return;
@@ -168,7 +180,10 @@
 				this.emit("data", chunk);
 			}
 			if (st.flowing && st.buffer.length === 0 && !st.ended) this._callRead();
-			if (st.ended && st.buffer.length === 0 && !st.endEmitted && st.flowing !== false) {
+			// 'end' fires only once a consumer exists (flowing via 'data'/
+			// resume, or paused-mode read()) — Node never ends a stream nobody
+			// started reading, and late listeners must still get their data.
+			if (st.ended && st.buffer.length === 0 && !st.endEmitted && (st.flowing === true || st.consumed)) {
 				st.endEmitted = true;
 				this.readable = false;
 				this.readableEnded = true;
@@ -179,7 +194,7 @@
 				this.emit("end");
 				this.emit("close");
 			}
-		}
+		},
 		pipe(dest, options = {}) {
 			const st = this._rs;
 			const rec = { dest };
@@ -194,7 +209,7 @@
 			st.pipes.push(rec);
 			dest.emit("pipe", this);
 			return dest;
-		}
+		},
 		unpipe(dest) {
 			const st = this._rs;
 			for (let i = st.pipes.length - 1; i >= 0; i--) {
@@ -207,7 +222,7 @@
 				rec.dest.emit("unpipe", this);
 			}
 			return this;
-		}
+		},
 		destroy(err) {
 			const st = this._rs;
 			if (st.destroyed) return this;
@@ -221,31 +236,39 @@
 			if (this._destroy) this._destroy(err, done);
 			else done(err);
 			return this;
-		}
-		[Symbol.asyncIterator]() {
-			const chunks = [];
-			let ended = false, error = null, wake = null;
-			this.on("data", (c) => { chunks.push(c); if (wake) wake(); });
-			this.on("end", () => { ended = true; if (wake) wake(); });
-			this.on("error", (e) => { error = e; if (wake) wake(); });
-			const next = async () => {
-				for (;;) {
-					if (chunks.length) return { value: chunks.shift(), done: false };
-					if (error) throw error;
-					if (ended) return { value: undefined, done: true };
-					await new Promise((res) => { wake = res; });
-					wake = null;
-				}
-			};
-			return { next, [Symbol.asyncIterator]() { return this; } };
-		}
-	}
+		},
+	});
 
-	function totalLength(chunks) {
-		let n = 0;
-		for (const c of chunks) n += c.length;
-		return n;
-	}
+	Readable.prototype[Symbol.asyncIterator] = function asyncIterator() {
+		const chunks = [];
+		let ended = false, error = null, wake = null;
+		this.on("data", (c) => { chunks.push(c); if (wake) wake(); });
+		this.on("end", () => { ended = true; if (wake) wake(); });
+		this.on("error", (e) => { error = e; if (wake) wake(); });
+		const next = async () => {
+			for (;;) {
+				if (chunks.length) return { value: chunks.shift(), done: false };
+				if (error) throw error;
+				if (ended) return { value: undefined, done: true };
+				await new Promise((res) => { wake = res; });
+				wake = null;
+			}
+		};
+		return { next, [Symbol.asyncIterator]() { return this; } };
+	};
+
+	Readable.from = (iterable) => {
+		const rs = new Readable({ read() {} });
+		(async () => {
+			try {
+				for await (const chunk of iterable) rs.push(chunk);
+				rs.push(null);
+			} catch (e) {
+				rs.destroy(e);
+			}
+		})();
+		return rs;
+	};
 
 	// ------------------------------------------------------------ Writable
 
@@ -272,7 +295,6 @@
 				return false;
 			}
 			st.pending++;
-			let returned = true;
 			this._write(toChunk(chunk, encoding), encoding || "utf8", (err) => {
 				st.pending--;
 				if (err) { this.destroy(err); if (callback) callback(err); return; }
@@ -280,7 +302,7 @@
 				if (st.pending === 0 && !st.ending) this.emit("drain");
 				this._maybeFinish();
 			});
-			return returned;
+			return true;
 		},
 		end(chunk, encoding, callback) {
 			if (typeof chunk === "function") { callback = chunk; chunk = null; }
@@ -326,22 +348,22 @@
 		setDefaultEncoding() { return this; },
 	};
 
-	class Writable extends EventEmitter {
-		constructor(options) {
-			super();
-			initWritable(this, options);
-		}
+	function Writable(options) {
+		EventEmitter.call(this);
+		initWritable(this, options);
 	}
+	Object.setPrototypeOf(Writable.prototype, EventEmitter.prototype);
+	Object.setPrototypeOf(Writable, EventEmitter);
 	Object.assign(Writable.prototype, writableMethods);
 
 	// --------------------------------------- Duplex / Transform / PassThrough
 
-	class Duplex extends Readable {
-		constructor(options) {
-			super(options);
-			initWritable(this, options);
-		}
+	function Duplex(options) {
+		Readable.call(this, options);
+		initWritable(this, options);
 	}
+	Object.setPrototypeOf(Duplex.prototype, Readable.prototype);
+	Object.setPrototypeOf(Duplex, Readable);
 	for (const [name, fn] of Object.entries(writableMethods)) {
 		if (name !== "destroy") Duplex.prototype[name] = fn;
 	}
@@ -349,20 +371,22 @@
 		return writableMethods.destroy.call(this, err);
 	};
 
-	class Transform extends Duplex {
-		constructor(options = {}) {
-			super(options);
-			if (typeof options.transform === "function") this._transform = options.transform;
-			if (typeof options.flush === "function") this._flush = options.flush;
-		}
-		_transform(chunk, encoding, callback) { callback(null, chunk); }
+	function Transform(options = {}) {
+		Duplex.call(this, options);
+		if (typeof options.transform === "function") this._transform = options.transform;
+		if (typeof options.flush === "function") this._flush = options.flush;
+	}
+	Object.setPrototypeOf(Transform.prototype, Duplex.prototype);
+	Object.setPrototypeOf(Transform, Duplex);
+	Object.assign(Transform.prototype, {
+		_transform(chunk, encoding, callback) { callback(null, chunk); },
 		_write(chunk, encoding, callback) {
 			this._transform(chunk, encoding, (err, out) => {
 				if (err) return callback(err);
 				if (out !== null && out !== undefined) this.push(out);
 				callback();
 			});
-		}
+		},
 		_final(callback) {
 			const finish = (err) => {
 				this.push(null);
@@ -373,10 +397,14 @@
 				finish(err);
 			});
 			else finish();
-		}
-	}
+		},
+	});
 
-	class PassThrough extends Transform {}
+	function PassThrough(options) {
+		Transform.call(this, options);
+	}
+	Object.setPrototypeOf(PassThrough.prototype, Transform.prototype);
+	Object.setPrototypeOf(PassThrough, Transform);
 
 	// ------------------------------------------------------------- helpers
 
@@ -406,12 +434,37 @@
 		return current;
 	}
 
-	const streamMod = Object.assign(
-		class Stream extends EventEmitter {},
-		{ Readable, Writable, Duplex, Transform, PassThrough, Stream: null, finished, pipeline },
-	);
-	streamMod.Stream = streamMod;
+	// The legacy base class: packages subclass it via util.inherits and call
+	// Stream.call(this).
+	function Stream() {
+		EventEmitter.call(this);
+	}
+	Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
+	Object.setPrototypeOf(Stream, EventEmitter);
+	Stream.prototype.pipe = Readable.prototype.pipe;
+
+	const streamMod = Object.assign(Stream, {
+		Readable, Writable, Duplex, Transform, PassThrough, Stream, finished, pipeline,
+	});
 	core.stream = streamMod;
+
+	core["stream/promises"] = {
+		pipeline: (...streams) =>
+			new Promise((resolve, reject) => pipeline(...streams, (err) => (err ? reject(err) : resolve()))),
+		finished: (stream) =>
+			new Promise((resolve, reject) => finished(stream, (err) => (err ? reject(err) : resolve()))),
+	};
+	core["stream/web"] = {
+		ReadableStream: globalThis.ReadableStream,
+		WritableStream: globalThis.WritableStream,
+		TransformStream: globalThis.TransformStream,
+		TextEncoderStream: class TextEncoderStream {
+			constructor() { throw new Error("TextEncoderStream is not supported yet"); }
+		},
+		TextDecoderStream: class TextDecoderStream {
+			constructor() { throw new Error("TextDecoderStream is not supported yet"); }
+		},
+	};
 
 	// -------------------------------------------------- fs stream flavors
 

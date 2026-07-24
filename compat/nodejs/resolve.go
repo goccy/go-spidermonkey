@@ -34,12 +34,18 @@ type resolution struct {
 
 // coreModules are the node: builtins compat/nodejs implements (js/corelibs.js).
 var coreModules = map[string]bool{
-	"assert": true, "buffer": true, "child_process": true, "crypto": true,
-	"events": true, "fs": true, "fs/promises": true, "http": true,
-	"https": true, "net": true, "os": true, "path": true, "process": true,
-	"querystring": true, "stream": true, "string_decoder": true,
-	"timers": true, "timers/promises": true, "tty": true, "url": true,
-	"util": true, "zlib": true,
+	"assert": true, "async_hooks": true, "buffer": true,
+	"child_process": true, "cluster": true, "console": true,
+	"constants": true, "crypto": true, "diagnostics_channel": true,
+	"dns": true, "events": true, "fs": true, "fs/promises": true,
+	"http": true, "http2": true, "https": true, "inspector": true,
+	"module": true, "net": true, "os": true, "path": true,
+	"perf_hooks": true, "process": true, "punycode": true,
+	"querystring": true, "readline": true, "stream": true,
+	"stream/promises": true, "stream/web": true, "string_decoder": true,
+	"timers": true, "timers/promises": true, "tls": true, "tty": true,
+	"url": true, "util": true, "v8": true, "vm": true,
+	"worker_threads": true, "zlib": true,
 }
 
 // Export-condition preference: import (this runtime is Workers/browser-like,
@@ -76,6 +82,13 @@ func resolveModule(fsys fs.FS, specifier, parent string, cjs bool) (resolution, 
 
 	spec := specifier
 	bare := false
+	// file: URLs arrive from pathToFileURL round trips (dynamic import of
+	// config files); map them onto the FS namespace.
+	if after, ok := strings.CutPrefix(spec, "file://"); ok {
+		spec = "/" + strings.TrimLeft(after, "/")
+	} else if after, ok := strings.CutPrefix(spec, "file:"); ok {
+		spec = "/" + strings.TrimLeft(after, "/")
+	}
 	switch {
 	case strings.HasPrefix(spec, "./"), strings.HasPrefix(spec, "../"):
 		spec = path.Join(path.Dir(parent), spec)

@@ -6,6 +6,9 @@
 	"use strict";
 	const ops = globalThis.__node_ops;
 
+	// Node's global alias.
+	globalThis.global = globalThis;
+
 	// ------------------------------------------------------ core registry
 
 	const core = {};
@@ -101,6 +104,20 @@
 		uptime: () => performance.now() / 1000,
 		memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
 		emitWarning: (w) => { console.error("Warning:", w); },
+		execPath: "/usr/local/bin/node",
+		getuid: () => 1000,
+		getgid: () => 1000,
+		geteuid: () => 1000,
+		getegid: () => 1000,
+		cpuUsage: () => ({ user: 0, system: 0 }),
+		resourceUsage: () => ({}),
+		release: { name: "node" },
+		config: { variables: {} },
+		features: {},
+		allowedNodeEnvironmentFlags: new Set(),
+		binding() { throw new Error("process.binding is not supported"); },
+		dlopen() { throw new Error("process.dlopen is not supported"); },
+		kill() { throw new Error("process.kill is not supported"); },
 		// EventEmitter surface is grafted on by corelibs.js once node:events
 		// exists; give inert fallbacks meanwhile.
 		on() { return this; }, once() { return this; }, off() { return this; },
@@ -217,6 +234,24 @@
 		includes(value, byteOffset) { return this.indexOf(value, byteOffset) !== -1; }
 		readUInt8(off = 0) { return this[off]; }
 		writeUInt8(v, off = 0) { this[off] = v; return off + 1; }
+		_dv() { return new DataView(this.buffer, this.byteOffset, this.byteLength); }
+		readUInt16BE(o = 0) { return this._dv().getUint16(o, false); }
+		readUInt16LE(o = 0) { return this._dv().getUint16(o, true); }
+		readUInt32BE(o = 0) { return this._dv().getUint32(o, false); }
+		readUInt32LE(o = 0) { return this._dv().getUint32(o, true); }
+		readInt8(o = 0) { return this._dv().getInt8(o); }
+		readInt16BE(o = 0) { return this._dv().getInt16(o, false); }
+		readInt16LE(o = 0) { return this._dv().getInt16(o, true); }
+		readInt32BE(o = 0) { return this._dv().getInt32(o, false); }
+		readInt32LE(o = 0) { return this._dv().getInt32(o, true); }
+		readDoubleBE(o = 0) { return this._dv().getFloat64(o, false); }
+		readDoubleLE(o = 0) { return this._dv().getFloat64(o, true); }
+		readBigUInt64BE(o = 0) { return this._dv().getBigUint64(o, false); }
+		writeUInt16BE(v, o = 0) { this._dv().setUint16(o, v, false); return o + 2; }
+		writeUInt16LE(v, o = 0) { this._dv().setUint16(o, v, true); return o + 2; }
+		writeUInt32BE(v, o = 0) { this._dv().setUint32(o, v, false); return o + 4; }
+		writeUInt32LE(v, o = 0) { this._dv().setUint32(o, v, true); return o + 4; }
+		writeInt32BE(v, o = 0) { this._dv().setInt32(o, v, false); return o + 4; }
 	}
 
 	function wrap(u8) { return Object.setPrototypeOf(u8, Buffer.prototype); }

@@ -28,7 +28,12 @@
 			case "function": return `[Function: ${v.name || "anonymous"}]`;
 		}
 		if (v === null) return "null";
-		if (v instanceof Error) return v.stack ? String(v.stack) : `${v.name}: ${v.message}`;
+		if (v instanceof Error) {
+			// SpiderMonkey stacks do NOT include the message line; always
+			// compose both.
+			const head = `${v.name}: ${v.message}`;
+			return v.stack ? `${head}\n${v.stack}` : head;
+		}
 		if (v instanceof Date) return v.toISOString();
 		if (v instanceof RegExp) return String(v);
 		if (seen.has(v)) return "[Circular]";
@@ -380,7 +385,7 @@
 
 	const ABSOLUTE_URL = /^([a-zA-Z][a-zA-Z0-9+.\-]*):(?:\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/;
 	const DEFAULT_PORTS = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21" };
-	const SPECIAL = new Set(Object.keys(DEFAULT_PORTS));
+	const SPECIAL = new Set([...Object.keys(DEFAULT_PORTS), "file:"]);
 
 	function parseAuthority(auth) {
 		let username = "", password = "", host = auth;
@@ -573,11 +578,18 @@
 			const s = this._stream;
 			if (!s) return Promise.reject(new TypeError("reader has released its lock"));
 			try {
-				if (s._queue.length === 0 && !s._closed && !s._errored) s._pull();
+				if (s._queue.length === 0 && !s._closed && !s._errored && s._source.pull) s._pull();
 				if (s._queue.length > 0) return Promise.resolve({ value: s._queue.shift(), done: false });
 				if (s._errored) return Promise.reject(s._errorValue);
 				if (s._closed) return Promise.resolve({ value: undefined, done: true });
-				return Promise.reject(new TypeError("underlyingSource.pull made no progress"));
+				if (s._source.pull) {
+					// A synchronous pull MUST make progress (fetch bodies):
+					// "no data yet" is inexpressible there.
+					return Promise.reject(new TypeError("underlyingSource.pull made no progress"));
+				}
+				// Push-style source (TransformStream readable): wait for the
+				// next enqueue/close.
+				return new Promise((resolve, reject) => s._waiters.push({ resolve, reject }));
 			} catch (e) {
 				return Promise.reject(e);
 			}
@@ -598,11 +610,23 @@
 			this._errored = false;
 			this._errorValue = undefined;
 			this._locked = false;
+			this._waiters = []; // pending read() resolvers (push-style sources)
 			const self = this;
 			this._controller = {
-				enqueue(chunk) { self._queue.push(chunk); },
-				close() { self._closed = true; },
-				error(e) { self._errored = true; self._errorValue = e; },
+				enqueue(chunk) {
+					const w = self._waiters.shift();
+					if (w) w.resolve({ value: chunk, done: false });
+					else self._queue.push(chunk);
+				},
+				close() {
+					self._closed = true;
+					for (const w of self._waiters.splice(0)) w.resolve({ value: undefined, done: true });
+				},
+				error(e) {
+					self._errored = true;
+					self._errorValue = e;
+					for (const w of self._waiters.splice(0)) w.reject(e);
+				},
 			};
 			if (underlyingSource.start) underlyingSource.start(this._controller);
 		}
@@ -637,8 +661,112 @@
 			};
 		}
 		[Symbol.asyncIterator](opts) { return this.values(opts); }
+		async pipeTo(destination, options = {}) {
+			const reader = this.getReader();
+			const writer = destination.getWriter();
+			try {
+				for (;;) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					await writer.write(value);
+				}
+				if (options.preventClose !== true) await writer.close();
+				else writer.releaseLock();
+			} catch (e) {
+				if (options.preventAbort !== true) await writer.abort(e);
+				throw e;
+			} finally {
+				reader.releaseLock();
+			}
+		}
+		pipeThrough(transform, options) {
+			this.pipeTo(transform.writable, options).catch(() => {});
+			return transform.readable;
+		}
 	}
 	globalThis.ReadableStream = ReadableStream;
+
+	class WritableStreamDefaultWriter {
+		constructor(stream) {
+			if (stream._locked) throw new TypeError("WritableStream is locked");
+			stream._locked = true;
+			this._stream = stream;
+			this.ready = Promise.resolve();
+			this.desiredSize = 1;
+			this.closed = new Promise((resolve, reject) => { stream._closedResolve = resolve; stream._closedReject = reject; });
+		}
+		async write(chunk) {
+			const s = this._stream;
+			if (!s || s._state !== "writable") throw new TypeError("cannot write to this stream");
+			if (s._sink.write) await s._sink.write(chunk, s._controller);
+		}
+		async close() {
+			const s = this._stream;
+			if (!s || s._state !== "writable") throw new TypeError("cannot close this stream");
+			s._state = "closed";
+			if (s._sink.close) await s._sink.close();
+			s._closedResolve();
+		}
+		async abort(reason) {
+			const s = this._stream;
+			if (!s) return;
+			s._state = "errored";
+			if (s._sink.abort) await s._sink.abort(reason);
+			s._closedResolve();
+		}
+		releaseLock() {
+			if (this._stream) {
+				this._stream._locked = false;
+				this._stream = null;
+			}
+		}
+	}
+
+	class WritableStream {
+		constructor(underlyingSink = {}) {
+			this._sink = underlyingSink;
+			this._locked = false;
+			this._state = "writable";
+			this._controller = { error: () => { this._state = "errored"; } };
+			if (underlyingSink.start) underlyingSink.start(this._controller);
+		}
+		get locked() { return this._locked; }
+		getWriter() { return new WritableStreamDefaultWriter(this); }
+		async close() {
+			const w = this.getWriter();
+			await w.close();
+			w.releaseLock();
+		}
+		async abort(reason) {
+			const w = this.getWriter();
+			await w.abort(reason);
+			w.releaseLock();
+		}
+	}
+	globalThis.WritableStream = WritableStream;
+
+	class TransformStream {
+		constructor(transformer = {}) {
+			let rc;
+			this.readable = new ReadableStream({ start(c) { rc = c; } });
+			const controller = {
+				enqueue: (chunk) => rc.enqueue(chunk),
+				terminate: () => rc.close(),
+				error: (e) => rc.error(e),
+				get desiredSize() { return 1; },
+			};
+			this.writable = new WritableStream({
+				write: (chunk) => (transformer.transform ? transformer.transform(chunk, controller) : controller.enqueue(chunk)),
+				close: async () => {
+					if (transformer.flush) await transformer.flush(controller);
+					rc.close();
+				},
+				abort: (e) => rc.error(e),
+			});
+			if (transformer.start) transformer.start(controller);
+		}
+	}
+	globalThis.TransformStream = TransformStream;
 
 	// ---------------------------------------- Headers / Request / Response
 	// The fetch-vocabulary classes user code constructs (Workers handlers,

@@ -562,10 +562,12 @@ func (rt *Runtime) opFSReaddir(cfg spidermonkey.Config, args []spidermonkey.Valu
 		return fsErrValue(err), nil
 	}
 	names := make([]string, len(entries))
+	dirs := make([]bool, len(entries))
 	for i, e := range entries {
 		names[i] = e.Name()
+		dirs[i] = e.IsDir()
 	}
-	return spidermonkey.ValueOf(map[string]any{"names": names}), nil
+	return spidermonkey.ValueOf(map[string]any{"names": names, "dirs": dirs}), nil
 }
 
 func (rt *Runtime) opFSMkdir(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {

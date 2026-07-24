@@ -103,30 +103,36 @@
 
 	// ------------------------------------------------------------- events
 
-	class EventEmitter {
-		constructor() { this._events = Object.create(null); this._maxListeners = undefined; }
+	// A FUNCTION-style constructor on purpose: the util.inherits generation
+	// of npm packages calls `EventEmitter.call(this)` / `Stream.call(this)`,
+	// which a class constructor rejects.
+	function EventEmitter() {
+		this._events = Object.create(null);
+		this._maxListeners = undefined;
+	}
+	Object.assign(EventEmitter.prototype, {
 		_list(type, create) {
 			if (!this._events) this._events = Object.create(null);
 			let l = this._events[type];
 			if (!l && create) this._events[type] = l = [];
 			return l;
-		}
+		},
 		on(type, fn) {
 			this._list(type, true).push(fn);
 			return this;
-		}
-		addListener(type, fn) { return this.on(type, fn); }
-		prependListener(type, fn) { this._list(type, true).unshift(fn); return this; }
+		},
+		addListener(type, fn) { return this.on(type, fn); },
+		prependListener(type, fn) { this._list(type, true).unshift(fn); return this; },
 		once(type, fn) {
 			const wrapper = (...args) => { this.off(type, wrapper); fn.apply(this, args); };
 			wrapper.listener = fn;
 			return this.on(type, wrapper);
-		}
+		},
 		prependOnceListener(type, fn) {
 			const wrapper = (...args) => { this.off(type, wrapper); fn.apply(this, args); };
 			wrapper.listener = fn;
 			return this.prependListener(type, wrapper);
-		}
+		},
 		off(type, fn) {
 			const l = this._list(type, false);
 			if (!l) return this;
@@ -134,13 +140,13 @@
 			if (i >= 0) l.splice(i, 1);
 			if (l.length === 0) delete this._events[type];
 			return this;
-		}
-		removeListener(type, fn) { return this.off(type, fn); }
+		},
+		removeListener(type, fn) { return this.off(type, fn); },
 		removeAllListeners(type) {
 			if (type === undefined) this._events = Object.create(null);
 			else delete this._events[type];
 			return this;
-		}
+		},
 		emit(type, ...args) {
 			const l = this._list(type, false);
 			if (!l || l.length === 0) {
@@ -152,14 +158,14 @@
 			}
 			for (const fn of [...l]) fn.apply(this, args);
 			return true;
-		}
-		listeners(type) { return [...(this._list(type, false) || [])].map((h) => h.listener || h); }
-		rawListeners(type) { return [...(this._list(type, false) || [])]; }
-		listenerCount(type) { return (this._list(type, false) || []).length; }
-		eventNames() { return Object.keys(this._events || {}); }
-		setMaxListeners(n) { this._maxListeners = n; return this; }
-		getMaxListeners() { return this._maxListeners ?? EventEmitter.defaultMaxListeners; }
-	}
+		},
+		listeners(type) { return [...(this._list(type, false) || [])].map((h) => h.listener || h); },
+		rawListeners(type) { return [...(this._list(type, false) || [])]; },
+		listenerCount(type) { return (this._list(type, false) || []).length; },
+		eventNames() { return Object.keys(this._events || {}); },
+		setMaxListeners(n) { this._maxListeners = n; return this; },
+		getMaxListeners() { return this._maxListeners ?? EventEmitter.defaultMaxListeners; },
+	});
 	EventEmitter.defaultMaxListeners = 10;
 	EventEmitter.EventEmitter = EventEmitter;
 	EventEmitter.once = (emitter, type) =>
@@ -192,7 +198,10 @@
 			case "function": return `[Function: ${v.name || "anonymous"}]`;
 		}
 		if (v === null) return "null";
-		if (v instanceof Error) return v.stack ? `${v.name}: ${v.message}\n${v.stack}` : `${v.name}: ${v.message}`;
+		if (v instanceof Error) {
+			const head = `${v.name}: ${v.message}`;
+			return v.stack ? `${head}\n${v.stack}` : head;
+		}
 		if (v instanceof Date) return v.toISOString();
 		if (v instanceof RegExp) return String(v);
 		if (globalThis.Buffer && Buffer.isBuffer(v)) {
@@ -354,6 +363,24 @@
 	globalThis.clearImmediate = (id) => {
 		if (id !== undefined && id !== null) ops.immediate_clear(Number(id) || 0);
 	};
+	// Node returns Timeout OBJECTS with ref/unref; wrap the web timers so
+	// unguarded `.unref()` calls (common in server libraries) work.
+	// Number(timeout) still yields the raw id for clearTimeout.
+	{
+		const webSetTimeout = globalThis.setTimeout;
+		const webSetInterval = globalThis.setInterval;
+		const wrapTimer = (id) => ({
+			_id: id,
+			ref() { return this; },
+			unref() { return this; },
+			hasRef: () => true,
+			refresh() { return this; },
+			close() { globalThis.clearTimeout(id); return this; },
+			[Symbol.toPrimitive]() { return id; },
+		});
+		globalThis.setTimeout = (fn, ms, ...args) => wrapTimer(webSetTimeout(fn, ms, ...args));
+		globalThis.setInterval = (fn, ms, ...args) => wrapTimer(webSetInterval(fn, ms, ...args));
+	}
 	core.timers = {
 		setTimeout: globalThis.setTimeout,
 		clearTimeout: globalThis.clearTimeout,
@@ -437,6 +464,19 @@
 		return {
 			size: r.size,
 			mode: r.mode,
+			// etag (and friends) duck-type fs.Stats: ino/ctime/mtime/size must
+			// exist with the right types.
+			ino: 0,
+			dev: 0,
+			nlink: 1,
+			uid: 1000,
+			gid: 1000,
+			rdev: 0,
+			blksize: 4096,
+			blocks: Math.ceil(r.size / 512),
+			atimeMs: r.mtimeMs,
+			ctimeMs: r.mtimeMs,
+			birthtimeMs: r.mtimeMs,
 			mtime: new Date(r.mtimeMs),
 			mtimeMs: r.mtimeMs,
 			atime: new Date(r.mtimeMs),
@@ -478,10 +518,28 @@
 			return statsOf(r);
 		},
 		lstatSync(p) { return fsSync.statSync(p); },
-		readdirSync(p) {
+		readdirSync(p, options) {
 			const r = ops.fs_readdir(String(p));
 			if (isErr(r)) throw fsError(r, "scandir", p);
+			if (options && options.withFileTypes) {
+				return r.names.map((name, i) => ({
+					name,
+					parentPath: String(p),
+					isDirectory: () => r.dirs[i],
+					isFile: () => !r.dirs[i],
+					isSymbolicLink: () => false,
+					isFIFO: () => false,
+					isSocket: () => false,
+					isBlockDevice: () => false,
+					isCharacterDevice: () => false,
+				}));
+			}
 			return r.names;
+		},
+		accessSync(p, mode) {
+			if (!ops.fs_exists(String(p))) {
+				throw fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p);
+			}
 		},
 		mkdirSync(p, opts) {
 			const r = ops.fs_mkdir(String(p), !!(opts && opts.recursive));
@@ -526,6 +584,13 @@
 		rename: callbackify1(fsSync.renameSync),
 		realpath: callbackify1(fsSync.realpathSync),
 		exists: (p, cb) => queueMicrotask(() => cb(fsSync.existsSync(p))),
+		access: (p, mode, cb) => {
+			const done = typeof mode === "function" ? mode : cb;
+			queueMicrotask(() => {
+				try { fsSync.accessSync(p); done(null); } catch (e) { done(e); }
+			});
+		},
+		constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
 	};
 	core.fs = fsMod;
 
@@ -576,19 +641,53 @@
 
 	const requireCache = Object.create(null);
 
+	// The Module class IS require("module")'s export, and ALL requires flow
+	// through Module.prototype.require / Module._resolveFilename — so
+	// monkey-patches (Next.js's require-hook aliasing) intercept everything,
+	// exactly as on Node.
+	function Module(id) {
+		this.id = id;
+		this.filename = id;
+		this.path = path.dirname(id);
+		this.exports = {};
+		this.loaded = false;
+		this.children = [];
+		this.paths = [];
+	}
+	Module._cache = requireCache;
+	Module._resolveFilename = function _resolveFilename(request, parent, isMain, options) {
+		const parentPath = typeof parent === "string"
+			? parent.replace(/^\//, "")
+			: parent && parent.filename ? String(parent.filename).replace(/^\//, "") : "main.js";
+		const r = ops.node_resolve(String(request), parentPath);
+		if (isErr(r)) throw requireError(request, r.message);
+		return r.core ? r.core : "/" + r.path;
+	};
+	Module.prototype.require = function require(request) {
+		const resolved = Module._resolveFilename(request, this);
+		if (!resolved.startsWith("/")) return globalThis.__node_core(resolved);
+		return loadCJSPath(resolved.slice(1));
+	};
+	Module.createRequire = (from) => {
+		const m = new Module(typeof from === "string" ? from : "/main.js");
+		return makeRequireFor(m);
+	};
+	Module.isBuiltin = (name) => {
+		try { globalThis.__node_core(name); return true; } catch { return false; }
+	};
+	Object.defineProperty(Module, "builtinModules", {
+		get: () => Object.keys(core).concat(Object.keys(core).map((n) => "node:" + n)),
+	});
+	Module.syncBuiltinESMExports = () => {};
+	Module.Module = Module;
+	core.module = Module;
+
 	function loadCJSPath(fsPath) {
 		const cached = requireCache[fsPath];
 		if (cached) return cached.exports;
 		const src = ops.node_read(fsPath);
 		if (isErr(src)) throw requireError(fsPath, `Cannot load module '${fsPath}': ${src.message}`);
-		const module = {
-			exports: {},
-			id: "/" + fsPath,
-			filename: "/" + fsPath,
-			path: path.dirname("/" + fsPath),
-			loaded: false,
-			children: [],
-		};
+		const module = new Module("/" + fsPath);
 		requireCache[fsPath] = module;
 		try {
 			if (fsPath.endsWith(".json")) {
@@ -598,7 +697,7 @@
 					"exports", "require", "module", "__filename", "__dirname",
 					src + "\n//# sourceURL=" + fsPath,
 				);
-				fn.call(module.exports, module.exports, makeRequire(fsPath), module, module.filename, module.path);
+				fn.call(module.exports, module.exports, makeRequireFor(module), module, module.filename, module.path);
 			}
 		} catch (e) {
 			delete requireCache[fsPath];
@@ -608,24 +707,17 @@
 		return module.exports;
 	}
 
-	function makeRequire(parent) {
-		const req = (spec) => {
-			const r = ops.node_resolve(String(spec), parent);
-			if (isErr(r)) throw requireError(spec, r.message);
-			if (r.core) return globalThis.__node_core(r.core);
-			return loadCJSPath(r.path);
-		};
+	function makeRequireFor(module) {
+		const req = (request) => module.require(request);
 		req.cache = requireCache;
-		req.resolve = (spec) => {
-			const r = ops.node_resolve(String(spec), parent);
-			if (isErr(r)) throw requireError(spec, r.message);
-			return r.core ? String(spec) : "/" + r.path;
-		};
+		req.resolve = (request) => Module._resolveFilename(request, module);
 		req.main = undefined;
+		req.extensions = { ".js": () => {}, ".json": () => {}, ".node": () => {} };
 		return req;
 	}
 
-	globalThis.require = makeRequire("main.js");
+	const rootModule = new Module("/main.js");
+	globalThis.require = makeRequireFor(rootModule);
 	globalThis.__node_require_path = loadCJSPath;
 	globalThis.__dirname = "/";
 	globalThis.__filename = "/main.js";
