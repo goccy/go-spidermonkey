@@ -566,8 +566,23 @@
 	// one-request-at-a-time execution this runtime does; NOT correct for
 	// interleaved concurrent contexts.
 
+	// All live AsyncLocalStorage instances, so a context snapshot can capture
+	// every store at once (the basis for AsyncResource propagation).
+	const allStores = new Set();
+	function snapshotStores() {
+		const snap = new Map();
+		for (const als of allStores) snap.set(als, als._store);
+		return snap;
+	}
+	function withSnapshot(snap, fn, thisArg, args) {
+		const prev = snapshotStores();
+		for (const [als, v] of snap) als._store = v;
+		try { return fn.apply(thisArg, args); }
+		finally { for (const [als, v] of prev) als._store = v; }
+	}
+
 	class AsyncLocalStorage {
-		constructor() { this._store = undefined; }
+		constructor() { this._store = undefined; allStores.add(this); }
 		getStore() { return this._store; }
 		run(store, fn, ...args) {
 			const prev = this._store;
@@ -587,15 +602,21 @@
 		}
 		exit(fn, ...args) { return this.run(undefined, fn, ...args); }
 		enterWith(store) { this._store = store; }
-		disable() { this._store = undefined; }
+		disable() { this._store = undefined; allStores.delete(this); }
+		static bind(fn) { const snap = snapshotStores(); return (...a) => withSnapshot(snap, fn, this, a); }
+		static snapshot() { const snap = snapshotStores(); return (fn, ...a) => withSnapshot(snap, fn, undefined, a); }
 	}
+	// A snapshot-carrying resource: bind() captures the current stores so the
+	// callback later runs under them (correct explicit context propagation,
+	// the pattern APM/tracing libraries use). Bare await interleaving without
+	// AsyncResource still cannot be tracked without engine async-context hooks.
 	class AsyncResource {
-		constructor(type) { this.type = type; }
-		runInAsyncScope(fn, thisArg, ...args) { return fn.apply(thisArg, args); }
+		constructor(type) { this.type = type; this._snap = snapshotStores(); }
+		runInAsyncScope(fn, thisArg, ...args) { return withSnapshot(this._snap, fn, thisArg, args); }
 		emitDestroy() { return this; }
-		bind(fn) { return fn; }
+		bind(fn) { const snap = this._snap; return (...a) => withSnapshot(snap, fn, this, a); }
 		asyncId() { return 1; }
-		static bind(fn) { return fn; }
+		static bind(fn) { const snap = snapshotStores(); return (...a) => withSnapshot(snap, fn, undefined, a); }
 	}
 	core.async_hooks = {
 		AsyncLocalStorage,
