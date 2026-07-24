@@ -176,13 +176,100 @@
 		return { publicKey: r.publicKey, privateKey: r.privateKey };
 	}
 
+	// RSA public/private encryption. key may be a PEM string or { key, padding,
+	// oaepHash }. Node padding constants: 4 = OAEP, 1 = PKCS1.
+	const PAD = { 4: "oaep", 1: "pkcs1" };
+	function keyPEMof(key) { return typeof key === "string" ? key : (key.key || key); }
+	function keyPadding(key, def) {
+		if (typeof key === "object" && key.padding !== undefined) return PAD[key.padding] || def;
+		return def;
+	}
+	function oaepHashOf(key) {
+		return typeof key === "object" && key.oaepHash ? String(key.oaepHash).toLowerCase() : "sha1";
+	}
+	function publicEncrypt(key, buffer) {
+		const r = ops.crypto_rsa_public(keyPEMof(key), toBuf(buffer), keyPadding(key, "oaep"), oaepHashOf(key));
+		ops.release_pending();
+		if (isErr(r)) cryptoThrow(r);
+		return Buffer.from(r);
+	}
+	function privateDecrypt(key, buffer) {
+		const r = ops.crypto_rsa_private(keyPEMof(key), toBuf(buffer), keyPadding(key, "oaep"), oaepHashOf(key));
+		ops.release_pending();
+		if (isErr(r)) cryptoThrow(r);
+		return Buffer.from(r);
+	}
+
+	// Diffie-Hellman (modp) over the crypto_dh_* ops.
+	class DiffieHellman {
+		constructor(primeHexOrBits, generator) {
+			const r = ops.crypto_dh_generate(primeHexOrBits, generator);
+			if (isErr(r)) cryptoThrow(r);
+			this._prime = r.prime; this._gen = r.generator; this._priv = r.priv; this._pub = r.pub;
+		}
+		generateKeys() { return Buffer.from(this._pub, "hex"); }
+		getPublicKey(enc) { const b = Buffer.from(this._pub, "hex"); return enc ? b.toString(enc) : b; }
+		getPrivateKey(enc) { const b = Buffer.from(this._priv, "hex"); return enc ? b.toString(enc) : b; }
+		getPrime(enc) { const b = Buffer.from(this._prime, "hex"); return enc ? b.toString(enc) : b; }
+		getGenerator(enc) { const b = Buffer.from(this._gen, "hex"); return enc ? b.toString(enc) : b; }
+		computeSecret(otherPub, inEnc, outEnc) {
+			const hex = Buffer.isBuffer(otherPub) || otherPub instanceof Uint8Array
+				? Buffer.from(otherPub).toString("hex") : Buffer.from(otherPub, inEnc).toString("hex");
+			const r = ops.crypto_dh_compute(this._prime, this._priv, hex);
+			if (isErr(r)) cryptoThrow(r);
+			const b = Buffer.from(r, "hex");
+			return outEnc ? b.toString(outEnc) : b;
+		}
+	}
+
+	// ChaCha20-Poly1305 via createCipheriv("chacha20-poly1305", ...).
+	class ChaChaCipher {
+		constructor(encrypt, key, iv) { this._enc = encrypt; this._key = toBuf(key); this._iv = toBuf(iv); this._chunks = []; this._aad = new Uint8Array(0); this._authTag = new Uint8Array(0); }
+		setAAD(aad) { this._aad = toBuf(aad); return this; }
+		setAuthTag(tag) { this._authTag = toBuf(tag); return this; }
+		getAuthTag() { return this._tagOut; }
+		update(data, ie, oe) { this._chunks.push(toBuf(data, ie)); return oe ? "" : Buffer.alloc(0); }
+		final(oe) {
+			const r = ops.crypto_chacha(this._enc, this._key, this._iv, Buffer.concat(this._chunks), this._aad, this._authTag);
+			ops.release_pending();
+			if (isErr(r)) cryptoThrow(r);
+			this._tagOut = Buffer.from(r.tag);
+			const out = Buffer.from(r.data);
+			return oe ? out.toString(oe) : out;
+		}
+	}
+
+	class X509Certificate {
+		constructor(pem) {
+			const r = ops.crypto_x509(toBuf(pem));
+			if (isErr(r)) cryptoThrow(r);
+			this.subject = r.subject;
+			this.issuer = r.issuer;
+			this.validFrom = r.validFrom;
+			this.validTo = r.validTo;
+			this.serialNumber = r.serialNumber.toUpperCase();
+			this.fingerprint256 = r.fingerprint256;
+			this.ca = r.ca;
+			this._publicKeyPEM = r.publicKey;
+		}
+		get publicKey() { return { export: () => this._publicKeyPEM }; }
+	}
+
 	core.crypto = {
 		createHash: (algorithm) => new Hash(algorithm),
 		createHmac: (algorithm, key) => new Hash(algorithm, toBuf(key)),
 		Hash, Hmac: Hash,
-		createCipheriv: (algo, key, iv) => new Cipheriv(algo, key, iv),
-		createDecipheriv: (algo, key, iv) => new Decipheriv(algo, key, iv),
+		createCipheriv: (algo, key, iv) =>
+			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(true, key, iv) : new Cipheriv(algo, key, iv),
+		createDecipheriv: (algo, key, iv) =>
+			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(false, key, iv) : new Decipheriv(algo, key, iv),
 		Cipheriv, Decipheriv,
+		publicEncrypt, privateDecrypt,
+		publicDecrypt: privateDecrypt, // Node allows verify-style; approximated
+		privateEncrypt: publicEncrypt,
+		createDiffieHellman: (prime, gen) => new DiffieHellman(prime, gen),
+		DiffieHellman,
+		X509Certificate,
 		createSign: (algo) => new Sign(algo),
 		createVerify: (algo) => new Verify(algo),
 		Sign, Verify,

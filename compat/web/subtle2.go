@@ -8,6 +8,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -19,6 +21,13 @@ import (
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/pbkdf2"
 )
+
+func rsaEncryptOAEP(newHash func() hash.Hash, pub *rsa.PublicKey, data, label []byte) ([]byte, error) {
+	return rsa.EncryptOAEP(newHash(), rand.Reader, pub, data, label)
+}
+func rsaDecryptOAEP(newHash func() hash.Hash, priv *rsa.PrivateKey, data, label []byte) ([]byte, error) {
+	return rsa.DecryptOAEP(newHash(), rand.Reader, priv, data, label)
+}
 
 func jsonUnmarshalString(s string, v any) error { return json.Unmarshal([]byte(s), v) }
 
@@ -259,6 +268,53 @@ func subtleErr(msg string) spidermonkey.Value {
 	return spidermonkey.ValueOf(map[string]any{"__subtleError": true, "message": msg})
 }
 
+// opRSAOAEP(encrypt, keyHandle, hash, data, label) -> bytes. Uses the RSA key
+// table from subtle.go (opRSAImport* store handles).
+func (s *subtleAPI) opRSAOAEP(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 4 {
+		return nil, fmt.Errorf("rsa-oaep: (encrypt, keyHandle, hash, data, label?) required")
+	}
+	encrypt := args[0].Bool()
+	k, err := s.get(args[1])
+	if err != nil {
+		return subtleErr(err.Error()), nil
+	}
+	newHash, err := hashNewByName(args[2].String())
+	if err != nil {
+		return subtleErr(err.Error()), nil
+	}
+	data, err := argBytes(args[3])
+	if err != nil {
+		return nil, err
+	}
+	var label []byte
+	if len(args) > 4 {
+		label, _ = argBytes(args[4])
+	}
+	if encrypt {
+		pub := k.rsaPub
+		if pub == nil && k.rsaPriv != nil {
+			pub = &k.rsaPriv.PublicKey
+		}
+		if pub == nil {
+			return subtleErr("not an RSA key"), nil
+		}
+		ct, e := rsaEncryptOAEP(newHash, pub, data, label)
+		if e != nil {
+			return subtleErr(e.Error()), nil
+		}
+		return bytesValue(ct), nil
+	}
+	if k.rsaPriv == nil {
+		return subtleErr("decrypt needs an RSA private key"), nil
+	}
+	pt, e := rsaDecryptOAEP(newHash, k.rsaPriv, data, label)
+	if e != nil {
+		return subtleErr("OperationError: decryption failed"), nil
+	}
+	return bytesValue(pt), nil
+}
+
 func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
 		"subtle_aes_encrypt": s.opAESEncrypt,
@@ -266,5 +322,6 @@ func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 		"subtle_ecdh":        s.opECDHDerive,
 		"subtle_hkdf":        s.opHKDFDerive,
 		"subtle_pbkdf2":      s.opPBKDF2Derive,
+		"subtle_rsa_oaep":    s.opRSAOAEP,
 	}
 }

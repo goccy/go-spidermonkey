@@ -51,6 +51,7 @@
 	const unsupported = (what) => { throw new DOMException(`unsupported ${what}`, "NotSupportedError"); };
 
 	const RSA_NAMES = ["RSASSA-PKCS1-V1_5", "RSA-PSS"];
+	const RSA_ALL = ["RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP"];
 	const rsaScheme = (name) => (name === "RSA-PSS" ? "pss" : "pkcs1");
 	const AES_NAMES = ["AES-GCM", "AES-CBC", "AES-CTR"];
 
@@ -82,14 +83,15 @@
 					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
-			if (RSA_NAMES.includes(name)) {
+			if (RSA_ALL.includes(name)) {
 				const hash = hashName(alg.hash);
 				const bits = Number(alg.modulusLength);
 				const r = ops.subtle_rsa_generate(bits);
 				const algo = { name: algName(alg), hash: { name: hash }, modulusLength: bits, publicExponent: new Uint8Array([1, 0, 1]) };
+				const isOAEP = name === "RSA-OAEP";
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => isOAEP ? u === "decrypt" || u === "unwrapKey" : u === "sign"), r.priv),
+					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => isOAEP ? u === "encrypt" || u === "wrapKey" : u === "verify"), r.pub),
 				};
 			}
 			if (AES_NAMES.includes(name)) {
@@ -132,7 +134,7 @@
 				else unsupported(`EC key format ${format}`);
 				return new CryptoKey(r.type, extractable, { name: "ECDSA", namedCurve: r.crv }, usages, r.id);
 			}
-			if (RSA_NAMES.includes(name)) {
+			if (RSA_ALL.includes(name)) {
 				let r;
 				if (format === "jwk") r = ops.subtle_rsa_import_jwk(JSON.stringify(keyData));
 				else if (format === "pkcs8" || format === "spki") r = ops.subtle_rsa_import_der(format, toU8(keyData));
@@ -184,7 +186,7 @@
 				if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_ec_export_der(format, key._h));
 				unsupported(`EC export format ${format}`);
 			}
-			if (RSA_NAMES.includes(name)) {
+			if (RSA_ALL.includes(name)) {
 				if (format === "jwk") return JSON.parse(ops.subtle_rsa_export_jwk(key._h));
 				if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_rsa_export_der(format, key._h));
 				unsupported(`RSA export format ${format}`);
@@ -228,6 +230,11 @@
 				const tagLen = alg.tagLength ?? 128;
 				return toBuf(subtleFail(ops.subtle_aes_encrypt(name, key._raw, iv, toU8(data), aad, tagLen)));
 			}
+			if (name === "RSA-OAEP") {
+				const hash = hashName(key.algorithm.hash).replace("SHA-", "sha").replace("sha1", "sha1");
+				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
+				return toBuf(subtleFail(ops.subtle_rsa_oaep(true, key._h, key.algorithm.hash.name, toU8(data), label)));
+			}
 			unsupported(`encrypt algorithm ${algName(alg)}`);
 		},
 
@@ -240,7 +247,31 @@
 				const tagLen = alg.tagLength ?? 128;
 				return toBuf(subtleFail(ops.subtle_aes_decrypt(name, key._raw, iv, toU8(data), aad, tagLen)));
 			}
+			if (name === "RSA-OAEP") {
+				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
+				return toBuf(subtleFail(ops.subtle_rsa_oaep(false, key._h, key.algorithm.hash.name, toU8(data), label)));
+			}
 			unsupported(`decrypt algorithm ${algName(alg)}`);
+		},
+
+		// wrapKey exports the key material, then encrypts it with the wrapping
+		// key (spec: export to `format`, encrypt with `wrapAlg`). The internal
+		// encrypt/decrypt bypass the encrypt/decrypt usage gate — the wrapping
+		// key only carries wrapKey/unwrapKey usages.
+		async wrapKey(format, key, wrappingKey, wrapAlg) {
+			need(wrappingKey, "wrapKey");
+			const exported = await subtle.exportKey(format, key);
+			const bytes = format === "jwk" ? new TextEncoder().encode(JSON.stringify(exported)) : new Uint8Array(exported);
+			return toBuf(rawCrypt(true, wrapAlg, wrappingKey, bytes));
+		},
+
+		async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlg, keyAlg, extractable, usages) {
+			need(unwrappingKey, "unwrapKey");
+			const decrypted = new Uint8Array(rawCrypt(false, unwrapAlg, unwrappingKey, toU8(wrappedKey)));
+			const material = format === "jwk"
+				? JSON.parse(new TextDecoder().decode(decrypted))
+				: decrypted;
+			return subtle.importKey(format, material, keyAlg, extractable, usages);
 		},
 
 		async deriveBits(alg, baseKey, length) {
@@ -272,6 +303,25 @@
 			unsupported(`deriveKey derived algorithm ${derivedName}`);
 		},
 	};
+
+	// rawCrypt runs AES/RSA-OAEP encrypt or decrypt WITHOUT the usage gate,
+	// for the internal wrapKey/unwrapKey path. Returns the raw op result
+	// (bytes), throwing on OperationError.
+	function rawCrypt(encrypt, alg, key, data) {
+		const name = algName(alg).toUpperCase();
+		if (AES_NAMES.includes(name)) {
+			const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
+			const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+			const tagLen = alg.tagLength ?? 128;
+			const op = encrypt ? ops.subtle_aes_encrypt : ops.subtle_aes_decrypt;
+			return subtleFail(op(name, key._raw, iv, toU8(data), aad, tagLen));
+		}
+		if (name === "RSA-OAEP") {
+			const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
+			return subtleFail(ops.subtle_rsa_oaep(encrypt, key._h, key.algorithm.hash.name, toU8(data), label));
+		}
+		throw new DOMException(`unsupported wrap algorithm ${name}`, "NotSupportedError");
+	}
 
 	// jwkOf returns a key's JWK JSON string, whether it was imported (has
 	// _jwk) or generated (has an EC handle to export).
