@@ -369,7 +369,9 @@ func (rt *Runtime) opScrypt(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	if N <= 1 || N&(N-1) != 0 || r <= 0 || p <= 0 {
 		return cryptoErr("invalid scrypt parameters"), nil
 	}
-	if int64(128)*int64(N)*int64(r) > maxScryptMem {
+	// scrypt.Key allocates 128*N*r (the V array) AND 128*r*p (the B buffer, via
+	// pbkdf2) — bound BOTH, or a huge p (with tiny N,r) still OOMs the host.
+	if int64(128)*int64(N)*int64(r) > maxScryptMem || int64(128)*int64(r)*int64(p) > maxScryptMem {
 		return cryptoErr("scrypt parameters exceed the memory limit"), nil
 	}
 	out, err := scrypt.Key(pw, salt, N, r, p, keylen)
@@ -424,6 +426,12 @@ func (rt *Runtime) opGenerateKeyPair(cfg spidermonkey.Config, args []spidermonke
 	var err error
 	switch typ {
 	case "rsa":
+		// Bound the modulus: an unchecked huge value makes rsa.GenerateKey spin
+		// on billion-bit prime search, wedging the host. (Matches the subtle
+		// side's 1024..8192 range.)
+		if modulus < 1024 || modulus > 8192 {
+			return cryptoErr("unsupported RSA modulus length"), nil
+		}
 		k, gerr := rsa.GenerateKey(rand.Reader, modulus)
 		if gerr != nil {
 			return cryptoErr(gerr.Error()), nil
