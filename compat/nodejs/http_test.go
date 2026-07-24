@@ -277,3 +277,31 @@ func TestHTTPListenPermission(t *testing.T) {
 	}
 	_ = fmt.Sprint()
 }
+
+// The handler responds WITHOUT reading the request body (early reject). The
+// server must not hang, must not race the body pump, and must return the
+// intended status — the pump is joined before ServeHTTP returns.
+func TestHTTPServerEarlyResponseUnconsumedBody(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	port, _ := startServer(t, js, rt, `
+		const http = require("http");
+		const server = http.createServer((req, res) => {
+			// Do NOT read req; respond immediately.
+			res.statusCode = 413;
+			res.end("too large");
+		});
+		server.listen(0);
+		globalThis.__server = server;
+		globalThis.PORT = server.address().port;
+	`)
+	big := strings.NewReader(strings.Repeat("x", 1<<20)) // 1 MiB, unconsumed
+	resp, err := http.Post("http://127.0.0.1:"+port+"/upload", "application/octet-stream", big)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 413 || string(body) != "too large" {
+		t.Fatalf("early response = %d %q, want 413 \"too large\"", resp.StatusCode, body)
+	}
+}

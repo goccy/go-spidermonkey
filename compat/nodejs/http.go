@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
@@ -309,9 +310,15 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	// Stream the request body incrementally to the guest IncomingMessage.
+	// Stream the request body incrementally to the guest IncomingMessage. The
+	// pump is the SOLE reader of r.Body; ServeHTTP waits for it below so it can
+	// never read the body after ServeHTTP returns (which the net/http contract
+	// forbids and would race net/http's own post-handler body drain).
+	var pumpDone chan struct{}
 	if hasBody {
+		pumpDone = make(chan struct{})
 		go func() {
+			defer close(pumpDone)
 			buf := make([]byte, 32<<10)
 			for {
 				n, rerr := r.Body.Read(buf)
@@ -346,6 +353,21 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// writes happen off the loop. Returns when the guest ends the response or
 	// the client disconnects.
 	p.serve(r.Context())
+
+	// Ensure the body pump has stopped before returning — no read may outlive
+	// ServeHTTP. If it already finished (body fully consumed, the common case),
+	// leave the connection untouched so keep-alive still works. Only if it is
+	// still blocked in a read (the guest responded before consuming the body)
+	// force that read to unblock with a past read deadline (which correctly
+	// ends keep-alive for this undrained connection), then join it.
+	if pumpDone != nil {
+		select {
+		case <-pumpDone:
+		default:
+			http.NewResponseController(w).SetReadDeadline(time.Now())
+			<-pumpDone
+		}
+	}
 	st.mu.Lock()
 	delete(st.reqs, reqID)
 	st.mu.Unlock()

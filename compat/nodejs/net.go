@@ -164,7 +164,7 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 
 	rt.loop.AddPending()
 	if onConnect != nil {
-		rt.loop.Post(func() error { onConnect.Call(); return nil })
+		rt.loop.Post(func() error { onConnect.Call(); onConnect.Free(); return nil })
 	}
 	go rt.pumpConn(id, conn, onData, onEnd, onError)
 	return spidermonkey.ValueOf(id), nil

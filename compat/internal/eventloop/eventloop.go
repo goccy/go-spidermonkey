@@ -82,6 +82,11 @@ func (l *Loop) SetTimer(fn *spidermonkey.Object, delay time.Duration, repeat boo
 	if delay < 0 {
 		delay = 0
 	}
+	// A repeating timer needs a positive interval, else takeDue treats it as a
+	// one-shot (fires once, then uncancellable). Node clamps intervals to 1ms.
+	if repeat && delay < time.Millisecond {
+		delay = time.Millisecond
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.nextID++

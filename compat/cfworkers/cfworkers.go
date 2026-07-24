@@ -336,6 +336,13 @@ func (wk *worker) serve(rw http.ResponseWriter, req *http.Request, drainTimeout 
 	// request's un-awaited work can't fire during the next on this instance.
 	defer func() {
 		if r := recover(); r != nil {
+			// net/http uses ErrAbortHandler as a sentinel to abort the response
+			// without logging; re-panic it (after clearing loop state) so the
+			// server handles it as intended rather than turning it into a 500.
+			if r == http.ErrAbortHandler {
+				wk.web.Loop().Reset()
+				panic(r)
+			}
 			func() {
 				defer func() { _ = recover() }()
 				http.Error(rw, "internal error", http.StatusInternalServerError)

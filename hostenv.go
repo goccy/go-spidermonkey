@@ -100,7 +100,10 @@ func (e *hostEnv) Go_host_result(m *base.Module, outPtr int32) {
 func (e *hostEnv) safeDispatch(key string, argsJSON []byte) (payload []byte) {
 	defer func() {
 		if r := recover(); r != nil {
-			payload = append([]byte{'E'}, fmt.Sprintf("host call %q panicked: %v", key, r)...)
+			// Do NOT leak the panic value to the sandboxed guest — Go runtime
+			// panics embed host paths/internals. A generic, catchable error is
+			// enough for the guest; the key identifies which op for the embedder.
+			payload = append([]byte{'E'}, fmt.Sprintf("host call %q failed", key)...)
 		}
 	}()
 	return e.dispatch(key, argsJSON)

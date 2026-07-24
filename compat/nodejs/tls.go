@@ -65,7 +65,7 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 
 	rt.loop.AddPending()
 	if onConnect := args[6].Object(); onConnect != nil {
-		rt.loop.Post(func() error { onConnect.Call(); return nil })
+		rt.loop.Post(func() error { onConnect.Call(); onConnect.Free(); return nil })
 	}
 	go rt.pumpConn(id, conn, args[3].Object(), args[4].Object(), args[5].Object())
 	return spidermonkey.ValueOf(id), nil
