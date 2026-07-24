@@ -32,6 +32,7 @@ type httpServer struct {
 
 type httpPending struct {
 	w           http.ResponseWriter
+	serverID    int64 // the server this request belongs to
 	done        chan struct{}
 	closeOnce   sync.Once
 	wroteHeader bool
@@ -55,7 +56,7 @@ func (rt *Runtime) opHTTPListen(cfg spidermonkey.Config, args []spidermonkey.Val
 	}
 	host, port := args[0].String(), args[1].Int()
 	addr := net.JoinHostPort(host, fmt.Sprint(port))
-	if cfg.Listen != nil && !cfg.Listen("tcp", addr) {
+	if cfg.Listen == nil || !cfg.Listen("tcp", addr) {
 		return spidermonkey.ValueOf(map[string]any{
 			"code": "EACCES", "message": fmt.Sprintf("listen %s: permission denied", addr),
 		}), nil
@@ -90,10 +91,14 @@ func (rt *Runtime) opHTTPClose(cfg spidermonkey.Config, args []spidermonkey.Valu
 	if ok {
 		delete(st.servers, s.id)
 	}
-	// Unblock any request goroutine still waiting on the guest.
-	for id, p := range st.reqs {
-		delete(st.reqs, id)
-		p.finish()
+	// Unblock only THIS server's in-flight requests; other servers keep theirs.
+	if ok {
+		for id, p := range st.reqs {
+			if p.serverID == s.id {
+				delete(st.reqs, id)
+				p.finish()
+			}
+		}
 	}
 	st.mu.Unlock()
 	if ok {
@@ -108,7 +113,7 @@ func (rt *Runtime) opHTTPClose(cfg spidermonkey.Config, args []spidermonkey.Valu
 // guest ends the response (or the client goes away).
 func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st := s.rt.http
-	p := &httpPending{w: w, done: make(chan struct{})}
+	p := &httpPending{w: w, serverID: s.id, done: make(chan struct{})}
 	st.mu.Lock()
 	st.nextID++
 	reqID := st.nextID

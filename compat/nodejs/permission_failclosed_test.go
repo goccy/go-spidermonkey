@@ -13,7 +13,7 @@ import (
 // node runtime but leaves Dial/Resolve/Listen nil must NOT get an open network.
 // These tests build the runtime directly (bypassing newRuntime's allow-all
 // test defaults) with a bare Config to assert the deny-by-default property.
-func newBareRuntime(t *testing.T) *spidermonkey.JS {
+func newBareRuntime(t *testing.T) (*spidermonkey.JS, *nodejs.Runtime) {
 	t.Helper()
 	js, err := spidermonkey.New(spidermonkey.Config{})
 	if err != nil {
@@ -25,11 +25,11 @@ func newBareRuntime(t *testing.T) *spidermonkey.JS {
 		t.Fatalf("Install: %v", err)
 	}
 	t.Cleanup(func() { rt.Close() })
-	return js
+	return js, rt
 }
 
 func TestNetConnectDeniedByDefault(t *testing.T) {
-	js := newBareRuntime(t)
+	js, _ := newBareRuntime(t)
 	js.Eval(context.Background(), `
 		globalThis.__r = {};
 		const net = require("net");
@@ -42,7 +42,7 @@ func TestNetConnectDeniedByDefault(t *testing.T) {
 }
 
 func TestListenDeniedByDefault(t *testing.T) {
-	js := newBareRuntime(t)
+	js, _ := newBareRuntime(t)
 	r, err := js.Eval(context.Background(), `
 		globalThis.__r = {};
 		const net = require("net");
@@ -64,13 +64,17 @@ func TestListenDeniedByDefault(t *testing.T) {
 }
 
 func TestHTTPClientDeniedByDefault(t *testing.T) {
-	js := newBareRuntime(t)
-	js.Eval(context.Background(), `
+	js, rt := newBareRuntime(t)
+	// http.get is async; the denial surfaces as an 'error' event once the loop
+	// processes the (denied) dial. Run the loop to completion, then assert.
+	if _, err := rt.RunScript(context.Background(), `
 		globalThis.__r = {};
 		const http = require("http");
 		const req = http.get("http://127.0.0.1:9/", () => { __r.responded = true; });
 		req.on("error", (e) => { __r.err = String(e && e.message || e); });
-	`)
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
 	if got := evalStr(t, js, `__r.err ?? ""`); !strings.Contains(got, "permission denied") {
 		t.Fatalf("nil Dial should deny http.get; got err=%q", got)
 	}

@@ -291,17 +291,18 @@
 		_write(chunk, encoding, callback) { this._chunks.push(chunk); callback(); }
 		_final(callback) {
 			const body = this._chunks.length ? Buffer.concat(this._chunks.map((c) => (typeof c === "string" ? Buffer.from(c) : c))) : Buffer.alloc(0);
-			const r = ops.http_client_req(this.method, this._url, JSON.stringify(this._headers), body);
-			ops.release_pending();
-			if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); callback(); return; }
-			const res = new IncomingMessage({ method: this.method, url: this._url, rawHeaders: r.headers });
-			res.statusCode = r.status;
-			res.statusMessage = r.statusText;
-			const bodyBuf = Object.setPrototypeOf(r.body, Buffer.prototype);
-			process.nextTick(() => {
+			// Async: the op returns immediately and drives one of these callbacks
+			// from the loop once the round-trip finishes off the loop goroutine.
+			const onResponse = (r) => {
+				const res = new IncomingMessage({ method: this.method, url: this._url, rawHeaders: r.headers });
+				res.statusCode = r.status;
+				res.statusMessage = r.statusText;
+				const bodyBuf = Object.setPrototypeOf(r.body, Buffer.prototype);
 				this.emit("response", res);
 				process.nextTick(() => { if (bodyBuf.length) res.push(bodyBuf); res.push(null); });
-			});
+			};
+			const onError = (e) => { const err = new Error(e.message); err.code = e.code; this.emit("error", err); };
+			ops.http_client_req(this.method, this._url, JSON.stringify(this._headers), body, onResponse, onError);
 			callback();
 		}
 		abort() { this.destroy(); }

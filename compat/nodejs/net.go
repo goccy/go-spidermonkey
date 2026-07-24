@@ -316,17 +316,20 @@ func (rt *Runtime) opNetCloseServer(cfg spidermonkey.Config, args []spidermonkey
 	return spidermonkey.Undefined(), nil
 }
 
-// opHTTPClientReq(method, url, headersJSON, body) -> {status, statusText,
-// headers, body} | err. Synchronous (blocks the op) — the JS http.request
-// shim adapts it to the ClientRequest/IncomingMessage event surface.
+// opHTTPClientReq(method, url, headersJSON, body, onResponse, onError).
+// Asynchronous: the round-trip runs on its own goroutine and the result is
+// delivered through onResponse({status, statusText, headers, body}) or
+// onError({code, message}) posted back onto the loop, so a slow peer cannot
+// freeze the loop. The JS http.request shim adapts it to the
+// ClientRequest/IncomingMessage event surface.
 func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
-	if len(args) < 3 {
-		return nil, fmt.Errorf("http_client_req: (method, url, headersJSON, body?) required")
+	if len(args) < 6 {
+		return nil, fmt.Errorf("http_client_req: (method, url, headersJSON, body, onResponse, onError) required")
 	}
 	method := args[0].String()
 	rawURL := args[1].String()
 	var reqBody io.Reader
-	if len(args) > 3 {
+	if args[3].Object() != nil || args[3].String() != "" {
 		if b, err := valueBytes(args[3]); err == nil && len(b) > 0 {
 			reqBody = bytes.NewReader(b)
 		}
@@ -341,35 +344,70 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 			req.Header.Set(k, v)
 		}
 	}
-	// The gated client enforces Config.Resolve/Dial in its DialContext and
-	// connects only to the approved IP (no DNS-rebinding window).
-	resp, err := gatedHTTPClient(cfg).Do(req)
-	if err != nil {
-		return netErr(err), nil
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	onResponse := args[4].Object()
+	onError := args[5].Object()
 
-	hdrPairs := [][2]string{}
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			hdrPairs = append(hdrPairs, [2]string{k, v})
+	// Do the round-trip on a separate goroutine so a slow/hung peer never
+	// freezes the single loop goroutine (which drives every timer and every
+	// other in-flight request). The result is posted back onto the loop.
+	rt.loop.AddPending()
+	go func() {
+		// The gated client enforces Config.Resolve/Dial in its DialContext and
+		// connects only to the approved IP (no DNS-rebinding window).
+		resp, derr := gatedHTTPClient(cfg).Do(req)
+		var body []byte
+		var hdrPairs [][2]string
+		var status int
+		var statusText string
+		if derr == nil {
+			body, derr = io.ReadAll(resp.Body)
+			if cerr := resp.Body.Close(); derr == nil {
+				derr = cerr
+			}
+			status, statusText = resp.StatusCode, resp.Status
+			for k, vs := range resp.Header {
+				for _, v := range vs {
+					hdrPairs = append(hdrPairs, [2]string{k, v})
+				}
+			}
 		}
-	}
-	obj, err := rt.js.NewObject()
-	if err != nil {
-		return nil, err
-	}
-	obj.Set("status", spidermonkey.ValueOf(resp.StatusCode))
-	obj.Set("statusText", spidermonkey.ValueOf(resp.Status))
-	obj.Set("headers", spidermonkey.ValueOf(hdrPairs))
-	u8, err := rt.js.NewBytes(body)
-	if err != nil {
-		return nil, err
-	}
-	defer u8.Free()
-	obj.Set("body", u8)
-	return rt.trackReturn(obj), nil
+		rt.loop.Post(func() (perr error) {
+			defer rt.loop.DonePending()
+			defer func() {
+				if onResponse != nil {
+					onResponse.Free()
+				}
+				if onError != nil {
+					onError.Free()
+				}
+			}()
+			if derr != nil {
+				if onError != nil {
+					onError.Call(netErr(derr))
+				}
+				return nil
+			}
+			obj, oerr := rt.js.NewObject()
+			if oerr != nil {
+				return oerr
+			}
+			defer obj.Free()
+			obj.Set("status", spidermonkey.ValueOf(status))
+			obj.Set("statusText", spidermonkey.ValueOf(statusText))
+			obj.Set("headers", spidermonkey.ValueOf(hdrPairs))
+			u8, uerr := rt.js.NewBytes(body)
+			if uerr != nil {
+				return uerr
+			}
+			defer u8.Free()
+			obj.Set("body", u8)
+			if onResponse != nil {
+				onResponse.Call(obj)
+			}
+			return nil
+		})
+	}()
+	return spidermonkey.Undefined(), nil
 }
 
 func (rt *Runtime) closeNet() {

@@ -24,6 +24,7 @@ type Loop struct {
 	mu         sync.Mutex
 	nextID     int64
 	timers     map[int64]*timer
+	dueBatch   []*timer // timers taken for the current turn, still cancellable
 	immediates []*immediate
 	batch      []*immediate // check-phase snapshot currently executing
 	posts      []func() error
@@ -85,7 +86,21 @@ func (l *Loop) ClearTimer(id int64) {
 	if ok {
 		t.cleared = true
 		delete(l.timers, id)
+	} else {
+		// The timer may be in the batch already taken for this turn (a sibling
+		// due in the same tick, deleted from l.timers by takeDue). Node lets an
+		// earlier same-tick callback cancel it, so mark it and the run loop
+		// skips it before calling.
+		for _, dt := range l.dueBatch {
+			if dt.id == id {
+				dt.cleared = true
+				t, ok = dt, true
+				break
+			}
+		}
 	}
+	// A timer taken for this turn has running=true, so the run loop (not us)
+	// owns its Free; only free a not-yet-running timer here.
 	free := ok && !t.running
 	l.mu.Unlock()
 	if free {
@@ -176,7 +191,40 @@ func (l *Loop) Run(ctx context.Context) error {
 			return err
 		}
 
-		// Posted completions first: they represent finished work whose
+		// Due timers first (Node's timers phase), in due order; microtasks
+		// drain after each callback. Timers scheduled DURING this turn's later
+		// phases are not yet in l.timers, so they wait for the next turn — which
+		// is what makes setImmediate (check phase, below) beat setTimeout(0)
+		// scheduled from the same I/O (post) callback, matching Node.
+		dueTimers := l.takeDue(time.Now())
+		for _, t := range dueTimers {
+			l.mu.Lock()
+			skip := t.cleared // cancelled by an earlier sibling this same tick
+			l.mu.Unlock()
+			if skip {
+				t.fn.Free()
+				continue
+			}
+			_, err := t.fn.Call()
+			l.mu.Lock()
+			t.running = false
+			free := t.interval == 0 || t.cleared
+			l.mu.Unlock()
+			if free {
+				t.fn.Free()
+			}
+			if err != nil {
+				return err
+			}
+			if err := l.drainMicro(ctx); err != nil {
+				return err
+			}
+		}
+		l.mu.Lock()
+		l.dueBatch = nil
+		l.mu.Unlock()
+
+		// Posted completions (the poll phase): finished async work whose
 		// callbacks unblock the guest.
 		for {
 			l.mu.Lock()
@@ -188,24 +236,6 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.posts = l.posts[1:]
 			l.mu.Unlock()
 			if err := f(); err != nil {
-				return err
-			}
-			if err := l.drainMicro(ctx); err != nil {
-				return err
-			}
-		}
-
-		// Due timers, in due order; microtasks drain after each callback.
-		for _, t := range l.takeDue(time.Now()) {
-			_, err := t.fn.Call()
-			l.mu.Lock()
-			t.running = false
-			free := t.interval == 0 || t.cleared
-			l.mu.Unlock()
-			if free {
-				t.fn.Free()
-			}
-			if err != nil {
 				return err
 			}
 			if err := l.drainMicro(ctx); err != nil {
@@ -300,6 +330,9 @@ func (l *Loop) takeDue(now time.Time) []*timer {
 			delete(l.timers, t.id)
 		}
 	}
+	// Keep the batch visible to ClearTimer so a same-tick sibling can cancel a
+	// timer already removed from l.timers.
+	l.dueBatch = due
 	return due
 }
 
