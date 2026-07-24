@@ -68,8 +68,35 @@
 		}
 	}
 
+	// printf-style formatting like util.format: if the first arg is a string with
+	// %s/%d/%i/%f/%j/%o/%O/%c specifiers, substitute the following args; trailing
+	// args are appended. Without specifiers, inspect+join every arg.
+	const formatConsole = (args) => {
+		const f = args[0];
+		if (typeof f !== "string" || !/%[sdifjoOc%]/.test(f)) {
+			return args.map((a) => inspect(a, 0, new Set())).join(" ");
+		}
+		let i = 1;
+		let out = f.replace(/%([sdifjoOc%])/g, (m, spec) => {
+			if (spec === "%") return "%";
+			if (i >= args.length) return m;
+			const a = args[i++];
+			switch (spec) {
+				case "s": return typeof a === "string" ? a : inspect(a, 0, new Set());
+				case "d": return typeof a === "bigint" ? a + "n" : typeof a === "symbol" ? "NaN" : String(Number(a));
+				case "i": return typeof a === "bigint" ? a + "n" : typeof a === "symbol" ? "NaN" : String(parseInt(a, 10));
+				case "f": return typeof a === "symbol" ? "NaN" : String(parseFloat(a));
+				case "j": try { return JSON.stringify(a); } catch { return "[Circular]"; }
+				case "o": case "O": return inspect(a, 0, new Set());
+				case "c": return ""; // CSS directive, ignored in a text console
+				default: return m;
+			}
+		});
+		for (; i < args.length; i++) out += " " + inspect(args[i], 0, new Set());
+		return out;
+	};
 	const consoleWrite = (level, args) => {
-		ops.console_write(level, args.map((a) => inspect(a, 0, new Set())).join(" "));
+		ops.console_write(level, formatConsole(args));
 	};
 	globalThis.console = {
 		log: (...a) => consoleWrite(0, a),
@@ -493,7 +520,7 @@
 			const c = host.lastIndexOf(":");
 			if (c >= 0) { hostname = host.slice(0, c); port = host.slice(c + 1); }
 		}
-		if (port && !/^[0-9]+$/.test(port)) throw new TypeError("Invalid URL: bad port");
+		if (port && (!/^[0-9]+$/.test(port) || Number(port) > 65535)) throw new TypeError("Invalid URL: bad port");
 		return { username, password, hostname: hostname.toLowerCase(), port };
 	}
 
@@ -973,7 +1000,19 @@
 	}
 	globalThis.Headers = Headers;
 
-	let __fdBoundarySeq = 0;
+	// (boundary/name escaping helpers)
+	// Escape a FormData field name / filename for a Content-Disposition header,
+	// exactly as Node/undici do: a raw " or CR/LF would break header quoting and
+	// inject headers, so percent-encode them.
+	const escapeFormName = (s) => String(s).replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
+	// A random multipart boundary so it cannot be predicted and made to appear
+	// inside the content (a predictable boundary is a part-injection vector).
+	const randomBoundary = () => {
+		const b = ops.random_bytes(16);
+		let s = "";
+		for (let i = 0; i < b.length; i++) s += (b[i] & 0xff).toString(16).padStart(2, "0");
+		return "----GSMFormBoundary" + s;
+	};
 	const concatChunks = (chunks) => {
 		let n = 0;
 		for (const c of chunks) n += c.length;
@@ -1000,13 +1039,13 @@
 			return { bytes: new Uint8Array(init._bytes), contentType: init.type || null };
 		}
 		if (globalThis.FormData && init instanceof globalThis.FormData) {
-			const boundary = "----GSMFormBoundary" + (__fdBoundarySeq++).toString(36) + "x";
+			const boundary = randomBoundary();
 			const chunks = [];
 			for (const [name, value] of init) {
-				let head = `--${boundary}\r\nContent-Disposition: form-data; name="${name}"`;
+				let head = `--${boundary}\r\nContent-Disposition: form-data; name="${escapeFormName(name)}"`;
 				if (globalThis.Blob && value instanceof globalThis.Blob) {
 					const fn = value.name !== undefined ? value.name : "blob";
-					head += `; filename="${fn}"\r\n`;
+					head += `; filename="${escapeFormName(fn)}"\r\n`;
 					if (value.type) head += `Content-Type: ${value.type}\r\n`;
 					head += "\r\n";
 					chunks.push(utf8Encode(head), new Uint8Array(value._bytes), utf8Encode("\r\n"));

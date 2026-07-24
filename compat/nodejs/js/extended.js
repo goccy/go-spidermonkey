@@ -46,7 +46,9 @@
 	const rawLog = con.log.bind(con);
 	const rawErr = con.error.bind(con);
 	const indent = (args) => {
-		const text = args.map((a) => (typeof a === "string" ? a : core.util.inspect(a, { raw: true }))).join(" ");
+		// Route through util.format so printf specifiers (%s/%d/%j/...) substitute,
+		// matching Node's console.
+		const text = core.util.format(...args);
 		return groupIndent ? groupIndent + text.replace(/\n/g, "\n" + groupIndent) : text;
 	};
 	const writeOut = (s) => rawLog(groupIndent + String(s).replace(/\n/g, "\n" + groupIndent));

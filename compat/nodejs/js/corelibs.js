@@ -308,9 +308,10 @@
 			const a = args[i++];
 			switch (m) {
 				case "%s": return typeof a === "string" ? a : inspect(a, { raw: true });
-				case "%d": return String(Number(a));
-				case "%i": return String(Math.trunc(Number(a)));
-				case "%f": return String(Number(a));
+				// A Symbol can't be coerced to Number (would throw); Node yields NaN.
+				case "%d": return typeof a === "bigint" ? a + "n" : typeof a === "symbol" ? "NaN" : String(Number(a));
+				case "%i": return typeof a === "bigint" ? a + "n" : typeof a === "symbol" ? "NaN" : String(parseInt(a, 10));
+				case "%f": return typeof a === "symbol" ? "NaN" : String(parseFloat(a));
 				case "%j": try { return JSON.stringify(a); } catch { return "[Circular]"; }
 				case "%o": case "%O": return inspect(a);
 				case "%c": return "";
@@ -450,8 +451,25 @@
 		clearImmediate: globalThis.clearImmediate,
 	};
 	core["timers/promises"] = {
-		setTimeout: (ms, value) => new Promise((res) => setTimeout(() => res(value), ms)),
-		setImmediate: (value) => new Promise((res) => setImmediate(() => res(value))),
+		setTimeout: (ms, value, options = {}) => new Promise((res, rej) => {
+			const signal = options.signal;
+			if (signal && signal.aborted) {
+				return rej(signal.reason || Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+			}
+			const t = setTimeout(() => { cleanup(); res(value); }, ms);
+			// Node keeps the timer ref'd by default; unref only when ref:false.
+			if (options.ref === false && t && typeof t.unref === "function") t.unref();
+			const onAbort = () => { clearTimeout(t); cleanup(); rej(signal.reason || Object.assign(new Error("The operation was aborted"), { name: "AbortError" })); };
+			const cleanup = () => { if (signal) signal.removeEventListener("abort", onAbort); };
+			if (signal) signal.addEventListener("abort", onAbort, { once: true });
+		}),
+		setImmediate: (value, options = {}) => new Promise((res, rej) => {
+			const signal = options.signal;
+			if (signal && signal.aborted) {
+				return rej(signal.reason || Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+			}
+			setImmediate(() => res(value));
+		}),
 	};
 
 	// ------------------------------------------------------------- assert

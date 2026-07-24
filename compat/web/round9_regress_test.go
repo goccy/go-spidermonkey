@@ -1,6 +1,7 @@
 package web_test
 
 import (
+	"strings"
 	"testing"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
@@ -57,6 +58,35 @@ func TestFormDataBody(t *testing.T) {
 	}
 	if got := evalString(t, js, `(__c.body.includes('name="a"') && __c.body.includes("two")) ? "ok" : "no"`); got != "ok" {
 		t.Errorf("multipart body missing expected parts: %q", evalString(t, js, "__c.body"))
+	}
+}
+
+// TestFormDataHeaderInjection verifies a FormData field name containing quotes /
+// CRLF is escaped in the multipart Content-Disposition (no header injection), and
+// the boundary is not the old predictable counter.
+func TestFormDataHeaderInjection(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const fd = new FormData();
+			fd.append('na"me\r\nX-Evil: 1', "val");
+			const r = new Response(fd);
+			__c.body = await r.text();
+			__c.ctype = r.headers.get("content-type");
+		})().catch((e) => { __c.err = String(e && e.stack || e); });
+	`)
+	if got := evalString(t, js, `__c.err ?? ""`); got != "" {
+		t.Fatalf("unexpected error: %s", got)
+	}
+	body := evalString(t, js, "__c.body")
+	if strings.Contains(body, "\r\nX-Evil: 1") {
+		t.Errorf("CRLF in field name was not escaped (header injection): %q", body)
+	}
+	if !strings.Contains(body, "%0D%0A") || !strings.Contains(body, "%22") {
+		t.Errorf("field name special chars were not percent-escaped: %q", body)
+	}
+	if ct := evalString(t, js, "__c.ctype"); strings.Contains(ct, "GSMFormBoundary0x") {
+		t.Errorf("boundary is the old predictable counter: %q", ct)
 	}
 }
 
