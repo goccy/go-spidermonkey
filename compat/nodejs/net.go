@@ -107,6 +107,10 @@ func resolveDialAddr(cfg spidermonkey.Config, network, host string, port int) (s
 	return "", fmt.Errorf("dial %s:%d: permission denied", host, port)
 }
 
+// maxClientBody caps a buffered node:http client response so an
+// approved-but-huge peer can't exhaust host memory.
+const maxClientBody = 100 << 20 // 100 MiB
+
 // gatedHTTPClient builds an http.Client whose DialContext enforces the same
 // resolve-once, dial-the-approved-IP policy as compat/web's fetch, so the
 // node:http/https client cannot be DNS-rebound past Config.Dial and connects
@@ -354,13 +358,20 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 	go func() {
 		// The gated client enforces Config.Resolve/Dial in its DialContext and
 		// connects only to the approved IP (no DNS-rebinding window).
-		resp, derr := gatedHTTPClient(cfg).Do(req)
+		client := gatedHTTPClient(cfg)
+		defer client.CloseIdleConnections() // don't leak kept-alive conns per request
+		resp, derr := client.Do(req)
 		var body []byte
 		var hdrPairs [][2]string
 		var status int
 		var statusText string
 		if derr == nil {
-			body, derr = io.ReadAll(resp.Body)
+			// Cap the buffered body so an approved-but-huge response can't
+			// exhaust host memory. Overflow surfaces as an error.
+			body, derr = io.ReadAll(io.LimitReader(resp.Body, maxClientBody+1))
+			if derr == nil && int64(len(body)) > maxClientBody {
+				derr = fmt.Errorf("response body exceeds %d bytes", maxClientBody)
+			}
 			if cerr := resp.Body.Close(); derr == nil {
 				derr = cerr
 			}
@@ -381,15 +392,23 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 					onError.Free()
 				}
 			}()
-			if derr != nil {
+			// Deliver failures — including guest-object materialization
+			// failures — through onError. Returning an error here would stop the
+			// WHOLE shared loop (every other in-flight request/timer), which is
+			// the wrong blast radius for one client call.
+			fail := func(e error) {
 				if onError != nil {
-					onError.Call(netErr(derr))
+					onError.Call(netErr(e))
 				}
+			}
+			if derr != nil {
+				fail(derr)
 				return nil
 			}
 			obj, oerr := rt.js.NewObject()
 			if oerr != nil {
-				return oerr
+				fail(oerr)
+				return nil
 			}
 			defer obj.Free()
 			obj.Set("status", spidermonkey.ValueOf(status))
@@ -397,7 +416,8 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 			obj.Set("headers", spidermonkey.ValueOf(hdrPairs))
 			u8, uerr := rt.js.NewBytes(body)
 			if uerr != nil {
-				return uerr
+				fail(uerr)
+				return nil
 			}
 			defer u8.Free()
 			obj.Set("body", u8)
