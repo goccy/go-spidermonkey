@@ -28,8 +28,8 @@ import (
 // under its own path and ITS relative imports resolve correctly.
 //
 // CommonJS files are rejected here — that interop needs the full runtime
-// (nodejs.Install, whose loader supersedes this one). Reads are gated by
-// Config.FSAccess.
+// (nodejs.Install, whose loader supersedes this one). Access control lives
+// in Config.FS.
 func ESMLoader(cfg spidermonkey.Config, specifier, referrer string) (string, error) {
 	r, err := resolveModule(cfg.FS, specifier, referrer, false)
 	if err != nil {
@@ -91,11 +91,9 @@ func hasDefaultExport(src []byte) bool {
 	return strings.Contains(s, "export default") || strings.Contains(s, "as default")
 }
 
-// readModuleFile reads p from Config.FS under the FSAccess gate.
+// readModuleFile reads p from Config.FS. Access control lives in the FS (it
+// may deny with fs.ErrPermission or hide with fs.ErrNotExist).
 func readModuleFile(cfg spidermonkey.Config, p string) ([]byte, error) {
-	if cfg.FSAccess != nil && !cfg.FSAccess(p, false) {
-		return nil, fmt.Errorf("load module %q: permission denied", p)
-	}
 	b, err := readFile(cfg.FS, p)
 	if err != nil {
 		return nil, fmt.Errorf("load module %q: %w", p, err)

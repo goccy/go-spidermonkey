@@ -73,16 +73,14 @@ type prefixResolver struct {
 	load   ModuleLoader
 }
 
-// defaultModuleLoader reads the resolved specifier from Config.FS, gated by
-// Config.FSAccess. Relative specifiers arrive already resolved against the
+// defaultModuleLoader reads the resolved specifier from Config.FS. Access
+// control lives in the FS (it may deny with fs.ErrPermission), so the loader
+// simply reads. Relative specifiers arrive already resolved against the
 // referrer, so a plain ReadFile suffices; bare specifiers arrive verbatim for
 // the FS to map.
 func defaultModuleLoader(cfg Config, specifier, referrer string) (string, error) {
 	if cfg.FS == nil {
 		return "", fmt.Errorf("cannot load module %q: no FS configured", specifier)
-	}
-	if cfg.FSAccess != nil && !cfg.FSAccess(specifier, false) {
-		return "", fmt.Errorf("load module %q: %w", specifier, fs.ErrPermission)
 	}
 	b, err := fs.ReadFile(cfg.FS, specifier)
 	if err != nil {

@@ -316,10 +316,10 @@ func TestFSReadOnlyAndPermissions(t *testing.T) {
 		t.Errorf("write to read-only FS: code = %q, want EROFS", got)
 	}
 
-	// FSAccess gates fs reads too.
+	// A policy FS that denies a read surfaces EACCES to the guest — the FS is
+	// the single access-control point (a sheena Volume works the same way).
 	js2, rt2 := newRuntime(t, spidermonkey.Config{
-		FS:       fstest.MapFS{"secret.txt": {Data: []byte("s")}},
-		FSAccess: func(path string, write bool) bool { return false },
+		FS: denyAllFS{fstest.MapFS{"secret.txt": {Data: []byte("s")}}},
 	})
 	runScript(t, rt2, `
 		const fs = require("fs");
@@ -329,7 +329,7 @@ func TestFSReadOnlyAndPermissions(t *testing.T) {
 		})();
 	`)
 	if got := evalStr(t, js2, `denied`); got != "EACCES" {
-		t.Errorf("FSAccess-denied read: code = %q, want EACCES", got)
+		t.Errorf("FS-denied read: code = %q, want EACCES", got)
 	}
 }
 

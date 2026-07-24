@@ -8,8 +8,16 @@ import "io/fs"
 // the filesystem behaves as a read-only mount and writes surface to the guest
 // as permission errors. Reads always go through the plain fs.FS methods.
 //
-// The memfs package provides an in-memory implementation, useful in tests and
-// for isolating instances from the host filesystem entirely.
+// An implementation is the single point of filesystem access control: it
+// enforces its own policy inside these methods and inside the fs.FS read
+// methods (return fs.ErrPermission to deny, fs.ErrNotExist to hide). A sheena
+// fs.Volume satisfies this interface through a tiny adapter (its OpenFile
+// returns sheena's fs.File, which is an io/fs.File; the rest match by
+// embedding), so a sheena sandbox's Refuse/Hide/Access rules carry straight
+// into the guest.
+//
+// The memfs package provides an unrestricted in-memory implementation, useful
+// in tests and for isolating instances from the host filesystem entirely.
 type WritableFS interface {
 	fs.FS
 

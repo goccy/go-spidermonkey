@@ -2,8 +2,8 @@ package nodejs
 
 // fsextra.go: the fs operations beyond the basic read/write/stat set —
 // copyFile, rm (recursive), cp, mkdtemp, realpath, and the fd-based
-// openSync/readSync/writeSync/closeSync surface. All gated by
-// Config.FSAccess; writes require a WritableFS.
+// openSync/readSync/writeSync/closeSync surface. Access control lives in
+// Config.FS; writes require a WritableFS.
 
 import (
 	"fmt"
@@ -34,12 +34,6 @@ func (rt *Runtime) opFSCopyFile(cfg spidermonkey.Config, args []spidermonkey.Val
 	}
 	src := guestPath(args[0].String())
 	dst := guestPath(args[1].String())
-	if err := checkAccess(cfg, src, false); err != nil {
-		return fsErrValue(err), nil
-	}
-	if err := checkAccess(cfg, dst, true); err != nil {
-		return fsErrValue(err), nil
-	}
 	wfs, err := writableFS(cfg)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -70,9 +64,6 @@ func (rt *Runtime) opFSRm(cfg spidermonkey.Config, args []spidermonkey.Value) (s
 	p := guestPath(args[0].String())
 	recursive := args[1].Bool()
 	force := args[2].Bool()
-	if err := checkAccess(cfg, p, true); err != nil {
-		return fsErrValue(err), nil
-	}
 	wfs, err := writableFS(cfg)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -133,9 +124,6 @@ func (rt *Runtime) opFSMkdtemp(cfg spidermonkey.Config, args []spidermonkey.Valu
 		seq := rt.nextFD
 		rt.mu.Unlock()
 		candidate := prefix + strconv.FormatInt(seq, 36) + "xxxxx"[:5]
-		if err := checkAccess(cfg, candidate, true); err != nil {
-			return fsErrValue(err), nil
-		}
 		if _, statErr := fs.Stat(wfs, candidate); statErr == nil {
 			continue
 		}
@@ -155,9 +143,6 @@ func (rt *Runtime) opFSOpen(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	p := guestPath(args[0].String())
 	flags := args[1].String()
 	write := flags != "r"
-	if err := checkAccess(cfg, p, write); err != nil {
-		return fsErrValue(err), nil
-	}
 	var data []byte
 	switch flags {
 	case "r", "r+":

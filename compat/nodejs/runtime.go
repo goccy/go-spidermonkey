@@ -477,13 +477,6 @@ func writableFS(cfg spidermonkey.Config) (spidermonkey.WritableFS, error) {
 	return w, nil
 }
 
-func checkAccess(cfg spidermonkey.Config, p string, write bool) error {
-	if cfg.FSAccess != nil && !cfg.FSAccess(p, write) {
-		return fmt.Errorf("%q: %w", p, fs.ErrPermission)
-	}
-	return nil
-}
-
 // trackReturn pins obj until the guest calls release_pending (immediately
 // after copying the value out), so returned handles do not accumulate.
 func (rt *Runtime) trackReturn(obj *spidermonkey.Object) spidermonkey.Value {
@@ -509,9 +502,6 @@ func (rt *Runtime) opFSReadFile(cfg spidermonkey.Config, args []spidermonkey.Val
 		return nil, fmt.Errorf("fs_read_file: path required")
 	}
 	p := guestPath(args[0].String())
-	if err := checkAccess(cfg, p, false); err != nil {
-		return fsErrValue(err), nil
-	}
 	b, err := readFile(cfg.FS, p)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -528,9 +518,6 @@ func (rt *Runtime) opFSWriteFile(cfg spidermonkey.Config, args []spidermonkey.Va
 		return nil, fmt.Errorf("fs_write_file: (path, data, append) required")
 	}
 	p := guestPath(args[0].String())
-	if err := checkAccess(cfg, p, true); err != nil {
-		return fsErrValue(err), nil
-	}
 	wfs, err := writableFS(cfg)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -573,9 +560,6 @@ func (rt *Runtime) opFSStat(cfg spidermonkey.Config, args []spidermonkey.Value) 
 		return nil, fmt.Errorf("fs_stat: path required")
 	}
 	p := guestPath(args[0].String())
-	if err := checkAccess(cfg, p, false); err != nil {
-		return fsErrValue(err), nil
-	}
 	if cfg.FS == nil {
 		return fsErrValue(fs.ErrNotExist), nil
 	}
@@ -596,9 +580,6 @@ func (rt *Runtime) opFSReaddir(cfg spidermonkey.Config, args []spidermonkey.Valu
 		return nil, fmt.Errorf("fs_readdir: path required")
 	}
 	p := guestPath(args[0].String())
-	if err := checkAccess(cfg, p, false); err != nil {
-		return fsErrValue(err), nil
-	}
 	if cfg.FS == nil {
 		return fsErrValue(fs.ErrNotExist), nil
 	}
@@ -620,9 +601,6 @@ func (rt *Runtime) opFSMkdir(cfg spidermonkey.Config, args []spidermonkey.Value)
 		return nil, fmt.Errorf("fs_mkdir: (path, recursive) required")
 	}
 	p := guestPath(args[0].String())
-	if err := checkAccess(cfg, p, true); err != nil {
-		return fsErrValue(err), nil
-	}
 	wfs, err := writableFS(cfg)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -651,9 +629,6 @@ func (rt *Runtime) opFSRemove(cfg spidermonkey.Config, args []spidermonkey.Value
 		return nil, fmt.Errorf("fs_remove: path required")
 	}
 	p := guestPath(args[0].String())
-	if err := checkAccess(cfg, p, true); err != nil {
-		return fsErrValue(err), nil
-	}
 	wfs, err := writableFS(cfg)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -669,12 +644,6 @@ func (rt *Runtime) opFSRename(cfg spidermonkey.Config, args []spidermonkey.Value
 		return nil, fmt.Errorf("fs_rename: (old, new) required")
 	}
 	oldp, newp := guestPath(args[0].String()), guestPath(args[1].String())
-	if err := checkAccess(cfg, oldp, true); err != nil {
-		return fsErrValue(err), nil
-	}
-	if err := checkAccess(cfg, newp, true); err != nil {
-		return fsErrValue(err), nil
-	}
 	wfs, err := writableFS(cfg)
 	if err != nil {
 		return fsErrValue(err), nil
@@ -690,9 +659,8 @@ func (rt *Runtime) opFSExists(cfg spidermonkey.Config, args []spidermonkey.Value
 		return spidermonkey.ValueOf(false), nil
 	}
 	p := guestPath(args[0].String())
-	if cfg.FSAccess != nil && !cfg.FSAccess(p, false) {
-		return spidermonkey.ValueOf(false), nil
-	}
+	// A policy FS may hide the path (fs.ErrNotExist) or deny it; either way
+	// existsSync reports false.
 	_, err := fs.Stat(cfg.FS, p)
 	return spidermonkey.ValueOf(err == nil), nil
 }

@@ -2,6 +2,7 @@ package nodejs_test
 
 import (
 	"context"
+	"io/fs"
 	"testing"
 	"testing/fstest"
 
@@ -115,15 +116,20 @@ func TestRelativeAndExtensionFallback(t *testing.T) {
 	}
 }
 
-func TestFSAccessGatesModuleReads(t *testing.T) {
+// denyAllFS denies every read — a policy FS stand-in (like a sheena Volume
+// that refuses everything). Access control is in the FS, not a Config hook.
+type denyAllFS struct{ fs.FS }
+
+func (d denyAllFS) Open(name string) (fs.File, error) {
+	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
+}
+
+func TestFSDeniesModuleReads(t *testing.T) {
 	fsys := fstest.MapFS{
 		"node_modules/sec/package.json": {Data: []byte(`{"exports": "./index.js"}`)},
 		"node_modules/sec/index.js":     {Data: []byte(`export const x = 1;`)},
 	}
-	js, err := spidermonkey.New(spidermonkey.Config{
-		FS:       fsys,
-		FSAccess: func(path string, write bool) bool { return false },
-	})
+	js, err := spidermonkey.New(spidermonkey.Config{FS: denyAllFS{fsys}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +140,6 @@ func TestFSAccessGatesModuleReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r.Error == nil {
-		t.Fatal("import succeeded although FSAccess denied it")
+		t.Fatal("import succeeded although the FS denied the read")
 	}
 }

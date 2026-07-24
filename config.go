@@ -30,25 +30,31 @@ type Config struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	// FS backs the default ES module loader and is available to host functions
-	// (a future Node-compatible fs). SpiderMonkey itself has no filesystem API,
-	// so it does nothing on its own. nil means modules must be supplied by
-	// a custom SetModuleLoader. An FS that also implements WritableFS accepts
-	// writes from host functions that need them; a plain fs.FS behaves as a
-	// read-only filesystem.
+	// FS is the filesystem the guest sees: it backs the default ES module
+	// loader and every host-function file operation (the compat packages'
+	// node:fs). SpiderMonkey itself has no filesystem API, so it does nothing
+	// on its own. nil means modules must be supplied by a custom
+	// SetModuleLoader and no filesystem is reachable.
+	//
+	// FS is ALSO the single point of filesystem access control: an
+	// implementation enforces its own policy inside its Open/OpenFile/Stat/…
+	// methods (deny a path with fs.ErrPermission, hide it with
+	// fs.ErrNotExist), exactly as a sheena fs.Volume does with its
+	// Refuse/Hide/Access rules. There is deliberately no separate access
+	// callback — a plain fs.FS grants read access to everything it exposes
+	// (the embedder chose to expose it), and a policy-carrying FS restricts
+	// reads and writes uniformly from one place. An FS that also implements
+	// WritableFS accepts writes; a plain fs.FS is read-only (writes surface
+	// as EROFS).
 	FS fs.FS
 
 	// The permission hooks below are callback allow-lists consulted by host
-	// functions (the compat packages' ops) and, for FSAccess, by the default
-	// module loader. SpiderMonkey has no I/O of its own, so a hook only gates
-	// capabilities an embedder explicitly installed: the zero Config remains
-	// fully sandboxed because there is nothing to allow. A nil hook permits
-	// the operations of installed host functions unrestricted.
-
-	// FSAccess, when non-nil, is a per-access whitelist. It receives the guest
-	// path and whether the access is a write; returning false denies it (the
-	// guest sees a permission error).
-	FSAccess func(path string, write bool) bool
+	// functions (the compat packages' ops). SpiderMonkey has no I/O of its
+	// own, so a hook only gates capabilities an embedder explicitly
+	// installed: the zero Config remains fully sandboxed because there is
+	// nothing to allow. A nil hook permits the operations of installed host
+	// functions unrestricted. (Filesystem access is governed by FS itself,
+	// above, not by a hook here.)
 
 	// Dial, when non-nil, is the outbound-connection whitelist. It is called
 	// with ("tcp", dotted-quad IP, port) before each connect; returning false

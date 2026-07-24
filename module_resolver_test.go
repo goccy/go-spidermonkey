@@ -2,6 +2,7 @@ package spidermonkey_test
 
 import (
 	"context"
+	"io/fs"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -10,18 +11,26 @@ import (
 	"github.com/goccy/go-spidermonkey/memfs"
 )
 
-func TestModuleLoaderFSAccessDenied(t *testing.T) {
-	var asked []string
+// denyFS wraps an fs.FS and denies the named paths — the "policy lives in the
+// FS" model (a stand-in for a sheena Volume's Refuse rule). Access control is
+// enforced by the FS itself; there is no separate Config hook.
+type denyFS struct {
+	fs.FS
+	deny map[string]bool
+}
+
+func (d denyFS) Open(name string) (fs.File, error) {
+	if d.deny[name] {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
+	}
+	return d.FS.Open(name)
+}
+
+func TestModuleLoaderFSDenied(t *testing.T) {
 	js, _ := spidermonkey.New(spidermonkey.Config{
-		FS: fstest.MapFS{
-			"dep.js": {Data: []byte(`export const answer = 42;`)},
-		},
-		FSAccess: func(path string, write bool) bool {
-			asked = append(asked, path)
-			if write {
-				t.Errorf("module load asked for write access to %q", path)
-			}
-			return false
+		FS: denyFS{
+			FS:   fstest.MapFS{"dep.js": {Data: []byte(`export const answer = 42;`)}},
+			deny: map[string]bool{"dep.js": true},
 		},
 	})
 	defer js.Close()
@@ -32,22 +41,20 @@ func TestModuleLoaderFSAccessDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r.Error == nil {
-		t.Fatal("import succeeded although FSAccess denied it")
+		t.Fatal("import succeeded although the FS denied the read")
 	}
 	if !strings.Contains(r.Error.Error(), "permission") {
 		t.Errorf("error = %q, want a permission error", r.Error)
 	}
-	if len(asked) == 0 || asked[0] != "dep.js" {
-		t.Errorf("FSAccess consulted with %v, want [dep.js ...]", asked)
-	}
 }
 
-func TestModuleLoaderFSAccessAllowed(t *testing.T) {
+func TestModuleLoaderFSAllowed(t *testing.T) {
+	// The same FS with nothing denied loads normally.
 	js, _ := spidermonkey.New(spidermonkey.Config{
-		FS: fstest.MapFS{
-			"dep.js": {Data: []byte(`export const answer = 42;`)},
+		FS: denyFS{
+			FS:   fstest.MapFS{"dep.js": {Data: []byte(`export const answer = 42;`)}},
+			deny: map[string]bool{},
 		},
-		FSAccess: func(path string, write bool) bool { return path == "dep.js" && !write },
 	})
 	defer js.Close()
 
