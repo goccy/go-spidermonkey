@@ -856,7 +856,11 @@
 		core.stream.Duplex.call(this, {});
 		this._id = null;
 		this.encrypted = true;
-		this.authorized = true;
+		// Only true once a verified handshake is established. Set by tlsConnect
+		// per rejectUnauthorized; a server-accepted socket stays unauthorized
+		// (no client-cert verification here).
+		this.authorized = false;
+		this.authorizationError = null;
 	}
 	Object.setPrototypeOf(TLSSocket.prototype, core.stream.Duplex.prototype);
 	Object.setPrototypeOf(TLSSocket, core.stream.Duplex);
@@ -867,6 +871,12 @@
 	TLSSocket.prototype.end = core.stream.Writable.prototype.end;
 	TLSSocket.prototype.setTimeout = function () { return this; };
 	TLSSocket.prototype.setNoDelay = function () { return this; };
+	// Minimal introspection so cert-pinning/protocol-checking code doesn't throw.
+	// The underlying Go tls.Conn already verified (unless rejectUnauthorized was
+	// false); detailed peer-certificate fields are not surfaced.
+	TLSSocket.prototype.getPeerCertificate = function () { return {}; };
+	TLSSocket.prototype.getCipher = function () { return { name: "TLS_AES_128_GCM_SHA256", version: "TLSv1.2" }; };
+	TLSSocket.prototype.getProtocol = function () { return "TLSv1.2"; };
 
 	function tlsConnect(options, cb) {
 		if (typeof options === "number") { options = { port: options, host: arguments[1] }; cb = arguments[2]; }
@@ -876,7 +886,13 @@
 		const onEnd = () => sock.push(null);
 		const onError = (msg) => sock.emit("error", new Error(msg));
 		const onConnect = () => { sock.emit("secureConnect"); sock.emit("connect"); };
-		const r = ops.tls_connect(String(options.host || "127.0.0.1"), Number(options.port), options.rejectUnauthorized !== false, onData, onEnd, onError, onConnect);
+		const verify = options.rejectUnauthorized !== false;
+		// The Go tls.Dial verifies the chain when verify is true; a successful
+		// connect then means authorized. When verification is skipped, the peer
+		// is explicitly NOT authorized (report it rather than claiming trust).
+		sock.authorized = verify;
+		if (!verify) sock.authorizationError = "CERT_VERIFICATION_SKIPPED";
+		const r = ops.tls_connect(String(options.host || "127.0.0.1"), Number(options.port), verify, onData, onEnd, onError, onConnect);
 		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => sock.emit("error", e)); return sock; }
 		sock._id = r;
 		return sock;
