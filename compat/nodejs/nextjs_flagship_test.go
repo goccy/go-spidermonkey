@@ -1,10 +1,11 @@
 package nodejs_test
 
-// The stretch flagship: an unmodified Next.js 14 production server (pages
-// router) running inside go-spidermonkey. The app is BUILT on the host with
-// real Node (`npm run build` in examples/nextjs — SWC natives are build-time
-// only); the engine runs the production server via the custom-server API.
-// Opt-in: skipped unless examples/nextjs has node_modules AND .next.
+// The stretch flagship: an unmodified Next.js 14 App Router production server
+// (Server + Client Components, dynamic SSR, a Route Handler) running inside
+// go-spidermonkey. The app is BUILT on the host with real Node (`npm run
+// build` in examples/nextjs — SWC natives are build-time only); the engine
+// runs the production server via the custom-server API. Opt-in: skipped unless
+// examples/nextjs has node_modules AND .next.
 
 import (
 	"bytes"
@@ -135,30 +136,44 @@ func TestNextJSFlagship(t *testing.T) {
 		return resp.StatusCode, string(body), resp.Header
 	}
 
-	// SSR page (getServerSideProps).
+	// Dynamic-SSR home: the Server Component runs per request and renders a
+	// Client Component with server-computed props.
 	status, body, headers := get("/")
 	if status != 200 {
 		t.Fatalf("GET / = %d: %.500s", status, body)
 	}
-	if !strings.Contains(body, "Hello from Next.js on go-spidermonkey!") {
+	if !strings.Contains(body, "Hello from Next.js App Router on go-spidermonkey!") {
 		t.Errorf("SSR body missing heading: %.300s", body)
 	}
+	// The Server Component's server-computed data is in the HTML.
 	if !strings.Contains(body, "spidermonkey") || !strings.Contains(body, "42") {
-		t.Errorf("SSR props missing from body")
+		t.Errorf("server component data missing from body")
+	}
+	// The Client Component was server-rendered: its initial state ("Server
+	// value: 42") and its interactive button markup are present pre-hydration.
+	if !strings.Contains(body, "Server value") {
+		t.Errorf("client component initial render missing: %.400s", body)
+	}
+	if !strings.Contains(body, "increment") {
+		t.Errorf("client component button markup missing (use-client boundary not rendered)")
+	}
+	// A "use client" boundary means Next ships a client chunk for hydration.
+	if !strings.Contains(body, "/_next/static/chunks/") {
+		t.Errorf("no client chunk referenced — client component was not hydratable")
 	}
 	if got := headers.Get("X-Powered-By"); got != "Next.js" {
 		t.Errorf("X-Powered-By = %q", got)
 	}
 
-	// Statically generated page.
+	// Statically prerendered Server Component route.
 	status2, body2, _ := get("/about")
-	if status2 != 200 || !strings.Contains(body2, "Statically generated about page") {
+	if status2 != 200 || !strings.Contains(body2, "Statically generated About (App Router)") {
 		t.Errorf("GET /about = %d: %.300s", status2, body2)
 	}
 
-	// API route.
+	// Route Handler (App Router API).
 	status3, body3, _ := get("/api/hello")
-	if status3 != 200 || !strings.Contains(body3, `"hello":"from api"`) {
+	if status3 != 200 || !strings.Contains(body3, `"hello":"from route handler"`) {
 		t.Errorf("GET /api/hello = %d: %s", status3, body3)
 	}
 

@@ -743,17 +743,31 @@
 	};
 	globalThis.__node_punycode = core.punycode;
 
+	// vm without true realm isolation: runInNewContext/runInContext run the
+	// code with globalThis/self/global bound to the supplied sandbox, so code
+	// that assigns to globals (e.g. Next's App Router manifest files, which do
+	// `globalThis.__RSC_MANIFEST = ...`) writes into the sandbox and Next reads
+	// it back. This is NOT a security boundary — the code can still reach the
+	// real global through other means — but it makes the common
+	// eval-a-manifest / evaluate-config pattern work.
+	function runInSandbox(code, sandbox) {
+		const ctx = sandbox || {};
+		const fn = new Function("globalThis", "self", "global", "exports", "module", String(code));
+		fn(ctx, ctx, ctx, ctx.exports, ctx.module);
+		return ctx;
+	}
 	core.vm = {
 		createContext: (o = {}) => o,
 		isContext: () => false,
 		runInThisContext: (code) => (0, eval)(String(code)),
-		runInNewContext: notSupported("vm.runInNewContext"),
-		runInContext: notSupported("vm.runInContext"),
+		runInNewContext: (code, sandbox) => runInSandbox(code, sandbox),
+		runInContext: (code, contextifiedObject) => runInSandbox(code, contextifiedObject),
 		compileFunction: (code, params = []) => new Function(...params, String(code)),
 		Script: class Script {
 			constructor(code) { this._code = String(code); }
 			runInThisContext() { return (0, eval)(this._code); }
-			runInNewContext() { notSupported("vm.Script.runInNewContext")(); }
+			runInNewContext(sandbox) { return runInSandbox(this._code, sandbox); }
+			runInContext(contextifiedObject) { return runInSandbox(this._code, contextifiedObject); }
 		},
 	};
 

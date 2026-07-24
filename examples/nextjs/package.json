@@ -1,7 +1,7 @@
 {
   "name": "nextjs-example",
   "private": true,
-  "description": "compat/nodejs stretch flagship: an unmodified Next.js 12 production server",
+  "description": "compat/nodejs stretch flagship: an unmodified Next.js 14 App Router production server (Server + Client Components)",
   "scripts": {
     "build": "next build"
   },

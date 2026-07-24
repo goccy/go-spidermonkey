@@ -595,22 +595,15 @@
 		read() {
 			const s = this._stream;
 			if (!s) return Promise.reject(new TypeError("reader has released its lock"));
-			try {
-				if (s._queue.length === 0 && !s._closed && !s._errored && s._source.pull) s._pull();
-				if (s._queue.length > 0) return Promise.resolve({ value: s._queue.shift(), done: false });
-				if (s._errored) return Promise.reject(s._errorValue);
-				if (s._closed) return Promise.resolve({ value: undefined, done: true });
-				if (s._source.pull) {
-					// A synchronous pull MUST make progress (fetch bodies):
-					// "no data yet" is inexpressible there.
-					return Promise.reject(new TypeError("underlyingSource.pull made no progress"));
-				}
-				// Push-style source (TransformStream readable): wait for the
-				// next enqueue/close.
-				return new Promise((resolve, reject) => s._waiters.push({ resolve, reject }));
-			} catch (e) {
-				return Promise.reject(e);
-			}
+			if (s._queue.length > 0) return Promise.resolve({ value: s._queue.shift(), done: false });
+			if (s._errored) return Promise.reject(s._errorValue);
+			if (s._closed) return Promise.resolve({ value: undefined, done: true });
+			// Wait for the next enqueue/close/error, and drive the source's
+			// pull (which may enqueue synchronously — fetch bodies block in the
+			// host — or asynchronously — React's renderToReadableStream).
+			const waiter = new Promise((resolve, reject) => s._waiters.push({ resolve, reject }));
+			s._maybePull();
+			return waiter;
 		}
 		releaseLock() { if (this._stream) { this._stream._locked = false; this._stream = null; } }
 		cancel(reason) {
@@ -649,9 +642,42 @@
 			if (underlyingSource.start) underlyingSource.start(this._controller);
 		}
 		get locked() { return this._locked; }
-		_pull() {
-			if (this._source.pull) this._source.pull(this._controller);
-			else this._closed = true;
+		// _maybePull drives the underlying source's pull to satisfy pending
+		// reads. A source with no pull (a push stream / TransformStream
+		// readable) just waits for enqueues. pull may enqueue synchronously
+		// (a fetch body blocks in the host) or return a promise and enqueue
+		// later (React SSR); either way we re-pull while reads are outstanding
+		// and nothing has been queued yet.
+		_maybePull() {
+			if (this._pulling || this._closed || this._errored) return;
+			// A push-style source (no pull — a TransformStream readable, or any
+			// stream fed only through its controller) waits for external
+			// enqueue/close; there is nothing to pull.
+			if (!this._source.pull) return;
+			if (this._waiters.length === 0) return; // no outstanding demand
+			this._pulling = true;
+			// Call pull synchronously: a synchronous source (a fetch/Response
+			// body) enqueues before returning, so the waiting read resolves
+			// this turn with no extra scheduling. An async source returns a
+			// promise and enqueues later — handled by the re-pull below.
+			let pulled;
+			try { pulled = this._source.pull(this._controller); }
+			catch (e) { this._pulling = false; this._controller.error(e); return; }
+			Promise.resolve(pulled).then(() => {
+				this._pulling = false;
+				// Still-unmet demand with nothing queued: a source like React's
+				// renderToReadableStream advances only when pulled again, so
+				// re-pull — but via a macrotask so its own scheduler (timers /
+				// setImmediate) gets to run rather than being starved by a tight
+				// microtask loop. (A synchronous source like a fetch body
+				// enqueues during pull, so this branch is never taken for it.)
+				if (this._queue.length === 0 && this._waiters.length && !this._closed && !this._errored) {
+					setTimeout(() => this._maybePull(), 0);
+				}
+			}).catch((e) => {
+				this._pulling = false;
+				this._controller.error(e);
+			});
 		}
 		getReader() { return new ReadableStreamDefaultReader(this); }
 		cancel(reason) {
@@ -700,6 +726,24 @@
 		pipeThrough(transform, options) {
 			this.pipeTo(transform.writable, options).catch(() => {});
 			return transform.readable;
+		}
+		// tee() splits the stream into two branches that each receive every
+		// chunk (React's renderToReadableStream + Next App Router use it).
+		tee() {
+			const reader = this.getReader();
+			let c1, c2;
+			const branch1 = new ReadableStream({ start(c) { c1 = c; } });
+			const branch2 = new ReadableStream({ start(c) { c2 = c; } });
+			const pump = () => {
+				reader.read().then(({ value, done }) => {
+					if (done) { c1.close(); c2.close(); return; }
+					c1.enqueue(value);
+					c2.enqueue(value);
+					pump();
+				}).catch((e) => { c1.error(e); c2.error(e); });
+			};
+			pump();
+			return [branch1, branch2];
 		}
 	}
 	globalThis.ReadableStream = ReadableStream;
