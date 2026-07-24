@@ -46,3 +46,20 @@ func TestImmediateBeforeTimeoutInsideCallback(t *testing.T) {
 		t.Fatalf("order = %q, want immediate,timeout", got)
 	}
 }
+
+// Clearing a timer that already fired in the SAME tick must be a harmless
+// no-op, not a double-free of its (already-freed) callback handle.
+func TestClearAlreadyFiredSameTickTimer(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__order = [];
+		// a fires first (and its handle is freed); b then clears a — already fired.
+		const a = setTimeout(() => { __order.push("a"); }, 0);
+		setTimeout(() => { clearTimeout(a); __order.push("b"); }, 0);
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if got := evalStr(t, js, `__order.join(",")`); got != "a,b" {
+		t.Fatalf("order = %q, want a,b (clearing a fired timer must not crash)", got)
+	}
+}

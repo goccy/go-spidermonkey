@@ -43,6 +43,17 @@ type immediate struct {
 	cleared bool
 }
 
+// freeFn releases the callback handle exactly once; a second call is a no-op.
+// Every free site goes through this so a handle taken into dueBatch/the check
+// batch can't be double-freed (which, if the engine recycles handle ids, would
+// unpin an unrelated live object). All frees happen on the loop goroutine.
+func (im *immediate) freeFn() {
+	if im.fn != nil {
+		im.fn.Free()
+		im.fn = nil
+	}
+}
+
 type timer struct {
 	id       int64
 	due      time.Time
@@ -50,6 +61,13 @@ type timer struct {
 	fn       *spidermonkey.Object
 	running  bool // callback currently executing (the loop owns the free)
 	cleared  bool
+}
+
+func (t *timer) freeFn() {
+	if t.fn != nil {
+		t.fn.Free()
+		t.fn = nil
+	}
 }
 
 // New creates a loop bound to js.
@@ -100,11 +118,13 @@ func (l *Loop) ClearTimer(id int64) {
 		}
 	}
 	// A timer taken for this turn has running=true, so the run loop (not us)
-	// owns its Free; only free a not-yet-running timer here.
+	// owns its Free; only free a not-yet-running timer here. freeFn is
+	// idempotent, so even if the run loop already fired-and-freed this id
+	// (it lingers in dueBatch), this is a safe no-op rather than a double-free.
 	free := ok && !t.running
 	l.mu.Unlock()
 	if free {
-		t.fn.Free()
+		t.freeFn()
 	}
 }
 
@@ -153,25 +173,38 @@ func (l *Loop) ClearImmediate(id int64) {
 // request on the same instance (a cross-request state leak). Call only when the
 // loop goroutine is idle (Run has returned), so nothing is mid-callback.
 func (l *Loop) Reset() {
+	// Run any leftover engine jobs (queued promise reactions) now, on THIS
+	// instance's teardown, so a reaction one request left behind can't execute
+	// during the next request on the same instance — the cross-request leak the
+	// Go-side clears below don't cover on their own. Bounded by the engine
+	// draining to quiescence; errors are irrelevant during teardown.
+	_ = l.drainJobs(context.Background())
 	l.mu.Lock()
 	timers := l.timers
 	l.timers = map[int64]*timer{}
 	imms := l.immediates
 	l.immediates = nil
+	batch := l.batch
+	due := l.dueBatch
 	l.dueBatch = nil
 	l.batch = nil
 	l.posts = nil
 	l.pending = 0
 	l.mu.Unlock()
+	// The loop is idle here (Run has returned), so nothing is mid-callback and
+	// every handle is safe to free. freeFn is idempotent, so timers that also
+	// sit in dueBatch, or immediates in both immediates and batch, free once.
 	for _, t := range timers {
-		if !t.running {
-			t.fn.Free()
-		}
+		t.freeFn()
+	}
+	for _, t := range due {
+		t.freeFn()
 	}
 	for _, im := range imms {
-		if !im.cleared {
-			im.fn.Free()
-		}
+		im.freeFn()
+	}
+	for _, im := range batch {
+		im.freeFn()
 	}
 }
 
@@ -231,7 +264,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			skip := t.cleared // cancelled by an earlier sibling this same tick
 			l.mu.Unlock()
 			if skip {
-				t.fn.Free()
+				t.freeFn()
 				continue
 			}
 			_, err := t.fn.Call()
@@ -240,7 +273,7 @@ func (l *Loop) Run(ctx context.Context) error {
 			free := t.interval == 0 || t.cleared
 			l.mu.Unlock()
 			if free {
-				t.fn.Free()
+				t.freeFn()
 			}
 			if err != nil {
 				return err
@@ -284,11 +317,11 @@ func (l *Loop) Run(ctx context.Context) error {
 			skip := im.cleared
 			l.mu.Unlock()
 			if skip {
-				im.fn.Free()
+				im.freeFn()
 				continue
 			}
 			_, err := im.fn.Call()
-			im.fn.Free()
+			im.freeFn()
 			if err != nil {
 				return err
 			}
@@ -345,9 +378,17 @@ func (l *Loop) takeDue(now time.Time) []*timer {
 			due = append(due, t)
 		}
 	}
-	// Insertion sort: the due set is tiny and mostly ordered already.
+	// Insertion sort by due time, tie-breaking on id so timers armed in the
+	// same tick fire in registration order (Node's guarantee) rather than the
+	// random map-iteration order.
+	less := func(a, b *timer) bool {
+		if a.due.Equal(b.due) {
+			return a.id < b.id
+		}
+		return a.due.Before(b.due)
+	}
 	for i := 1; i < len(due); i++ {
-		for j := i; j > 0 && due[j].due.Before(due[j-1].due); j-- {
+		for j := i; j > 0 && less(due[j], due[j-1]); j-- {
 			due[j], due[j-1] = due[j-1], due[j]
 		}
 	}
