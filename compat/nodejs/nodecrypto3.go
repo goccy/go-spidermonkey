@@ -22,12 +22,14 @@ import (
 
 func (rt *Runtime) crypto3Ops() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
-		"crypto_rsa_public":  rt.opRSAPublicEncrypt,
-		"crypto_rsa_private": rt.opRSAPrivateDecrypt,
-		"crypto_dh_generate": rt.opDHGenerate,
-		"crypto_dh_compute":  rt.opDHCompute,
-		"crypto_chacha":      rt.opChaCha,
-		"crypto_x509":        rt.opX509Parse,
+		"crypto_rsa_public":          rt.opRSAPublicEncrypt,
+		"crypto_rsa_private":         rt.opRSAPrivateDecrypt,
+		"crypto_rsa_private_encrypt": rt.opRSAPrivateEncrypt,
+		"crypto_rsa_public_decrypt":  rt.opRSAPublicDecrypt,
+		"crypto_dh_generate":         rt.opDHGenerate,
+		"crypto_dh_compute":          rt.opDHCompute,
+		"crypto_chacha":              rt.opChaCha,
+		"crypto_x509":                rt.opX509Parse,
 	}
 }
 
@@ -115,6 +117,64 @@ func (rt *Runtime) opRSAPrivateDecrypt(cfg spidermonkey.Config, args []spidermon
 		return rt.bytesReturn(pt)
 	}
 	return cryptoErr("unsupported padding"), nil
+}
+
+// opRSAPrivateEncrypt(keyPEM, data) -> RSA private-key operation with PKCS#1
+// type-1 padding (Node's crypto.privateEncrypt, RSA_PKCS1_PADDING). SignPKCS1v15
+// with hash 0 signs the data directly with type-1 padding and no DigestInfo,
+// which is exactly the private encrypt primitive.
+func (rt *Runtime) opRSAPrivateEncrypt(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rsa_private_encrypt: (keyPEM, data) required")
+	}
+	keyPEM, _ := valueBytes(args[0])
+	data, _ := valueBytes(args[1])
+	key, err := parsePrivateKey(keyPEM)
+	if err != nil {
+		return cryptoErr(err.Error()), nil
+	}
+	priv, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return cryptoErr("not an RSA private key"), nil
+	}
+	out, e := rsa.SignPKCS1v15(rand.Reader, priv, crypto.Hash(0), data)
+	if e != nil {
+		return cryptoErr(e.Error()), nil
+	}
+	return rt.bytesReturn(out)
+}
+
+// opRSAPublicDecrypt(keyPEM, data) -> recover the message from a
+// privateEncrypt (Node's crypto.publicDecrypt): the raw public-key operation
+// c^e mod n, then strip PKCS#1 type-1 padding (00 01 FF..FF 00 M).
+func (rt *Runtime) opRSAPublicDecrypt(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("rsa_public_decrypt: (keyPEM, data) required")
+	}
+	keyPEM, _ := valueBytes(args[0])
+	data, _ := valueBytes(args[1])
+	pub, err := parseAnyRSAPublic(keyPEM)
+	if err != nil {
+		return cryptoErr(err.Error()), nil
+	}
+	k := (pub.N.BitLen() + 7) / 8
+	c := new(big.Int).SetBytes(data)
+	if c.Cmp(pub.N) >= 0 {
+		return cryptoErr("decryption error"), nil
+	}
+	em := new(big.Int).Exp(c, big.NewInt(int64(pub.E)), pub.N).FillBytes(make([]byte, k))
+	// PKCS#1 type-1: 0x00 0x01 (0xFF)+ 0x00 M, with at least 8 padding bytes.
+	if len(em) < 11 || em[0] != 0x00 || em[1] != 0x01 {
+		return cryptoErr("decryption error"), nil
+	}
+	i := 2
+	for i < len(em) && em[i] == 0xFF {
+		i++
+	}
+	if i < 10 || i >= len(em) || em[i] != 0x00 {
+		return cryptoErr("decryption error"), nil
+	}
+	return rt.bytesReturn(em[i+1:])
 }
 
 func parseAnyRSAPublic(pemBytes []byte) (*rsa.PublicKey, error) {

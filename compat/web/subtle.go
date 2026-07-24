@@ -647,12 +647,19 @@ func (s *subtleAPI) opRSAExportDER(cfg spidermonkey.Config, args []spidermonkey.
 	return nil, fmt.Errorf("rsa export: unsupported format")
 }
 
-func rsaPSSOptions(saltLen int, h crypto.Hash) *rsa.PSSOptions {
+// rsaPSSOptions maps the WebCrypto saltLength: a negative value (the JS side's
+// sentinel for "not provided") means the hash length; a positive value is used
+// verbatim; a literal 0 can't be expressed by rsa.PSSOptions (0 = auto), so it
+// is rejected rather than silently substituted with the hash length.
+func rsaPSSOptions(saltLen int, h crypto.Hash) (*rsa.PSSOptions, error) {
+	if saltLen == 0 {
+		return nil, fmt.Errorf("RSA-PSS saltLength 0 is not supported")
+	}
 	opts := &rsa.PSSOptions{Hash: h, SaltLength: rsa.PSSSaltLengthEqualsHash}
 	if saltLen > 0 {
 		opts.SaltLength = saltLen
 	}
-	return opts
+	return opts, nil
 }
 
 func (s *subtleAPI) opRSASign(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -682,7 +689,11 @@ func (s *subtleAPI) opRSASign(cfg spidermonkey.Config, args []spidermonkey.Value
 	case "pkcs1":
 		sig, err = rsa.SignPKCS1v15(rand.Reader, k.rsaPriv, h, digest)
 	case "pss":
-		sig, err = rsa.SignPSS(rand.Reader, k.rsaPriv, h, digest, rsaPSSOptions(args[2].Int(), h))
+		opts, oerr := rsaPSSOptions(args[2].Int(), h)
+		if oerr != nil {
+			return subtleErr("OperationError: " + oerr.Error()), nil
+		}
+		sig, err = rsa.SignPSS(rand.Reader, k.rsaPriv, h, digest, opts)
 	default:
 		return nil, fmt.Errorf("rsa sign: unsupported scheme")
 	}
@@ -726,7 +737,11 @@ func (s *subtleAPI) opRSAVerify(cfg spidermonkey.Config, args []spidermonkey.Val
 	case "pkcs1":
 		return spidermonkey.ValueOf(rsa.VerifyPKCS1v15(pub, h, digest, sig) == nil), nil
 	case "pss":
-		return spidermonkey.ValueOf(rsa.VerifyPSS(pub, h, digest, sig, rsaPSSOptions(args[2].Int(), h)) == nil), nil
+		opts, oerr := rsaPSSOptions(args[2].Int(), h)
+		if oerr != nil {
+			return subtleErr("OperationError: " + oerr.Error()), nil
+		}
+		return spidermonkey.ValueOf(rsa.VerifyPSS(pub, h, digest, sig, opts) == nil), nil
 	}
 	return nil, fmt.Errorf("rsa verify: unsupported scheme")
 }

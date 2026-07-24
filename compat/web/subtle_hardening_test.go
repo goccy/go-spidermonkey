@@ -74,3 +74,62 @@ func TestDeriveKeyWithDeriveKeyUsageOnly(t *testing.T) {
 		t.Fatalf("derived key type = %q, want secret", got)
 	}
 }
+
+// A non-extractable AES key must not expose its raw bytes through any property;
+// exportKey stays the only (gated) way out.
+func TestNonExtractableKeyMaterialHidden(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const k = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+			__c.rawProp = (k._raw === undefined) ? "hidden" : "LEAKED";
+			try { await crypto.subtle.exportKey("raw", k); __c.exp = "no-throw"; }
+			catch (e) { __c.exp = e.name; }
+			// The key must still WORK for its usage (material reachable internally).
+			const iv = new Uint8Array(12);
+			const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, k, new TextEncoder().encode("x"));
+			__c.works = ct.byteLength > 0;
+		})().catch((e) => { __c.err = String(e && e.stack || e); });
+	`)
+	if got := evalString(t, js, `__c.err ?? ""`); got != "" {
+		t.Fatalf("unexpected: %s", got)
+	}
+	if got := evalString(t, js, `__c.rawProp`); got != "hidden" {
+		t.Fatalf("non-extractable key raw material = %q, want hidden", got)
+	}
+	if got := evalString(t, js, `__c.exp`); got != "InvalidAccessError" {
+		t.Fatalf("exportKey on non-extractable = %q, want InvalidAccessError", got)
+	}
+	if evalString(t, js, `String(__c.works)`) != "true" {
+		t.Fatalf("non-extractable key stopped working for its own usage")
+	}
+}
+
+// AES-CTR with a partial counter length (WebCrypto AesCtrParams.length) must
+// round-trip (encrypt then decrypt yields the original), across a block
+// boundary so the counter actually increments.
+func TestSubtleAESCTRPartialCounterRoundTrip(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	runAsync(t, js, `
+		(async () => {
+			const raw = new Uint8Array(32).fill(5);
+			const key = await crypto.subtle.importKey("raw", raw, { name: "AES-CTR" }, false, ["encrypt", "decrypt"]);
+			const counter = new Uint8Array(16); counter[15] = 1;
+			const data = new TextEncoder().encode("a".repeat(40)); // > 2 blocks
+			const params = { name: "AES-CTR", counter, length: 64 };
+			const ct = await crypto.subtle.encrypt(params, key, data);
+			const pt = await crypto.subtle.decrypt(params, key, ct);
+			__c.roundtrip = new TextDecoder().decode(pt) === "a".repeat(40);
+			__c.changed = new Uint8Array(ct)[0] !== data[0];
+		})().catch((e) => { __c.err = String(e && (e.name + ": " + e.message) || e); });
+	`)
+	if got := evalString(t, js, `__c.err ?? ""`); got != "" {
+		t.Fatalf("AES-CTR length=64 failed: %s", got)
+	}
+	if evalString(t, js, `String(__c.roundtrip)`) != "true" {
+		t.Fatalf("AES-CTR partial-counter did not round-trip")
+	}
+	if evalString(t, js, `String(__c.changed)`) != "true" {
+		t.Fatalf("AES-CTR produced no ciphertext change")
+	}
+}

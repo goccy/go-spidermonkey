@@ -199,6 +199,20 @@
 		if (isErr(r)) cryptoThrow(r);
 		return Buffer.from(r);
 	}
+	// privateEncrypt / publicDecrypt are the PKCS#1 type-1 private/public
+	// primitives — distinct from public-encrypt / private-decrypt above.
+	function privateEncrypt(key, buffer) {
+		const r = ops.crypto_rsa_private_encrypt(keyPEMof(key), toBuf(buffer));
+		ops.release_pending();
+		if (isErr(r)) cryptoThrow(r);
+		return Buffer.from(r);
+	}
+	function publicDecrypt(key, buffer) {
+		const r = ops.crypto_rsa_public_decrypt(keyPEMof(key), toBuf(buffer));
+		ops.release_pending();
+		if (isErr(r)) cryptoThrow(r);
+		return Buffer.from(r);
+	}
 
 	// Diffie-Hellman (modp) over the crypto_dh_* ops.
 	class DiffieHellman {
@@ -265,8 +279,7 @@
 			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(false, key, iv) : new Decipheriv(algo, key, iv),
 		Cipheriv, Decipheriv,
 		publicEncrypt, privateDecrypt,
-		publicDecrypt: privateDecrypt, // Node allows verify-style; approximated
-		privateEncrypt: publicEncrypt,
+		publicDecrypt, privateEncrypt,
 		createDiffieHellman: (prime, gen) => new DiffieHellman(prime, gen),
 		DiffieHellman,
 		X509Certificate,

@@ -42,6 +42,15 @@
 	}
 	globalThis.CryptoKey = CryptoKey;
 
+	// Secret key material lives OUTSIDE the CryptoKey object, in WeakMaps, so a
+	// non-extractable AES/HKDF/PBKDF2/ECDH key cannot be read back through a
+	// plain property — exportKey (which enforces `extractable`) is the only path
+	// out. HMAC/EC/RSA keep opaque host handles (_h) and were never leakable.
+	const keyRaw = new WeakMap(); // CryptoKey -> raw Uint8Array
+	const keyJwk = new WeakMap(); // CryptoKey -> JWK object
+	const rawOf = (k) => keyRaw.get(k);
+	const jwkObjOf = (k) => keyJwk.get(k);
+
 	const need = (key, usage) => {
 		if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
 		if (!key.usages.includes(usage)) {
@@ -61,10 +70,10 @@
 			return toBuf(subtleFail(ops.subtle_ecdh(privJWK, pubJWK, length ?? 0)));
 		}
 		if (name === "HKDF") {
-			return toBuf(subtleFail(ops.subtle_hkdf(hashName(alg.hash), baseKey._raw, toU8(alg.salt), toU8(alg.info), length)));
+			return toBuf(subtleFail(ops.subtle_hkdf(hashName(alg.hash), rawOf(baseKey), toU8(alg.salt), toU8(alg.info), length)));
 		}
 		if (name === "PBKDF2") {
-			return toBuf(subtleFail(ops.subtle_pbkdf2(hashName(alg.hash), baseKey._raw, toU8(alg.salt), Number(alg.iterations), length)));
+			return toBuf(subtleFail(ops.subtle_pbkdf2(hashName(alg.hash), rawOf(baseKey), toU8(alg.salt), Number(alg.iterations), length)));
 		}
 		unsupported(`deriveBits algorithm ${algName(alg)}`);
 	}
@@ -117,7 +126,7 @@
 				const length = Number(alg.length) || 256;
 				const raw = crypto.getRandomValues(new Uint8Array(length / 8));
 				const key = new CryptoKey("secret", extractable, { name, length }, usages, null);
-				key._raw = raw;
+				keyRaw.set(key, raw);
 				return key;
 			}
 			if (name === "ECDH") {
@@ -167,7 +176,7 @@
 				else if (format === "jwk") raw = b64uDecode(keyData.k);
 				else unsupported(`AES key format ${format}`);
 				const key = new CryptoKey("secret", extractable, { name, length: raw.length * 8 }, usages, null);
-				key._raw = raw;
+				keyRaw.set(key, raw);
 				return key;
 			}
 			if (name === "ECDH") {
@@ -178,13 +187,13 @@
 					unsupported(`ECDH key format ${format}`);
 				}
 				const key = new CryptoKey(keyData.d ? "private" : "public", extractable, { name: "ECDH", namedCurve: keyData.crv }, usages, null);
-				key._jwk = { ...keyData, crv: keyData.crv };
+				keyJwk.set(key, { ...keyData, crv: keyData.crv });
 				return key;
 			}
 			if (name === "HKDF" || name === "PBKDF2") {
 				if (format !== "raw") unsupported(`${name} key format ${format}`);
 				const key = new CryptoKey("secret", false, { name }, usages, null);
-				key._raw = toU8(keyData);
+				keyRaw.set(key, toU8(keyData));
 				return key;
 			}
 			unsupported(`algorithm ${algName(alg)}`);
@@ -211,8 +220,8 @@
 				unsupported(`RSA export format ${format}`);
 			}
 			if (AES_NAMES.includes(name)) {
-				if (format === "raw") return key._raw.slice().buffer;
-				if (format === "jwk") return { kty: "oct", k: b64uEncode(key._raw), alg: name === "AES-GCM" ? "A256GCM" : undefined, ext: true, key_ops: [...key.usages] };
+				if (format === "raw") return rawOf(key).slice().buffer;
+				if (format === "jwk") return { kty: "oct", k: b64uEncode(rawOf(key)), alg: name === "AES-GCM" ? "A256GCM" : undefined, ext: true, key_ops: [...key.usages] };
 				unsupported(`AES export format ${format}`);
 			}
 			unsupported(`algorithm ${key.algorithm.name}`);
@@ -224,7 +233,7 @@
 			if (name === "HMAC") return toBuf(ops.subtle_hmac_sign(key.algorithm.hash.name, key._h, toU8(data)));
 			if (name === "ECDSA") return toBuf(ops.subtle_ec_sign(hashName(alg.hash), key._h, toU8(data)));
 			if (RSA_NAMES.includes(name)) {
-				return toBuf(ops.subtle_rsa_sign(rsaScheme(name), key.algorithm.hash.name, Number(alg.saltLength ?? 0), key._h, toU8(data)));
+				return toBuf(ops.subtle_rsa_sign(rsaScheme(name), key.algorithm.hash.name, alg.saltLength == null ? -1 : Number(alg.saltLength), key._h, toU8(data)));
 			}
 			unsupported(`algorithm ${algName(alg)}`);
 		},
@@ -235,7 +244,7 @@
 			if (name === "HMAC") return ops.subtle_hmac_verify(key.algorithm.hash.name, key._h, toU8(signature), toU8(data));
 			if (name === "ECDSA") return ops.subtle_ec_verify(hashName(alg.hash), key._h, toU8(signature), toU8(data));
 			if (RSA_NAMES.includes(name)) {
-				return ops.subtle_rsa_verify(rsaScheme(name), key.algorithm.hash.name, Number(alg.saltLength ?? 0), key._h, toU8(signature), toU8(data));
+				return ops.subtle_rsa_verify(rsaScheme(name), key.algorithm.hash.name, alg.saltLength == null ? -1 : Number(alg.saltLength), key._h, toU8(signature), toU8(data));
 			}
 			unsupported(`algorithm ${algName(alg)}`);
 		},
@@ -247,7 +256,7 @@
 				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
 				const tagLen = alg.tagLength ?? 128;
-				return toBuf(subtleFail(ops.subtle_aes_encrypt(name, key._raw, iv, toU8(data), aad, tagLen)));
+				return toBuf(subtleFail(ops.subtle_aes_encrypt(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128))));
 			}
 			if (name === "RSA-OAEP") {
 				const hash = hashName(key.algorithm.hash).replace("SHA-", "sha").replace("sha1", "sha1");
@@ -264,7 +273,7 @@
 				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
 				const tagLen = alg.tagLength ?? 128;
-				return toBuf(subtleFail(ops.subtle_aes_decrypt(name, key._raw, iv, toU8(data), aad, tagLen)));
+				return toBuf(subtleFail(ops.subtle_aes_decrypt(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128))));
 			}
 			if (name === "RSA-OAEP") {
 				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
@@ -327,7 +336,7 @@
 			const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
 			const tagLen = alg.tagLength ?? 128;
 			const op = encrypt ? ops.subtle_aes_encrypt : ops.subtle_aes_decrypt;
-			return subtleFail(op(name, key._raw, iv, toU8(data), aad, tagLen));
+			return subtleFail(op(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128)));
 		}
 		if (name === "RSA-OAEP") {
 			const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
@@ -339,7 +348,7 @@
 	// jwkOf returns a key's JWK JSON string, whether it was imported (has
 	// _jwk) or generated (has an EC handle to export).
 	function jwkOf(key) {
-		if (key._jwk) return JSON.stringify(key._jwk);
+		const j = jwkObjOf(key); if (j) return JSON.stringify(j);
 		if (key._h != null) return ops.subtle_ec_export_jwk(key._h);
 		throw new DOMException("key has no derivable material", "InvalidAccessError");
 	}

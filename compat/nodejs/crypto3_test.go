@@ -61,3 +61,24 @@ func TestCryptoChaCha(t *testing.T) {
 		t.Errorf("chacha round trip = %q", got)
 	}
 }
+
+func TestRSAPrivateEncryptPublicDecrypt(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	runScript(t, rt, `
+		const crypto = require("crypto");
+		globalThis.r = {};
+		const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const msg = Buffer.from("sign-with-private");
+		// The Node round-trip: privateEncrypt then publicDecrypt recovers it.
+		const enc = crypto.privateEncrypt(privateKey, msg);
+		r.recovered = crypto.publicDecrypt(publicKey, enc).toString();
+		// And it must NOT be the same as public-encrypt (distinct primitive).
+		r.distinct = enc.toString("hex") !== crypto.publicEncrypt({ key: publicKey, padding: 1 }, msg).toString("hex");
+	`)
+	if got := evalStr(t, js, `r.recovered`); got != "sign-with-private" {
+		t.Fatalf("privateEncrypt/publicDecrypt round-trip = %q, want sign-with-private", got)
+	}
+	if evalStr(t, js, `String(r.distinct)`) != "true" {
+		t.Fatalf("privateEncrypt produced the same output as publicEncrypt")
+	}
+}

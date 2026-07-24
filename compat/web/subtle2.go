@@ -143,11 +143,57 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 		if len(iv) != block.BlockSize() {
 			return subtleErr("OperationError: AES-CTR counter block must be 16 bytes"), nil
 		}
-		out := make([]byte, len(data))
-		cipher.NewCTR(block, iv).XORKeyStream(out, data)
-		return bytesValue(out), nil
+		ctrBits := 128
+		if len(args) > 6 && !args[6].IsUndefined() {
+			ctrBits = args[6].Int()
+		}
+		if ctrBits <= 0 || ctrBits > 128 {
+			return subtleErr("OperationError: AES-CTR length must be in 1..128"), nil
+		}
+		return bytesValue(aesCTR(block, iv, ctrBits, data)), nil
 	}
 	return subtleErr(fmt.Sprintf("unsupported AES mode %q", mode)), nil
+}
+
+// aesCTR runs AES in counter mode where only the low ctrBits of the 16-byte
+// block form the counter (the WebCrypto AesCtrParams.length); the high bits are
+// a fixed nonce. For the full 128-bit counter it delegates to the stdlib.
+func aesCTR(block cipher.Block, counter []byte, ctrBits int, data []byte) []byte {
+	if ctrBits >= 128 {
+		out := make([]byte, len(data))
+		cipher.NewCTR(block, counter).XORKeyStream(out, data)
+		return out
+	}
+	bs := block.BlockSize()
+	ctr := make([]byte, bs)
+	copy(ctr, counter)
+	ks := make([]byte, bs)
+	out := make([]byte, len(data))
+	for off := 0; off < len(data); off += bs {
+		block.Encrypt(ks, ctr)
+		n := len(data) - off
+		if n > bs {
+			n = bs
+		}
+		for i := 0; i < n; i++ {
+			out[off+i] = data[off+i] ^ ks[i]
+		}
+		incrCounterBits(ctr, ctrBits) // increment only the low ctrBits, wrapping within them
+	}
+	return out
+}
+
+// incrCounterBits adds 1 to the low `bits` (big-endian, LSB-first) of ctr,
+// wrapping within them and leaving the higher nonce bits untouched.
+func incrCounterBits(ctr []byte, bits int) {
+	for bit := 0; bit < bits; bit++ {
+		idx := len(ctr) - 1 - bit/8
+		mask := byte(1 << (uint(bit) % 8))
+		ctr[idx] ^= mask
+		if ctr[idx]&mask != 0 {
+			return // 0 -> 1: no carry
+		}
+	}
 }
 
 func pad7(data []byte, bs int) []byte {
