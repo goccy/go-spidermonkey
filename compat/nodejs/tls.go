@@ -60,8 +60,8 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	st.mu.Lock()
 	st.nextID++
 	id := st.nextID
-	st.conns[id] = conn
 	st.mu.Unlock()
+	rt.registerConn(id, conn, newConnWriter(), func(error) {})
 
 	rt.loop.AddPending()
 	if onConnect := args[6].Object(); onConnect != nil {
@@ -109,8 +109,8 @@ func (rt *Runtime) opTLSListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 			st.mu.Lock()
 			st.nextID++
 			cid := st.nextID
-			st.conns[cid] = conn
 			st.mu.Unlock()
+			rt.registerConn(cid, conn, newConnWriter(), func(error) {})
 			rt.loop.Post(func() error {
 				if onConn != nil {
 					onConn.Call(spidermonkey.ValueOf(cid), spidermonkey.ValueOf(conn.RemoteAddr().String()))

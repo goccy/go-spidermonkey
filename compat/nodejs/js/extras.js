@@ -356,7 +356,14 @@
 		if (connectListener) this.once("connect", connectListener);
 		const onData = (chunk) => this.push(Buffer.from(chunk));
 		const onEnd = () => this.push(null);
-		const onError = (msg) => { const e = new Error(msg); e.code = "ECONNRESET"; this.emit("error", e); };
+		const onError = (info) => {
+			// info is a plain string (read errors) or a {code, message} object
+			// (async connect failures — carries EACCES/ECONNREFUSED).
+			const obj = info && typeof info === "object";
+			const e = new Error(obj ? info.message : info);
+			e.code = (obj && info.code) || "ECONNRESET";
+			this.emit("error", e);
+		};
 		const onConnect = () => {
 			this.connecting = false;
 			this.remoteAddress = host;

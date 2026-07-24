@@ -29,13 +29,17 @@ func newBareRuntime(t *testing.T) (*spidermonkey.JS, *nodejs.Runtime) {
 }
 
 func TestNetConnectDeniedByDefault(t *testing.T) {
-	js, _ := newBareRuntime(t)
-	js.Eval(context.Background(), `
+	js, rt := newBareRuntime(t)
+	// net.connect is async now; the denial surfaces as an 'error' event once the
+	// loop processes the (denied) dial. Run the loop to completion, then assert.
+	if _, err := rt.RunScript(context.Background(), `
 		globalThis.__r = {};
 		const net = require("net");
 		const s = net.connect(9, "127.0.0.1");
 		s.on("error", (e) => { __r.err = String(e && e.message || e); });
-	`)
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
 	if got := evalStr(t, js, `__r.err ?? ""`); !strings.Contains(got, "permission denied") {
 		t.Fatalf("nil Dial should deny net.connect; got err=%q", got)
 	}

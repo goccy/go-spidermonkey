@@ -27,16 +27,110 @@ type netState struct {
 	mu        sync.Mutex
 	nextID    int64
 	conns     map[int64]net.Conn
+	writers   map[int64]*connWriter
 	listeners map[int64]net.Listener
 	udp       map[int64]*net.UDPConn
+}
+
+// connWriter serializes socket writes on the connection's OWN goroutine so a
+// slow peer (full send window) can never block the single event-loop goroutine.
+// Writes queued before the connection is established (async connect) are held
+// until it attaches, preserving order.
+type connWriter struct {
+	mu       sync.Mutex
+	conn     net.Conn // nil until attached
+	queue    [][]byte
+	closeReq bool
+	wake     chan struct{}
+}
+
+func newConnWriter() *connWriter { return &connWriter{wake: make(chan struct{}, 1)} }
+
+func (w *connWriter) signal() {
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
+}
+
+// enqueue adds a write; false once the writer is closing. Never blocks.
+func (w *connWriter) enqueue(data []byte) bool {
+	w.mu.Lock()
+	if w.closeReq {
+		w.mu.Unlock()
+		return false
+	}
+	w.queue = append(w.queue, data)
+	w.mu.Unlock()
+	w.signal()
+	return true
+}
+
+func (w *connWriter) attach(conn net.Conn) {
+	w.mu.Lock()
+	w.conn = conn
+	w.mu.Unlock()
+	w.signal()
+}
+
+func (w *connWriter) requestClose() {
+	w.mu.Lock()
+	w.closeReq = true
+	w.mu.Unlock()
+	w.signal()
+}
+
+// run drains queued writes in order on its own goroutine and closes the conn on
+// requestClose. It exits once closed; onErr reports a write failure.
+func (w *connWriter) run(onErr func(error)) {
+	for {
+		w.mu.Lock()
+		conn := w.conn
+		var q [][]byte
+		if conn != nil { // hold writes until the conn attaches (async connect)
+			q = w.queue
+			w.queue = nil
+		}
+		closeReq := w.closeReq
+		w.mu.Unlock()
+
+		for _, data := range q {
+			if _, err := conn.Write(data); err != nil {
+				if onErr != nil {
+					onErr(err)
+				}
+				break
+			}
+		}
+		if closeReq {
+			if conn != nil {
+				conn.Close()
+			}
+			return
+		}
+		<-w.wake
+	}
 }
 
 func newNetState() *netState {
 	return &netState{
 		conns:     map[int64]net.Conn{},
+		writers:   map[int64]*connWriter{},
 		listeners: map[int64]net.Listener{},
 		udp:       map[int64]*net.UDPConn{},
 	}
+}
+
+// registerConn stores an established conn and starts its write actor, returning
+// the writer. onErr reports async write failures.
+func (rt *Runtime) registerConn(id int64, conn net.Conn, w *connWriter, onErr func(error)) {
+	st := rt.net
+	st.mu.Lock()
+	st.conns[id] = conn
+	st.writers[id] = w
+	st.mu.Unlock()
+	w.attach(conn)
+	go w.run(onErr)
 }
 
 func (rt *Runtime) netOps() map[string]spidermonkey.Func {
@@ -147,26 +241,55 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	onError := args[4].Object()
 	onConnect := args[5].Object()
 
-	addr, err := resolveDialAddr(cfg, "tcp", host, port)
-	if err != nil {
-		return netErr(err), nil
-	}
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return netErr(err), nil
-	}
+	// Reserve the socket id synchronously (Node's net.connect returns a socket
+	// immediately) but resolve+dial OFF the loop, so a slow DNS lookup or TCP
+	// connect can never freeze the single event-loop goroutine. Writes issued
+	// before the connection lands are buffered by the writer and flushed on
+	// attach, so early write()s aren't lost.
 	st := rt.net
 	st.mu.Lock()
 	st.nextID++
 	id := st.nextID
-	st.conns[id] = conn
+	w := newConnWriter()
+	st.writers[id] = w
 	st.mu.Unlock()
 
 	rt.loop.AddPending()
-	if onConnect != nil {
-		rt.loop.Post(func() error { onConnect.Call(); onConnect.Free(); return nil })
-	}
-	go rt.pumpConn(id, conn, onData, onEnd, onError)
+	go func() {
+		addr, derr := resolveDialAddr(cfg, "tcp", host, port)
+		var conn net.Conn
+		if derr == nil {
+			conn, derr = net.DialTimeout("tcp", addr, 30*time.Second)
+		}
+		if derr != nil {
+			st.mu.Lock()
+			delete(st.writers, id)
+			st.mu.Unlock()
+			w.requestClose()
+			rt.loop.Post(func() error {
+				defer rt.loop.DonePending()
+				if onError != nil {
+					onError.Call(netErr(derr)) // {code, message} so the guest sees EACCES/ECONNREFUSED
+				}
+				for _, o := range []*spidermonkey.Object{onData, onEnd, onError, onConnect} {
+					if o != nil {
+						o.Free()
+					}
+				}
+				return nil
+			})
+			return
+		}
+		st.mu.Lock()
+		st.conns[id] = conn
+		st.mu.Unlock()
+		w.attach(conn)
+		go w.run(func(error) {}) // write failures surface via the read side (onError/onEnd)
+		if onConnect != nil {
+			rt.loop.Post(func() error { onConnect.Call(); onConnect.Free(); return nil })
+		}
+		rt.pumpConn(id, conn, onData, onEnd, onError) // becomes the read pump; DonePending at close
+	}()
 	return spidermonkey.ValueOf(id), nil
 }
 
@@ -194,7 +317,12 @@ func (rt *Runtime) pumpConn(id int64, conn net.Conn, onData, onEnd, onError *spi
 			rt.net.mu.Lock()
 			_, live := rt.net.conns[id]
 			delete(rt.net.conns, id)
+			w := rt.net.writers[id]
+			delete(rt.net.writers, id)
 			rt.net.mu.Unlock()
+			if w != nil {
+				w.requestClose() // stop the write actor for this closed conn
+			}
 			rt.loop.Post(func() error {
 				if live {
 					if err != io.EOF && onError != nil {
@@ -222,19 +350,18 @@ func (rt *Runtime) opNetWrite(cfg spidermonkey.Config, args []spidermonkey.Value
 		return nil, fmt.Errorf("net_write: (id, data) required")
 	}
 	rt.net.mu.Lock()
-	conn := rt.net.conns[int64(args[0].Float())]
+	w := rt.net.writers[int64(args[0].Float())]
 	rt.net.mu.Unlock()
-	if conn == nil {
+	if w == nil {
 		return spidermonkey.ValueOf(false), nil
 	}
 	data, err := valueBytes(args[1])
 	if err != nil {
 		return nil, err
 	}
-	if _, err := conn.Write(data); err != nil {
-		return spidermonkey.ValueOf(false), nil
-	}
-	return spidermonkey.ValueOf(true), nil
+	// Enqueue on the connection's write actor (off-loop). Buffered even before
+	// an async connect lands; false only once the socket is closing.
+	return spidermonkey.ValueOf(w.enqueue(data)), nil
 }
 
 func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -242,9 +369,13 @@ func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value
 		return spidermonkey.Undefined(), nil
 	}
 	rt.net.mu.Lock()
-	conn := rt.net.conns[int64(args[0].Float())]
+	id := int64(args[0].Float())
+	w := rt.net.writers[id]
+	conn := rt.net.conns[id]
 	rt.net.mu.Unlock()
-	if conn != nil {
+	if w != nil {
+		w.requestClose() // flush queued writes, then close the conn
+	} else if conn != nil {
 		conn.Close()
 	}
 	return spidermonkey.Undefined(), nil
@@ -292,8 +423,8 @@ func (rt *Runtime) opNetListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 			st.mu.Lock()
 			st.nextID++
 			cid := st.nextID
-			st.conns[cid] = conn
 			st.mu.Unlock()
+			rt.registerConn(cid, conn, newConnWriter(), func(error) {})
 			rt.loop.Post(func() error {
 				if onConn != nil {
 					onConn.Call(spidermonkey.ValueOf(cid), spidermonkey.ValueOf(conn.RemoteAddr().String()))
@@ -445,10 +576,18 @@ func (rt *Runtime) closeNet() {
 	for _, u := range st.udp {
 		udps = append(udps, u)
 	}
+	writers := make([]*connWriter, 0, len(st.writers))
+	for _, w := range st.writers {
+		writers = append(writers, w)
+	}
 	st.conns = map[int64]net.Conn{}
+	st.writers = map[int64]*connWriter{}
 	st.listeners = map[int64]net.Listener{}
 	st.udp = map[int64]*net.UDPConn{}
 	st.mu.Unlock()
+	for _, w := range writers {
+		w.requestClose()
+	}
 	for _, c := range conns {
 		c.Close()
 	}

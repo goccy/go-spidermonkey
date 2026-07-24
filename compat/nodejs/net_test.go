@@ -160,3 +160,44 @@ func TestHTTPRequestClient(t *testing.T) {
 		t.Errorf("response header = %q", got)
 	}
 }
+
+// A write issued BEFORE the socket connects must be buffered and flushed on
+// connect (not lost), and the connect itself must not block the loop.
+func TestNetWriteBeforeConnectBuffered(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		line, _ := r.ReadString('\n')
+		fmt.Fprint(conn, "GOT:"+line)
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	js.Global().Set("PORT", spidermonkey.ValueOf(port))
+	runScript(t, rt, `
+		const net = require("net");
+		globalThis.r = {};
+		const sock = net.connect(PORT, "127.0.0.1");
+		sock.write("early\n"); // BEFORE 'connect' fires — must be buffered
+		let buf = "";
+		sock.setEncoding("utf8");
+		sock.on("data", (d) => { buf += d; sock.end(); });
+		sock.on("close", () => { r.reply = buf; });
+		sock.on("error", (e) => { r.err = String(e); });
+	`)
+	if got := evalStr(t, js, `r.err ?? ""`); got != "" {
+		t.Fatalf("socket error: %s", got)
+	}
+	if got := evalStr(t, js, `r.reply`); got != "GOT:early\n" {
+		t.Fatalf("reply = %q, want GOT:early\\n (pre-connect write lost?)", got)
+	}
+}
