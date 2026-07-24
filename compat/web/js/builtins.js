@@ -627,17 +627,21 @@
 			const self = this;
 			this._controller = {
 				enqueue(chunk) {
+					if (self._closed || self._errored) return; // no enqueue after close/error
 					const w = self._waiters.shift();
 					if (w) w.resolve({ value: chunk, done: false });
 					else self._queue.push(chunk);
 				},
 				close() {
+					if (self._closed || self._errored) return;
 					self._closed = true;
 					for (const w of self._waiters.splice(0)) w.resolve({ value: undefined, done: true });
 				},
 				error(e) {
+					if (self._closed || self._errored) return;
 					self._errored = true;
 					self._errorValue = e;
+					self._queue = []; // drop buffered chunks; the stream is errored
 					for (const w of self._waiters.splice(0)) w.reject(e);
 				},
 			};
@@ -707,21 +711,37 @@
 			return transform.readable;
 		}
 		// tee() splits the stream into two branches that each receive every
-		// chunk (React's renderToReadableStream + Next App Router use it).
+		// chunk (React's renderToReadableStream + Next App Router use it). It is
+		// DEMAND-driven: the source is read only when a branch pulls, so an
+		// unbounded source is not eagerly drained into memory, and the source is
+		// cancelled once BOTH branches cancel.
 		tee() {
 			const reader = this.getReader();
 			let c1, c2;
-			const branch1 = new ReadableStream({ start(c) { c1 = c; } });
-			const branch2 = new ReadableStream({ start(c) { c2 = c; } });
+			let reading = false;
+			let cancelled1 = false;
+			let cancelled2 = false;
 			const pump = () => {
+				if (reading) return;
+				reading = true;
 				reader.read().then(({ value, done }) => {
+					reading = false;
 					if (done) { c1.close(); c2.close(); return; }
-					c1.enqueue(value);
-					c2.enqueue(value);
-					pump();
+					if (!cancelled1) c1.enqueue(value);
+					if (!cancelled2) c2.enqueue(value);
 				}).catch((e) => { c1.error(e); c2.error(e); });
 			};
-			pump();
+			const maybeCancel = (reason) => { if (cancelled1 && cancelled2) reader.cancel(reason); };
+			const branch1 = new ReadableStream({
+				start(c) { c1 = c; },
+				pull() { pump(); },
+				cancel(reason) { cancelled1 = true; maybeCancel(reason); },
+			});
+			const branch2 = new ReadableStream({
+				start(c) { c2 = c; },
+				pull() { pump(); },
+				cancel(reason) { cancelled2 = true; maybeCancel(reason); },
+			});
 			return [branch1, branch2];
 		}
 	}
@@ -736,14 +756,20 @@
 			this.desiredSize = 1;
 			this.closed = new Promise((resolve, reject) => { stream._closedResolve = resolve; stream._closedReject = reject; });
 		}
-		async write(chunk) {
+		write(chunk) {
 			const s = this._stream;
-			if (!s || s._state !== "writable") throw new TypeError("cannot write to this stream");
-			if (s._sink.write) await s._sink.write(chunk, s._controller);
+			if (!s || s._state !== "writable") return Promise.reject(new TypeError("cannot write to this stream"));
+			// Serialize writes: chaining on the previous one keeps two un-awaited
+			// write() calls from running the sink concurrently (which for a
+			// TransformStream would interleave transform/enqueue).
+			s._writeChain = (s._writeChain || Promise.resolve()).then(() =>
+				s._sink.write ? s._sink.write(chunk, s._controller) : undefined);
+			return s._writeChain;
 		}
 		async close() {
 			const s = this._stream;
 			if (!s || s._state !== "writable") throw new TypeError("cannot close this stream");
+			await (s._writeChain || Promise.resolve()); // flush queued writes first
 			s._state = "closed";
 			if (s._sink.close) await s._sink.close();
 			s._closedResolve();
@@ -753,7 +779,9 @@
 			if (!s) return;
 			s._state = "errored";
 			if (s._sink.abort) await s._sink.abort(reason);
-			s._closedResolve();
+			// Per spec, aborting REJECTS the writer's closed promise with the
+			// reason (it previously resolved it, defeating error handling).
+			if (s._closedReject) s._closedReject(reason);
 		}
 		releaseLock() {
 			if (this._stream) {
@@ -797,9 +825,20 @@
 				get desiredSize() { return 1; },
 			};
 			this.writable = new WritableStream({
-				write: (chunk) => (transformer.transform ? transformer.transform(chunk, controller) : controller.enqueue(chunk)),
+				// A throw/rejection in transform or flush must error the READABLE
+				// side too, not just reject the write — otherwise a consumer
+				// reading transform.readable directly (not via pipeThrough) would
+				// hang forever on a transform that failed.
+				write: async (chunk) => {
+					try {
+						if (transformer.transform) await transformer.transform(chunk, controller);
+						else controller.enqueue(chunk);
+					} catch (e) { rc.error(e); throw e; }
+				},
 				close: async () => {
-					if (transformer.flush) await transformer.flush(controller);
+					try {
+						if (transformer.flush) await transformer.flush(controller);
+					} catch (e) { rc.error(e); throw e; }
 					rc.close();
 				},
 				abort: (e) => rc.error(e),
@@ -931,15 +970,28 @@
 
 	// -------------------------------------------------------------- timers
 
+	// A Timeout-like handle: a lot of ecosystem code does `const t =
+	// setTimeout(...); t.unref()`. The handle coerces to its numeric id (via
+	// Symbol.toPrimitive), so clearTimeout(handle) still works. unref/ref are
+	// no-ops here (the loop already exits once no async work remains).
+	const makeTimer = (id) => ({
+		_id: id,
+		unref() { return this; },
+		ref() { return this; },
+		hasRef() { return true; },
+		refresh() { return this; },
+		close() { globalThis.clearTimeout(id); return this; },
+		[Symbol.toPrimitive]() { return id; },
+	});
 	globalThis.setTimeout = function setTimeout(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
 		const cb = args.length ? () => fn(...args) : fn;
-		return ops.timer_set(cb, Number(delay) || 0, false);
+		return makeTimer(ops.timer_set(cb, Number(delay) || 0, false));
 	};
 	globalThis.setInterval = function setInterval(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
 		const cb = args.length ? () => fn(...args) : fn;
-		return ops.timer_set(cb, Number(delay) || 0, true);
+		return makeTimer(ops.timer_set(cb, Number(delay) || 0, true));
 	};
 	globalThis.clearTimeout = globalThis.clearInterval = (id) => {
 		if (id !== undefined && id !== null) ops.timer_clear(Number(id) || 0);

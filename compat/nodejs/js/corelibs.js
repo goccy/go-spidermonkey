@@ -363,24 +363,9 @@
 	globalThis.clearImmediate = (id) => {
 		if (id !== undefined && id !== null) ops.immediate_clear(Number(id) || 0);
 	};
-	// Node returns Timeout OBJECTS with ref/unref; wrap the web timers so
-	// unguarded `.unref()` calls (common in server libraries) work.
-	// Number(timeout) still yields the raw id for clearTimeout.
-	{
-		const webSetTimeout = globalThis.setTimeout;
-		const webSetInterval = globalThis.setInterval;
-		const wrapTimer = (id) => ({
-			_id: id,
-			ref() { return this; },
-			unref() { return this; },
-			hasRef: () => true,
-			refresh() { return this; },
-			close() { globalThis.clearTimeout(id); return this; },
-			[Symbol.toPrimitive]() { return id; },
-		});
-		globalThis.setTimeout = (fn, ms, ...args) => wrapTimer(webSetTimeout(fn, ms, ...args));
-		globalThis.setInterval = (fn, ms, ...args) => wrapTimer(webSetInterval(fn, ms, ...args));
-	}
+	// The web layer's setTimeout/setInterval already return Timeout-like
+	// handles (ref/unref/refresh/close, coercing to the numeric id), so the
+	// Node timers inherit them directly — no extra wrapping here.
 	core.timers = {
 		setTimeout: globalThis.setTimeout,
 		clearTimeout: globalThis.clearTimeout,

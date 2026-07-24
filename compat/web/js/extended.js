@@ -133,14 +133,22 @@
 		}
 		if (seen.has(value)) return seen.get(value);
 
-		if (value instanceof Date) return new Date(value.getTime());
-		if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-		if (value instanceof ArrayBuffer) return value.slice(0);
+		// Register every clone in `seen` BEFORE recursing so shared references
+		// (and cycles) map to a single clone rather than being duplicated.
+		if (value instanceof Date) { const out = new Date(value.getTime()); seen.set(value, out); return out; }
+		if (value instanceof RegExp) { const out = new RegExp(value.source, value.flags); seen.set(value, out); return out; }
+		if (value instanceof ArrayBuffer) { const out = value.slice(0); seen.set(value, out); return out; }
 		if (ArrayBuffer.isView(value)) {
-			const buf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-			return new value.constructor(buf);
+			// Clone the underlying buffer through the same path, so two views
+			// over one ArrayBuffer keep sharing a single cloned buffer.
+			const clonedBuf = fullClone(value.buffer, seen);
+			const out = value instanceof DataView
+				? new DataView(clonedBuf, value.byteOffset, value.byteLength)
+				: new value.constructor(clonedBuf, value.byteOffset, value.length);
+			seen.set(value, out);
+			return out;
 		}
-		if (value instanceof Blob) return value.slice(0, value.size, value.type);
+		if (value instanceof Blob) { const out = value.slice(0, value.size, value.type); seen.set(value, out); return out; }
 
 		if (value instanceof Map) {
 			const out = new Map();
@@ -163,7 +171,14 @@
 		// Plain object (reject exotic platform objects with methods only).
 		const out = {};
 		seen.set(value, out);
-		for (const k of Object.keys(value)) out[k] = fullClone(value[k], seen);
+		for (const k of Object.keys(value)) {
+			// defineProperty (not out[k]=) so an own "__proto__" key becomes a
+			// real data property instead of invoking the prototype setter.
+			Object.defineProperty(out, k, {
+				value: fullClone(value[k], seen),
+				writable: true, enumerable: true, configurable: true,
+			});
+		}
 		return out;
 	}
 	globalThis.structuredClone = (value, options) => {
