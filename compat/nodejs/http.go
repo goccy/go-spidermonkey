@@ -9,7 +9,6 @@ package nodejs
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -108,12 +107,6 @@ func (rt *Runtime) opHTTPClose(cfg spidermonkey.Config, args []spidermonkey.Valu
 // response, posts the dispatch to the loop goroutine, and blocks until the
 // guest ends the response (or the client goes away).
 func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "reading request body", http.StatusBadRequest)
-		return
-	}
-
 	st := s.rt.http
 	p := &httpPending{w: w, done: make(chan struct{})}
 	st.mu.Lock()
@@ -137,24 +130,17 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rt := s.rt
+	hasBody := r.ContentLength != 0 || r.Header.Get("Transfer-Encoding") != ""
 	rt.loop.Post(func() error {
-		var bodyVal spidermonkey.Value = spidermonkey.Null()
-		if len(body) > 0 {
-			u8, berr := rt.js.NewBytes(body)
-			if berr != nil {
-				s.fail(reqID, p)
-				return nil
-			}
-			defer u8.Free()
-			bodyVal = u8
-		}
+		// Dispatch immediately with NO buffered body; the request body streams
+		// in via __node_http_body chunks (below).
 		_, cerr := rt.httpDispatch.Call(
 			spidermonkey.ValueOf(s.id),
 			spidermonkey.ValueOf(reqID),
 			spidermonkey.ValueOf(r.Method),
 			spidermonkey.ValueOf(r.URL.RequestURI()),
 			spidermonkey.ValueOf(headerPairs),
-			bodyVal,
+			spidermonkey.ValueOf(hasBody),
 			spidermonkey.ValueOf(r.RemoteAddr),
 			spidermonkey.ValueOf(r.TLS != nil),
 		)
@@ -164,6 +150,39 @@ func (s *httpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+
+	// Stream the request body incrementally to the guest IncomingMessage.
+	if hasBody {
+		go func() {
+			buf := make([]byte, 32<<10)
+			for {
+				n, rerr := r.Body.Read(buf)
+				if n > 0 {
+					chunk := append([]byte(nil), buf[:n]...)
+					rt.loop.Post(func() error {
+						u8, e := rt.js.NewBytes(chunk)
+						if e == nil {
+							rt.httpBody.Call(spidermonkey.ValueOf(reqID), u8)
+							u8.Free()
+						}
+						return nil
+					})
+				}
+				if rerr != nil {
+					rt.loop.Post(func() error {
+						rt.httpBody.Call(spidermonkey.ValueOf(reqID), spidermonkey.Null())
+						return nil
+					})
+					return
+				}
+			}
+		}()
+	} else {
+		rt.loop.Post(func() error {
+			rt.httpBody.Call(spidermonkey.ValueOf(reqID), spidermonkey.Null())
+			return nil
+		})
+	}
 
 	select {
 	case <-p.done:

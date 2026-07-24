@@ -60,6 +60,7 @@ type Runtime struct {
 	coreExports  map[string][]string // core module -> identifier export names
 	http         *httpState
 	httpDispatch *spidermonkey.Object // __node_http_dispatch
+	httpBody     *spidermonkey.Object // __node_http_body
 	net          *netState
 	workers      *workerManager
 	child        *procState
@@ -144,6 +145,15 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 		rt.httpDispatch = o
 	} else {
 		return nil, fmt.Errorf("nodejs: __node_http_dispatch missing")
+	}
+	bv, err := js.Global().Get("__node_http_body")
+	if err != nil {
+		return nil, err
+	}
+	if o := bv.Object(); o != nil && o.IsFunction() {
+		rt.httpBody = o
+	} else {
+		return nil, fmt.Errorf("nodejs: __node_http_body missing")
 	}
 
 	if err := rt.collectCoreExports(ctx); err != nil {

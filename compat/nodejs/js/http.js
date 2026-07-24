@@ -78,10 +78,6 @@
 			}
 			this.complete = false;
 			this.aborted = false;
-			// NOT named _body: body-parser uses req._body as its
-			// "already parsed" flag, and a truthy value there makes it
-			// skip parsing entirely.
-			this._rawRequestBody = init.body ?? null;
 		}
 		setTimeout() { return this; }
 	}
@@ -208,7 +204,23 @@
 		unref() { return this; }
 	}
 
-	globalThis.__node_http_dispatch = (serverId, reqId, method, url, rawHeaders, body, remoteAddr, encrypted) => {
+	// reqId -> IncomingMessage, for streaming the request body in.
+	const openRequests = new Map();
+
+	// The host streams request-body chunks here (Buffer, or null at EOF).
+	globalThis.__node_http_body = (reqId, chunk) => {
+		const req = openRequests.get(reqId);
+		if (!req) return;
+		if (chunk === null || chunk === undefined) {
+			req.complete = true;
+			req.push(null);
+			openRequests.delete(reqId);
+		} else {
+			req.push(Object.setPrototypeOf(chunk, Buffer.prototype));
+		}
+	};
+
+	globalThis.__node_http_dispatch = (serverId, reqId, method, url, rawHeaders, hasBody, remoteAddr, encrypted) => {
 		const server = servers.get(serverId);
 		if (!server) {
 			ops.http_respond(reqId, 503, "[]");
@@ -223,10 +235,9 @@
 		}
 		const socket = makeSocket(remoteAddress, remotePort);
 		socket.encrypted = !!encrypted;
-		const req = new IncomingMessage({
-			method, url, rawHeaders, socket,
-			body: body === null || body === undefined ? null : Object.setPrototypeOf(body, Buffer.prototype),
-		});
+		const req = new IncomingMessage({ method, url, rawHeaders, socket });
+		// Body chunks arrive via __node_http_body; register for routing.
+		openRequests.set(reqId, req);
 		const res = new ServerResponse({ reqId, socket, req });
 		try {
 			server.emit("request", req, res);
@@ -241,12 +252,9 @@
 				}
 			} catch {}
 		}
-		// Deliver the body after the handler installed its listeners.
-		process.nextTick(() => {
-			if (req._rawRequestBody && req._rawRequestBody.length) req.push(req._rawRequestBody);
-			req.complete = true;
-			req.push(null);
-		});
+		// The request body streams in through __node_http_body; the handler
+		// attached its 'data'/'end' listeners synchronously above (the
+		// Readable buffers any chunks that arrive first).
 	};
 
 	class Agent { constructor() { this.options = {}; } destroy() {} }
