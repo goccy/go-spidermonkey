@@ -405,8 +405,16 @@
 				const joined = new Uint8Array(total);
 				let off = 0;
 				for (const c of chunks) { joined.set(c, off); off += c.length; }
-				rc.enqueue(new Uint8Array(zlib[method + "Sync"] ? zlib[method + "Sync"](joined) : zlib[method](joined)));
-				rc.close();
+				try {
+					rc.enqueue(new Uint8Array(zlib[method + "Sync"] ? zlib[method + "Sync"](joined) : zlib[method](joined)));
+					rc.close();
+				} catch (e) {
+					// A transform failure (e.g. corrupt input to DecompressionStream)
+					// must ERROR the readable side so a consumer's read rejects,
+					// rather than leaving it open forever (a hang).
+					rc.error(e);
+					throw e;
+				}
 			},
 		});
 		return { readable, writable };

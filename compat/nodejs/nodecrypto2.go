@@ -49,6 +49,20 @@ func (rt *Runtime) crypto2Ops() map[string]spidermonkey.Func {
 	}
 }
 
+// aesKeyLen returns the key length (bytes) implied by an "aes-<bits>-<mode>"
+// algorithm name, and whether the name is a recognized AES variant.
+func aesKeyLen(algo string) (int, bool) {
+	switch {
+	case strings.HasPrefix(algo, "aes-128-"):
+		return 16, true
+	case strings.HasPrefix(algo, "aes-192-"):
+		return 24, true
+	case strings.HasPrefix(algo, "aes-256-"):
+		return 32, true
+	}
+	return 0, false
+}
+
 // opCipher is a one-shot symmetric transform (the JS Cipheriv/Decipheriv
 // classes buffer update() data and call this at final): encrypt returns
 // {data, tag} (tag empty for non-GCM); decrypt returns {data} or an error
@@ -70,6 +84,13 @@ func (rt *Runtime) opCipher(cfg spidermonkey.Config, args []spidermonkey.Value) 
 		tag, _ = valueBytes(args[6])
 	}
 
+	// The named algorithm's key size must match the actual key. aes.NewCipher
+	// picks AES-128/192/256 from len(key) ALONE, so without this check
+	// createCipheriv("aes-256-gcm", key16, iv) would silently encrypt with
+	// AES-128 (a downgrade / interop break); Node rejects the mismatch.
+	if want, ok := aesKeyLen(algo); ok && len(key) != want {
+		return cryptoErr("Invalid key length"), nil
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return cryptoErr(err.Error()), nil

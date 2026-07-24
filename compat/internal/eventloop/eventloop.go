@@ -317,6 +317,14 @@ func (l *Loop) run(ctx context.Context, stop func() bool) error {
 		if err := l.drainMicro(ctx); err != nil {
 			return err
 		}
+		// If the stop condition is already met (the handler settled in the drain
+		// above), return NOW — before running this turn's due timers. Otherwise a
+		// timer callback that throws would abort the loop and discard the response
+		// that is already available (cfworkers has no uncaught-exception channel to
+		// absorb the throw). The leftover timers are cleared by Reset.
+		if stop != nil && stop() {
+			return nil
+		}
 
 		// Due timers first (Node's timers phase), in due order; microtasks
 		// drain after each callback. Timers scheduled DURING this turn's later
@@ -350,6 +358,9 @@ func (l *Loop) run(ctx context.Context, stop func() bool) error {
 		l.mu.Lock()
 		l.dueBatch = nil
 		l.mu.Unlock()
+		if stop != nil && stop() {
+			return nil
+		}
 
 		// Posted completions (the poll phase): finished async work whose
 		// callbacks unblock the guest.
@@ -368,6 +379,10 @@ func (l *Loop) run(ctx context.Context, stop func() bool) error {
 			if err := l.drainMicro(ctx); err != nil {
 				return err
 			}
+		}
+
+		if stop != nil && stop() {
+			return nil
 		}
 
 		// Check phase: run the immediates queued when this turn started;

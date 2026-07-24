@@ -473,16 +473,31 @@
 		}
 		if (a instanceof Map) {
 			// Map/Set have no own-enumerable keys, so the Object.keys fallthrough
-			// would compare them equal regardless of contents; compare entries.
+			// would compare them equal regardless of contents. Match entries
+			// STRUCTURALLY (Node's deepStrictEqual), pairing each of a's entries to
+			// a distinct not-yet-used entry of b.
 			if (a.size !== b.size) return false;
-			for (const [k, v] of a) {
-				if (!b.has(k) || !deepEqual(v, b.get(k), seen)) return false;
+			const be = [...b], used = new Array(be.length).fill(false);
+			outer: for (const [ak, av] of a) {
+				for (let i = 0; i < be.length; i++) {
+					if (!used[i] && deepEqual(ak, be[i][0], seen) && deepEqual(av, be[i][1], seen)) {
+						used[i] = true;
+						continue outer;
+					}
+				}
+				return false;
 			}
 			return true;
 		}
 		if (a instanceof Set) {
 			if (a.size !== b.size) return false;
-			for (const v of a) if (!b.has(v)) return false;
+			const bv = [...b], used = new Array(bv.length).fill(false);
+			outer: for (const av of a) {
+				for (let i = 0; i < bv.length; i++) {
+					if (!used[i] && deepEqual(av, bv[i], seen)) { used[i] = true; continue outer; }
+				}
+				return false;
+			}
 			return true;
 		}
 		const ka = Object.keys(a), kb = Object.keys(b);

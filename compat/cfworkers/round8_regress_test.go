@@ -62,6 +62,35 @@ func TestCryptoKeyCrossRequestIsolation(t *testing.T) {
 	}
 }
 
+// TestHandlerTimerThrowStillResponds verifies a handler that returns a response
+// but leaves a timer that throws still delivers the response (200), rather than
+// the timer throw aborting the loop and turning it into a 500.
+func TestHandlerTimerThrowStillResponds(t *testing.T) {
+	srv := newPoolServer(t, cfworkers.PoolConfig{
+		Size: 1,
+		Source: `
+			export default {
+				async fetch(req, env, ctx) {
+					setTimeout(() => { throw new Error("boom"); }, 0);
+					return new Response("ok");
+				},
+			};
+		`,
+	})
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200 (timer throw must not clobber the response)", resp.StatusCode)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want ok", body)
+	}
+}
+
 // TestFetchResponsePassthrough verifies a handler can return an upstream fetch()
 // Response straight through (the reverse-proxy pattern) — status, headers, and
 // body must survive.

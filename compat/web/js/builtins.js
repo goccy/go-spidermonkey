@@ -973,16 +973,63 @@
 	}
 	globalThis.Headers = Headers;
 
-	function bodyToBytes(init) {
-		if (init === null || init === undefined) return null;
-		if (typeof init === "string") return utf8Encode(init);
-		if (init instanceof URLSearchParams) return utf8Encode(init.toString());
-		if (init instanceof ArrayBuffer) return new Uint8Array(init.slice(0));
+	let __fdBoundarySeq = 0;
+	const concatChunks = (chunks) => {
+		let n = 0;
+		for (const c of chunks) n += c.length;
+		const out = new Uint8Array(n);
+		let o = 0;
+		for (const c of chunks) { out.set(c, o); o += c.length; }
+		return out;
+	};
+
+	// normalizeBody turns a body init into { bytes, contentType }. The implied
+	// contentType lets Request/Response set a default Content-Type (as the spec
+	// requires) and is essential for FormData, whose multipart boundary must match
+	// the header. Returning the raw bytes (not String(init)) is what stops a Blob
+	// or FormData body from being serialized to "[object Blob]".
+	function normalizeBody(init) {
+		if (init === null || init === undefined) return { bytes: null, contentType: null };
+		if (typeof init === "string") return { bytes: utf8Encode(init), contentType: "text/plain;charset=UTF-8" };
+		if (init instanceof URLSearchParams) return { bytes: utf8Encode(init.toString()), contentType: "application/x-www-form-urlencoded;charset=UTF-8" };
+		if (init instanceof ArrayBuffer) return { bytes: new Uint8Array(init.slice(0)), contentType: null };
 		if (ArrayBuffer.isView(init)) {
-			return new Uint8Array(init.buffer.slice(init.byteOffset, init.byteOffset + init.byteLength));
+			return { bytes: new Uint8Array(init.buffer.slice(init.byteOffset, init.byteOffset + init.byteLength)), contentType: null };
+		}
+		if (globalThis.Blob && init instanceof globalThis.Blob) {
+			return { bytes: new Uint8Array(init._bytes), contentType: init.type || null };
+		}
+		if (globalThis.FormData && init instanceof globalThis.FormData) {
+			const boundary = "----GSMFormBoundary" + (__fdBoundarySeq++).toString(36) + "x";
+			const chunks = [];
+			for (const [name, value] of init) {
+				let head = `--${boundary}\r\nContent-Disposition: form-data; name="${name}"`;
+				if (globalThis.Blob && value instanceof globalThis.Blob) {
+					const fn = value.name !== undefined ? value.name : "blob";
+					head += `; filename="${fn}"\r\n`;
+					if (value.type) head += `Content-Type: ${value.type}\r\n`;
+					head += "\r\n";
+					chunks.push(utf8Encode(head), new Uint8Array(value._bytes), utf8Encode("\r\n"));
+				} else {
+					head += "\r\n\r\n";
+					chunks.push(utf8Encode(head + String(value) + "\r\n"));
+				}
+			}
+			chunks.push(utf8Encode(`--${boundary}--\r\n`));
+			return { bytes: concatChunks(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
 		}
 		if (init instanceof ReadableStream) throw new TypeError("ReadableStream bodies are not supported yet");
-		return utf8Encode(String(init));
+		return { bytes: utf8Encode(String(init)), contentType: null };
+	}
+
+	// setBody stores the body bytes on a Request/Response and, if the body implies
+	// a Content-Type and none was set explicitly, applies it (spec behavior).
+	function setBody(target, init) {
+		const { bytes, contentType } = normalizeBody(init);
+		target._body = bytes;
+		if (contentType && target.headers && !target.headers.has("content-type")) {
+			target.headers.set("content-type", contentType);
+		}
 	}
 
 	// Shared buffered-body surface for Request and Response.
@@ -1002,6 +1049,11 @@
 		async json() { return JSON.parse(await this.text()); },
 		async bytes() { this.bodyUsed = true; return this._body === null ? new Uint8Array(0) : new Uint8Array(this._body); },
 		async arrayBuffer() { return (await this.bytes()).buffer; },
+		async blob() {
+			this.bodyUsed = true;
+			const type = this.headers && this.headers.get ? (this.headers.get("content-type") || "") : "";
+			return new Blob([this._body === null ? new Uint8Array(0) : new Uint8Array(this._body)], { type });
+		},
 	};
 
 	class Request {
@@ -1011,7 +1063,8 @@
 			this.method = String(init.method ?? (from ? from.method : "GET")).toUpperCase();
 			this.headers = new Headers(init.headers ?? (from ? from.headers : undefined));
 			this.signal = init.signal ?? (from ? from.signal : undefined);
-			this._body = init.body !== undefined ? bodyToBytes(init.body) : from ? from._body : null;
+			if (init.body !== undefined) setBody(this, init.body);
+			else this._body = from ? from._body : null;
 			this.bodyUsed = false;
 		}
 		clone() { return new Request(this); }
@@ -1024,10 +1077,7 @@
 			this.status = init.status !== undefined ? Number(init.status) : 200;
 			this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
 			this.headers = new Headers(init.headers);
-			this._body = bodyToBytes(body);
-			if (typeof body === "string" && !this.headers.has("content-type")) {
-				this.headers.set("content-type", "text/plain;charset=UTF-8");
-			}
+			setBody(this, body);
 			this.ok = this.status >= 200 && this.status <= 299;
 			this.redirected = false;
 			this.url = "";

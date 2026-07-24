@@ -208,11 +208,25 @@
 	globalThis.TextEncoderStream = class TextEncoderStream {
 		constructor() {
 			const enc = new TextEncoder();
+			let pending = ""; // a lone high surrogate carried from the previous chunk
 			this.encoding = "utf-8";
 			this.readable = new ReadableStream({ start: (c) => (this._rc = c) });
 			this.writable = new WritableStream({
-				write: (chunk) => this._rc.enqueue(enc.encode(String(chunk))),
-				close: () => this._rc.close(),
+				write: (chunk) => {
+					let s = pending + String(chunk);
+					pending = "";
+					// Hold a trailing lone high surrogate for the next chunk so a
+					// surrogate pair split across writes isn't corrupted to U+FFFD.
+					if (s.length) {
+						const last = s.charCodeAt(s.length - 1);
+						if (last >= 0xd800 && last <= 0xdbff) { pending = s.slice(-1); s = s.slice(0, -1); }
+					}
+					if (s) this._rc.enqueue(enc.encode(s));
+				},
+				close: () => {
+					if (pending) this._rc.enqueue(enc.encode(pending)); // lone surrogate -> U+FFFD
+					this._rc.close();
+				},
 			});
 		}
 	};
