@@ -893,7 +893,12 @@
 		if (cb) sock.once("secureConnect", cb);
 		const onData = (chunk) => sock.push(Buffer.from(chunk));
 		const onEnd = () => sock.push(null);
-		const onError = (msg) => sock.emit("error", new Error(msg));
+		const onError = (info) => {
+			const obj = info && typeof info === "object"; // {code,message} from async connect
+			const e = new Error(obj ? info.message : info);
+			e.code = (obj && info.code) || "ECONNRESET";
+			sock.emit("error", e);
+		};
 		const onConnect = () => { sock.emit("secureConnect"); sock.emit("connect"); };
 		const verify = options.rejectUnauthorized !== false;
 		// The Go tls.Dial verifies the chain when verify is true; a successful

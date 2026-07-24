@@ -40,11 +40,11 @@ func signalByName(name string) os.Signal {
 type procState struct {
 	mu    sync.Mutex
 	procs map[int64]*exec.Cmd
-	stdin map[int64]interface{ Write([]byte) (int, error) }
+	stdin map[int64]*connWriter // async stdin pipe writer (off-loop, ordered)
 }
 
 func newProcState() *procState {
-	return &procState{procs: map[int64]*exec.Cmd{}, stdin: map[int64]interface{ Write([]byte) (int, error) }{}}
+	return &procState{procs: map[int64]*exec.Cmd{}, stdin: map[int64]*connWriter{}}
 }
 
 func (rt *Runtime) childOps() map[string]spidermonkey.Func {
@@ -109,7 +109,7 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	onError := args[4].Object()
 
 	cmd := exec.Command(file, argv...)
-	applyCwdEnv(cmd, opts)
+	applyCwdEnv(cmd, opts, cfg.Env)
 	stdin, _ := cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -122,7 +122,12 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	id := int64(cmd.Process.Pid)
 	st.procs[id] = cmd
 	if stdin != nil {
-		st.stdin[id] = stdin
+		// Writes go through an off-loop actor so a child that stops reading its
+		// stdin can't block the event loop on a full pipe buffer.
+		w := newConnWriter()
+		w.attach(stdin)
+		go w.run(func(error) {})
+		st.stdin[id] = w
 	}
 	st.mu.Unlock()
 
@@ -166,8 +171,12 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 		code, signal := exitInfo(werr)
 		st.mu.Lock()
 		delete(st.procs, id)
+		sw := st.stdin[id]
 		delete(st.stdin, id)
 		st.mu.Unlock()
+		if sw != nil {
+			sw.requestClose() // stop the stdin write actor
+		}
 		rt.loop.Post(func() error {
 			if onExit != nil {
 				onExit.Call(spidermonkey.ValueOf(code), spidermonkey.ValueOf(signal))
@@ -198,9 +207,7 @@ func (rt *Runtime) opChildStdin(cfg spidermonkey.Config, args []spidermonkey.Val
 		return spidermonkey.ValueOf(false), nil
 	}
 	if args[1].IsUndefined() || args[1].Object() == nil && args[1].Export() == nil {
-		if c, ok := w.(interface{ Close() error }); ok {
-			c.Close()
-		}
+		w.requestClose() // flush queued writes, then close the pipe
 		st.mu.Lock()
 		delete(st.stdin, pid)
 		st.mu.Unlock()
@@ -210,8 +217,7 @@ func (rt *Runtime) opChildStdin(cfg spidermonkey.Config, args []spidermonkey.Val
 	if err != nil {
 		return nil, err
 	}
-	w.Write(data)
-	return spidermonkey.ValueOf(true), nil
+	return spidermonkey.ValueOf(w.enqueue(data)), nil
 }
 
 func (rt *Runtime) opChildKill(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -252,7 +258,7 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 		return childErr(err), nil
 	}
 	cmd := exec.Command(file, argv...)
-	applyCwdEnv(cmd, opts)
+	applyCwdEnv(cmd, opts, cfg.Env)
 	if len(args) > 1 && !args[1].IsUndefined() {
 		if in, ierr := valueBytes(args[1]); ierr == nil && len(in) > 0 {
 			cmd.Stdin = bytes.NewReader(in)
@@ -292,10 +298,11 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 
 // applyCwdEnv reads opts.cwd and opts.envArray (the JS side flattens an env
 // object into a ["KEY=VALUE", ...] array, undefined when inheriting).
-func applyCwdEnv(cmd *exec.Cmd, opts *spidermonkey.Object) {
+func applyCwdEnv(cmd *exec.Cmd, opts *spidermonkey.Object, defaultEnv []string) {
 	if cwd, _ := opts.Get("cwd"); cwd != nil && !cwd.IsUndefined() {
 		cmd.Dir = cwd.String()
 	}
+	set := false
 	if envV, _ := opts.Get("envArray"); envV != nil {
 		if a := envV.Object(); a != nil {
 			defer a.Free()
@@ -306,6 +313,17 @@ func applyCwdEnv(cmd *exec.Cmd, opts *spidermonkey.Object) {
 				env = append(env, iv.String())
 			}
 			cmd.Env = env
+			set = true
+		}
+	}
+	// No env option: default to the sandbox's Config.Env, NOT nil — a nil
+	// cmd.Env makes os/exec inherit the HOST process environment (which may hold
+	// secrets the embedder deliberately kept out of Config.Env). Use a non-nil
+	// empty slice so the child gets exactly the configured environment.
+	if !set {
+		cmd.Env = append([]string(nil), defaultEnv...)
+		if cmd.Env == nil {
+			cmd.Env = []string{}
 		}
 	}
 }

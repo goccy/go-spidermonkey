@@ -181,6 +181,14 @@ func (rt *Runtime) opFSWatch(cfg spidermonkey.Config, args []spidermonkey.Value)
 		for {
 			select {
 			case <-stop:
+				// Free the guest callback handle on the loop (it was leaked on
+				// every unwatch/close before).
+				rt.loop.Post(func() error {
+					if onChange != nil {
+						onChange.Free()
+					}
+					return nil
+				})
 				rt.loop.DonePending()
 				return
 			case <-ticker.C:

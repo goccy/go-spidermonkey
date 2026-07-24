@@ -43,31 +43,63 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	host := args[0].String()
 	port := args[1].Int()
 	insecure := !args[2].Bool()
-	addr, err := resolveDialAddr(cfg, "tcp", host, port)
-	if err != nil {
-		return netErr(err), nil
-	}
-	// Dial the exact authorized IP (addr), but keep ServerName = host so TLS
-	// SNI and certificate verification still validate against the hostname.
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: insecure,
-	})
-	if err != nil {
-		return netErr(err), nil
-	}
+	onData := args[3].Object()
+	onEnd := args[4].Object()
+	onError := args[5].Object()
+	onConnect := args[6].Object()
+
+	// Reserve the socket id synchronously, then resolve + TLS-dial OFF the loop
+	// so a slow DNS/connect/handshake can't freeze the single event-loop
+	// goroutine. Writes before the handshake completes buffer in the writer.
 	st := rt.net
 	st.mu.Lock()
 	st.nextID++
 	id := st.nextID
+	w := newConnWriter()
+	st.writers[id] = w
 	st.mu.Unlock()
-	rt.registerConn(id, conn, newConnWriter(), func(error) {})
 
 	rt.loop.AddPending()
-	if onConnect := args[6].Object(); onConnect != nil {
-		rt.loop.Post(func() error { onConnect.Call(); onConnect.Free(); return nil })
-	}
-	go rt.pumpConn(id, conn, args[3].Object(), args[4].Object(), args[5].Object())
+	go func() {
+		addr, derr := resolveDialAddr(cfg, "tcp", host, port)
+		var conn net.Conn
+		if derr == nil {
+			// Dial the exact authorized IP (addr) but keep ServerName = host so
+			// SNI and certificate verification validate against the hostname.
+			conn, derr = tls.DialWithDialer(&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, &tls.Config{
+				ServerName:         host,
+				InsecureSkipVerify: insecure,
+			})
+		}
+		if derr != nil {
+			st.mu.Lock()
+			delete(st.writers, id)
+			st.mu.Unlock()
+			w.requestClose()
+			rt.loop.Post(func() error {
+				defer rt.loop.DonePending()
+				if onError != nil {
+					onError.Call(netErr(derr))
+				}
+				for _, o := range []*spidermonkey.Object{onData, onEnd, onError, onConnect} {
+					if o != nil {
+						o.Free()
+					}
+				}
+				return nil
+			})
+			return
+		}
+		st.mu.Lock()
+		st.conns[id] = conn
+		st.mu.Unlock()
+		w.attach(conn)
+		go w.run(func(error) {})
+		if onConnect != nil {
+			rt.loop.Post(func() error { onConnect.Call(); onConnect.Free(); return nil })
+		}
+		rt.pumpConn(id, conn, onData, onEnd, onError)
+	}()
 	return spidermonkey.ValueOf(id), nil
 }
 

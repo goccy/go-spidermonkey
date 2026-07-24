@@ -36,9 +36,11 @@ type netState struct {
 // slow peer (full send window) can never block the single event-loop goroutine.
 // Writes queued before the connection is established (async connect) are held
 // until it attaches, preserving order.
+// connWriter drives an io.WriteCloser (a socket, or a child's stdin pipe) — any
+// destination whose Write can block on a full buffer.
 type connWriter struct {
 	mu       sync.Mutex
-	conn     net.Conn // nil until attached
+	conn     io.WriteCloser // nil until attached
 	queue    [][]byte
 	closeReq bool
 	wake     chan struct{}
@@ -66,7 +68,7 @@ func (w *connWriter) enqueue(data []byte) bool {
 	return true
 }
 
-func (w *connWriter) attach(conn net.Conn) {
+func (w *connWriter) attach(conn io.WriteCloser) {
 	w.mu.Lock()
 	w.conn = conn
 	w.mu.Unlock()
