@@ -759,9 +759,11 @@
 		// `globalThis.x = ...` (e.g. Next's App Router manifest) lands there.
 		// Caveat: a top-level `var`/`function` DECLARATION binds to this wrapper,
 		// not the sandbox — true per-context binding needs a realm we don't have.
+		// The source param name is deliberately obscure so a sandbox property
+		// can't shadow it through `with (this)` and substitute the code.
 		const runner = new Function(
-			"globalThis", "self", "global", "exports", "module", "__vmCode__",
-			"with (this) { return eval(__vmCode__); }",
+			"globalThis", "self", "global", "exports", "module", "__sm$vmSrc__",
+			"with (this) { return eval(__sm$vmSrc__); }",
 		);
 		return runner.call(ctx, ctx, ctx, ctx, ctx.exports, ctx.module, String(code));
 	}
@@ -875,7 +877,7 @@
 	// The underlying Go tls.Conn already verified (unless rejectUnauthorized was
 	// false); detailed peer-certificate fields are not surfaced.
 	TLSSocket.prototype.getPeerCertificate = function () { return {}; };
-	TLSSocket.prototype.getCipher = function () { return { name: "TLS_AES_128_GCM_SHA256", version: "TLSv1.2" }; };
+	TLSSocket.prototype.getCipher = function () { return { name: "ECDHE-RSA-AES128-GCM-SHA256", version: "TLSv1.2" }; };
 	TLSSocket.prototype.getProtocol = function () { return "TLSv1.2"; };
 
 	function tlsConnect(options, cb) {

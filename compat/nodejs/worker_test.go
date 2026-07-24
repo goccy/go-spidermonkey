@@ -206,3 +206,27 @@ func TestWorkerTopLevelThrowEmitsError(t *testing.T) {
 		t.Errorf("worker exit code = %q, want 1 after an uncaught throw", got)
 	}
 }
+
+// The worker source wrapper must preserve a top-level "use strict" directive:
+// an assignment to an undeclared variable must throw (surfacing as 'error').
+func TestWorkerPreservesUseStrict(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	r, err := js.Eval(context.Background(), `
+		const { Worker } = require("worker_threads");
+		globalThis.r = {};
+		const w = new Worker('"use strict"; undeclaredGlobalX = 1;', { eval: true });
+		w.on("error", (e) => { r.errName = String(e && e.name || ""); r.errMsg = String(e && e.message || ""); });
+		w.on("exit", (c) => { r.code = c; });
+	`)
+	if err != nil || r.Error != nil {
+		t.Fatalf("eval: %v %v", err, r.Error)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := rt.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := evalStr(t, js, `r.errMsg ?? ""`); !strings.Contains(got, "undeclaredGlobalX") {
+		t.Fatalf("strict-mode assignment did not throw in worker (use strict not preserved): errMsg=%q", got)
+	}
+}

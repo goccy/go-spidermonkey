@@ -15,6 +15,8 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +25,32 @@ import (
 
 //go:embed js/worker.js
 var workerJS string
+
+// leadingUseStrict matches a "use strict" directive at the very start of a
+// worker source (after optional whitespace).
+var leadingUseStrict = regexp.MustCompile(`^\s*(?:"use strict"|'use strict')\s*;?`)
+
+// wrapWorkerSource wraps the user source so a top-level throw is reported to the
+// main thread (Worker 'error' then exit 1), while preserving the source's own
+// semantics: a leading shebang is stripped (Node does this), a leading
+// "use strict" directive is hoisted so the source stays strict (a directive
+// inside the try block would be inert), and `try {` is glued to the source with
+// no intervening newline so stack-trace line numbers are unchanged.
+func wrapWorkerSource(source string) string {
+	src := source
+	if strings.HasPrefix(src, "#!") {
+		if i := strings.IndexByte(src, '\n'); i >= 0 {
+			src = src[i+1:]
+		} else {
+			src = ""
+		}
+	}
+	prefix := ""
+	if leadingUseStrict.MatchString(src) {
+		prefix = `"use strict"; `
+	}
+	return prefix + "try {" + src + "\n} catch (__wt_e) { __wt_reportError(__wt_e); }"
+}
 
 type workerManager struct {
 	rt       *Runtime
@@ -85,11 +113,9 @@ func (rt *Runtime) opWorkerSpawn(cfg spidermonkey.Config, args []spidermonkey.Va
 
 	// Wrap the user source so a top-level throw is reported to the main thread
 	// as the Worker's 'error' event (then exit 1) instead of silently killing
-	// the agent with only a bare exit. The wrapper is a block, so top-level
-	// var/function still hoist to the worker global and let/const closures
-	// (message handlers) still capture correctly.
-	wrapped := "try {\n" + source + "\n} catch (__wt_e) { __wt_reportError(__wt_e); }"
-	id, err := wm.agents.Spawn(workerJS, wrapped)
+	// the agent with only a bare exit. The wrapper preserves strict mode,
+	// strips a shebang, and keeps line numbers (see wrapWorkerSource).
+	id, err := wm.agents.Spawn(workerJS, wrapWorkerSource(source))
 	if err != nil {
 		return nil, err
 	}

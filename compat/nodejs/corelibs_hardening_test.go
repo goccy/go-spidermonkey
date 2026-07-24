@@ -77,3 +77,20 @@ func TestRequireCacheKeyedByResolvedPath(t *testing.T) {
 		t.Fatalf("require.cache[require.resolve(id)] missed — key mismatch")
 	}
 }
+
+// A real ./main.js on the FS must be require-able — the synthetic entry module
+// id "/main.js" must not be preseeded into require.cache and shadow it.
+func TestRequireRealMainJsNotShadowed(t *testing.T) {
+	fsys := memfs.New()
+	fsys.WriteFile("main.js", []byte("module.exports = { fromFile: true };"), 0o644)
+	js, rt := newRuntime(t, spidermonkey.Config{FS: fsys})
+	if _, err := rt.RunScript(context.Background(), `
+		globalThis.__r = {};
+		__r.v = require("/main.js").fromFile;
+	`); err != nil {
+		t.Fatalf("RunScript: %v", err)
+	}
+	if evalStr(t, js, `String(__r.v)`) != "true" {
+		t.Fatalf("require('/main.js') returned the empty entry module, not the file")
+	}
+}

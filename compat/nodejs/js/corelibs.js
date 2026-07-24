@@ -975,7 +975,9 @@
 	}
 
 	const rootModule = new Module("/main.js");
-	requireCache[rootModule.id] = rootModule;
+	// NOTE: do NOT seed requireCache with rootModule — its "/main.js" id would
+	// shadow a real ./main.js on the FS (require would return the empty entry
+	// exports). require.main === module still works via require.main below.
 	globalThis.require = makeRequireFor(rootModule);
 	globalThis.module = rootModule; // the entry module object (for require.main === module)
 	globalThis.__node_require_path = loadCJSPath;
