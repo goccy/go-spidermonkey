@@ -558,6 +558,29 @@
 			if (isErr(r)) throw fsError(r, "rename", oldP);
 		},
 		realpathSync: (p) => path.resolve(String(p)),
+		watch(p, options, listener) {
+			if (typeof options === "function") { listener = options; options = {}; }
+			const watcher = new EventEmitter();
+			const id = ops.fs_watch(String(p), (eventType, filename) => {
+				watcher.emit("change", eventType, filename);
+				if (listener) listener(eventType, filename);
+			});
+			watcher.close = () => ops.fs_unwatch(id);
+			return watcher;
+		},
+		watchFile(p, options, listener) {
+			if (typeof options === "function") { listener = options; options = {}; }
+			let prev = null;
+			try { prev = fsSync.statSync(p); } catch {}
+			const id = ops.fs_watch(String(p), () => {
+				let cur = null;
+				try { cur = fsSync.statSync(p); } catch {}
+				listener(cur || { mtime: new Date(0), size: 0 }, prev || { mtime: new Date(0), size: 0 });
+				prev = cur;
+			});
+			return { _id: id };
+		},
+		unwatchFile(p) {},
 		copyFileSync(src, dest) {
 			const r = ops.fs_copyfile(String(src), String(dest));
 			if (isErr(r)) throw fsError(r, "copyfile", src);

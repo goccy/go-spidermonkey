@@ -631,17 +631,96 @@
 
 	// ------------------------------------- small stubs the loaders require
 
+	// Real RFC 3492 punycode + IDNA toASCII/toUnicode.
+	const puny = (() => {
+		const base = 36, tMin = 1, tMax = 26, skew = 38, damp = 700, initialBias = 72, initialN = 128, delimiter = "-";
+		const adapt = (delta, numPoints, firstTime) => {
+			delta = firstTime ? Math.floor(delta / damp) : delta >> 1;
+			delta += Math.floor(delta / numPoints);
+			let k = 0;
+			for (; delta > ((base - tMin) * tMax) >> 1; k += base) delta = Math.floor(delta / (base - tMin));
+			return Math.floor(k + ((base - tMin + 1) * delta) / (delta + skew));
+		};
+		const ucs2decode = (s) => [...s].map((c) => c.codePointAt(0));
+		const digitToBasic = (d) => d + 22 + 75 * (d < 26 ? 1 : 0);
+		const basicToDigit = (cp) => {
+			if (cp - 48 < 10) return cp - 22;
+			if (cp - 65 < 26) return cp - 65;
+			if (cp - 97 < 26) return cp - 97;
+			return base;
+		};
+		function encode(input) {
+			const cps = ucs2decode(input);
+			const output = [];
+			let n = initialN, delta = 0, bias = initialBias;
+			for (const cp of cps) if (cp < 0x80) output.push(String.fromCharCode(cp));
+			let basicLength = output.length, handled = basicLength;
+			if (basicLength) output.push(delimiter);
+			while (handled < cps.length) {
+				let m = Infinity;
+				for (const cp of cps) if (cp >= n && cp < m) m = cp;
+				delta += (m - n) * (handled + 1);
+				n = m;
+				for (const cp of cps) {
+					if (cp < n) delta++;
+					if (cp === n) {
+						let q = delta;
+						for (let k = base; ; k += base) {
+							const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+							if (q < t) break;
+							output.push(String.fromCharCode(digitToBasic(t + ((q - t) % (base - t)))));
+							q = Math.floor((q - t) / (base - t));
+						}
+						output.push(String.fromCharCode(digitToBasic(q)));
+						bias = adapt(delta, handled + 1, handled === basicLength);
+						delta = 0;
+						handled++;
+					}
+				}
+				delta++;
+				n++;
+			}
+			return output.join("");
+		}
+		function decode(input) {
+			const output = [];
+			let n = initialN, i = 0, bias = initialBias;
+			let basic = input.lastIndexOf(delimiter);
+			if (basic < 0) basic = 0;
+			for (let j = 0; j < basic; j++) output.push(input.charCodeAt(j));
+			for (let index = basic > 0 ? basic + 1 : 0; index < input.length;) {
+				let oldi = i;
+				for (let w = 1, k = base; ; k += base) {
+					const digit = basicToDigit(input.charCodeAt(index++));
+					i += digit * w;
+					const t = k <= bias ? tMin : k >= bias + tMax ? tMax : k - bias;
+					if (digit < t) break;
+					w *= base - t;
+				}
+				const out = output.length + 1;
+				bias = adapt(i - oldi, out, oldi === 0);
+				n += Math.floor(i / out);
+				i %= out;
+				output.splice(i++, 0, n);
+			}
+			return String.fromCodePoint(...output);
+		}
+		const toASCII = (domain) => String(domain).split(".").map((l) => /[^\x00-\x7f]/.test(l) ? "xn--" + encode(l) : l).join(".");
+		const toUnicode = (domain) => String(domain).split(".").map((l) => l.startsWith("xn--") ? decode(l.slice(4)) : l).join(".");
+		return { encode, decode, toASCII, toUnicode };
+	})();
 	core.punycode = {
-		version: "2.1.0",
-		toASCII: (s) => String(s),
-		toUnicode: (s) => String(s),
-		encode: (s) => String(s),
-		decode: (s) => String(s),
+		version: "2.3.1",
+		encode: puny.encode,
+		decode: puny.decode,
+		toASCII: puny.toASCII,
+		toUnicode: puny.toUnicode,
 		ucs2: {
 			encode: (arr) => String.fromCodePoint(...arr),
 			decode: (s) => [...String(s)].map((c) => c.codePointAt(0)),
 		},
 	};
+	globalThis.__node_punycode = core.punycode;
 
 	core.vm = {
 		createContext: (o = {}) => o,
@@ -817,10 +896,67 @@
 		},
 	};
 
+	// readline: a line splitter over an input Readable, emitting 'line' and
+	// answering question() prompts. Enough for interactive CLIs / config
+	// readers driven by process.stdin.
+	class Interface extends core.events {
+		constructor(options) {
+			super();
+			this.input = options.input;
+			this.output = options.output;
+			this._buf = "";
+			this._questionCb = null;
+			this._closed = false;
+			if (this.input) {
+				this.input.setEncoding && this.input.setEncoding("utf8");
+				this.input.on("data", (chunk) => this._onData(String(chunk)));
+				this.input.on("end", () => this.close());
+			}
+		}
+		_onData(str) {
+			this._buf += str;
+			let idx;
+			while ((idx = this._buf.indexOf("\n")) >= 0) {
+				const line = this._buf.slice(0, idx).replace(/\r$/, "");
+				this._buf = this._buf.slice(idx + 1);
+				if (this._questionCb) { const cb = this._questionCb; this._questionCb = null; cb(line); }
+				else this.emit("line", line);
+			}
+		}
+		question(query, cb) {
+			if (this.output) this.output.write(query);
+			this._questionCb = cb;
+		}
+		prompt() { if (this.output) this.output.write("> "); }
+		write(data) { if (this.output) this.output.write(data); }
+		close() {
+			if (this._closed) return;
+			this._closed = true;
+			this.emit("close");
+		}
+		[Symbol.asyncIterator]() {
+			const lines = [];
+			let done = false, wake = null;
+			this.on("line", (l) => { lines.push(l); if (wake) { wake(); wake = null; } });
+			this.on("close", () => { done = true; if (wake) { wake(); wake = null; } });
+			return {
+				async next() {
+					for (;;) {
+						if (lines.length) return { value: lines.shift(), done: false };
+						if (done) return { value: undefined, done: true };
+						await new Promise((r) => { wake = r; });
+					}
+				},
+				[Symbol.asyncIterator]() { return this; },
+			};
+		}
+	}
 	core.readline = {
-		createInterface: notSupported("readline.createInterface"),
+		Interface,
+		createInterface: (options) => new Interface(options),
 		clearLine: () => {},
 		cursorTo: () => {},
+		moveCursor: () => {},
 	};
 
 	core.cluster = {

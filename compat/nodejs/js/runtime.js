@@ -91,6 +91,8 @@
 			end: () => {},
 			columns: 80,
 		},
+		// stdin is lazily backed by Config.Stdin (a Readable); corelibs.js
+		// grafts the real stream once node:stream exists.
 		stdin: { isTTY: false },
 		hrtime: Object.assign(
 			(prev) => {

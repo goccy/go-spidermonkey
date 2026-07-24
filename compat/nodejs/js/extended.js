@@ -320,6 +320,38 @@
 	let refCount = 0;
 	process.ref = () => { refCount++; };
 	process.unref = () => { refCount--; };
+
+	// process.stdin: a Readable backed by Config.Stdin (lazily started when a
+	// consumer attaches). __node_ops is still in scope here (extended.js runs
+	// before its deletion).
+	{
+		const ops = globalThis.__node_ops;
+		const stdin = new core.stream.Readable({ read() {} });
+		stdin.isTTY = false;
+		let started = false;
+		const startStdin = () => {
+			if (started) return;
+			started = true;
+			ops.stdin_start((chunk) => stdin.push(Buffer.from(chunk)), () => stdin.push(null));
+		};
+		const origOn = stdin.on.bind(stdin);
+		stdin.on = (type, fn) => { if (type === "data" || type === "readable") startStdin(); return origOn(type, fn); };
+		stdin.resume = function () { startStdin(); return core.stream.Readable.prototype.resume.call(this); };
+		process.stdin = stdin;
+
+		// process signals: install one OS handler that re-emits onto process.
+		let signalWired = false;
+		const wireSignals = () => {
+			if (signalWired) return;
+			signalWired = true;
+			ops.signal_watch((name) => process.emit(name));
+		};
+		const procOn = process.on.bind(process);
+		process.on = (type, fn) => {
+			if (typeof type === "string" && type.startsWith("SIG")) wireSignals();
+			return procOn(type, fn);
+		};
+	}
 	process.getBuiltinModule = (name) => {
 		try { return globalThis.__node_core(name); } catch { return undefined; }
 	};

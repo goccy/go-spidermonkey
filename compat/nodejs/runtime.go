@@ -63,6 +63,7 @@ type Runtime struct {
 	net          *netState
 	workers      *workerManager
 	child        *procState
+	io           *ioState
 
 	mu             sync.Mutex
 	pendingReturns []*spidermonkey.Object // handles returned to the guest, freed on release_pending
@@ -91,6 +92,7 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 		http:        &httpState{servers: map[int64]*httpServer{}, reqs: map[int64]*httpPending{}},
 		net:         newNetState(),
 		child:       newProcState(),
+		io:          newIOState(),
 		fds:         map[int64]*openFile{},
 		nextFD:      3, // 0,1,2 reserved for stdio
 	}
@@ -171,6 +173,7 @@ func (rt *Runtime) Close() error {
 	rt.closeHTTP()
 	rt.closeNet()
 	rt.closeChild()
+	rt.closeIO()
 	rt.workers.close()
 	rt.mu.Lock()
 	pending := rt.pendingReturns
@@ -302,7 +305,7 @@ func (rt *Runtime) ops() map[string]spidermonkey.Func {
 		"crypto_hmac":     rt.opCryptoHMAC,
 	}
 	for _, group := range []map[string]spidermonkey.Func{
-		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(),
+		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(), rt.ioOps(),
 	} {
 		for name, fn := range group {
 			table[name] = fn
