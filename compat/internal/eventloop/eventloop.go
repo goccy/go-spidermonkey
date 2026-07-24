@@ -291,10 +291,23 @@ func (l *Loop) SetTimerRef(id int64, ref bool) {
 // exception thrown by a timer callback (or an error from a posted completion)
 // stops the loop and is returned, mirroring Node's uncaught-exception
 // behavior.
-func (l *Loop) Run(ctx context.Context) error {
+func (l *Loop) Run(ctx context.Context) error { return l.run(ctx, nil) }
+
+// RunUntil drives the loop like Run but ALSO returns (nil) as soon as stop()
+// reports true — used to deliver a handler's response the moment its promise
+// settles, without waiting for unrelated timers it left running (e.g. a
+// setInterval, or a not-yet-fired AbortSignal.timeout) to make the loop idle.
+// stop is evaluated on the loop goroutine between phases, so it may call into
+// the guest.
+func (l *Loop) RunUntil(ctx context.Context, stop func() bool) error { return l.run(ctx, stop) }
+
+func (l *Loop) run(ctx context.Context, stop func() bool) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if stop != nil && stop() {
+			return nil
 		}
 
 		// Drain microtasks left over from work that ran before (or between)
@@ -403,7 +416,10 @@ func (l *Loop) Run(ctx context.Context) error {
 		activePending := l.pending - l.unrefPending
 		idle := !hasRefTimer && activePending <= 0 && len(l.posts) == 0 && len(l.immediates) == 0
 		l.mu.Unlock()
-		if idle {
+		// Return before sleeping if idle, or if the stop condition is now met (the
+		// handler settled during this turn's phases) — otherwise we'd sleep on an
+		// unrelated timer while the response is already available.
+		if idle || (stop != nil && stop()) {
 			return nil
 		}
 

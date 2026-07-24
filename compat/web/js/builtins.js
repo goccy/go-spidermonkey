@@ -58,7 +58,11 @@
 			}
 			const keys = Object.keys(v);
 			if (!keys.length) return "{}";
-			return `{ ${keys.map((k) => `${k}: ${inspect(v[k], depth + 1, seen)}`).join(", ")} }`;
+			return `{ ${keys.map((k) => {
+				let val;
+				try { val = v[k]; } catch (e) { return `${k}: [Getter: threw ${e && e.name || "Error"}]`; }
+				return `${k}: ${inspect(val, depth + 1, seen)}`;
+			}).join(", ")} }`;
 		} finally {
 			seen.delete(v);
 		}
@@ -149,6 +153,21 @@
 	globalThis.TextEncoder = class TextEncoder {
 		get encoding() { return "utf-8"; }
 		encode(input = "") { return utf8Encode(String(input)); }
+		// encodeInto(src, dest): write UTF-8 of src into dest, returning how many
+		// source code units were read and bytes written (WHATWG). Commonly used
+		// for zero-copy encoding; its absence crashes such libraries.
+		encodeInto(source, dest) {
+			const s = String(source);
+			let read = 0, written = 0;
+			for (const ch of s) {
+				const bytes = utf8Encode(ch);
+				if (written + bytes.length > dest.length) break;
+				dest.set(bytes, written);
+				written += bytes.length;
+				read += ch.length; // surrogate pairs count as 2 units
+			}
+			return { read, written };
+		}
 	};
 
 	// Encodings supported without ICU tables: utf-8, latin1 (1:1 code points),
@@ -316,7 +335,11 @@
 		}
 		static timeout(ms) {
 			const s = new AbortSignal();
-			setTimeout(() => abortSignal(s, new DOMException("The operation timed out", "TimeoutError")), ms);
+			// The timer must NOT keep the loop alive on its own (Node unref's it):
+			// otherwise a completed handler still holding an AbortSignal.timeout(30s)
+			// delays the whole loop/response until the timeout fires.
+			const t = setTimeout(() => abortSignal(s, new DOMException("The operation timed out", "TimeoutError")), ms);
+			if (t && typeof t.unref === "function") t.unref();
 			return s;
 		}
 	}

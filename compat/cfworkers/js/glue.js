@@ -97,7 +97,18 @@
 		};
 		Promise.resolve()
 			.then(() => globalThis.__cfw_handler.fetch(req, globalThis.__cfw_env, ctx))
-			.then((resp) => { state.result = { ok: true, resp }; })
+			.then(async (resp) => {
+				// A handler may return the Response from fetch() straight through
+				// (the reverse-proxy pattern). That object carries its body as a
+				// stream with no `_body`, which the meta/body glue can't read; buffer
+				// it into `_body` here so passthrough works.
+				if (resp && typeof resp === "object" && resp._body === undefined
+					&& typeof resp.status === "number" && typeof resp.arrayBuffer === "function") {
+					try { const ab = await resp.arrayBuffer(); resp._body = ab ? new Uint8Array(ab) : null; }
+					catch { resp._body = null; }
+				}
+				state.result = { ok: true, resp };
+			})
 			.catch((err) => {
 				// SpiderMonkey stacks do not include the message line; compose
 				// both so the host error is actually diagnosable.

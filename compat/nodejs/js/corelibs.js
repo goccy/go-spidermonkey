@@ -285,7 +285,13 @@
 			}
 			const keys = Object.keys(v);
 			if (!keys.length) return "{}";
-			return `{ ${keys.map((k) => `${k}: ${inspect(v[k], opts, depth + 1, seen)}`).join(", ")} }`;
+			return `{ ${keys.map((k) => {
+				// A throwing getter must degrade to a placeholder, not abort the
+				// whole inspect/console.log call (Node renders "[Getter]"/the error).
+				let val;
+				try { val = v[k]; } catch (e) { return `${k}: [Getter: threw ${e && e.name || "Error"}]`; }
+				return `${k}: ${inspect(val, opts, depth + 1, seen)}`;
+			}).join(", ")} }`;
 		} finally {
 			seen.delete(v);
 		}
@@ -465,8 +471,39 @@
 			return a.byteLength === b.byteLength && [...new Uint8Array(a.buffer, a.byteOffset, a.byteLength)]
 				.every((x, i) => x === new Uint8Array(b.buffer, b.byteOffset, b.byteLength)[i]);
 		}
+		if (a instanceof Map) {
+			// Map/Set have no own-enumerable keys, so the Object.keys fallthrough
+			// would compare them equal regardless of contents; compare entries.
+			if (a.size !== b.size) return false;
+			for (const [k, v] of a) {
+				if (!b.has(k) || !deepEqual(v, b.get(k), seen)) return false;
+			}
+			return true;
+		}
+		if (a instanceof Set) {
+			if (a.size !== b.size) return false;
+			for (const v of a) if (!b.has(v)) return false;
+			return true;
+		}
 		const ka = Object.keys(a), kb = Object.keys(b);
 		return ka.length === kb.length && ka.every((k) => deepEqual(a[k], b[k], seen));
+	}
+
+	// matchError validates a thrown value against a Node error matcher: an error
+	// constructor, a RegExp (tested against the message), a validation object
+	// (own keys must deep-equal), or a predicate function.
+	function matchError(err, matcher) {
+		if (matcher === undefined) return true;
+		if (typeof matcher === "function") {
+			// Constructor (Error subclass) vs. plain predicate.
+			if (matcher.prototype instanceof Error || matcher === Error) return err instanceof matcher;
+			return matcher(err) === true;
+		}
+		if (matcher instanceof RegExp) return matcher.test(err && err.message !== undefined ? String(err.message) : String(err));
+		if (matcher && typeof matcher === "object") {
+			return Object.keys(matcher).every((k) => deepEqual(err ? err[k] : undefined, matcher[k]));
+		}
+		return true;
 	}
 
 	class AssertionError extends Error {
@@ -492,9 +529,31 @@
 		notStrictEqual: (a, e, m) => { if (Object.is(a, e)) throw new AssertionError({ actual: a, expected: e, operator: "!==", message: m }); },
 		deepEqual: (a, e, m) => { if (!deepEqual(a, e)) throw new AssertionError({ actual: a, expected: e, operator: "deepEqual", message: m }); },
 		deepStrictEqual: (a, e, m) => { if (!deepEqual(a, e)) throw new AssertionError({ actual: a, expected: e, operator: "deepStrictEqual", message: m }); },
-		throws: (fn, m) => {
-			try { fn(); } catch { return; }
-			throw new AssertionError({ message: m || "Missing expected exception", operator: "throws" });
+		throws: (fn, matcher, m) => {
+			// If the 2nd arg is a plain string it's the message, not a matcher.
+			if (typeof matcher === "string") { m = matcher; matcher = undefined; }
+			let thrown;
+			try { fn(); } catch (e) { thrown = e; }
+			if (thrown === undefined) {
+				throw new AssertionError({ message: m || "Missing expected exception", operator: "throws" });
+			}
+			if (!matchError(thrown, matcher)) {
+				throw new AssertionError({ actual: thrown, expected: matcher, operator: "throws", message: m || "thrown error did not match" });
+			}
+		},
+		doesNotThrow: (fn, matcher, m) => {
+			if (typeof matcher === "string") { m = matcher; matcher = undefined; }
+			try { fn(); } catch (e) {
+				if (matchError(e, matcher)) throw new AssertionError({ actual: e, operator: "doesNotThrow", message: m || "Got unwanted exception" });
+				throw e;
+			}
+		},
+		async rejects(fn, matcher, m) {
+			if (typeof matcher === "string") { m = matcher; matcher = undefined; }
+			let thrown, threw = false;
+			try { await (typeof fn === "function" ? fn() : fn); } catch (e) { thrown = e; threw = true; }
+			if (!threw) throw new AssertionError({ message: m || "Missing expected rejection", operator: "rejects" });
+			if (!matchError(thrown, matcher)) throw new AssertionError({ actual: thrown, expected: matcher, operator: "rejects", message: m });
 		},
 		match: (s, re, m) => { if (!re.test(s)) throw new AssertionError({ actual: s, expected: re, operator: "match", message: m }); },
 	});

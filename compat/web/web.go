@@ -39,10 +39,11 @@ var extendedJS string
 
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
-	js    *spidermonkey.JS
-	loop  *eventloop.Loop
-	fetch *fetchAPI
-	start time.Time
+	js     *spidermonkey.JS
+	loop   *eventloop.Loop
+	fetch  *fetchAPI
+	subtle *subtleAPI
+	start  time.Time
 }
 
 // Install defines the web globals on js and returns the handle that drives
@@ -64,6 +65,7 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		"timer_ref":     w.opTimerRef,
 	}
 	subtle := newSubtleAPI()
+	w.subtle = subtle
 	for name, fn := range subtle.ops() {
 		opTable[name] = fn
 	}
@@ -116,6 +118,17 @@ func (w *Web) Close() error {
 // drain. The type lives in an internal package; external callers use Wait.
 func (w *Web) Loop() *eventloop.Loop {
 	return w.loop
+}
+
+// ResetPerRequest drops per-request host state that must not leak across pooled
+// instance reuse (cfworkers). Currently the SubtleCrypto key table: its handles
+// are guest-visible and forgeable via globalThis.CryptoKey, so a later request
+// must not be able to address an earlier request's key material. Call alongside
+// Loop().Reset() between requests.
+func (w *Web) ResetPerRequest() {
+	if w.subtle != nil {
+		w.subtle.reset()
+	}
 }
 
 func (w *Web) opConsoleWrite(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {

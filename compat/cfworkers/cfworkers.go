@@ -179,24 +179,22 @@ func (wk *worker) runNonFetch(ctx context.Context, entry *spidermonkey.Object, d
 			err = fmt.Errorf("handler panicked: %v", r)
 		}
 		wk.web.Loop().Reset()
+		wk.web.ResetPerRequest()
 	}()
 	if _, err := entry.Call(args...); err != nil {
 		return fmt.Errorf("invoking handler: %w", err)
 	}
-	for {
-		st, err := wk.status.Call()
-		if err != nil {
-			return err
-		}
-		if st.String() != "pending" {
-			break
-		}
-		if err := wk.web.Wait(ctx); err != nil {
-			return err
-		}
-		if st2, _ := wk.status.Call(); st2 != nil && st2.String() == "pending" {
-			return fmt.Errorf("handler never settled")
-		}
+	// Run until the handler settles, not until fully idle (a handler may leave
+	// timers running); see the fetch path for the rationale.
+	stop := func() bool {
+		st, serr := wk.status.Call()
+		return serr != nil || st.String() != "pending"
+	}
+	if err := wk.web.Loop().RunUntil(ctx, stop); err != nil {
+		return err
+	}
+	if st, _ := wk.status.Call(); st == nil || st.String() == "pending" {
+		return fmt.Errorf("handler never settled")
 	}
 	if st, _ := wk.status.Call(); st != nil && st.String() == "error" {
 		msg, _ := wk.errMsg.Call()
@@ -341,6 +339,7 @@ func (wk *worker) serve(rw http.ResponseWriter, req *http.Request, drainTimeout 
 			// server handles it as intended rather than turning it into a 500.
 			if r == http.ErrAbortHandler {
 				wk.web.Loop().Reset()
+				wk.web.ResetPerRequest()
 				panic(r)
 			}
 			func() {
@@ -349,6 +348,7 @@ func (wk *worker) serve(rw http.ResponseWriter, req *http.Request, drainTimeout 
 			}()
 		}
 		wk.web.Loop().Reset()
+		wk.web.ResetPerRequest()
 	}()
 	fail := func(status int, format string, args ...any) {
 		http.Error(rw, fmt.Sprintf(format, args...), status)
@@ -406,26 +406,26 @@ func (wk *worker) serve(rw http.ResponseWriter, req *http.Request, drainTimeout 
 	}
 	reqObj.Free()
 
-	// Drive the loop until the handler's promise settles. Wait returns when
-	// the loop is idle; idle with the promise still pending means it can
-	// never settle (awaiting something that no timer or op will resolve).
-	for {
+	// Drive the loop until the handler's promise settles — NOT until the loop is
+	// fully idle. A handler can settle while leaving timers running (a
+	// setInterval, an un-fired AbortSignal.timeout); waiting for idle would delay
+	// or hang the already-available response and pin the pooled instance. RunUntil
+	// returns as soon as status flips, or when the loop goes idle while still
+	// pending (the promise awaits something nothing will resolve).
+	stop := func() bool {
 		st, serr := wk.status.Call()
-		if serr != nil {
-			fail(http.StatusInternalServerError, "handler status: %v", serr)
-			return
-		}
-		if st.String() != "pending" {
-			break
-		}
-		if werr := wk.web.Wait(ctx); werr != nil {
-			fail(http.StatusInternalServerError, "handler failed: %v", werr)
-			return
-		}
-		if st2, _ := wk.status.Call(); st2 != nil && st2.String() == "pending" {
-			fail(http.StatusInternalServerError, "handler never settled")
-			return
-		}
+		return serr != nil || st.String() != "pending"
+	}
+	if werr := wk.web.Loop().RunUntil(ctx, stop); werr != nil {
+		fail(http.StatusInternalServerError, "handler failed: %v", werr)
+		return
+	}
+	// Check the real status after the loop returns (it may have returned because
+	// the loop went idle, coinciding with the handler settling): pending here
+	// means the promise awaits something nothing will resolve.
+	if st, _ := wk.status.Call(); st == nil || st.String() == "pending" {
+		fail(http.StatusInternalServerError, "handler never settled")
+		return
 	}
 
 	if st, _ := wk.status.Call(); st != nil && st.String() == "error" {

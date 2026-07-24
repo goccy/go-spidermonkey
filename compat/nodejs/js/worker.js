@@ -117,20 +117,31 @@
 	function scheduleTimer(fn, ms, repeat, args) {
 		const id = ++timerSeq;
 		liveTimers.add(id);
+		// Node clamps intervals to >= 1ms; also keep any repeat off the 0ms path
+		// (which would be a hot microtask loop below).
+		let delay = Math.max(0, ms);
+		if (repeat && delay < 1) delay = 1;
+		const fire = () => {
+			if (!liveTimers.has(id)) return;
+			try {
+				fn(...args);
+			} catch (e) {
+				// Don't silently swallow a timer throw (which would also loop a
+				// repeating timer forever); surface it like an uncaught error.
+				if (globalThis.__wt_reportError) globalThis.__wt_reportError(e);
+			} finally {
+				if (repeat && liveTimers.has(id)) arm(); else liveTimers.delete(id);
+			}
+		};
 		const arm = () => {
 			const sab = new Int32Array(new SharedArrayBuffer(4));
-			Atomics.waitAsync(sab, 0, 0, Math.max(0, ms)).value.then(() => {
-				if (!liveTimers.has(id)) return;
-				try {
-					fn(...args);
-				} catch (e) {
-					// Don't silently swallow a timer throw (which would also loop a
-					// repeating timer forever); surface it like an uncaught error.
-					if (globalThis.__wt_reportError) globalThis.__wt_reportError(e);
-				} finally {
-					if (repeat && liveTimers.has(id)) arm(); else liveTimers.delete(id);
-				}
-			});
+			const w = Atomics.waitAsync(sab, 0, 0, delay);
+			// waitAsync returns {async:false, value:"timed-out"} for a 0ms (already
+			// elapsed) wait — value is a STRING, not a thenable — so setImmediate and
+			// setTimeout(fn, 0) would throw on `.value.then`. Fall back to a
+			// microtask in that case.
+			if (w.async) w.value.then(fire);
+			else Promise.resolve().then(fire);
 		};
 		arm();
 		return makeWorkerTimer(id);

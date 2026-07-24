@@ -688,11 +688,20 @@
 				try {
 					// An empty stream must still create/truncate the file.
 					if (fd === null) fd = fsMod.openSync(p, flags);
-					if (ownFd) fsMod.closeSync(fd);
+					if (ownFd && fd !== null) { fsMod.closeSync(fd); fd = null; }
 					callback();
 				} catch (e) {
 					callback(e);
 				}
+			},
+			destroy(err, callback) {
+				// destroy() does NOT run final(), so close our fd here too or it
+				// leaks in the host fd table (and buffered bytes are lost, since
+				// closeSync is what flushes them to the FS).
+				try {
+					if (ownFd && fd !== null) { fsMod.closeSync(fd); fd = null; }
+				} catch (_e) { /* best effort on the error/destroy path */ }
+				callback(err);
 			},
 		});
 		ws.path = p;

@@ -17,6 +17,7 @@ import (
 	_ "crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -49,19 +50,40 @@ type subtleKey struct {
 }
 
 type subtleAPI struct {
-	mu     sync.Mutex
-	nextID int64
-	keys   map[int64]*subtleKey
+	mu   sync.Mutex
+	keys map[int64]*subtleKey
 }
 
 func newSubtleAPI() *subtleAPI { return &subtleAPI{keys: map[int64]*subtleKey{}} }
 
+// randUint64 returns 8 crypto-random bytes as a uint64. crypto/rand.Read never
+// fails on the platforms this runs on; on the theoretical error it falls back to
+// a fixed value (the caller only uses it to pick an unused map key, retrying on
+// collision, so correctness does not depend on the value).
+func randUint64() uint64 {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+// put stores host-side key material (HMAC/RSA/ECDSA) under an UNGUESSABLE random
+// handle. Handles are exposed to guest code, and globalThis.CryptoKey lets a
+// guest forge a CryptoKey around any handle value; a random 63-bit id makes
+// enumerating another (e.g. a pooled prior request's) key handle infeasible.
+// Reset additionally drops all handles between pooled requests.
 func (s *subtleAPI) put(k *subtleKey) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.nextID++
-	s.keys[s.nextID] = k
-	return s.nextID
+	for {
+		// 52-bit id so it round-trips exactly through a JS float64 handle, yet is
+		// still a 2^52 space that a guest cannot feasibly enumerate.
+		id := int64(randUint64() & ((1 << 52) - 1))
+		if id == 0 || s.keys[id] != nil {
+			continue
+		}
+		s.keys[id] = k
+		return id
+	}
 }
 
 func (s *subtleAPI) get(v spidermonkey.Value) (*subtleKey, error) {
@@ -72,6 +94,15 @@ func (s *subtleAPI) get(v spidermonkey.Value) (*subtleKey, error) {
 		return nil, fmt.Errorf("unknown key handle")
 	}
 	return k, nil
+}
+
+// reset drops all stored key material. A pooled instance (cfworkers) calls this
+// between requests so one request's keys can't be addressed — via a forged
+// CryptoKey handle — by the next request on the same instance.
+func (s *subtleAPI) reset() {
+	s.mu.Lock()
+	s.keys = map[int64]*subtleKey{}
+	s.mu.Unlock()
 }
 
 func hashByName(name string) (crypto.Hash, error) {

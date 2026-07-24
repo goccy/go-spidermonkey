@@ -284,6 +284,30 @@ func (a *fetchAPI) newResponse(resp *http.Response) (*spidermonkey.Object, error
 	}); err != nil {
 		return nil, err
 	}
+	// entries(): [[k,v],...] with lower-cased names. Needed so this response can
+	// be re-emitted (e.g. a Workers handler returning fetch() straight through);
+	// Set-Cookie is left to getSetCookie so multiple cookies aren't comma-joined.
+	if err := headersObj.DefineFunc("entries", func(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+		pairs := []any{} // never nil, so it marshals as [] not null
+		for name, vals := range hdr {
+			if http.CanonicalHeaderKey(name) == "Set-Cookie" {
+				continue
+			}
+			pairs = append(pairs, []any{strings.ToLower(name), strings.Join(vals, ", ")})
+		}
+		return spidermonkey.ValueOf(pairs), nil
+	}); err != nil {
+		return nil, err
+	}
+	if err := headersObj.DefineFunc("getSetCookie", func(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+		cookies := []any{}
+		for _, c := range hdr.Values("Set-Cookie") {
+			cookies = append(cookies, c)
+		}
+		return spidermonkey.ValueOf(cookies), nil
+	}); err != nil {
+		return nil, err
+	}
 	if err := r.Set("headers", headersObj); err != nil {
 		return nil, err
 	}
