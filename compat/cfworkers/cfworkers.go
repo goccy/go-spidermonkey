@@ -138,7 +138,12 @@ func (p *Pool) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 // instance and drives the loop until it settles. cron is the schedule
 // expression; scheduledTimeMs is the trigger time in Unix ms.
 func (p *Pool) Scheduled(ctx context.Context, cron string, scheduledTimeMs int64) error {
-	w := <-p.workers
+	var w *worker
+	select {
+	case w = <-p.workers:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	defer func() { p.workers <- w }()
 	return w.runNonFetch(ctx, w.runScheduled, p.drainTimeout,
 		spidermonkey.ValueOf(cron), spidermonkey.ValueOf(scheduledTimeMs))
@@ -147,7 +152,12 @@ func (p *Pool) Scheduled(ctx context.Context, cron string, scheduledTimeMs int64
 // Queue fires the worker's queue() handler with a batch. queueName names the
 // queue; bodies are the message payloads (any JSON-encodable values).
 func (p *Pool) Queue(ctx context.Context, queueName string, bodies []any) error {
-	w := <-p.workers
+	var w *worker
+	select {
+	case w = <-p.workers:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	defer func() { p.workers <- w }()
 	messages := make([]map[string]any, len(bodies))
 	for i, b := range bodies {
@@ -161,7 +171,15 @@ func (p *Pool) Queue(ctx context.Context, queueName string, bodies []any) error 
 }
 
 // runNonFetch drives a scheduled/queue handler to completion.
-func (wk *worker) runNonFetch(ctx context.Context, entry *spidermonkey.Object, drain time.Duration, args ...spidermonkey.Value) error {
+func (wk *worker) runNonFetch(ctx context.Context, entry *spidermonkey.Object, drain time.Duration, args ...spidermonkey.Value) (err error) {
+	// Clear leftover loop state before this instance returns to the pool, and
+	// recover a handler panic so it can't poison the instance.
+	defer func() {
+		if r := recover(); r != nil && err == nil {
+			err = fmt.Errorf("handler panicked: %v", r)
+		}
+		wk.web.Loop().Reset()
+	}()
 	if _, err := entry.Call(args...); err != nil {
 		return fmt.Errorf("invoking handler: %w", err)
 	}
@@ -306,15 +324,32 @@ type responseMeta struct {
 	Headers    [][2]string `json:"headers"`
 }
 
+// maxRequestBody caps a buffered Workers request body so a large/slow upload
+// can't exhaust memory while holding a pool slot.
+const maxRequestBody = 100 << 20 // 100 MiB
+
 func (wk *worker) serve(rw http.ResponseWriter, req *http.Request, drainTimeout time.Duration) {
 	ctx := req.Context()
+	// A panic in the handler path (e.g. an out-of-range WriteHeader) must not
+	// return a mid-operation instance to the pool. Recover, best-effort 500,
+	// and always clear leftover loop state (timers/pending ops) so one
+	// request's un-awaited work can't fire during the next on this instance.
+	defer func() {
+		if r := recover(); r != nil {
+			func() {
+				defer func() { _ = recover() }()
+				http.Error(rw, "internal error", http.StatusInternalServerError)
+			}()
+		}
+		wk.web.Loop().Reset()
+	}()
 	fail := func(status int, format string, args ...any) {
 		http.Error(rw, fmt.Sprintf(format, args...), status)
 	}
 
-	reqBody, err := io.ReadAll(req.Body)
+	reqBody, err := io.ReadAll(http.MaxBytesReader(rw, req.Body, maxRequestBody))
 	if err != nil {
-		fail(http.StatusBadRequest, "reading request body: %v", err)
+		fail(http.StatusRequestEntityTooLarge, "reading request body: %v", err)
 		return
 	}
 
@@ -420,6 +455,11 @@ func (wk *worker) serve(rw http.ResponseWriter, req *http.Request, drainTimeout 
 	h := rw.Header()
 	for _, kv := range meta.Headers {
 		h.Add(kv[0], kv[1])
+	}
+	// A worker can set any status (Response.error() uses 0); an out-of-range
+	// code panics net/http's WriteHeader, so clamp it.
+	if meta.Status < 100 || meta.Status > 999 {
+		meta.Status = http.StatusInternalServerError
 	}
 	rw.WriteHeader(meta.Status)
 	if len(respBody) > 0 {

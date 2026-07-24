@@ -90,6 +90,7 @@
 	// queue (drained by the host loop).
 	globalThis.__cfw_run = (req) => {
 		state.result = null;
+		state.pending = []; // drop the previous request's settled waitUntil promises
 		const ctx = {
 			waitUntil: (p) => { state.pending.push(Promise.resolve(p).catch(() => {})); },
 			passThroughOnException: () => {},
@@ -111,6 +112,7 @@
 	// response; the host just drives them to completion and checks for error.
 	globalThis.__cfw_run_scheduled = (cron, scheduledTime) => {
 		state.result = null;
+		state.pending = [];
 		if (typeof globalThis.__cfw_handler.scheduled !== "function") {
 			state.result = { ok: false, error: "worker has no scheduled() handler" };
 			return;
@@ -125,6 +127,7 @@
 
 	globalThis.__cfw_run_queue = (batchJSON) => {
 		state.result = null;
+		state.pending = [];
 		if (typeof globalThis.__cfw_handler.queue !== "function") {
 			state.result = { ok: false, error: "worker has no queue() handler" };
 			return;

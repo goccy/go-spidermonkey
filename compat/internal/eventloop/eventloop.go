@@ -146,6 +146,35 @@ func (l *Loop) ClearImmediate(id int64) {
 	}
 }
 
+// Reset clears every armed timer, immediate, queued post and the pending
+// counter, freeing all held callback handles. A pooled instance (cfworkers)
+// calls this between requests so one request's un-awaited work — a leftover
+// setTimeout, an unresolved pending op — can never fire during the next
+// request on the same instance (a cross-request state leak). Call only when the
+// loop goroutine is idle (Run has returned), so nothing is mid-callback.
+func (l *Loop) Reset() {
+	l.mu.Lock()
+	timers := l.timers
+	l.timers = map[int64]*timer{}
+	imms := l.immediates
+	l.immediates = nil
+	l.dueBatch = nil
+	l.batch = nil
+	l.posts = nil
+	l.pending = 0
+	l.mu.Unlock()
+	for _, t := range timers {
+		if !t.running {
+			t.fn.Free()
+		}
+	}
+	for _, im := range imms {
+		if !im.cleared {
+			im.fn.Free()
+		}
+	}
+}
+
 // Post queues f to run on the loop goroutine — the only safe way for another
 // goroutine (an async op's completion) to touch the guest. Safe to call
 // concurrently.

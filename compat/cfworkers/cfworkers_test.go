@@ -285,3 +285,39 @@ func TestPoolBootErrors(t *testing.T) {
 		t.Errorf("throwing-module boot err = %v", err)
 	}
 }
+
+// A worker returning an out-of-range status (Response.error() uses 0) must not
+// panic net/http's WriteHeader and poison the pooled instance: it becomes a
+// clean 500 and the same instance keeps serving.
+func TestPoolInvalidStatusReturns500AndSurvives(t *testing.T) {
+	srv := newPoolServer(t, cfworkers.PoolConfig{
+		Size: 1,
+		Source: `
+			export default {
+				async fetch(req) {
+					const u = new URL(req.url);
+					if (u.pathname === "/bad") return new Response("x", { status: 0 });
+					return new Response("ok");
+				},
+			};
+		`,
+	})
+	resp, err := http.Get(srv.URL + "/bad")
+	if err != nil {
+		t.Fatalf("GET /bad: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("GET /bad status = %d, want 500", resp.StatusCode)
+	}
+	// The instance must still be usable.
+	resp2, err := http.Get(srv.URL + "/ok")
+	if err != nil {
+		t.Fatalf("GET /ok after bad: %v", err)
+	}
+	body, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 || string(body) != "ok" {
+		t.Errorf("instance poisoned: GET /ok = %d %q", resp2.StatusCode, body)
+	}
+}
