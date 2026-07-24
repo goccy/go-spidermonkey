@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -399,7 +400,7 @@ func TestFetchJSONWithDialAllowList(t *testing.T) {
 	srv := newJSONServer(t)
 	var dialed []string
 	js, _ := newWeb(t, spidermonkey.Config{
-		Dial: func(network, ip string, port int) bool {
+		Dial: func(network, host, ip string, port int) bool {
 			dialed = append(dialed, fmt.Sprintf("%s/%s:%d", network, ip, port))
 			return ip == "127.0.0.1"
 		},
@@ -430,10 +431,46 @@ func TestFetchJSONWithDialAllowList(t *testing.T) {
 	}
 }
 
+func TestFetchDialReceivesHost(t *testing.T) {
+	// A localhost server addressed by name: the Dial hook must receive the
+	// requested host ("localhost") alongside the resolved IP, so a
+	// host-scoped policy ("localhost only on this port") can be enforced.
+	srv := newJSONServer(t)
+	port := srv.URL[strings.LastIndex(srv.URL, ":")+1:]
+	var gotHost, gotIP string
+	var gotPort int
+	js, _ := newWeb(t, spidermonkey.Config{
+		Dial: func(network, host, ip string, p int) bool {
+			gotHost, gotIP, gotPort = host, ip, p
+			// Host-scoped rule: allow only "localhost".
+			return host == "localhost"
+		},
+	})
+	eval(t, js, `globalThis.BASE = "http://localhost:`+port+`"`)
+	eval(t, js, `
+		globalThis.__r = {};
+		fetch(BASE + "/json").then(res => res.json()).then(j => { __r.name = j.name; })
+			.catch(e => { __r.err = String(e); });
+	`)
+	if got := evalString(t, js, `__r.err ?? ""`); got != "" {
+		t.Fatalf("host-allowed fetch rejected: %s", got)
+	}
+	if gotHost != "localhost" {
+		t.Errorf("Dial host = %q, want localhost", gotHost)
+	}
+	if gotIP == "" || gotIP == "localhost" {
+		t.Errorf("Dial ip = %q, want a resolved IP distinct from the host", gotIP)
+	}
+	wantPort, _ := strconv.Atoi(port)
+	if gotPort != wantPort {
+		t.Errorf("Dial port = %d, want %d", gotPort, wantPort)
+	}
+}
+
 func TestFetchDialDenied(t *testing.T) {
 	srv := newJSONServer(t)
 	js, _ := newWeb(t, spidermonkey.Config{
-		Dial: func(network, ip string, port int) bool { return false },
+		Dial: func(network, host, ip string, port int) bool { return false },
 	})
 	eval(t, js, `globalThis.BASE = `+fmt.Sprintf("%q", srv.URL))
 

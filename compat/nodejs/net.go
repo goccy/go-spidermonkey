@@ -7,6 +7,7 @@ package nodejs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,16 +69,31 @@ func (rt *Runtime) opNetAttach(cfg spidermonkey.Config, args []spidermonkey.Valu
 	return spidermonkey.Undefined(), nil
 }
 
-// dialAllowed enforces Resolve (per hostname) then Dial (per resolved IP).
+// dialAllowed enforces Config.Resolve (per hostname) and Config.Dial (per
+// resolved IP, WITH the requested host so a host-scoped policy can match host
+// and port jointly). A literal-IP dial resolves no name, so host is passed as
+// "". For a hostname, at least one resolved address must be permitted.
 func dialAllowed(cfg spidermonkey.Config, host string, port int) error {
 	if ip := net.ParseIP(host); ip != nil {
-		if cfg.Dial != nil && !cfg.Dial("tcp", ip.String(), port) {
+		if cfg.Dial != nil && !cfg.Dial("tcp", "", ip.String(), port) {
 			return fmt.Errorf("dial %s:%d: permission denied", host, port)
 		}
 		return nil
 	}
 	if cfg.Resolve != nil && !cfg.Resolve(host) {
 		return fmt.Errorf("resolve %q: permission denied", host)
+	}
+	if cfg.Dial != nil {
+		ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+		if err != nil {
+			return fmt.Errorf("resolve %q: %w", host, err)
+		}
+		for _, ip := range ips {
+			if cfg.Dial("tcp", host, ip.String(), port) {
+				return nil
+			}
+		}
+		return fmt.Errorf("dial %s:%d: permission denied", host, port)
 	}
 	return nil
 }

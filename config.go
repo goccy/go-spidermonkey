@@ -56,10 +56,15 @@ type Config struct {
 	// functions unrestricted. (Filesystem access is governed by FS itself,
 	// above, not by a hook here.)
 
-	// Dial, when non-nil, is the outbound-connection whitelist. It is called
-	// with ("tcp", dotted-quad IP, port) before each connect; returning false
-	// denies the connection.
-	Dial func(network, ip string, port int) bool
+	// Dial, when non-nil, is the outbound-connection whitelist, called before
+	// each connect: host is the name the guest requested and that resolved to
+	// ip (or "" for a literal-IP dial with no preceding lookup), ip is the
+	// dotted-quad/IPv6 being dialed, and port is the port. Returning false
+	// denies the connection. Passing host lets a policy match host and port
+	// jointly (e.g. "example.com only on 443") — an IP alone cannot be tied
+	// back to the name resolved. This mirrors wasm2go's WASI dial hook
+	// (func(network, host, ip string, port int) bool).
+	Dial func(network, host, ip string, port int) bool
 
 	// Resolve, when non-nil, is the name-resolution whitelist. It is called
 	// with the host being resolved before each lookup; returning false denies

@@ -90,7 +90,7 @@ func TestNetServerAcceptsGoClient(t *testing.T) {
 
 func TestNetConnectDenied(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{
-		Dial: func(network, ip string, port int) bool { return false },
+		Dial: func(network, host, ip string, port int) bool { return false },
 	})
 	runScript(t, rt, `
 		const net = require("net");

@@ -92,7 +92,8 @@ func newHTTPClient(cfg spidermonkey.Config) *http.Client {
 		}
 		port, _ := strconv.Atoi(portStr)
 		if ip := net.ParseIP(host); ip != nil {
-			if cfg.Dial != nil && !cfg.Dial(network, ip.String(), port) {
+			// Literal IP: no name was resolved, so host is "".
+			if cfg.Dial != nil && !cfg.Dial(network, "", ip.String(), port) {
 				return nil, fmt.Errorf("dial %s: permission denied", addr)
 			}
 			return dialer.DialContext(ctx, network, addr)
@@ -106,7 +107,7 @@ func newHTTPClient(cfg spidermonkey.Config) *http.Client {
 		}
 		var lastErr error
 		for _, ip := range ips {
-			if cfg.Dial != nil && !cfg.Dial(network, ip.String(), port) {
+			if cfg.Dial != nil && !cfg.Dial(network, host, ip.String(), port) {
 				lastErr = fmt.Errorf("dial %s (%s): permission denied", addr, ip)
 				continue
 			}
@@ -137,7 +138,7 @@ func checkRequestPermission(cfg spidermonkey.Config, req *http.Request) error {
 				port = 80
 			}
 		}
-		if cfg.Dial != nil && !cfg.Dial("tcp", ip.String(), port) {
+		if cfg.Dial != nil && !cfg.Dial("tcp", "", ip.String(), port) {
 			return fmt.Errorf("dial %s:%d: permission denied", host, port)
 		}
 		return nil
