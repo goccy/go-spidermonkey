@@ -7,12 +7,35 @@ package nodejs
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
+
+// signalByName maps a Node signal name to the OS signal; unknown names and the
+// empty string default to SIGTERM (Node's default for ChildProcess.kill()).
+func signalByName(name string) os.Signal {
+	switch name {
+	case "SIGKILL":
+		return syscall.SIGKILL
+	case "SIGINT":
+		return syscall.SIGINT
+	case "SIGHUP":
+		return syscall.SIGHUP
+	case "SIGQUIT":
+		return syscall.SIGQUIT
+	case "SIGUSR1":
+		return syscall.SIGUSR1
+	case "SIGUSR2":
+		return syscall.SIGUSR2
+	default:
+		return syscall.SIGTERM
+	}
+}
 
 type procState struct {
 	mu    sync.Mutex
@@ -196,12 +219,17 @@ func (rt *Runtime) opChildKill(cfg spidermonkey.Config, args []spidermonkey.Valu
 		return spidermonkey.Undefined(), nil
 	}
 	pid := int64(args[0].Float())
+	sig := os.Signal(syscall.SIGTERM)
+	if len(args) > 1 && !args[1].IsUndefined() {
+		sig = signalByName(args[1].String())
+	}
 	st := rt.child
 	st.mu.Lock()
 	cmd := st.procs[pid]
 	st.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
-		cmd.Process.Kill()
+		// Honor the requested signal (Node's kill(signal)); default SIGTERM.
+		cmd.Process.Signal(sig)
 	}
 	return spidermonkey.Undefined(), nil
 }

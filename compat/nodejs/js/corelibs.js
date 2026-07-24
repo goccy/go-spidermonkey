@@ -117,12 +117,38 @@
 			if (!l && create) this._events[type] = l = [];
 			return l;
 		},
+		_emitNewListener(type, fn) {
+			// 'newListener' fires BEFORE the add (Node), and only when someone
+			// is actually listening for it (avoid recursion on every add).
+			if (this._events && this._events.newListener && type !== "newListener") {
+				this.emit("newListener", type, fn.listener || fn);
+			}
+		},
+		_checkMaxListeners(type, l) {
+			const max = this._maxListeners ?? EventEmitter.defaultMaxListeners;
+			if (max > 0 && l.length > max && !l._warned) {
+				l._warned = true;
+				const w = new Error(`Possible EventEmitter memory leak detected. ${l.length} ${String(type)} listeners added to [${this.constructor && this.constructor.name || "EventEmitter"}]. Use emitter.setMaxListeners() to increase limit`);
+				w.name = "MaxListenersExceededWarning";
+				if (typeof process !== "undefined" && process.emitWarning) process.emitWarning(w);
+				else if (typeof console !== "undefined") console.error(String(w.message));
+			}
+		},
 		on(type, fn) {
-			this._list(type, true).push(fn);
+			this._emitNewListener(type, fn);
+			const l = this._list(type, true);
+			l.push(fn);
+			this._checkMaxListeners(type, l);
 			return this;
 		},
 		addListener(type, fn) { return this.on(type, fn); },
-		prependListener(type, fn) { this._list(type, true).unshift(fn); return this; },
+		prependListener(type, fn) {
+			this._emitNewListener(type, fn);
+			const l = this._list(type, true);
+			l.unshift(fn);
+			this._checkMaxListeners(type, l);
+			return this;
+		},
 		once(type, fn) {
 			const wrapper = (...args) => { this.off(type, wrapper); fn.apply(this, args); };
 			wrapper.listener = fn;
@@ -137,7 +163,13 @@
 			const l = this._list(type, false);
 			if (!l) return this;
 			const i = l.findIndex((h) => h === fn || h.listener === fn);
-			if (i >= 0) l.splice(i, 1);
+			if (i >= 0) {
+				const removed = l[i];
+				l.splice(i, 1);
+				if (this._events && this._events.removeListener && type !== "removeListener") {
+					this.emit("removeListener", type, removed.listener || removed);
+				}
+			}
 			if (l.length === 0) delete this._events[type];
 			return this;
 		},
@@ -170,10 +202,16 @@
 	EventEmitter.EventEmitter = EventEmitter;
 	EventEmitter.once = (emitter, type) =>
 		new Promise((resolve, reject) => {
-			emitter.once(type, (...args) => resolve(args));
-			if (type !== "error" && typeof emitter.once === "function") {
-				emitter.once("error", reject);
+			let errHandler;
+			const onEvent = (...args) => {
+				if (errHandler) emitter.off("error", errHandler);
+				resolve(args);
+			};
+			if (type !== "error") {
+				errHandler = (e) => { emitter.off(type, onEvent); reject(e); };
+				emitter.once("error", errHandler);
 			}
+			emitter.once(type, onEvent);
 		});
 	core.events = EventEmitter;
 
@@ -261,10 +299,16 @@
 			ctor.super_ = superCtor;
 		},
 		promisify(fn) {
-			return (...args) =>
+			// Honor a function's own promisified implementation (Node's
+			// util.promisify.custom), e.g. timers' setTimeout.
+			const custom = fn[Symbol.for("nodejs.util.promisify.custom")];
+			if (custom) return custom;
+			const promisified = (...args) =>
 				new Promise((resolve, reject) => {
 					fn(...args, (err, value) => (err ? reject(err) : resolve(value)));
 				});
+			promisified[Symbol.for("nodejs.util.promisify.custom")] = promisified;
+			return promisified;
 		},
 		callbackify(fn) {
 			return (...args) => {
@@ -285,6 +329,7 @@
 		TextEncoder: globalThis.TextEncoder,
 		TextDecoder: globalThis.TextDecoder,
 	};
+	util.promisify.custom = Symbol.for("nodejs.util.promisify.custom");
 	core.util = util;
 
 	// -------------------------------------------------------- querystring
@@ -714,7 +759,9 @@
 		}
 		kill(signal) {
 			this.killed = true;
-			if (this.pid !== undefined) ops.child_kill(this.pid);
+			const sig = typeof signal === "string" ? signal : "SIGTERM";
+			this.signalCode = sig;
+			if (this.pid !== undefined) ops.child_kill(this.pid, sig);
 			return true;
 		}
 	}
@@ -888,12 +935,16 @@
 	core.module = Module;
 
 	function loadCJSPath(fsPath) {
-		const cached = requireCache[fsPath];
+		// Key the cache by the ABSOLUTE filename, exactly what
+		// Module._resolveFilename / require.resolve return, so
+		// require.cache[require.resolve(id)] hits (it was keyed slash-less).
+		const absPath = "/" + fsPath;
+		const cached = requireCache[absPath];
 		if (cached) return cached.exports;
 		const src = ops.node_read(fsPath);
 		if (isErr(src)) throw requireError(fsPath, `Cannot load module '${fsPath}': ${src.message}`);
-		const module = new Module("/" + fsPath);
-		requireCache[fsPath] = module;
+		const module = new Module(absPath);
+		requireCache[absPath] = module;
 		try {
 			if (fsPath.endsWith(".json")) {
 				module.exports = JSON.parse(src);
@@ -905,7 +956,7 @@
 				fn.call(module.exports, module.exports, makeRequireFor(module), module, module.filename, module.path);
 			}
 		} catch (e) {
-			delete requireCache[fsPath];
+			delete requireCache[absPath];
 			throw e;
 		}
 		module.loaded = true;
@@ -916,13 +967,17 @@
 		const req = (request) => module.require(request);
 		req.cache = requireCache;
 		req.resolve = (request) => Module._resolveFilename(request, module);
-		req.main = undefined;
+		// The entry module, so the `if (require.main === module)` guard works
+		// (true only in the top-level/entry module, false in required ones).
+		req.main = rootModule;
 		req.extensions = { ".js": () => {}, ".json": () => {}, ".node": () => {} };
 		return req;
 	}
 
 	const rootModule = new Module("/main.js");
+	requireCache[rootModule.id] = rootModule;
 	globalThis.require = makeRequireFor(rootModule);
+	globalThis.module = rootModule; // the entry module object (for require.main === module)
 	globalThis.__node_require_path = loadCJSPath;
 	globalThis.__dirname = "/";
 	globalThis.__filename = "/main.js";
