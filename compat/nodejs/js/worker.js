@@ -102,6 +102,18 @@
 	// ---- timers via Atomics.waitAsync (each fires as a drained job) ----
 	let timerSeq = 0;
 	const liveTimers = new Set();
+	// A Timeout-like handle so `setTimeout(...).unref()` (extremely common) works
+	// in a worker realm too. unref/ref are no-ops here (the worker's lifetime is
+	// managed by the host), but they must exist so the calls don't throw.
+	const makeWorkerTimer = (id) => ({
+		_id: id,
+		unref() { return this; },
+		ref() { return this; },
+		hasRef() { return true; },
+		refresh() { return this; },
+		close() { liveTimers.delete(id); return this; },
+		[Symbol.toPrimitive]() { return id; },
+	});
 	function scheduleTimer(fn, ms, repeat, args) {
 		const id = ++timerSeq;
 		liveTimers.add(id);
@@ -109,17 +121,25 @@
 			const sab = new Int32Array(new SharedArrayBuffer(4));
 			Atomics.waitAsync(sab, 0, 0, Math.max(0, ms)).value.then(() => {
 				if (!liveTimers.has(id)) return;
-				try { fn(...args); } finally { if (repeat && liveTimers.has(id)) arm(); else liveTimers.delete(id); }
+				try {
+					fn(...args);
+				} catch (e) {
+					// Don't silently swallow a timer throw (which would also loop a
+					// repeating timer forever); surface it like an uncaught error.
+					if (globalThis.__wt_reportError) globalThis.__wt_reportError(e);
+				} finally {
+					if (repeat && liveTimers.has(id)) arm(); else liveTimers.delete(id);
+				}
 			});
 		};
 		arm();
-		return id;
+		return makeWorkerTimer(id);
 	}
 	globalThis.setTimeout = (fn, ms, ...args) => scheduleTimer(fn, ms || 0, false, args);
 	globalThis.setInterval = (fn, ms, ...args) => scheduleTimer(fn, ms || 0, true, args);
-	globalThis.clearTimeout = globalThis.clearInterval = (id) => liveTimers.delete(id);
+	globalThis.clearTimeout = globalThis.clearInterval = (id) => { if (id != null) liveTimers.delete(Number(id)); };
 	globalThis.setImmediate = (fn, ...args) => scheduleTimer(fn, 0, false, args);
-	globalThis.clearImmediate = (id) => liveTimers.delete(id);
+	globalThis.clearImmediate = (id) => { if (id != null) liveTimers.delete(Number(id)); };
 
 	// ---- console (forwarded to the main thread) ----
 	const fmt = (args) => args.map((a) => (typeof a === "string" ? a : (() => { try { return JSON.stringify(a); } catch { return String(a); } })())).join(" ");

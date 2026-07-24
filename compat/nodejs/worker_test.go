@@ -57,6 +57,46 @@ func TestWorkerThreadsEchoAndWorkerData(t *testing.T) {
 	}
 }
 
+// TestWorkerTimerHandleHasUnref verifies a worker realm's setTimeout returns a
+// Timeout-like handle: `setTimeout(...).unref()` must not throw (it did when the
+// worker returned a bare numeric id).
+func TestWorkerTimerHandleHasUnref(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	r, err := js.Eval(context.Background(), `
+		const { Worker } = require("worker_threads");
+		globalThis.r = {};
+		const w = new Worker(`+"`"+`
+			const { parentPort } = require("worker_threads");
+			let ok = false;
+			try {
+				const t = setTimeout(() => {}, 60000);
+				t.unref(); t.ref();
+				clearTimeout(t);
+				ok = true;
+			} catch (e) { ok = "threw: " + e.message; }
+			parentPort.postMessage(ok);
+			process.exit(0);
+		`+"`"+`, { eval: true });
+		w.on("message", (m) => { r.ok = m; });
+		w.on("error", (e) => { r.err = String(e); });
+		w.on("exit", (c) => { r.code = c; });
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Error != nil {
+		t.Fatalf("script threw: %v", r.Error)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := rt.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := evalStr(t, js, `String(r.ok)`); got != "true" {
+		t.Errorf("worker setTimeout().unref() = %q, want true", got)
+	}
+}
+
 func TestWorkerThreadsParallelCompute(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
 

@@ -262,8 +262,34 @@
 			return -1;
 		}
 		includes(value, byteOffset) { return this.indexOf(value, byteOffset) !== -1; }
-		readUInt8(off = 0) { return this[off]; }
-		writeUInt8(v, off = 0) { this[off] = v; return off + 1; }
+		// fill(value[, offset[, end]][, encoding]). Buffer extends Uint8Array, whose
+		// own fill coerces a string value to NaN -> 0 (silently zero-filling); Node
+		// repeats the string/Buffer pattern, so override it.
+		fill(value, offset = 0, end = this.length, encoding) {
+			if (typeof offset === "string") { encoding = offset; offset = 0; end = this.length; }
+			else if (typeof end === "string") { encoding = end; end = this.length; }
+			offset = offset < 0 ? 0 : offset | 0;
+			end = end > this.length ? this.length : end | 0;
+			if (end <= offset) return this;
+			if (typeof value === "number") {
+				Uint8Array.prototype.fill.call(this, value & 0xff, offset, end);
+				return this;
+			}
+			const src = typeof value === "string" ? encodeString(value, encoding)
+				: (value && value.length !== undefined ? value : Buffer.from(value));
+			if (!src || src.length === 0) { Uint8Array.prototype.fill.call(this, 0, offset, end); return this; }
+			for (let i = offset; i < end; i++) this[i] = src[(i - offset) % src.length];
+			return this;
+		}
+		readUInt8(off = 0) {
+			if (off < 0 || off >= this.length) throw new RangeError(`The value of "offset" is out of range. It must be >= 0 and <= ${this.length - 1}. Received ${off}`);
+			return this[off];
+		}
+		writeUInt8(v, off = 0) {
+			if (off < 0 || off >= this.length) throw new RangeError(`The value of "offset" is out of range. It must be >= 0 and <= ${this.length - 1}. Received ${off}`);
+			this[off] = v & 0xff;
+			return off + 1;
+		}
 		_dv() { return new DataView(this.buffer, this.byteOffset, this.byteLength); }
 		readUInt16BE(o = 0) { return this._dv().getUint16(o, false); }
 		readUInt16LE(o = 0) { return this._dv().getUint16(o, true); }

@@ -661,17 +661,34 @@
 	};
 
 	fsMod.createWriteStream = (p, options = {}) => {
-		let first = true;
+		const flags = options.flags || "w";
+		// A caller-supplied fd is used directly (and not closed by us); otherwise
+		// open lazily on the first write. A numeric `start` makes every write a
+		// positioned (pwrite) write from that offset, which Node honors.
+		let fd = typeof options.fd === "number" ? options.fd : null;
+		const ownFd = typeof options.fd !== "number";
+		let pos = typeof options.start === "number" ? options.start : null;
 		const ws = new Writable({
 			write(chunk, encoding, callback) {
 				try {
-					if (first && !(options.flags || "").includes("a")) {
-						fsMod.writeFileSync(p, chunk);
-						first = false;
+					const buf = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+					if (fd === null) fd = fsMod.openSync(p, flags);
+					if (pos !== null) {
+						fsMod.writeSync(fd, buf, 0, buf.length, pos);
+						pos += buf.length;
 					} else {
-						fsMod.appendFileSync(p, chunk);
-						first = false;
+						fsMod.writeSync(fd, buf, 0, buf.length);
 					}
+					callback();
+				} catch (e) {
+					callback(e);
+				}
+			},
+			final(callback) {
+				try {
+					// An empty stream must still create/truncate the file.
+					if (fd === null) fd = fsMod.openSync(p, flags);
+					if (ownFd) fsMod.closeSync(fd);
 					callback();
 				} catch (e) {
 					callback(e);
@@ -680,6 +697,7 @@
 		});
 		ws.path = p;
 		ws.close = (cb) => ws.end(cb);
+		process.nextTick(() => ws.emit("open"));
 		return ws;
 	};
 })();

@@ -7,6 +7,7 @@ package nodejs
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -144,6 +145,10 @@ func (rt *Runtime) opFSOpen(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	flags := args[1].String()
 	write := flags != "r"
 	var data []byte
+	// "w"/"w+" create-and-truncate at open time, so the file must materialize even
+	// if nothing is ever written (Node truncates/creates on open). Mark it dirty
+	// so close flushes the (possibly empty) buffer instead of skipping it.
+	dirty := false
 	switch flags {
 	case "r", "r+":
 		b, err := readFile(cfg.FS, p)
@@ -156,7 +161,7 @@ func (rt *Runtime) opFSOpen(cfg spidermonkey.Config, args []spidermonkey.Value) 
 			data = b
 		}
 	case "w", "w+":
-		// truncate
+		dirty = true // truncate/create on open
 	default:
 		return fsErrValue(fmt.Errorf("unsupported flags %q", flags)), nil
 	}
@@ -169,6 +174,7 @@ func (rt *Runtime) opFSOpen(cfg spidermonkey.Config, args []spidermonkey.Value) 
 		write:  write,
 		append: flags == "a" || flags == "a+",
 		pos:    0,
+		dirty:  dirty,
 		cfg:    cfg,
 	}
 	rt.mu.Unlock()
@@ -295,7 +301,12 @@ func (rt *Runtime) opFSCloseFD(cfg spidermonkey.Config, args []spidermonkey.Valu
 	if err != nil {
 		return fsErrValue(err), nil
 	}
-	if _, err := fh.(interface{ Write([]byte) (int, error) }).Write(f.data); err != nil {
+	w, ok := fh.(io.Writer)
+	if !ok {
+		fh.Close()
+		return fsErrValue(fmt.Errorf("file handle is not writable")), nil
+	}
+	if _, err := w.Write(f.data); err != nil {
 		fh.Close()
 		return fsErrValue(err), nil
 	}

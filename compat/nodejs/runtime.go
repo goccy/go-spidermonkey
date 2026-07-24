@@ -88,6 +88,16 @@ func (rt *Runtime) exitFilter(err error) error {
 	return err
 }
 
+// resetExit clears the exit state at the start of each run so a process.exit()
+// from a PRIOR run on a reused Runtime can't make this run's genuine error read
+// as a clean exit.
+func (rt *Runtime) resetExit() {
+	rt.mu.Lock()
+	rt.exited = false
+	rt.exitCode = 0
+	rt.mu.Unlock()
+}
+
 // openFile is one fs.openSync handle: the whole file loaded into memory,
 // position-tracked; writes flush back on close.
 type openFile struct {
@@ -215,6 +225,7 @@ func (rt *Runtime) Close() error {
 // RunScript evaluates src as a classic script (require available) and then
 // runs the event loop to completion.
 func (rt *Runtime) RunScript(ctx context.Context, src string) (spidermonkey.Result, error) {
+	rt.resetExit()
 	r, err := rt.js.Eval(ctx, src)
 	if err != nil {
 		return r, err
@@ -234,6 +245,7 @@ func (rt *Runtime) RunScript(ctx context.Context, src string) (spidermonkey.Resu
 // RunModule evaluates src as an ES module registered under specifier and
 // then runs the event loop to completion.
 func (rt *Runtime) RunModule(ctx context.Context, specifier, src string) (spidermonkey.ModuleResult, error) {
+	rt.resetExit()
 	r, err := rt.js.EvalModule(ctx, specifier, src)
 	if err != nil {
 		return r, err
