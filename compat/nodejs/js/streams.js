@@ -251,12 +251,16 @@
 		_flowNow() {
 			const st = this._rs;
 			if (st.destroyed) return;
-			while (st.flowing && st.buffer.length) {
+			// Re-check destroyed EACH iteration: a 'data' listener commonly calls
+			// stream.destroy() (early-abort / read-to-marker / size-limit), and the
+			// remaining buffered chunks must NOT be emitted after 'close'.
+			while (st.flowing && st.buffer.length && !st.destroyed) {
 				let chunk = st.buffer.shift();
 				st.length -= chunkSize(st, chunk);
 				if (st.decoder && !st.objectMode) chunk = st.decoder.write(chunk);
 				this.emit("data", chunk);
 			}
+			if (st.destroyed) return;
 			if (st.flowing && st.buffer.length === 0 && !st.ended) this._callRead();
 			// 'end' fires only once a consumer exists (flowing via 'data'/
 			// resume, or paused-mode read()) — Node never ends a stream nobody

@@ -98,6 +98,32 @@ func TestPipelineDestroysOnError(t *testing.T) {
 	}
 }
 
+// TestReadableDestroyDuringData verifies destroying a Readable from inside a
+// 'data' handler stops further chunks (and no 'data'/'end' after 'close').
+func TestReadableDestroyDuringData(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+	runScript(t, rt, `
+		globalThis.r = { seen: [], afterClose: [] };
+		const { Readable } = require("stream");
+		const s = new Readable({ read() {} });
+		s.push("a"); s.push("b"); s.push("c"); s.push(null);
+		let closed = false;
+		s.on("close", () => { closed = true; });
+		s.on("end", () => { if (closed) r.afterClose.push("end"); });
+		s.on("data", (c) => {
+			if (closed) { r.afterClose.push("data:" + c); return; }
+			r.seen.push(String(c));
+			if (r.seen.length === 1) s.destroy();
+		});
+	`)
+	if got := evalStr(t, js, "r.seen.join(',')"); got != "a" {
+		t.Errorf("chunks after destroy-in-data = %q, want just 'a'", got)
+	}
+	if got := evalStr(t, js, "r.afterClose.join(',')"); got != "" {
+		t.Errorf("events fired after close: %q", got)
+	}
+}
+
 // TestEventsOnceAbort verifies events.once rejects with AbortError when its
 // signal aborts before the event fires.
 func TestEventsOnceAbort(t *testing.T) {
