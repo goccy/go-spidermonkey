@@ -201,6 +201,15 @@ func (a *Agents) Alive() int {
 	return len(a.alive)
 }
 
+// IsAlive reports whether the agent with id has not yet exited. A Worker
+// adapter polls this to fire 'exit' even when an agent ends without posting a
+// farewell (e.g. an uncaught error during evaluation).
+func (a *Agents) IsAlive(id AgentID) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.alive[uint64(id)]
+}
+
 // close releases every agent blocked in receive or inbox (they unwind with an
 // error) so the engine's shutdown join can complete, then frees every clone
 // handle still owned by the cluster. Called by JS.Close (on the main goroutine)
