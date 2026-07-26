@@ -1,0 +1,8 @@
+{
+  "name": "jose-example",
+  "private": true,
+  "description": "compat/web flagship: the unmodified jose package on the WinterTC surface",
+  "dependencies": {
+    "jose": "^5.10.0"
+  }
+}
