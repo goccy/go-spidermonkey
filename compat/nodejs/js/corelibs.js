@@ -441,6 +441,35 @@
 		}
 		return false;
 	};
+	// The unhandled-rejection channel. The host calls this once per promise
+	// rejection that reached a microtask checkpoint with nothing to handle it;
+	// only the engine can see those (an async function's promise is made by the
+	// engine, so no Promise wrapper here observes it). This REPLACES the web
+	// layer's `unhandledrejection` event dispatch: Node reports through
+	// process, not through a global event.
+	//
+	// Node routes a rejection with no 'unhandledRejection' listener to
+	// 'uncaughtException' with origin 'unhandledRejection'. With neither
+	// listener Node terminates the process; here it is reported on stderr and
+	// the loop continues, so an unhandled rejection is loud but never turns a
+	// working embedding into a crashing one.
+	globalThis.__unhandled_rejection = (reason, promise) => {
+		if (process.listenerCount && process.listenerCount("unhandledRejection") > 0) {
+			process.emit("unhandledRejection", reason, promise);
+			return;
+		}
+		const err = reason instanceof Error ? reason : Object.assign(
+			new Error("This error originated either by throwing inside of an async " +
+				"function without a catch block, or by rejecting a promise which was " +
+				"not handled with .catch(). The reason " + inspect(reason) + "."),
+			{ code: "ERR_UNHANDLED_REJECTION" });
+		if (process.listenerCount && process.listenerCount("uncaughtException") > 0) {
+			process.emit("uncaughtException", err, "unhandledRejection");
+			return;
+		}
+		console.error(err);
+	};
+
 	// The generic hook the shared (web-layer) timer wrapper routes a callback
 	// throw to, so a throw in a setTimeout/setInterval callback reaches the
 	// uncaughtException handler and does not tear down the loop. process.exit()'s

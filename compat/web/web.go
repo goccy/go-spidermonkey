@@ -95,7 +95,65 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 	if err != nil {
 		return nil, fmt.Errorf("web: installing fetch: %w", err)
 	}
+	w.loop.SetRejectionReporter(w.reportRejections)
 	return w, nil
+}
+
+// reportRejections hands the guest every promise rejection that reached a
+// microtask checkpoint with nothing to handle it, and reports whether there
+// were any.
+//
+// The engine is the only place these are visible — an async function's promise
+// is created by the engine, so no host-side Promise wrapper sees it — which is
+// why this is a host loop concern rather than something builtins.js could do
+// for itself. The guest hook decides POLICY (dispatch an `unhandledrejection`
+// event here; compat/nodejs replaces it with process.emit); this only carries
+// them across.
+func (w *Web) reportRejections(ctx context.Context) (bool, error) {
+	rejections, err := w.js.TakeUnhandledRejections()
+	if err != nil || len(rejections) == 0 {
+		return false, err
+	}
+	hookVal, err := w.js.Global().Get(rejectionHookName)
+	if err != nil {
+		freeRejections(rejections)
+		return false, err
+	}
+	hook := hookVal.Object()
+	if hook == nil || !hook.IsFunction() {
+		// No guest hook: still free the handles, and report nothing rather
+		// than failing a loop turn over a missing diagnostic channel.
+		freeRejections(rejections)
+		return false, nil
+	}
+	defer hook.Free()
+	for _, r := range rejections {
+		_, cerr := hook.Call(r.Reason, r.Promise)
+		freeValue(r.Reason)
+		freeValue(r.Promise)
+		if cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return true, err
+}
+
+// rejectionHookName is the guest function reportRejections calls, one call per
+// rejection, with (reason, promise). compat/nodejs redefines it to Node's
+// process.emit('unhandledRejection', ...) semantics.
+const rejectionHookName = "__unhandled_rejection"
+
+func freeRejections(rejections []spidermonkey.Rejection) {
+	for _, r := range rejections {
+		freeValue(r.Reason)
+		freeValue(r.Promise)
+	}
+}
+
+func freeValue(v spidermonkey.Value) {
+	if o := v.Object(); o != nil {
+		o.Free()
+	}
 }
 
 // Wait runs the event loop until every timer has fired (or been cleared) and
