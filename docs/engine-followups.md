@@ -190,7 +190,40 @@ NO symptom — no error, no log line, memory simply unchanged:
   classification sniff should cost. It stays a heuristic until that trade
   changes.
 
-## 4. `async_hooks`: a store cannot outlive the call that established it
+## 4. Temporal's non-ISO calendars lag the ICU data behind them
+
+- **Symptom:** 258 of the 328 expected `intl402` failures are Temporal, and all
+  of them are its calendar layer. `Intl` itself is fine — ICU has the data and
+  `Intl.DateTimeFormat` formats every one of the 16 calendars
+  `Intl.supportedValuesOf("calendar")` lists. It is Temporal that disagrees with
+  it, in three ways:
+  - **111 — `islamic-umalqura` is not a Temporal calendar at all.**
+    `Temporal.PlainDate.from("2024-01-01").withCalendar("islamic-umalqura")`
+    throws `RangeError: invalid calendar`, while
+    `new Intl.DateTimeFormat("en-US-u-ca-islamic-umalqura").format(new Date(0))`
+    returns `10/22/1389 AH` on the same build. It is the ONLY one of the 16 that
+    Temporal rejects — `hebrew`, `chinese`, `japanese`, `ethioaa` and the rest
+    all construct, take leap month codes (`M05L`) and resolve eras correctly.
+  - **51 — era names Temporal will not accept**, e.g.
+    `RangeError: invalid "era" calendar field: aa` (Amete Alem within the
+    `ethiopic` calendar; the same era works when the calendar is spelled
+    `ethioaa`). Era aliasing, not missing data.
+  - **96 — calendar arithmetic and era mapping**, e.g. `AM 0 resolves to
+    AA 5500` expecting era `aa` and getting `am`, and month arithmetic across a
+    leap month (`M04L`→`M04` distances reported in months where test262 wants
+    years).
+- **Root cause:** most likely the version gap rather than the build. This
+  embedding is Firefox 147.0.4; upstream `sm` on test262.fyi is nightly 154, and
+  Temporal's calendar layer was under active development across exactly that
+  window. That is a hypothesis, not a measurement — nobody has diffed these
+  tests against a 154 build.
+- **Engine fix needed, in order:** (1) confirm the hypothesis by running these
+  test paths against a newer SpiderMonkey, which decides whether this is simply
+  an engine bump; (2) if it is not, the calendar list and era-alias tables in
+  the Temporal implementation are what needs correcting — the ICU data they read
+  from is already present and already right.
+
+## 5. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.

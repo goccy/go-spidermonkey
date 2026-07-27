@@ -93,9 +93,10 @@ Fidelity caveats (present but not behaviorally complete):
   NumberFormat, PluralRules, RelativeTimeFormat, Segmenter, plus
   getCanonicalLocales/supportedValuesOf), real locale data, 445 time zones,
   Unicode property escapes and normalize. intl402 passes 3013/3341; of the 328
-  expected failures 258 are Temporal's non-ISO calendars (islamic-umalqura,
-  Hebrew leap months) and 70 are core Intl, mostly Intl.Locale detail — part of
-  that is the Firefox 147 vs SpiderMonkey-nightly version gap, not a build gap.
+  expected failures 258 are Temporal's calendar layer disagreeing with the ICU
+  data underneath it (tracked as an engine follow-up) and 70 are core Intl,
+  mostly Intl.Locale detail — part of that is the Firefox 147 vs
+  SpiderMonkey-nightly version gap, not a build gap.
 
 ## Engine follow-ups
 
@@ -104,7 +105,8 @@ compat layer) are tracked separately, with root cause and the engine change
 each needs, in [engine-followups.md](engine-followups.md). These are the
 per-agent memory floor, an intermittent test262 Atomics structured-clone race,
 the two remaining module-loader heuristics (CommonJS named-export extraction
-and default-export detection), and `AsyncLocalStorage` across a bare `await`.
+and default-export detection), Temporal's non-ISO calendars, and
+`AsyncLocalStorage` across a bare `await`.
 
 ## Bottom line
 
