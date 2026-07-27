@@ -184,6 +184,18 @@ func (o *Object) call(self *Object, args []Value) (Value, error) {
 // Free releases the object handle (its GC pin). The object itself lives on in
 // the guest; only the host's reference is dropped. The global object (from
 // Global) is freed by Close and must not be freed here.
+//
+// Freeing twice is a no-op rather than a fault. A handle IS a pointer to the
+// guest's GC root for this object, so a second release would delete it twice
+// and corrupt the guest heap — with no symptom until something much later
+// walks the root list, typically surfacing as an unrelated crash inside
+// teardown. Ownership of a handle is easy to lose track of across the host's
+// close paths, so the primitive absorbs it instead of every caller having to.
 func (o *Object) Free() error {
-	return o.js.raw.FreeObject(o.handle)
+	if o.handle == 0 {
+		return nil
+	}
+	h := o.handle
+	o.handle = 0
+	return o.js.raw.FreeObject(h)
 }

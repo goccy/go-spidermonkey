@@ -858,11 +858,16 @@ func (a *fetchAPI) closeOpenStreams() {
 	}
 }
 
+// closeAll releases the cached engine handles. Idempotent: Close is reachable
+// more than once (an embedder that closes explicitly still has its deferred
+// close run), and releasing a handle twice would delete the guest's GC root
+// for it twice.
 func (a *fetchAPI) closeAll() {
 	a.closeOpenStreams()
-	for _, o := range []*spidermonkey.Object{a.promiseCls, a.jsonObj, a.streamCls, a.deferredFn, a.typeErrorCls} {
-		if o != nil {
-			o.Free()
+	for _, o := range []**spidermonkey.Object{&a.promiseCls, &a.jsonObj, &a.streamCls, &a.deferredFn, &a.typeErrorCls} {
+		if *o != nil {
+			(*o).Free()
+			*o = nil
 		}
 	}
 }

@@ -6,6 +6,8 @@ package spidermonkey
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"iter"
 	"sync"
 	"time"
@@ -117,6 +119,55 @@ func (js *JS) RunJobs(ctx context.Context) iter.Seq2[Result, error] {
 			}
 		}
 	}
+}
+
+// Rejection is one promise rejection that nothing handled: the reason it was
+// rejected with, and the promise itself.
+type Rejection struct {
+	Reason  Value
+	Promise Value
+}
+
+// TakeUnhandledRejections hands back every rejection still unhandled and forgets
+// them. It is what `unhandledRejection` / `unhandledrejection` are built on:
+// such a rejection is visible ONLY to the engine, since an async function's
+// promise is created by the engine and so escapes any Promise wrapper installed
+// from the host.
+//
+// Call it at a microtask checkpoint — after Eval or after RunJobs runs dry — so
+// a rejection the guest went on to handle in the same tick is not reported; the
+// engine retracts those as soon as a handler is attached. Draining is
+// destructive: each rejection is reported exactly once, however often this is
+// called.
+//
+// The caller owns any *Object in the result and must Free it.
+func (js *JS) TakeUnhandledRejections() ([]Rejection, error) {
+	raw, err := js.raw.TakeUnhandledRejections()
+	if err != nil {
+		return nil, err
+	}
+	var entries []struct {
+		Reason  json.RawMessage `json:"reason"`
+		Promise json.RawMessage `json:"promise"`
+	}
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, fmt.Errorf("undecodable rejection list %q: %w", raw, err)
+	}
+	out := make([]Rejection, 0, len(entries))
+	for _, e := range entries {
+		reason, err := decodeValue(js, string(e.Reason))
+		if err != nil {
+			// A reason that is itself an error encoding still IS the reason;
+			// report it as a value rather than failing the whole drain.
+			reason = ValueOf(err.Error())
+		}
+		promise, err := decodeValue(js, string(e.Promise))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Rejection{Reason: reason, Promise: promise})
+	}
+	return out, nil
 }
 
 // Close destroys the interpreter and releases its resources. Agents blocked
