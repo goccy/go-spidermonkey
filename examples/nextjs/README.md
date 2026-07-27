@@ -1,9 +1,16 @@
 # Next.js example
 
-Boots an unmodified [Next.js 14](https://nextjs.org/) App Router **production
-server** — Server + Client Components, dynamic SSR, and a Route Handler — inside
-the go-spidermonkey Node runtime. No Node.js binary is involved at serve time;
-the whole program is a normal Go `main`.
+Boots an unmodified [Next.js 15](https://nextjs.org/) App Router **production
+server** — prerendered Server Components, a Route Handler, and static assets —
+inside the go-spidermonkey Node runtime. No Node.js binary is involved at serve
+time; the whole program is a normal Go `main`.
+
+**Dynamic SSR does not work yet.** A Server Component that runs per request
+needs `AsyncLocalStorage` to survive into work the render schedules and finishes
+after the call that established the store returns, which needs engine
+async-context hooks this build does not have — see `docs/engine-followups.md`
+item 8. `/` therefore returns 500; `/about`, `/api/hello`, `/_next/static/*` and
+Next's own 404 all work.
 
 The app in `app/` is a stock Next.js App Router app. It is built ahead of time
 with real Node (`next build`), because Next's compiler (SWC) uses native
