@@ -207,15 +207,19 @@ func (rt *Runtime) opWorkerPost(cfg spidermonkey.Config, args []spidermonkey.Val
 	return spidermonkey.Undefined(), err
 }
 
-// opWorkerTerminate requests a worker stop by sending a cooperative
-// __terminate__ sentinel to its inbox; the agent acts on it between job-queue
-// drains. KNOWN LIMITATION: this cannot stop a worker stuck in an infinite
-// SYNCHRONOUS loop (e.g. new Worker('while(true){}', {eval:true})) — it never
-// drains its inbox, so it never sees the sentinel. Forcibly interrupting such a
-// worker needs a per-agent engine interrupt (a js_agent_interrupt primitive in
-// the spidermonkey-wasm C++/js.cc that trips that agent's JSContext
-// interruptBits_); the host ctx-interrupt only targets the main JSContext.
-// Tracked as a separate engine-layer follow-up.
+// opWorkerTerminate stops a worker, by both routes it can be reached by.
+//
+// The __terminate__ sentinel handles a worker that is BLOCKED IN THE HOST
+// (waiting on its inbox, which is where an idle worker spends its life): it
+// unblocks the receive and the agent leaves through its normal exit path. The
+// interrupt handles the opposite case — a worker executing JS, up to and
+// including `new Worker('while(true){}')`, which never returns to its inbox and
+// so can never be reached by any message. Sending only the sentinel left such a
+// worker running forever; interrupting only would not reach one parked in the
+// host.
+//
+// The worker's 'exit' fires with code 1, as Node's does for a terminated
+// worker: the reaper sees an agent that ended without a farewell.
 func (rt *Runtime) opWorkerTerminate(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 1 {
 		return spidermonkey.Undefined(), nil
@@ -227,7 +231,15 @@ func (rt *Runtime) opWorkerTerminate(cfg spidermonkey.Config, args []spidermonke
 	}
 	defer sentinel.Free()
 	sentinel.Set("__terminate__", spidermonkey.ValueOf(true))
-	return spidermonkey.Undefined(), rt.workers.agents.Send(id, sentinel)
+	if err := rt.workers.agents.Send(id, sentinel); err != nil {
+		return nil, err
+	}
+	// An already-exited agent reports false, which is not an error: the worker
+	// is stopped, which is all the caller asked for.
+	if _, err := rt.workers.agents.Interrupt(id); err != nil {
+		return nil, err
+	}
+	return spidermonkey.Undefined(), nil
 }
 
 // pump drains worker->main messages and posts each onto the main loop. When
