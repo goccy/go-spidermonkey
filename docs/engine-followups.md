@@ -172,25 +172,18 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Root cause:** a wasi-threads / agent structured-clone race in the engine.
 - **Engine fix needed:** fix the race in the engine's agent clone transport.
 
-## 3. Module-loader classification heuristics — two of three still unanswerable
+## 3. Two module-loader heuristics no module compile can answer
 
-- **Symptom:** the module loader uses regex/string heuristics to classify a
-  module. These are the load-bearing exceptions to the "no heuristics" rule.
-- **ESM-vs-CJS detection is DONE.** `js_source_is_module` compiles the source
-  twice — once as a module, once inside the CommonJS wrapper function — and
-  reports whether it needs module semantics, which is Node's own detection rule.
-  The resolver still sniffs, but now marks the answer as a guess
-  (`resolution.KindGuessed`), and `Runtime.refineKind` replaces every guess with
-  `spidermonkey.JS.SourceIsModule`. The regex survives only as the fallback for
-  `nodejs.ESMLoader` used standalone, which has no interpreter to ask.
-- **Not answerable by ANY module compile:** `cjs_exports.go`. It asks which
-  string keys a CommonJS module would end up putting on `module.exports` —
-  `exports.foo = …`, `Object.defineProperty(exports, …)`, `module.exports =
-  {…}`. None of that is ESM syntax; it is ordinary script code whose result is
-  only knowable by RUNNING the module, which the loader (synchronous and
-  re-entrancy-locked) cannot do. Removing that heuristic needs either a
-  script-AST introspection primitive or a `cjs-module-lexer` equivalent in
-  C++, not module introspection.
+- **Symptom:** the module loader still extracts a CommonJS module's export
+  names, and detects whether a target has a default export, by matching source
+  text. These are the load-bearing exceptions to the "no heuristics" rule.
+- **`cjs_exports.go`** asks which string keys a CommonJS module would end up
+  putting on `module.exports` — `exports.foo = …`,
+  `Object.defineProperty(exports, …)`, `module.exports = {…}`. None of that is
+  ESM syntax; it is ordinary script code whose result is only knowable by
+  RUNNING the module, which the loader (synchronous and re-entrancy-locked)
+  cannot do. Removing it needs either a script-AST introspection primitive or a
+  `cjs-module-lexer` equivalent in C++ — module introspection does not reach it.
 - **`hasDefaultExport`** (`nodejs.go`) needs a module's export-name set, which
   the public JSAPI only exposes through a module NAMESPACE — and that requires
   the whole dependency graph to be loaded and linked, far more than a
