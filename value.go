@@ -138,6 +138,15 @@ func (opaqueValue) IsObject() bool    { return false }
 func (opaqueValue) Object() *Object   { return nil }
 func (opaqueValue) Export() any       { return nil }
 
+// free releases the handle's GC pin. A symbol or bigint crosses by handle like
+// an object does, but has no *Object to hang Free on, so the dispatcher is the
+// only thing that can release one.
+func (o opaqueValue) free() {
+	if o.js != nil && o.handle != 0 {
+		o.js.raw.FreeObject(o.handle)
+	}
+}
+
 // thrownValue is the error a host Func returns (via Throw) to throw a Value
 // as-is — preserving its JS type — instead of a generic Error.
 type thrownValue struct{ v Value }

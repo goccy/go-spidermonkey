@@ -267,6 +267,9 @@ func (w *Web) opTimerSet(cfg spidermonkey.Config, args []spidermonkey.Value) (sp
 	}
 	fn := args[0].Object()
 	if fn == nil || !fn.IsFunction() {
+		// A non-callable object was still taken here, so it is ours to release:
+		// setTimeout({}) in a loop must not accumulate roots.
+		fn.Free()
 		return nil, fmt.Errorf("timer_set: callback is not a function")
 	}
 	delay := time.Duration(args[1].Float() * float64(time.Millisecond))

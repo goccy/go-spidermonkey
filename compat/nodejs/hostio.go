@@ -87,6 +87,11 @@ func (rt *Runtime) opStdinStart(cfg spidermonkey.Config, args []spidermonkey.Val
 			}
 		}()
 	})
+	if !started {
+		// A second start finds the reader already running: nothing will ever
+		// call — or release — these callbacks, so they are ours to drop.
+		freeObjects(onData, onEnd)
+	}
 	return spidermonkey.ValueOf(started), nil
 }
 

@@ -1004,7 +1004,7 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 	method := args[0].String()
 	rawURL := strArg(args[1])
 	var reqBody io.Reader
-	if args[3].Object() != nil || args[3].String() != "" {
+	if args[3].IsObject() || args[3].String() != "" {
 		if b, err := valueBytes(args[3]); err == nil && len(b) > 0 {
 			reqBody = bytes.NewReader(b)
 		}
