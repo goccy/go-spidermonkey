@@ -217,8 +217,11 @@
 		}
 	};
 
-	// Encodings supported without ICU tables: utf-8, latin1 (1:1 code points),
-	// and utf-16le (fixed 2-byte). Others still throw (need engine ICU).
+	// Encodings that need no conversion table: utf-8, latin1 (1:1 code points)
+	// and utf-16le (fixed 2-byte). Every other label throws for now. Adding one
+	// is a HOST-side job (a byte table, or golang.org/x/text/encoding behind a
+	// host op) — TextDecoder is a web API, so the engine's ICU does not offer it
+	// even though Intl is fully built in.
 	// Per WHATWG, the latin1/iso-8859-1/windows-1252 labels ALL use the
 	// windows-1252 decoder, which differs from ISO-8859-1 only in 0x80-0x9F (euro,
 	// smart quotes, dashes, ellipsis, ™). The high half (0xA0-0xFF) is identical.

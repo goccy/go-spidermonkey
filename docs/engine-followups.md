@@ -190,15 +190,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   classification sniff should cost. It stays a heuristic until that trade
   changes.
 
-## 4. ICU / Intl and non-core text encodings
-
-- **Symptom:** full `Intl`/ICU behavior and text encodings beyond
-  utf-8/latin1/utf-16le are not available.
-- **Root cause:** these are the engine's domain (ICU data compiled into the
-  wasm build), not implementable in the compat layer.
-- **Engine fix needed:** build the engine wasm with the required ICU data.
-
-## 5. `async_hooks`: a store cannot outlive the call that established it
+## 4. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.

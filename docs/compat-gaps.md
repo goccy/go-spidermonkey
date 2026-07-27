@@ -71,7 +71,10 @@ Implementable, deferred for size:
 - Server-side WebSocket upgrade (http 'upgrade' / hijack + raw duplex socket).
   A guest 'ws' server cannot be built yet. Client-side WS also absent.
 - TextEncoderStream/TextDecoderStream cover utf-8 only for streaming decode.
-- Encodings beyond utf-8/latin1/utf-16le (needs engine ICU).
+- Text encodings beyond utf-8/latin1(windows-1252)/utf-16le for TextDecoder
+  (shift_jis, euc-jp, gbk, big5, koi8-r, ...). This is a COMPAT-LAYER job, not
+  an engine one: TextDecoder is a web API the engine does not provide at all,
+  so the tables belong here (golang.org/x/text/encoding behind a host op).
 
 Fidelity caveats (present but not behaviorally complete):
 - async_hooks: AsyncLocalStorage is correct for synchronous run(), nested
@@ -85,7 +88,14 @@ Fidelity caveats (present but not behaviorally complete):
 - worker_threads: worker code is self-contained — inside a worker only
   require('worker_threads'|'buffer') works (other node: ops are per-instance
   host functions on the main interpreter).
-- Full Intl/ICU is the engine's domain, not the compat layer.
+- Intl/ICU is BUILT IN and exercised by test262 — all twelve constructors
+  (Collator, DateTimeFormat, DisplayNames, DurationFormat, ListFormat, Locale,
+  NumberFormat, PluralRules, RelativeTimeFormat, Segmenter, plus
+  getCanonicalLocales/supportedValuesOf), real locale data, 445 time zones,
+  Unicode property escapes and normalize. intl402 passes 3013/3341; of the 328
+  expected failures 258 are Temporal's non-ISO calendars (islamic-umalqura,
+  Hebrew leap months) and 70 are core Intl, mostly Intl.Locale detail — part of
+  that is the Firefox 147 vs SpiderMonkey-nightly version gap, not a build gap.
 
 ## Engine follow-ups
 
@@ -94,8 +104,7 @@ compat layer) are tracked separately, with root cause and the engine change
 each needs, in [engine-followups.md](engine-followups.md). These are the
 per-agent memory floor, an intermittent test262 Atomics structured-clone race,
 the two remaining module-loader heuristics (CommonJS named-export extraction
-and default-export detection), ICU/Intl, and `AsyncLocalStorage` across a bare
-`await`.
+and default-export detection), and `AsyncLocalStorage` across a bare `await`.
 
 ## Bottom line
 
