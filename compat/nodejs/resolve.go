@@ -31,6 +31,12 @@ type resolution struct {
 	Core string // core-module name ("path", "fs/promises", ...); else empty
 	Path string // fs path of the resolved file
 	Kind moduleKind
+	// KindGuessed marks a Kind that no file extension and no package.json
+	// "type" decided — it came from sniffing the source text, which cannot
+	// tell an `import` keyword from the same word in a comment or a string.
+	// A caller holding an interpreter replaces the guess with the engine's
+	// own answer; see Runtime.refineKind.
+	KindGuessed bool
 }
 
 // coreModules are the node: builtins compat/nodejs implements (js/corelibs.js).
@@ -385,7 +391,7 @@ func finish(fsys fs.FS, p string) (resolution, error) {
 	case ".cjs":
 		r.Kind = kindCJS
 	default:
-		r.Kind = classifyJS(fsys, p)
+		r.Kind, r.KindGuessed = classifyJS(fsys, p)
 	}
 	return r, nil
 }
@@ -393,8 +399,10 @@ func finish(fsys fs.FS, p string) (resolution, error) {
 var esmSyntax = regexp.MustCompile(`(?m)^\s*(import|export)\b`)
 
 // classifyJS decides ESM vs CJS for a .js file: the nearest package.json
-// "type" field when present, else a top-level import/export sniff.
-func classifyJS(fsys fs.FS, p string) moduleKind {
+// "type" field when present, else a top-level import/export sniff. The second
+// result reports that the answer came from that sniff and is therefore only a
+// guess — the caller replaces it with the engine's answer where it can.
+func classifyJS(fsys fs.FS, p string) (moduleKind, bool) {
 	for _, d := range ancestorDirs(path.Dir(p)) {
 		raw, err := fs.ReadFile(fsys, path.Join(d, "package.json"))
 		if err != nil {
@@ -407,14 +415,44 @@ func classifyJS(fsys fs.FS, p string) moduleKind {
 			continue
 		}
 		if pkg.Type == "module" {
-			return kindESM
+			return kindESM, false
 		}
-		return kindCJS
+		return kindCJS, false
 	}
 	if src, err := fs.ReadFile(fsys, p); err == nil && esmSyntax.Match(src) {
-		return kindESM
+		return kindESM, true
 	}
-	return kindCJS
+	return kindCJS, true
+}
+
+// refineKind replaces a source-sniffed ESM/CJS guess with the engine's own
+// answer: it compiles the source both ways and reports which one it parses as,
+// which is Node's actual detection rule and the exact question the sniff is
+// approximating. Only a guess is touched — an explicit .mjs/.cjs extension or a
+// package.json "type" always wins, as it must.
+//
+// src is the already-read source when the caller has it, else nil to read it.
+// Anything that goes wrong leaves the guess in place: classification must not
+// start failing because a bridge call did.
+func (rt *Runtime) refineKind(fsys fs.FS, r *resolution, src []byte) {
+	if !r.KindGuessed || rt.js == nil {
+		return
+	}
+	if src == nil {
+		var err error
+		if src, err = readFile(fsys, r.Path); err != nil {
+			return
+		}
+	}
+	isModule, err := rt.js.SourceIsModule(string(src))
+	if err != nil {
+		return
+	}
+	r.Kind = kindCJS
+	if isModule {
+		r.Kind = kindESM
+	}
+	r.KindGuessed = false
 }
 
 // strField reads a package.json field that SHOULD be a string but is

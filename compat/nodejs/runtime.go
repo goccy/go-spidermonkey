@@ -393,6 +393,7 @@ func (rt *Runtime) esmLoader(cfg spidermonkey.Config, specifier, referrer string
 	if err != nil {
 		return "", err
 	}
+	rt.refineKind(cfg.FS, &r, src)
 	switch r.Kind {
 	case kindJSON:
 		return jsonModuleSource(src)
@@ -568,6 +569,7 @@ func (rt *Runtime) opResolve(cfg spidermonkey.Config, args []spidermonkey.Value)
 	if r.Core != "" {
 		return spidermonkey.ValueOf(map[string]any{"core": r.Core}), nil
 	}
+	rt.refineKind(cfg.FS, &r, nil)
 	kind := "cjs"
 	switch r.Kind {
 	case kindESM:

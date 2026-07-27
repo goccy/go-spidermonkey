@@ -268,7 +268,17 @@ func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
 	if load == nil {
 		return nil // no loader → total==0 → C++ falls back to missing-modules
 	}
-	src, err := load(e.cfg, spec, ref)
+	// Release the invoke lock for the loader, exactly as an ordinary host call
+	// does: the guest is paused inside this call, so the loader may re-enter the
+	// interpreter — which is what lets it ask SourceIsModule to classify a file
+	// instead of guessing from the source text.
+	src, err := func() (string, error) {
+		if e.js != nil {
+			relock := e.js.raw.UnlockForHostCallback()
+			defer relock()
+		}
+		return load(e.cfg, spec, ref)
+	}()
 	if err != nil {
 		return append([]byte{'E'}, err.Error()...)
 	}

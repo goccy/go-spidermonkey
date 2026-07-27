@@ -174,6 +174,7 @@ func (rt *Runtime) cjsReexportNames(fsys fs.FS, spec, parent string, seen map[st
 	if r.Core != "" {
 		return rt.coreExports[r.Core]
 	}
+	rt.refineKind(fsys, &r, nil)
 	if r.Kind != kindCJS || seen[r.Path] {
 		return nil
 	}
