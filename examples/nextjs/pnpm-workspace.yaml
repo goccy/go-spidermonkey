@@ -8,16 +8,30 @@ packages:
 # Makefile also passes --config.node-linker=hoisted, which predates this file.
 nodeLinker: hoisted
 
-# next pins postcss exactly, and the pinned version carries advisories. The
-# override lifts it to a patched release without forking the example.
+# Both of these are versions next chooses for us that carry advisories, lifted
+# to patched releases without forking the example.
+#
+# postcss is pinned exactly by next.
+#
+# sharp is next's OPTIONAL dependency for image optimization, at ^0.34.3, and
+# 0.34.x inherits four libvips CVEs. Nothing here uses next/image, so the
+# alternative would be to drop it — but pnpm has no way to exclude one
+# transitive optional dependency, and --no-optional would take the rest with it.
+# The override deliberately reaches past next's range, which is safe precisely
+# because the package is never loaded; if this example ever does add an
+# <Image>, that assumption needs rechecking.
 overrides:
   postcss: ^8.5.18
+  sharp: ^0.35.0
 
-# next pulls in sharp, whose install script links its prebuilt binary. pnpm 11
-# fails an install outright when a dependency asks to run a build script and the
-# project has not said whether that is allowed, so it has to be answered here.
-# Written by `pnpm approve-builds --all`, which is the supported way to produce
-# it — note this key is NOT the pnpm 10 `onlyBuiltDependencies`, which pnpm 11
-# still accepts as configuration and then ignores when deciding to fail.
-allowBuilds:
-  sharp: true
+# There is deliberately no allowBuilds here any more. sharp 0.34 had an install
+# script, pnpm 11 fails an install outright when a dependency asks to run one
+# and the project has not said whether that is allowed, and answering it was
+# what unblocked the Next 15 upgrade. sharp 0.35 dropped that script — as did
+# its per-platform @img/sharp-* packages, checked on the registry rather than
+# assumed from a macOS install — so the answer would now be dead configuration.
+# If a future bump reintroduces a build script, pnpm fails loudly and says so;
+# `pnpm approve-builds` writes the setting back. Note that the pnpm 10 spelling
+# `onlyBuiltDependencies` is still ACCEPTED as configuration and then ignored
+# when deciding to fail, so it is not the thing to reach for.
+
