@@ -1820,6 +1820,12 @@
 		get: () => Object.keys(core).concat(Object.keys(core).map((n) => "node:" + n)),
 	});
 	Module.syncBuiltinESMExports = () => {};
+	// Node returns undefined when a file has no source map, and callers are
+	// required to handle that. Nothing here records source maps, so undefined is
+	// the honest answer — and the honest answer is also the working one: Next.js
+	// calls this while formatting an error, and its absence turned every such
+	// format into a second error about findSourceMap not being a function.
+	Module.findSourceMap = () => undefined;
 	Module.Module = Module;
 	core.module = Module;
 

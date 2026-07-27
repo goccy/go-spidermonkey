@@ -1,4 +1,4 @@
-// Command nextjs serves an unmodified Next.js 14 App Router PRODUCTION build
+// Command nextjs serves an unmodified Next.js 15 App Router PRODUCTION build
 // inside the go-spidermonkey Node runtime — no Node.js binary is involved at
 // serve time. The app is built ahead of time with real Node (`next build`; SWC
 // natives are build-time only); the server itself is the standard Next.js

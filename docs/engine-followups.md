@@ -368,15 +368,40 @@ not.
   wasm build), not implementable in the compat layer.
 - **Engine fix needed:** build the engine wasm with the required ICU data.
 
-## 8. `async_hooks` bare-`await` interleaving
+## 8. `async_hooks`: a store cannot outlive the call that established it
+
+This is the item with the widest blast radius, and it stopped being theoretical:
+it is what makes **dynamic SSR fail on Next.js 15**.
 
 - **Symptom:** `AsyncLocalStorage` is correct for synchronous `run()`, nested
   `run()`, and explicit propagation (`AsyncResource.bind`/`runInAsyncScope`/
-  `ALS.snapshot`), but bare `await` interleaving across independent contexts on
-  ONE instance cannot be tracked. (The cfworkers pool gives each request its
-  own instance, where ALS is fully correct.)
-- **Root cause:** correct tracking of bare-`await` continuations needs engine
-  async-context hooks that are not exposed.
-- **Engine fix needed:** expose async-context (host-defined async op) hooks
-  from the engine so continuations can be associated with their originating
-  context.
+  `ALS.snapshot`). It is NOT correct when work SCHEDULED inside `run()` runs
+  after `run()` has returned. (The cfworkers pool gives each request its own
+  instance, where ALS is fully correct.)
+- **Root cause:** the store is a plain slot held for the duration of `run()`,
+  because associating a continuation with the context it was created in needs
+  engine async-context hooks that are not exposed. Nothing in userland can
+  recover it: a bare `await` on a native promise schedules a reaction job in the
+  engine without passing through `then`, `queueMicrotask`, or any other hook the
+  compat layer owns.
+- **What it costs, concretely.** Next.js 15 enters its per-request store as
+
+  ```js
+  const flightReadableStream = workUnitAsyncStorage.run(
+      requestStore, ctx.componentMod.renderToReadableStream, RSCPayload, …);
+  ```
+
+  `renderToReadableStream` returns a stream SYNCHRONOUSLY; the render happens
+  later, as the stream is pulled. The slot is restored the moment `run()`
+  returns, so by the time React asks for the store it is gone and the render
+  dies with `InvariantError: Expected workUnitAsyncStorage to have a store`.
+  Every dynamic Server Component render 500s. Prerendered pages, Route Handlers,
+  static assets and Next's own 404 are unaffected, which is exactly the split
+  `TestNextJSFlagship` now asserts.
+- **Why the obvious workarounds are not taken:** never restoring the slot does
+  fix Next (measured), but it leaks a store into every subsequent context, and
+  deferring the restore to the next macrotask breaks nested `run()` — the queued
+  restores run FIFO where correctness needs LIFO. Both trade a documented
+  limitation for an undocumented wrong answer.
+- **Engine fix needed:** expose async-context (host-defined async op) hooks from
+  the engine so continuations can be associated with their originating context.

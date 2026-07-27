@@ -153,6 +153,18 @@
 		getHeaderNames() { return [...this._headers.keys()]; }
 		hasHeader(name) { return this._headers.has(String(name).toLowerCase()); }
 		removeHeader(name) { this._headers.delete(String(name).toLowerCase()); }
+		// Node >= 16.17. Unlike setHeader this ACCUMULATES, which is the whole
+		// point: Set-Cookie and Vary are sent as repeated fields, and collapsing
+		// them to one value silently drops all but the last.
+		appendHeader(name, value) {
+			const key = String(name).toLowerCase();
+			const e = this._headers.get(key);
+			if (e === undefined) return this.setHeader(name, value);
+			const merged = (Array.isArray(e.value) ? e.value : [e.value])
+				.concat(Array.isArray(value) ? value : [value]);
+			this._headers.set(key, { name: e.name, value: merged });
+			return this;
+		}
 		writeHead(statusCode, reasonOrHeaders, headers) {
 			this.statusCode = statusCode;
 			if (typeof reasonOrHeaders === "string") this.statusMessage = reasonOrHeaders;

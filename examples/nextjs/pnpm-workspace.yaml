@@ -1,0 +1,23 @@
+# pnpm 11 no longer reads the "pnpm" field from package.json; project settings
+# live here instead (https://pnpm.io/settings).
+
+packages:
+  - .
+
+# A flat node_modules is what compat/nodejs's module resolver expects. The
+# Makefile also passes --config.node-linker=hoisted, which predates this file.
+nodeLinker: hoisted
+
+# next pins postcss exactly, and the pinned version carries advisories. The
+# override lifts it to a patched release without forking the example.
+overrides:
+  postcss: ^8.5.18
+
+# next pulls in sharp, whose install script links its prebuilt binary. pnpm 11
+# fails an install outright when a dependency asks to run a build script and the
+# project has not said whether that is allowed, so it has to be answered here.
+# Written by `pnpm approve-builds --all`, which is the supported way to produce
+# it — note this key is NOT the pnpm 10 `onlyBuiltDependencies`, which pnpm 11
+# still accepts as configuration and then ignores when deciding to fail.
+allowBuilds:
+  sharp: true

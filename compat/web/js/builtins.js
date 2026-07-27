@@ -2002,22 +2002,35 @@
 		},
 	};
 
+	// WHATWG makes url/method/headers/signal READONLY accessors on
+	// Request.prototype, and that is not cosmetic: a subclass is allowed to
+	// shadow them with its own getter, and Next.js does exactly that
+	// (`class NextRequest extends Request { get url() {…} }`). Assigning
+	// `this.url` in the constructor would then be a write to a getter-only
+	// property, which throws in strict mode — class bodies are always strict —
+	// and takes down every request. So the state lives behind a symbol and the
+	// public shape is accessors, as specified.
+	const kRequestState = Symbol("Request state");
+
 	class Request {
 		constructor(input, init = {}) {
 			const from = input instanceof Request ? input : null;
-			this.url = from ? from.url : String(input);
+			const url = from ? from.url : String(input);
 			// WHATWG/undici: constructing a Request from a URL that carries credentials
 			// throws a TypeError (they are NOT turned into an Authorization header).
 			if (!from) {
 				let parsed = null;
-				try { parsed = new URL(this.url); } catch { parsed = null; }
+				try { parsed = new URL(url); } catch { parsed = null; }
 				if (parsed && (parsed.username || parsed.password)) {
 					throw new TypeError("Request cannot be constructed from a URL that includes credentials");
 				}
 			}
-			this.method = String(init.method ?? (from ? from.method : "GET")).toUpperCase();
-			this.headers = new Headers(init.headers ?? (from ? from.headers : undefined));
-			this.signal = init.signal ?? (from ? from.signal : undefined);
+			this[kRequestState] = {
+				url,
+				method: String(init.method ?? (from ? from.method : "GET")).toUpperCase(),
+				headers: new Headers(init.headers ?? (from ? from.headers : undefined)),
+				signal: init.signal ?? (from ? from.signal : undefined),
+			};
 			// Workers' request.cf survives new Request(req) (workerd behavior).
 			if (from && from.cf !== undefined) this.cf = from.cf;
 			this._bodyStream = null;
@@ -2028,6 +2041,10 @@
 			}
 			this.bodyUsed = false;
 		}
+		get url() { return this[kRequestState].url; }
+		get method() { return this[kRequestState].method; }
+		get headers() { return this[kRequestState].headers; }
+		get signal() { return this[kRequestState].signal; }
 		clone() {
 			// A stream body is tee'd (WHATWG): each side gets every chunk, and the
 			// original keeps working. Cloning a used/locked body throws.

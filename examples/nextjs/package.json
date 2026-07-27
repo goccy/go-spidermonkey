@@ -1,12 +1,12 @@
 {
   "name": "nextjs-example",
   "private": true,
-  "description": "compat/nodejs stretch flagship: an unmodified Next.js 14 App Router production server (Server + Client Components)",
+  "description": "compat/nodejs stretch flagship: an unmodified Next.js 15 App Router production server (Server + Client Components)",
   "scripts": {
     "build": "next build"
   },
   "dependencies": {
-    "next": "14.2.35",
+    "next": "15.5.21",
     "react": "18.2.0",
     "react-dom": "18.2.0"
   }
