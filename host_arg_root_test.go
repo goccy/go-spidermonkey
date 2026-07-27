@@ -34,7 +34,14 @@ func evalOK(t *testing.T, js *spidermonkey.JS, src string) spidermonkey.Value {
 
 // scalarReadOfObjectArgDoesNotPin drives `calls` iterations of a host op that
 // reads args[0] with read, passing a fresh 4 MiB typed array each time. Pinned,
-// that is gigabytes against a 128 MiB cap; released, it plateaus.
+// they add up to well past the cap; released, each iteration frees a block the
+// next one takes straight back.
+//
+// The churn is deliberately just past the cap rather than many times it: linear
+// memory never shrinks, so every allocation the guest fails to reuse is
+// permanent, and pushing a gigabyte through a 128 MiB window makes the test
+// depend on how well dlmalloc recycles rather than on whether the root was
+// released.
 func scalarReadOfObjectArgDoesNotPin(t *testing.T, read func(spidermonkey.Value)) {
 	t.Helper()
 	js, err := spidermonkey.New(spidermonkey.Config{MaxMemoryBytes: 128 << 20})
@@ -50,7 +57,7 @@ func scalarReadOfObjectArgDoesNotPin(t *testing.T, read func(spidermonkey.Value)
 		t.Fatalf("DefineFunc: %v", err)
 	}
 
-	const calls = 256 // 1 GiB of backing store if every argument stays pinned
+	const calls = 48 // 192 MiB of backing store if every argument stays pinned
 	src := fmt.Sprintf(`for (let i = 0; i < %d; i++) take(new Uint8Array(4 * 1024 * 1024)); "ok"`, calls)
 	evalOK(t, js, src)
 }
