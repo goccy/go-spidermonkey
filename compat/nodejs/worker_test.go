@@ -222,6 +222,44 @@ func TestWorkerThreadsTerminate(t *testing.T) {
 	}
 }
 
+// terminate() has to stop a worker that is not listening. A worker spinning in
+// a synchronous loop never returns to its job queue, so it never reads the
+// cooperative sentinel terminate also sends; only the engine-level interrupt
+// reaches it. Before that existed, this worker ran until the process died.
+func TestWorkerThreadsTerminateSynchronousInfiniteLoop(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{})
+
+	r, err := js.Eval(context.Background(), `
+		const { Worker } = require("worker_threads");
+		globalThis.r = {};
+		const w = new Worker(`+"`"+`
+			const { parentPort } = require("worker_threads");
+			parentPort.postMessage("spinning");
+			while (true) {}
+		`+"`"+`, { eval: true });
+		w.on("message", (m) => { if (m === "spinning") { r.spinning = true; w.terminate(); } });
+		w.on("exit", () => { r.exited = true; });
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Error != nil {
+		t.Fatalf("script threw: %v", r.Error)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rt.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !evalVal(t, js, `r.spinning`).Bool() {
+		t.Fatal("worker never reported that it was spinning")
+	}
+	if !evalVal(t, js, `r.exited`).Bool() {
+		t.Error("terminate did not stop a synchronously spinning worker")
+	}
+}
+
 func TestWorkerTopLevelThrowEmitsError(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
 	r, err := js.Eval(context.Background(), `

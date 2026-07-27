@@ -390,6 +390,44 @@
 		}
 	};
 
+	// globalThis as an event target. The web dispatches host-originated events
+	// here rather than at an object the guest made — `unhandledrejection` below
+	// is one, and it is why the delegation exists at all.
+	const globalTarget = new EventTarget();
+	globalThis.addEventListener ??= (...a) => globalTarget.addEventListener(...a);
+	globalThis.removeEventListener ??= (...a) => globalTarget.removeEventListener(...a);
+	globalThis.dispatchEvent ??= (e) => globalTarget.dispatchEvent(e);
+
+	globalThis.PromiseRejectionEvent ??= class PromiseRejectionEvent extends Event {
+		constructor(type, init = {}) {
+			super(type, init);
+			this.promise = init.promise;
+			this.reason = init.reason;
+		}
+	};
+
+	// The host calls this once per promise rejection that reached a microtask
+	// checkpoint with nothing to handle it. Such a rejection is visible only to
+	// the engine — an async function's promise is created by the engine, so it
+	// never passes through any Promise wrapper defined here — so the host is
+	// the only possible source, and this is where it becomes a web event.
+	//
+	// Cancelable: a handler that calls preventDefault() takes responsibility
+	// for the rejection and suppresses the default report, exactly as in a
+	// browser.
+	globalThis.__unhandled_rejection = (reason, promise) => {
+		const ev = new globalThis.PromiseRejectionEvent("unhandledrejection", {
+			cancelable: true, promise, reason,
+		});
+		globalTarget.dispatchEvent(ev);
+		if (typeof globalThis.onunhandledrejection === "function") {
+			globalThis.onunhandledrejection(ev);
+		}
+		if (!ev.defaultPrevented) {
+			console.error("Uncaught (in promise)", reason);
+		}
+	};
+
 	class AbortSignal extends EventTarget {
 		constructor() {
 			super();

@@ -146,6 +146,24 @@ func (a *Agents) Send(to AgentID, v Value) error {
 	return nil
 }
 
+// Interrupt stops one agent whatever it is doing: its script ends with an
+// uncatchable exception (guest JS cannot swallow it) and the agent leaves
+// instead of resuming its pump.
+//
+// This is the forceful counterpart to a cooperative stop. Everything else here
+// is a MESSAGE, which an agent only sees between job-queue drains — and a
+// runaway `while(true){}` never drains, so no message can reach it. Interrupt
+// goes through the agent's own engine context instead, which also wakes one
+// parked in Atomics.wait or idling with nothing to do.
+//
+// Asynchronous: it returns once the agent is signalled, not once it has gone
+// (the agent may be mid-bytecode on its own thread) — poll IsAlive to wait for
+// the exit. Reports false when no agent with this id is running, in which case
+// there is nothing left to stop.
+func (a *Agents) Interrupt(id AgentID) (bool, error) {
+	return a.js.raw.AgentInterrupt(uint64(id))
+}
+
 // Broadcast latches v as THE broadcast and wakes every agent blocked in
 // receive. Agents that call receive later get the same value. A previously
 // latched value is superseded (its clone is retained until Close, since a

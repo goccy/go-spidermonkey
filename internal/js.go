@@ -9,11 +9,13 @@ package internal
 // per-module memory). JS below is that per-instance handle: every method drives
 // THIS instance's module via js.m.invoke, so there is no global module.
 //
-// The method IDs are hand-maintained (see mid* below). They do NOT auto-follow a
-// proto change the way the generated functions do — when the bridge is
-// regenerated, re-check them against spidermonkey.go. They funnel through the one
-// invokeMethod helper so callers (including the public API) only ever call
-// methods; they never touch invoke or an ID.
+// The method IDs and their generated entry points are hand-maintained (see mid*
+// and invokers below). They do NOT auto-follow a proto change the way the
+// generated functions do — the service numbers its RPCs alphabetically, so ONE
+// added method renumbers every later one; re-check the table against
+// spidermonkey.go on every regeneration. Everything funnels through the one
+// invokeMethod helper, so callers (including the public API) only ever call
+// methods; they never touch invoke, an ID or an entry point.
 
 import (
 	"context"
@@ -66,40 +68,89 @@ const (
 	AgentExitKey = "\x00agent-exit"
 )
 
-// Method IDs of the bridge service (service 0). Verified against the generated
-// spidermonkey.go; keep in sync on regeneration.
+// Method IDs of the bridge service (service 0). An ID is the RPC's index in
+// the generated service, which protoc-gen-wasmify-go emits in ALPHABETICAL
+// order — so adding one method renumbers every method that sorts after it.
+// They are listed in ID order and must be re-checked against the generated
+// spidermonkey.go on every regeneration.
 const (
-	midCall              int32 = 4
-	midClose             int32 = 8
-	midDefineFunction    int32 = 11
-	midDefineConstructor int32 = 10
-	midEval              int32 = 13
-	midEvalModule        int32 = 15
-	midFreeObject        int32 = 16
-	midGet               int32 = 18
-	midGlobal            int32 = 19
-	midInterruptAddr     int32 = 20
-	midInterruptBitsAddr int32 = 21
-	midInterruptBitsVal  int32 = 22
-	midNew               int32 = 23
-	midNewPlainObject    int32 = 26
-	midRunJobs           int32 = 28
-	midSet               int32 = 29
-	midAgentSpawn        int32 = 0
-	midAgentWake         int32 = 1
-	midBytesNew          int32 = 2
-	midBytesRead         int32 = 3
-	midConstruct         int32 = 9
-	midNewFunction       int32 = 24
-	midCloneWrite        int32 = 7
-	midCloneRead         int32 = 6
-	midCloneFree         int32 = 5
-	midGc                int32 = 17
-	midDetachArrayBuffer int32 = 12
-	midNewRealm          int32 = 27
-	midEvalIn            int32 = 14
-	midNewHTMLDDA        int32 = 25
+	midAgentInterrupt int32 = iota
+	midAgentSpawn
+	midAgentWake
+	midBytesNew
+	midBytesRead
+	midCall
+	midCloneFree
+	midCloneRead
+	midCloneWrite
+	midClose
+	midConstruct
+	midDefineConstructor
+	midDefineFunction
+	midDetachArrayBuffer
+	midEval
+	midEvalIn
+	midEvalModule
+	midFreeObject
+	midGc
+	midGet
+	midGlobal
+	midInterruptAddr
+	midInterruptBitsAddr
+	midInterruptBitsVal
+	midNew
+	midNewFunction
+	midNewHTMLDDA
+	midNewPlainObject
+	midNewRealm
+	midRunJobs
+	midSet
+	midSourceIsModule
+	midTakeUnhandledRejections
+	midCount
 )
+
+// invokers maps a method ID to the generated per-export entry point that
+// actually dispatches it. The entry point is what the call reaches; the ID
+// alone does not select anything, so pairing them by hand at each call site
+// let a wrong pair route a call to the WRONG bridge method with nothing to
+// catch it. Indexing one table by the ID makes the pair impossible to get
+// wrong anywhere but here.
+var invokers = [midCount]func(*base.Module, int32, int32) (int64, error){
+	midAgentInterrupt:          wasm2go.Inv_0_0,
+	midAgentSpawn:              wasm2go.Inv_0_1,
+	midAgentWake:               wasm2go.Inv_0_2,
+	midBytesNew:                wasm2go.Inv_0_3,
+	midBytesRead:               wasm2go.Inv_0_4,
+	midCall:                    wasm2go.Inv_0_5,
+	midCloneFree:               wasm2go.Inv_0_6,
+	midCloneRead:               wasm2go.Inv_0_7,
+	midCloneWrite:              wasm2go.Inv_0_8,
+	midClose:                   wasm2go.Inv_0_9,
+	midConstruct:               wasm2go.Inv_0_10,
+	midDefineConstructor:       wasm2go.Inv_0_11,
+	midDefineFunction:          wasm2go.Inv_0_12,
+	midDetachArrayBuffer:       wasm2go.Inv_0_13,
+	midEval:                    wasm2go.Inv_0_14,
+	midEvalIn:                  wasm2go.Inv_0_15,
+	midEvalModule:              wasm2go.Inv_0_16,
+	midFreeObject:              wasm2go.Inv_0_17,
+	midGc:                      wasm2go.Inv_0_18,
+	midGet:                     wasm2go.Inv_0_19,
+	midGlobal:                  wasm2go.Inv_0_20,
+	midInterruptAddr:           wasm2go.Inv_0_21,
+	midInterruptBitsAddr:       wasm2go.Inv_0_22,
+	midInterruptBitsVal:        wasm2go.Inv_0_23,
+	midNew:                     wasm2go.Inv_0_24,
+	midNewFunction:             wasm2go.Inv_0_25,
+	midNewHTMLDDA:              wasm2go.Inv_0_26,
+	midNewPlainObject:          wasm2go.Inv_0_27,
+	midNewRealm:                wasm2go.Inv_0_28,
+	midRunJobs:                 wasm2go.Inv_0_29,
+	midSet:                     wasm2go.Inv_0_30,
+	midSourceIsModule:          wasm2go.Inv_0_31,
+	midTakeUnhandledRejections: wasm2go.Inv_0_32,
+}
 
 // JS is one interpreter: its own wasm module and one SpiderMonkey runtime.
 type JS struct {
@@ -184,7 +235,7 @@ func (js *JS) EvalModule(specifier, src string) (string, error) {
 	buf = pbAppendUint64(buf, 3, uint64(len(specifier)))
 	buf = pbAppendString(buf, 4, src)
 	buf = pbAppendUint64(buf, 5, uint64(len(src)))
-	resp, err := js.invokeMethod(midEvalModule, buf, wasm2go.Inv_0_15)
+	resp, err := js.invokeMethod(midEvalModule, buf)
 	if err != nil {
 		return "", err
 	}
@@ -204,7 +255,7 @@ func (js *JS) EvalModuleContext(ctx context.Context, specifier, src string) (str
 func (js *JS) RunJobs() (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midRunJobs, buf, wasm2go.Inv_0_28)
+	resp, err := js.invokeMethod(midRunJobs, buf)
 	if err != nil {
 		return "", err
 	}
@@ -218,10 +269,10 @@ func (js *JS) RunJobsContext(ctx context.Context) (string, error) {
 }
 
 // u32 runs one interrupt-address accessor (handle in, single uint32 out).
-func (js *JS) u32(mid int32, call func(*base.Module, int32, int32) (int64, error)) (uint32, error) {
+func (js *JS) u32(mid int32) (uint32, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(mid, buf, call)
+	resp, err := js.invokeMethod(mid, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -229,15 +280,15 @@ func (js *JS) u32(mid int32, call func(*base.Module, int32, int32) (int64, error
 }
 
 func (js *JS) prepareInterrupter() (*interrupter, error) {
-	flagAddr, err := js.u32(midInterruptAddr, wasm2go.Inv_0_20)
+	flagAddr, err := js.u32(midInterruptAddr)
 	if err != nil {
 		return nil, err
 	}
-	bitsAddr, err := js.u32(midInterruptBitsAddr, wasm2go.Inv_0_21)
+	bitsAddr, err := js.u32(midInterruptBitsAddr)
 	if err != nil {
 		return nil, err
 	}
-	bitsValue, err := js.u32(midInterruptBitsVal, wasm2go.Inv_0_22)
+	bitsValue, err := js.u32(midInterruptBitsVal)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +307,7 @@ func (js *JS) AgentSpawn(glue, src string) (uint64, error) {
 	buf = pbAppendUint64(buf, 3, uint64(len(glue)))
 	buf = pbAppendString(buf, 4, src)
 	buf = pbAppendUint64(buf, 5, uint64(len(src)))
-	resp, err := js.invokeMethod(midAgentSpawn, buf, wasm2go.Inv_0_0)
+	resp, err := js.invokeMethod(midAgentSpawn, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -272,8 +323,79 @@ func (js *JS) AgentSpawn(glue, src string) (uint64, error) {
 func (js *JS) AgentWake() error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	_, err := js.invokeMethod(midAgentWake, buf, wasm2go.Inv_0_1)
+	_, err := js.invokeMethod(midAgentWake, buf)
 	return err
+}
+
+// AgentInterrupt stops ONE agent whatever it is doing, by tripping that agent's
+// own JSContext interrupt. Its script ends with an uncatchable exception (guest
+// JS cannot swallow it) and the agent leaves instead of resuming its pump.
+//
+// This is the forceful counterpart to a cooperative stop: a sentinel an agent
+// reads between job-queue drains cannot reach a guest that never drains, which
+// is exactly the runaway `while(true){}` worker a terminate has to be able to
+// stop. It also wakes an agent parked in Atomics.wait or idling on the event
+// futex.
+//
+// Asynchronous: it returns once the agent is signalled, not once it is gone —
+// the agent may be mid-bytecode on its own thread, and its exit arrives through
+// the usual AgentExitKey. Reports false when no agent with this id is running,
+// in which case there is nothing left to stop.
+func (js *JS) AgentInterrupt(id uint64) (bool, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	buf = pbAppendUint64(buf, 2, id)
+	resp, err := js.invokeMethod(midAgentInterrupt, buf)
+	if err != nil {
+		return false, err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readUint32) != 0, nil
+}
+
+// SourceIsModule reports whether src needs ES-module semantics, decided by the
+// engine's own parser rather than by matching import/export against the source
+// text. A source is a module when it compiles as one but NOT as CommonJS —
+// nearly every script is also a valid module, so it is the CommonJS compile
+// failing that isolates the constructs which can appear nowhere else (a
+// top-level import/export declaration, import.meta, top-level await).
+//
+// A source that compiles as neither is broken and reports false; the real load
+// then surfaces the syntax error against the file's own name and line numbers.
+// Nothing is registered, evaluated or cached — this only parses.
+func (js *JS) SourceIsModule(src string) (bool, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	buf = pbAppendString(buf, 2, src)
+	buf = pbAppendUint64(buf, 3, uint64(len(src)))
+	resp, err := js.invokeMethod(midSourceIsModule, buf)
+	if err != nil {
+		return false, err
+	}
+	res, err := envelopeResult(readScalarAtField(resp, 1, (*pbReader).readString))
+	if err != nil {
+		return false, err
+	}
+	return res == "1", nil
+}
+
+// TakeUnhandledRejections hands back every promise rejection still unhandled and
+// forgets them, as a JSON array of {"reason":<encoding>,"promise":<encoding>} in
+// rejection order.
+//
+// A rejection nobody handled is observable ONLY through the engine: an async
+// function's promise is created by the engine, so wrapping Promise host-side
+// misses exactly the cases that matter. Call this after a job drain (Eval,
+// RunJobs) — by then a rejection the guest handled in the same tick has already
+// retracted itself and is not reported. Draining is destructive: each rejection
+// is reported exactly once however often this is called.
+func (js *JS) TakeUnhandledRejections() (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	resp, err := js.invokeMethod(midTakeUnhandledRejections, buf)
+	if err != nil {
+		return "", err
+	}
+	return envelopeResult(readScalarAtField(resp, 1, (*pbReader).readString))
 }
 
 // CloneWrite structured-clones the value the encoding describes (shared-memory
@@ -284,7 +406,7 @@ func (js *JS) CloneWrite(val string) (uint64, error) {
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendString(buf, 2, val)
 	buf = pbAppendUint64(buf, 3, uint64(len(val)))
-	resp, err := js.invokeMethod(midCloneWrite, buf, wasm2go.Inv_0_7)
+	resp, err := js.invokeMethod(midCloneWrite, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -301,7 +423,7 @@ func (js *JS) CloneRead(clone uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendUint64(buf, 2, clone)
-	resp, err := js.invokeMethod(midCloneRead, buf, wasm2go.Inv_0_6)
+	resp, err := js.invokeMethod(midCloneRead, buf)
 	if err != nil {
 		return "", err
 	}
@@ -312,7 +434,7 @@ func (js *JS) CloneRead(clone uint64) (string, error) {
 func (js *JS) CloneFree(clone uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, clone)
-	_, err := js.invokeMethod(midCloneFree, buf, wasm2go.Inv_0_5)
+	_, err := js.invokeMethod(midCloneFree, buf)
 	return err
 }
 
@@ -320,7 +442,7 @@ func (js *JS) CloneFree(clone uint64) error {
 func (js *JS) Gc() error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	_, err := js.invokeMethod(midGc, buf, wasm2go.Inv_0_17)
+	_, err := js.invokeMethod(midGc, buf)
 	return err
 }
 
@@ -330,7 +452,7 @@ func (js *JS) DetachArrayBuffer(obj uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendUint64(buf, 2, obj)
-	resp, err := js.invokeMethod(midDetachArrayBuffer, buf, wasm2go.Inv_0_12)
+	resp, err := js.invokeMethod(midDetachArrayBuffer, buf)
 	if err != nil {
 		return "", err
 	}
@@ -349,7 +471,7 @@ func (js *JS) NewFunction(name, key string, nargs uint32) (uint64, error) {
 	buf = pbAppendString(buf, 4, key)
 	buf = pbAppendUint64(buf, 5, uint64(len(key)))
 	buf = pbAppendUint64(buf, 6, uint64(nargs))
-	resp, err := js.invokeMethod(midNewFunction, buf, wasm2go.Inv_0_24)
+	resp, err := js.invokeMethod(midNewFunction, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -369,7 +491,7 @@ func (js *JS) Construct(fn uint64, args string) (string, error) {
 	buf = pbAppendUint64(buf, 2, fn)
 	buf = pbAppendString(buf, 3, args)
 	buf = pbAppendUint64(buf, 4, uint64(len(args)))
-	resp, err := js.invokeMethod(midConstruct, buf, wasm2go.Inv_0_9)
+	resp, err := js.invokeMethod(midConstruct, buf)
 	if err != nil {
 		return "", err
 	}
@@ -384,7 +506,7 @@ func (js *JS) BytesNew(data []byte) (uint64, error) {
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendBytes(buf, 2, data)
 	buf = pbAppendUint64(buf, 3, uint64(len(data)))
-	resp, err := js.invokeMethod(midBytesNew, buf, wasm2go.Inv_0_2)
+	resp, err := js.invokeMethod(midBytesNew, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -402,7 +524,7 @@ func (js *JS) BytesRead(obj uint64) ([]byte, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendUint64(buf, 2, obj)
-	resp, err := js.invokeMethod(midBytesRead, buf, wasm2go.Inv_0_3)
+	resp, err := js.invokeMethod(midBytesRead, buf)
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +546,7 @@ func (js *JS) BytesRead(obj uint64) ([]byte, error) {
 func (js *JS) NewRealm() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midNewRealm, buf, wasm2go.Inv_0_27)
+	resp, err := js.invokeMethod(midNewRealm, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -444,7 +566,7 @@ func (js *JS) EvalIn(global uint64, src string) (string, error) {
 	buf = pbAppendUint64(buf, 2, global)
 	buf = pbAppendString(buf, 3, src)
 	buf = pbAppendUint64(buf, 4, uint64(len(src)))
-	resp, err := js.invokeMethod(midEvalIn, buf, wasm2go.Inv_0_14)
+	resp, err := js.invokeMethod(midEvalIn, buf)
 	if err != nil {
 		return "", err
 	}
@@ -461,7 +583,7 @@ func (js *JS) EvalInContext(ctx context.Context, global uint64, src string) (str
 func (js *JS) NewHTMLDDA() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midNewHTMLDDA, buf, wasm2go.Inv_0_25)
+	resp, err := js.invokeMethod(midNewHTMLDDA, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -490,8 +612,8 @@ func (js *JS) UnlockForHostCallback() (relock func()) {
 
 // invokeMethod runs one RPC on THIS instance's module and folds in the standard
 // bridge error check. The single seam every method funnels through.
-func (js *JS) invokeMethod(mid int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
-	resp, err := js.m.invoke(0, mid, req, call)
+func (js *JS) invokeMethod(mid int32, req []byte) ([]byte, error) {
+	resp, err := js.m.invoke(0, mid, req, invokers[mid])
 	if err != nil {
 		return nil, err
 	}
@@ -505,7 +627,7 @@ func (js *JS) jsNew(maxHeapBytes, nativeStackQuotaBytes uint32) (uint64, error) 
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, uint64(maxHeapBytes))
 	buf = pbAppendUint64(buf, 2, uint64(nativeStackQuotaBytes))
-	resp, err := js.invokeMethod(midNew, buf, wasm2go.Inv_0_23)
+	resp, err := js.invokeMethod(midNew, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -517,7 +639,7 @@ func (js *JS) jsNew(maxHeapBytes, nativeStackQuotaBytes uint32) (uint64, error) 
 func (js *JS) Close() error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	_, err := js.invokeMethod(midClose, buf, wasm2go.Inv_0_8)
+	_, err := js.invokeMethod(midClose, buf)
 	if js.mmapped != nil {
 		base.UnmapMemory(js.mmapped)
 		js.mmapped = nil
@@ -532,7 +654,7 @@ func (js *JS) Eval(src string) (string, error) {
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendString(buf, 2, src)
 	buf = pbAppendUint64(buf, 3, uint64(len(src)))
-	resp, err := js.invokeMethod(midEval, buf, wasm2go.Inv_0_13)
+	resp, err := js.invokeMethod(midEval, buf)
 	if err != nil {
 		return "", err
 	}
@@ -543,7 +665,7 @@ func (js *JS) Eval(src string) (string, error) {
 func (js *JS) Global() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midGlobal, buf, wasm2go.Inv_0_19)
+	resp, err := js.invokeMethod(midGlobal, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -554,7 +676,7 @@ func (js *JS) Global() (uint64, error) {
 func (js *JS) NewPlainObject() (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
-	resp, err := js.invokeMethod(midNewPlainObject, buf, wasm2go.Inv_0_26)
+	resp, err := js.invokeMethod(midNewPlainObject, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -572,7 +694,7 @@ func (js *JS) Get(obj uint64, name string) (string, error) {
 	buf = pbAppendUint64(buf, 2, obj)
 	buf = pbAppendString(buf, 3, name)
 	buf = pbAppendUint64(buf, 4, uint64(len(name)))
-	resp, err := js.invokeMethod(midGet, buf, wasm2go.Inv_0_18)
+	resp, err := js.invokeMethod(midGet, buf)
 	if err != nil {
 		return "", err
 	}
@@ -590,7 +712,7 @@ func (js *JS) Set(obj uint64, name, val string) (string, error) {
 	buf = pbAppendUint64(buf, 4, uint64(len(name)))
 	buf = pbAppendString(buf, 5, val)
 	buf = pbAppendUint64(buf, 6, uint64(len(val)))
-	resp, err := js.invokeMethod(midSet, buf, wasm2go.Inv_0_29)
+	resp, err := js.invokeMethod(midSet, buf)
 	if err != nil {
 		return "", err
 	}
@@ -607,7 +729,7 @@ func (js *JS) Call(fn, this uint64, args string) (string, error) {
 	buf = pbAppendUint64(buf, 3, this)
 	buf = pbAppendString(buf, 4, args)
 	buf = pbAppendUint64(buf, 5, uint64(len(args)))
-	resp, err := js.invokeMethod(midCall, buf, wasm2go.Inv_0_4)
+	resp, err := js.invokeMethod(midCall, buf)
 	if err != nil {
 		return "", err
 	}
@@ -631,7 +753,7 @@ func (js *JS) DefineFunction(obj uint64, name, key string, nargs uint32) error {
 	buf = pbAppendString(buf, 5, key)
 	buf = pbAppendUint64(buf, 6, uint64(len(key)))
 	buf = pbAppendUint64(buf, 7, uint64(nargs))
-	resp, err := js.invokeMethod(midDefineFunction, buf, wasm2go.Inv_0_11)
+	resp, err := js.invokeMethod(midDefineFunction, buf)
 	if err != nil {
 		return err
 	}
@@ -649,7 +771,7 @@ func (js *JS) DefineConstructor(obj uint64, name, key string, nargs uint32) erro
 	buf = pbAppendString(buf, 5, key)
 	buf = pbAppendUint64(buf, 6, uint64(len(key)))
 	buf = pbAppendUint64(buf, 7, uint64(nargs))
-	resp, err := js.invokeMethod(midDefineConstructor, buf, wasm2go.Inv_0_10)
+	resp, err := js.invokeMethod(midDefineConstructor, buf)
 	if err != nil {
 		return err
 	}
@@ -660,8 +782,27 @@ func (js *JS) DefineConstructor(obj uint64, name, key string, nargs uint32) erro
 func (js *JS) FreeObject(obj uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, obj)
-	_, err := js.invokeMethod(midFreeObject, buf, wasm2go.Inv_0_16)
+	_, err := js.invokeMethod(midFreeObject, buf)
 	return err
+}
+
+// envelopeResult unwraps the {ok,result,error} envelope the bridge returns,
+// yielding the result on success and the envelope's own message as an error on
+// failure. For the calls whose result is the answer itself (rather than a value
+// encoding the caller goes on to decode).
+func envelopeResult(s string) (string, error) {
+	var r struct {
+		Ok     bool   `json:"ok"`
+		Result string `json:"result"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(s), &r); err != nil {
+		return "", fmt.Errorf("undecodable bridge result: %w", err)
+	}
+	if !r.Ok {
+		return "", fmt.Errorf("%s", r.Error)
+	}
+	return r.Result, nil
 }
 
 // envelopeError decodes the {ok,error} result envelope js_define_function /

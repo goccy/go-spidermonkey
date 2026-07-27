@@ -39,6 +39,10 @@ type Loop struct {
 	// (compat/nodejs interleaves the process.nextTick queue here).
 	microDrain func(context.Context) error
 
+	// reportRejections delivers the promise rejections that reached a
+	// microtask checkpoint unhandled, and says whether it delivered any.
+	reportRejections func(context.Context) (bool, error)
+
 	wake chan struct{}
 }
 
@@ -154,6 +158,14 @@ func (l *Loop) SetMicroDrain(fn func(context.Context) error) { l.microDrain = fn
 // DrainEngineJobs pumps the engine's own job queue to exhaustion — the
 // building block a SetMicroDrain hook composes with its host-side queues.
 func (l *Loop) DrainEngineJobs(ctx context.Context) error { return l.drainJobs(ctx) }
+
+// SetRejectionReporter installs the delivery of promise rejections that reach
+// a microtask checkpoint with nothing to handle them. fn reports whether it
+// delivered any, so the loop knows to re-drain what the delivery queued. Not
+// safe to call concurrently with Run.
+func (l *Loop) SetRejectionReporter(fn func(context.Context) (bool, error)) {
+	l.reportRejections = fn
+}
 
 // PostImmediate schedules fn for the check phase of the current loop turn —
 // after due timers, before sleeping (setImmediate). The loop owns fn's
@@ -539,8 +551,32 @@ func (l *Loop) takeDue(now time.Time) []*timer {
 }
 
 // drainMicro is the between-callback microtask checkpoint: the installed
-// hook when set, the engine job queue otherwise.
+// hook when set, the engine job queue otherwise, followed by the report of
+// any rejection that survived it unhandled.
+//
+// The checkpoint is where "unhandled" becomes decidable: a rejection the guest
+// goes on to handle in the same tick has retracted itself by the time the
+// queue runs dry, so only what is left here is genuinely unhandled. Reporting
+// runs guest handlers, which may queue more jobs and may themselves leave a
+// new rejection unhandled — so the drain repeats until a pass reports nothing.
+// It terminates for the same reason a microtask drain does: only a guest that
+// generates work forever keeps it going.
 func (l *Loop) drainMicro(ctx context.Context) error {
+	for {
+		if err := l.drainMicroOnce(ctx); err != nil {
+			return err
+		}
+		if l.reportRejections == nil {
+			return nil
+		}
+		reported, err := l.reportRejections(ctx)
+		if err != nil || !reported {
+			return err
+		}
+	}
+}
+
+func (l *Loop) drainMicroOnce(ctx context.Context) error {
 	if l.microDrain != nil {
 		return l.microDrain(ctx)
 	}
