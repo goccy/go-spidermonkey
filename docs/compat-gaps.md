@@ -86,59 +86,16 @@ Fidelity caveats (present but not behaviorally complete):
   require('worker_threads'|'buffer') works (other node: ops are per-instance
   host functions on the main interpreter).
 - Full Intl/ICU is the engine's domain, not the compat layer.
-- `process.on('unhandledRejection')` / the web `unhandledrejection` event
-  never fire: SpiderMonkey only reports unhandled promise rejections through
-  an embedder callback (`JS_SetPromiseRejectionTrackerCallback`), which the
-  published engine wasm does not expose yet, and rejection state of native
-  promises is not observable from pure JS (async-function promises bypass any
-  Promise wrapper). A rejection with no handler is silently dropped. Fix
-  requires an engine change: wire the tracker callback in the engine bridge,
-  surface pending-unhandled rejections to the host after each job drain, and
-  route them to `process.emit('unhandledRejection', ...)` /
-  `globalThis unhandledrejection`. Tracked as an engine follow-up alongside
-  worker force-termination.
-
-## Known unfixed defects (TODO — compat layer)
-
-Guest-object-root leak, remaining sites. The class: a host op that reads an
-object-typed argument as a primitive (`Int`/`Float`/`Bool`/`String`/`Export`)
-without releasing the persistent root the decoder minted pins that object — and
-its whole reachable backing store — for the interpreter's life. A guest that
-passes an object where a primitive is expected, through a JS wrapper that
-forwards the value raw (no `Number()`/`String()` coercion), leaks unboundedly on
-every call (guest-triggerable memory exhaustion). Most of the crypto/http
-surface is fixed via `spidermonkey.Value.TakeInt/TakeFloat/TakeBool/TakeString`
-(which read the primitive AND release the root); these sites still read raw and
-MUST be migrated:
-
-- `opHTTPListen` host — `compat/nodejs/http.go:220` (`http_listen` forwards
-  `host` raw; `https_listen` and `udp_bind` already `String()`-coerce).
-- `opFSReadFD` length & position — `compat/nodejs/fsextra.go:304,314`
-  (`fs.readSync` forwards them raw; `writeSync` guards
-  `typeof position === "number"`, so `opFSWriteFD` is unaffected).
-- fs fd-op family, the `fd` argument — `compat/nodejs/fsextra.go:103,293,350,
-  403,438` (`readSync`/`writeSync`/`closeSync`/`fstatSync`/`ftruncateSync`
-  forward the guest fd raw).
-
-The durable fix is a single exhaustive pass rather than reactive per-site
-patching: enumerate every `args[N].{Int,Float,Bool,String,Export}()` read in
-every host op (`compat/nodejs`, `compat/web`), check each against its JS
-wrapper's coercion, and migrate every raw-forwarded scalar consume to the
-`Value.Take*` accessors. Alternatively, free unconsumed object-arg roots
-centrally in `hostEnv.dispatch` after the op returns — which requires
-distinguishing consumed arguments from retained ones (stored callbacks such as
-`onResponse`/`onError`, the worker instance object) so retained objects are not
-freed out from under the op.
 
 ## Engine follow-ups
 
 Defects/gaps whose root cause is in the wasm engine or its bridge (not the
 compat layer) are tracked separately, with root cause and the engine change
-each needs, in [engine-followups.md](engine-followups.md). These include the
-worker-teardown deadlock with many live agents, `worker.terminate()` of a
-synchronous infinite loop, `unhandledRejection` delivery, the intermittent
-`JS_DestroyContext` teardown SIGSEGV, the module-loader classification
-heuristics, and ICU/Intl.
+each needs, in [engine-followups.md](engine-followups.md). These are the
+per-agent memory floor, an intermittent test262 Atomics structured-clone race,
+the two remaining module-loader heuristics (CommonJS named-export extraction
+and default-export detection), ICU/Intl, and `AsyncLocalStorage` across a bare
+`await`.
 
 ## Bottom line
 

@@ -8,82 +8,19 @@ bridge primitive, then a wasm regen). They are collected here so the compat
 layer stays honest about what it does not yet cover. Each item lists the
 observable symptom, the root cause, and what the engine must provide.
 
-## 1. Worker-teardown deadlock with many live agents — FIXED
+Items are removed from this file as they close; the reasoning that closed one
+lives in its commit, not here.
 
-- **Symptom:** if a guest spawned ~16 or more `worker_threads.Worker`
-  instances that were still alive at teardown (e.g. idle workers each holding
-  a `parentPort.on('message', …)` listener), the embedder's teardown hung
-  forever. `Runtime.Close()` returned promptly; the hang was in the subsequent
-  `js.Close()`. Deterministic: N≤15 tore down in a few hundred ms, N≥16 hung.
-- **Root cause (measured, and not the one previously recorded here — there is
-  no thread pool at any layer):** every guest thread's stack is malloc'd out of
-  LINEAR MEMORY, and a thread created with a null `pthread_attr_t` takes
-  wasi-libc's default stack size — which is the LINKED main-stack size, 8 MiB.
-  That is right for the main thread and wildly wrong as a per-thread tax:
-  16 agents cost 128 MiB of stacks against a 256 MiB instance budget before a
-  single JS object exists, and each concurrent SpiderMonkey helper task took
-  another 8 MiB exactly when teardown GC needed them most. Past the budget
-  `pthread_create` returns EAGAIN, whereupon the helper dispatcher runs engine
-  work INLINE on the calling thread; the resulting lost wakeup parked a thread
-  in a guest futex, which has no timeout and no trap, while the main goroutine
-  held the instance's invoke lock for the whole of `js_close`.
-- **Engine fix (landed in `js.cc`):** give agent and helper threads explicit,
-  right-sized stacks (`kAgentThreadStackBytes` / `kHelperThreadStackBytes`)
-  instead of inheriting the linker's main-stack size, and bound the agent
-  context's native recursion inside its own stack. Teardown additionally sets
-  each agent's terminate flag, so shutdown does not depend on an agent
-  reaching a cooperative poll point. `js.Close()` with 16 live workers now
-  returns in tens of milliseconds.
-- **Also fixed — agents accumulated permanently.** A finished thread holds its
-  entire stack until someone joins it, and nothing joined one until the
-  instance closed. An instance that created and retired workers over time grew
-  without bound even while never running two at once: 24 sequential
-  spawn/exit cycles took linear memory from 33 MiB to 195 MiB. Finished
-  threads are now reaped at the next spawn and at close; the same 24 cycles
-  now plateau at 40 MiB and stay there.
-- **Remaining, by design:** an instance still has a finite agent budget — it
-  is now a function of what agents actually use, and `Config.MaxMemoryBytes`
-  is the knob that sets it. A spawn past the budget fails with an error
-  ("agent spawn failed") rather than hanging.
+## 1. Per-agent memory floor: a runtime holds three whole GC chunks
 
-## 1b. Per-agent memory floor: whole GC chunks are touched for 168 KiB of data — PARTLY FIXED, 3488 → 1144 KiB per agent
-
-**What was fixed.** A worker cost ~3.4 MiB of RAM to hold ~0.16 MiB of live
-JavaScript, and the cause was a single line that exists only on this platform —
-`js/src/gc/Memory.cpp`, `MapAlignedPages`, under `#ifdef __wasi__`:
-
-```c
-posix_memalign(&region, alignment, length);
-memset(region, 0, length);      // writes the whole 1 MiB chunk
-```
-
-Every other platform writes nothing there: `mmap` hands back zero pages and they
-fault in only as the GC actually uses them. On wasm the memset makes each chunk
-fully resident the moment it is created, and linear memory can never be returned
-to the OS, so it stays that way for the instance's life. **Gecko does not pay
-this** — the memset is wasi-only.
-
-Removing it outright is not safe: `ArenaChunkBase`'s mark bitmap and its
-free/decommitted page bitmaps are never cleared explicitly and do rely on zeroed
-memory. The arena bodies past `FirstArenaOffset` do not — each arena is
-initialized when it is handed out. So the patch in
-`spidermonkey-wasm/scripts/build-engine-intl.sh` zeroes only the header, taking
-the write from **1 MiB to 16 KiB per chunk**, scoped to exactly the chunk case
-(`length == alignment == ChunkSize`) so every other caller keeps the
-fully-zeroed contract. Measured per agent: **3488 → 1144 KiB resident**.
-
-The diagnosis that led there is below, and still describes the pre-fix numbers.
-The remaining floor — three 1 MiB chunks per runtime, of which two are
-near-empty in a worker that barely allocates — is unchanged, and is where the
-next lever is.
-
-Two different quantities, and they have different causes — keep them apart:
+An agent (a `worker_threads.Worker`) costs ~1144 KiB resident to hold ~168 KiB
+of live JavaScript. Two different quantities are involved and they have
+different causes — keep them apart:
 
 - **Linear memory** (~7 MiB per agent) is the `Config.MaxMemoryBytes` BUDGET.
   It decides how many agents fit; it is not RAM.
-- **Resident memory** (~3.3 MiB per agent, measured with `mincore` over the
-  instance's mapping; ~4.0 MiB of process RSS once host-side Go is counted) is
-  the actual physical cost.
+- **Resident memory** is the actual physical cost, measured with `mincore` over
+  the instance's mapping.
 
 Where the linear memory goes, from instrumenting each startup step: 1 MiB
 thread stack, 2 MiB at `JS_NewContext`, 4 MiB at `JS_NewGlobalObject`.
@@ -91,21 +28,14 @@ thread stack, 2 MiB at `JS_NewContext`, 4 MiB at `JS_NewGlobalObject`.
 shared with the parent runtime and standard classes are lazy.
 
 Where the RESIDENT memory goes. Scanning linear memory for 1 MiB-aligned GC
-chunk headers, and counting resident pages per chunk with `mincore`, one agent
-adds **exactly three 1 MiB chunks, each fully resident**:
+chunk headers, and counting resident pages per chunk, one agent adds **exactly
+three 1 MiB chunks**:
 
-| chunk | `ChunkKind` | resident | holding |
-|---|---|---|---|
-| tenured arenas | `TenuredArenas` | 1024/1024 KiB | 41 of 252 arenas = 164 KiB live |
-| buffers | `Buffers` | 1024/1024 KiB | — |
-| nursery | `NurseryToSpace` | 1024/1024 KiB | 256 KiB nursery capacity |
-
-3072 KiB of the 3488 KiB an agent makes resident is those three chunks; the
-remaining ~416 KiB is allocator metadata and small per-runtime structures. The
-thread stack is NOT part of it — 48 KiB of its reservation is ever touched.
-The main runtime has the identical three-chunk shape.
-
-**So 164 KiB of live JS data costs 3 MiB of resident chunks, a factor of ~19.**
+| chunk | `ChunkKind` | holding |
+|---|---|---|
+| tenured arenas | `TenuredArenas` | 41 of 252 arenas = 164 KiB live |
+| buffers | `Buffers` | — |
+| nursery | `NurseryToSpace` | 256 KiB nursery capacity |
 
 `JS_GetGCParameter(JSGC_TOTAL_CHUNKS)` reports `1`, which is what made this
 hard to see: it counts only TENURED chunks. The nursery and buffers chunks are
@@ -114,33 +44,9 @@ that does not allocate.
 
 No GC parameter changes any of it. `JSGC_MAX/MIN_NURSERY_BYTES` (256 KiB and
 64 KiB), `JSGC_MIN_EMPTY_CHUNK_COUNT=0`, `JSGC_ALLOCATION_THRESHOLD` and a
-2 MiB heap max were all swept: residency stayed at exactly 3424 KiB in every
-configuration. A smaller nursery still occupies a whole chunk — SpiderMonkey's
-sub-chunk nursery mode bounds what it USES, not what it holds.
-
-Two mechanisms were checked in the engine source at the pinned tag and are NOT
-the cause of the full residency: `ArenaChunk::init`'s
-`Poison(ptr, ..., ChunkSize, ...)` and the nursery's `poisonRange` both compile
-to nothing in a release build (`Poison` is guarded by
-`JS_GC_ALLOW_EXTRA_POISONING`), and both chunk-init branches
-(`decommitAllArenas` / `initAsCommitted`) only set header bitmaps. What touches
-the chunk bodies is still unidentified.
-
-**The lever, and it is the one worth taking:** a fresh runtime allocates THREE
-1 MiB chunks, two of which (buffers, nursery) are near-empty for a worker that
-barely allocates. Cutting the chunk count, or making a chunk's untouched tail
-stay untouched, is where the per-worker megabytes are. Note also that
-per-runtime sharing with the parent IS already working — `staticStrings`,
-`commonNames`, `permanentAtoms` and `selfHostStencil` are all owned only by the
-parent runtime (`JSRuntime::addSizeOfIncludingThis`), and `InitSelfHostedCode`
-measures at zero linear-memory growth. What a child still owns outright is its
-atoms table, GC markers, `tempLifoAlloc`, interpreter stack, source cache,
-nursery and store buffer.
-
-For contrast, a whole extra REALM on an existing runtime — a fresh global plus
-all the standard classes — costs 0.25 MiB. The cost is per-RUNTIME, not
-per-global, and an agent needs its own runtime because a JSContext is
-single-threaded.
+2 MiB heap max were all swept: residency stayed put in every configuration. A
+smaller nursery still occupies a whole chunk — SpiderMonkey's sub-chunk nursery
+mode bounds what it USES, not what it holds.
 
 **Root cause of half of it:** SpiderMonkey's GC chunk is 1 MiB and must be
 1 MiB-ALIGNED (`js/HeapAPI.h`, `ChunkShift = 20`). wasi-libc's dlmalloc cannot
@@ -162,9 +68,19 @@ SpiderMonkey source patch, which `scripts/build-engine-intl.sh` already has a
 verified-targeted-edit mechanism for; the build itself runs through the normal
 host pipeline (`make wasm`), so no container is required.
 
-Even with that fixed the floor is ~3 MiB of GC chunks plus the thread stack
-per agent. Sub-MiB per worker is not reachable while each worker is a full
-JSRuntime; the 0.25 MiB shape is a realm, which cannot have its own thread.
+The lever after that is the chunk COUNT: two of the three chunks are near-empty
+in a worker that barely allocates. Even with both fixed the floor is ~3 MiB of
+GC chunks plus the thread stack per agent. Sub-MiB per worker is not reachable
+while each worker is a full JSRuntime; the 0.25 MiB shape is a realm, which
+cannot have its own thread. (For contrast, a whole extra REALM on an existing
+runtime — a fresh global plus all the standard classes — costs 0.25 MiB. The
+cost is per-RUNTIME, not per-global, and an agent needs its own runtime because
+a JSContext is single-threaded.) Per-runtime sharing with the parent IS already
+working: `staticStrings`, `commonNames`, `permanentAtoms` and `selfHostStencil`
+are owned only by the parent runtime, and `InitSelfHostedCode` measures at zero
+linear-memory growth. What a child still owns outright is its atoms table, GC
+markers, `tempLifoAlloc`, interpreter stack, source cache, nursery and store
+buffer.
 
 ### Why the copy-on-write image does not help a worker
 
@@ -215,11 +131,11 @@ end. It changed nothing that matters:
 | **resident per agent, decommit on vs off** | **1084 → 1084 KiB** | **5120 → 5120 KiB** |
 
 The per-agent figure is byte-identical with the mechanism on and off. The engine
-only ever asks to release chunks it has just CREATED, and since the chunk-header
-fix above those pages were never touched — there is nothing to give back. The
-pages that are genuinely resident get re-touched by the GC immediately after
-release, which is why 27 MiB of successful `MADV_DONTNEED` on linux nets 3.5 MiB
-of process RSS and no per-agent change at all.
+only ever asks to release chunks it has just CREATED, and those pages were never
+touched — there is nothing to give back. The pages that are genuinely resident
+get re-touched by the GC immediately after release, which is why 27 MiB of
+successful `MADV_DONTNEED` on linux nets 3.5 MiB of process RSS and no per-agent
+change at all.
 
 It also needed `pageSize = PageSize` on wasi to make `DecommitEnabled()` true at
 all, which flips chunk init from `initAsCommitted` to `decommitAllArenas`
@@ -249,104 +165,24 @@ NO symptom — no error, no log line, memory simply unchanged:
   into the image and inherited by every restored instance — and restored
   instances never re-run `js_new`, so nothing ever cleared it.
 
-**Where the per-agent megabytes actually are is unchanged by all of this**:
-three 1 MiB chunks per runtime, two of them near-empty in a worker that barely
-allocates. Cutting the chunk COUNT is the lever; releasing pages afterwards is
-not.
-
-## 2. `worker.terminate()` cannot stop a synchronous infinite loop — FIXED
-
-- **Symptom:** `worker.terminate()` on a worker stuck in an infinite
-  SYNCHRONOUS loop (e.g. `new Worker('while(true){}', {eval:true})`) never
-  stopped it, because terminate was purely cooperative: it posted a
-  `__terminate__` sentinel the agent acts on between job-queue drains, and a
-  worker that never drains its inbox never sees it.
-- **Engine fix (landed):** `js_agent_interrupt(handle, agent_id)` in `js.cc`
-  trips that agent's own `JSContext` interrupt and raises a per-agent terminate
-  flag, so the agent's script ends with the same UNCATCHABLE exception the host
-  interrupt raises on the main context, and the agent leaves rather than
-  resuming its pump. Surfaced as `Agents.Interrupt`; `worker.terminate()` now
-  sends the sentinel (which reaches a worker blocked in the host, where no
-  interrupt lands) AND interrupts (which reaches a worker executing JS, where
-  no message lands).
-
-## 3. `unhandledRejection` / `unhandledrejection` never fire — FIXED
-
-- **Symptom:** `process.on('unhandledRejection', …)` and the web
-  `unhandledrejection` event never fired; a rejection with no handler was
-  silently dropped.
-- **Root cause:** SpiderMonkey reports unhandled rejections only through an
-  embedder callback (`JS_SetPromiseRejectionTrackerCallback`), which the
-  engine wasm did not expose. Native-promise rejection state is not observable
-  from pure JS (async-function promises bypass any Promise wrapper).
-- **Engine fix (landed):** `js.cc` registers the rejection tracker and exposes
-  `js_take_unhandled_rejections`, which hands the host the rejections still
-  unhandled and forgets them. The event loop drains it at each microtask
-  checkpoint — so a rejection the guest handles in the same tick is never
-  reported — and delivers each to a guest hook: the web layer dispatches a
-  cancelable `unhandledrejection` on `globalThis`, and `compat/nodejs`
-  replaces the hook with `process.emit('unhandledRejection', …)`, falling back
-  to `uncaughtException` with origin `unhandledRejection` as Node does.
-- **Deliberate divergence:** Node terminates the process when NEITHER listener
-  is registered. Here the rejection is reported on stderr and the loop
-  continues, so enabling this cannot turn a working embedding into a crashing
-  one.
-
-## 4. Intermittent `JS_DestroyContext` teardown SIGSEGV — FIXED, and it was NOT an engine bug
-
-- **Symptom:** the full `compat/nodejs` package intermittently faulted during
-  teardown, measured at 3 runs in 16, always inside generated engine code
-  reached via `js.Close()` → `JS_DestroyContext`, on a wild pointer (fault
-  addresses several GB up, far outside a 256 MiB linear memory).
-- **Actual root cause — a double free in the COMPAT layer, not the engine.**
-  `fetchAPI.closeAll` released its cached engine handles without clearing the
-  fields, and `Object.Free` had no guard. A handle IS a pointer to the guest's
-  GC root for that object, so closing a `Runtime` twice — reachable whenever an
-  embedder closes explicitly and a deferred close also runs — deleted five GC
-  roots twice. Nothing failed at that moment; the corrupted root list only
-  surfaced later, when teardown walked it, in whatever unrelated test happened
-  to tear down next. Fixed by making both `Object.Free` and `closeAll`
-  idempotent. 3/16 → 0/16.
-- **Why it read as an engine bug for so long, and the two lessons:**
-  - *Never benchmark a local build against the PUBLISHED
-    `spidermonkeywasm2go` artifact.* It is CI-built from a different engine
-    archive and an older `js.cc`, so it differs in far more than the change
-    under test. It measured 0/16 while a local build of the SAME `main` source
-    measured 3/16 — which made it look like whatever branch was being tested
-    had caused the fault. Build both arms locally.
-  - *Get a fast reproducer before forming hypotheses.* The full package is 84 s
-    a run, so each guess cost 20+ minutes and several were spent on plausible
-    but wrong engine-side theories. One test at `-count=4` reproduced it in
-    4.2 s; from there, isolating it took two comparisons — the same script with
-    one `Close` (0/6) versus two (6/6).
-
-## 5. Intermittent test262 Atomics structured-clone CI flake
+## 2. Intermittent test262 Atomics structured-clone CI flake
 
 - **Symptom:** a test262 Atomics case using structured clone across agents
   intermittently fails in CI with "extra data after end".
 - **Root cause:** a wasi-threads / agent structured-clone race in the engine.
 - **Engine fix needed:** fix the race in the engine's agent clone transport.
 
-## 6. Module-loader classification heuristics — engine side landed, loader not yet rewired
+## 3. Module-loader classification heuristics — two of three still unanswerable
 
 - **Symptom:** the module loader uses regex/string heuristics to classify a
-  module — CommonJS-exports detection (`cjs_exports.go`), default-export
-  detection (`nodejs.go` `hasDefaultExport`), and ESM-syntax detection
-  (`resolve.go` `esmSyntax`). These are the load-bearing exceptions to the
-  "no heuristics" rule.
-- **Engine side (landed):** `js_source_is_module` compiles the source twice —
-  once as a module, once inside the CommonJS wrapper function — and reports
-  whether it needs module semantics, which is Node's own detection rule and
-  the exact question `esmSyntax` is guessing at. It is strictly more correct
-  than the regex, which is line-anchored (so it misses a minified one-line
-  bundle) and unaware of comments and string literals (so it fires on the word
-  `export` inside either). Exposed as `internal.JS.SourceIsModule`.
-- **Still to do (loader side):** `resolve.go`'s `classifyJS` has to call it
-  instead of `esmSyntax`. That is blocked on one thing: `dispatchModuleLoad`
-  (`hostenv.go`) does NOT release the instance's invoke lock the way an
-  ordinary host function does, so any bridge call made from inside the module
-  loader self-deadlocks. `JS.UnlockForHostCallback` is the intended escape
-  hatch and is legal there; wiring it is the prerequisite.
+  module. These are the load-bearing exceptions to the "no heuristics" rule.
+- **ESM-vs-CJS detection is DONE.** `js_source_is_module` compiles the source
+  twice — once as a module, once inside the CommonJS wrapper function — and
+  reports whether it needs module semantics, which is Node's own detection rule.
+  The resolver still sniffs, but now marks the answer as a guess
+  (`resolution.KindGuessed`), and `Runtime.refineKind` replaces every guess with
+  `spidermonkey.JS.SourceIsModule`. The regex survives only as the fallback for
+  `nodejs.ESMLoader` used standalone, which has no interpreter to ask.
 - **Not answerable by ANY module compile:** `cjs_exports.go`. It asks which
   string keys a CommonJS module would end up putting on `module.exports` —
   `exports.foo = …`, `Object.defineProperty(exports, …)`, `module.exports =
@@ -355,12 +191,13 @@ not.
   re-entrancy-locked) cannot do. Removing that heuristic needs either a
   script-AST introspection primitive or a `cjs-module-lexer` equivalent in
   C++, not module introspection.
-- **`hasDefaultExport`** needs a module's export-name set, which the public
-  JSAPI only exposes through a module NAMESPACE — and that requires the whole
-  dependency graph to be loaded and linked, far more than a classification
-  sniff should cost. It stays a heuristic until that trade changes.
+- **`hasDefaultExport`** (`nodejs.go`) needs a module's export-name set, which
+  the public JSAPI only exposes through a module NAMESPACE — and that requires
+  the whole dependency graph to be loaded and linked, far more than a
+  classification sniff should cost. It stays a heuristic until that trade
+  changes.
 
-## 7. ICU / Intl and non-core text encodings
+## 4. ICU / Intl and non-core text encodings
 
 - **Symptom:** full `Intl`/ICU behavior and text encodings beyond
   utf-8/latin1/utf-16le are not available.
@@ -368,7 +205,7 @@ not.
   wasm build), not implementable in the compat layer.
 - **Engine fix needed:** build the engine wasm with the required ICU data.
 
-## 8. `async_hooks`: a store cannot outlive the call that established it
+## 5. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.
