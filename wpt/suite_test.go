@@ -247,7 +247,7 @@ func TestWPTSuite(t *testing.T) {
 		t.Logf("no %s: reporting only, not judging", expectationsFile)
 		return
 	}
-	var regressions, stale []string
+	var regressions, changed, stale []string
 	for k, detail := range failures {
 		want, ok := expected[k]
 		if !ok {
@@ -255,9 +255,11 @@ func TestWPTSuite(t *testing.T) {
 			continue
 		}
 		// The value carries the count and a digest of WHICH subtests failed, so a
-		// change here is a change in outcome even when the count is identical.
+		// difference here is a change in outcome even when the count matches. It
+		// may be an improvement — that still has to be recorded, or the file stops
+		// describing the run.
 		if want != detail {
-			regressions = append(regressions, k+": was "+want+", now "+detail)
+			changed = append(changed, k+": was "+want+", now "+detail)
 		}
 	}
 	for k := range expected {
@@ -268,7 +270,15 @@ func TestWPTSuite(t *testing.T) {
 		}
 	}
 	sort.Strings(regressions)
+	sort.Strings(changed)
 	sort.Strings(stale)
+	for i, c := range changed {
+		if i == 50 {
+			t.Errorf("... and %d more changed outcomes", len(changed)-50)
+			break
+		}
+		t.Errorf("outcome changed (update %s): %s", expectationsFile, c)
+	}
 	for i, r := range regressions {
 		if i == 50 {
 			t.Errorf("... and %d more unexpected failures", len(regressions)-50)

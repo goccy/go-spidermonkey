@@ -37,9 +37,17 @@
 			this.extractable = extractable;
 			this.algorithm = algorithm;
 			this.usages = [...usages];
-			this._h = handle;
+			// Not enumerable: `usages` and friends are the interface, the handle is
+			// not, and WPT's structural checks walk own enumerable properties.
+			Object.defineProperty(this, "_h", { value: handle, writable: true });
 		}
 	}
+	// Every Web IDL interface has one; WPT checks it on every key it produces,
+	// and its absence fails not only that assertion but everything downstream
+	// that reuses the key.
+	Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, {
+		value: "CryptoKey", configurable: true,
+	});
 	globalThis.CryptoKey = CryptoKey;
 
 	// Secret key material lives OUTSIDE the CryptoKey object, in WeakMaps, so a
