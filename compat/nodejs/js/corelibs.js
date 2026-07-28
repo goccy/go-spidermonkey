@@ -1242,6 +1242,19 @@
 		};
 	}
 
+	// fsResolve turns a path argument into the absolute path the host ops take.
+	// A RELATIVE path means "relative to process.cwd()", exactly as in Node —
+	// without this, process.chdir() would move the reported directory while
+	// every relative read kept resolving against the filesystem root, which is
+	// worse than not having chdir at all.
+	function fsResolve(p) {
+		if (p instanceof URL) return p.pathname;
+		const s = typeof p === "string" ? p : String(p);
+		if (s.startsWith("/")) return s;
+		const cwd = globalThis.process ? globalThis.process.cwd() : "/";
+		return (cwd === "/" ? "/" : cwd + "/") + s;
+	}
+
 	// flagOf extracts the string `flag` option ("w", "a", "wx", ...) from a
 	// writeFile/appendFile options bag; string opts are encodings, not flags.
 	const flagOf = (opts, dflt) =>
@@ -1249,7 +1262,7 @@
 	// Node's stringToFlags: 'x' anywhere means O_EXCL (wx/xw/ax/xa/wx+/...),
 	// 'a' anywhere (in a valid flag) means O_APPEND.
 	function checkExclusive(p, flag) {
-		if (flag.includes("x") && ops.fs_exists(String(p))) {
+		if (flag.includes("x") && ops.fs_exists(fsResolve(p))) {
 			throw fsError({ code: "EEXIST", message: "file already exists" }, "open", p);
 		}
 	}
@@ -1261,7 +1274,7 @@
 
 	const fsSync = {
 		readFileSync(p, opts) {
-			const r = ops.fs_read_file(String(p));
+			const r = ops.fs_read_file(fsResolve(p));
 			ops.release_pending();
 			if (isErr(r)) throw fsError(r, "open", p);
 			const buf = wrapBuf(r);
@@ -1281,18 +1294,18 @@
 			const flag = flagOf(opts, "w");
 			checkExclusive(p, flag);
 			const append = flag.includes("a");
-			const r = ops.fs_write_file(String(p), payload, append);
+			const r = ops.fs_write_file(fsResolve(p), payload, append);
 			if (isErr(r)) throw fsError(r, "open", p);
 		},
 		appendFileSync(p, data, opts) {
 			const payload = typeof data === "string" ? Buffer.from(data, encodingOf(opts) || "utf8") : Buffer.from(data);
 			checkExclusive(p, flagOf(opts, "a"));
-			const r = ops.fs_write_file(String(p), payload, true);
+			const r = ops.fs_write_file(fsResolve(p), payload, true);
 			if (isErr(r)) throw fsError(r, "open", p);
 		},
-		existsSync: (p) => ops.fs_exists(String(p)),
+		existsSync: (p) => ops.fs_exists(fsResolve(p)),
 		statSync(p, opts) {
-			const r = ops.fs_stat(String(p));
+			const r = ops.fs_stat(fsResolve(p));
 			if (isErr(r)) throw fsError(r, "stat", p);
 			return statsOf(r, !!(opts && opts.bigint));
 		},
@@ -1337,24 +1350,24 @@
 			return out;
 		},
 		accessSync(p, mode) {
-			if (!ops.fs_exists(String(p))) {
+			if (!ops.fs_exists(fsResolve(p))) {
 				throw fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p);
 			}
 		},
 		mkdirSync(p, opts) {
-			const r = ops.fs_mkdir(String(p), !!(opts && opts.recursive));
+			const r = ops.fs_mkdir(fsResolve(p), !!(opts && opts.recursive));
 			if (isErr(r)) throw fsError(r, "mkdir", p);
 		},
 		rmdirSync(p) {
-			const r = ops.fs_remove(String(p));
+			const r = ops.fs_remove(fsResolve(p));
 			if (isErr(r)) throw fsError(r, "rmdir", p);
 		},
 		unlinkSync(p) {
-			const r = ops.fs_remove(String(p));
+			const r = ops.fs_remove(fsResolve(p));
 			if (isErr(r)) throw fsError(r, "unlink", p);
 		},
 		renameSync(oldP, newP) {
-			const r = ops.fs_rename(String(oldP), String(newP));
+			const r = ops.fs_rename(fsResolve(oldP), String(newP));
 			if (isErr(r)) throw fsError(r, "rename", oldP);
 		},
 		realpathSync(p) {
@@ -1370,7 +1383,7 @@
 		watch(p, options, listener) {
 			if (typeof options === "function") { listener = options; options = {}; }
 			const watcher = new EventEmitter();
-			const id = ops.fs_watch(String(p), (eventType, filename) => {
+			const id = ops.fs_watch(fsResolve(p), (eventType, filename) => {
 				watcher.emit("change", eventType, filename);
 				if (listener) listener(eventType, filename);
 			});
@@ -1381,7 +1394,7 @@
 			if (typeof options === "function") { listener = options; options = {}; }
 			let prev = null;
 			try { prev = fsSync.statSync(p); } catch {}
-			const id = ops.fs_watch(String(p), () => {
+			const id = ops.fs_watch(fsResolve(p), () => {
 				let cur = null;
 				try { cur = fsSync.statSync(p); } catch {}
 				listener(cur || { mtime: new Date(0), size: 0 }, prev || { mtime: new Date(0), size: 0 });
@@ -1404,19 +1417,19 @@
 			}
 		},
 		copyFileSync(src, dest) {
-			const r = ops.fs_copyfile(String(src), String(dest));
+			const r = ops.fs_copyfile(fsResolve(src), String(dest));
 			if (isErr(r)) throw fsError(r, "copyfile", src);
 		},
 		rmSync(p, options = {}) {
-			const r = ops.fs_rm(String(p), !!options.recursive, !!options.force);
+			const r = ops.fs_rm(fsResolve(p), !!options.recursive, !!options.force);
 			if (isErr(r)) throw fsError(r, "rm", p);
 		},
 		rmdirSync(p, options = {}) {
-			const r = ops.fs_rm(String(p), !!(options && options.recursive), false);
+			const r = ops.fs_rm(fsResolve(p), !!(options && options.recursive), false);
 			if (isErr(r)) throw fsError(r, "rmdir", p);
 		},
 		mkdtempSync(prefix) {
-			const r = ops.fs_mkdtemp(String(prefix));
+			const r = ops.fs_mkdtemp(fsResolve(prefix));
 			if (isErr(r)) throw fsError(r, "mkdtemp", prefix);
 			return r;
 		},
@@ -1437,7 +1450,7 @@
 			// Exclusive ('x') fails on an existing file; the host op then gets the
 			// base flag ('x' and the sync 's' modifier stripped: "wx" -> "w").
 			checkExclusive(p, f);
-			const r = ops.fs_open(String(p), f.replace(/[xs]/g, "") || "r");
+			const r = ops.fs_open(fsResolve(p), f.replace(/[xs]/g, "") || "r");
 			if (isErr(r)) throw fsError(r, "open", p);
 			return r;
 		},
@@ -1484,7 +1497,7 @@
 		chmodSync(p, mode) {
 			// Node accepts an octal string ("755") or a number.
 			const m = typeof mode === "string" ? parseInt(mode, 8) : Number(mode);
-			const r = ops.fs_chmod(String(p), m & 0o7777);
+			const r = ops.fs_chmod(fsResolve(p), m & 0o7777);
 			if (isErr(r)) throw fsError(r, "chmod", p);
 		},
 		lchmodSync(p, mode) { return fsSync.chmodSync(p, mode); }, // no symlinks
@@ -1493,7 +1506,7 @@
 		utimesSync(p, atime, mtime) {
 			// Node: numbers are epoch SECONDS; Dates and numeric strings work too.
 			const toMs = (t) => (t instanceof Date ? t.getTime() : Number(t) * 1000);
-			const r = ops.fs_utimes(String(p), toMs(atime), toMs(mtime));
+			const r = ops.fs_utimes(fsResolve(p), toMs(atime), toMs(mtime));
 			if (isErr(r)) throw fsError(r, "utime", p);
 		},
 		lutimesSync(p, atime, mtime) { return fsSync.utimesSync(p, atime, mtime); },
@@ -1638,7 +1651,7 @@
 		if (signal && signal.aborted) return Promise.reject(fsAbortErr(signal));
 		try { return Promise.resolve(fsSync.writeFileSync(p, data, opts)); } catch (e) { return Promise.reject(e); }
 	};
-	promisified.access = (p) => (ops.fs_exists(String(p)) ? Promise.resolve() : Promise.reject(fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p)));
+	promisified.access = (p) => (ops.fs_exists(fsResolve(p)) ? Promise.resolve() : Promise.reject(fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p)));
 	promisified.open = (p, flags) => { try { return Promise.resolve(makeFileHandle(fsSync.openSync(p, flags))); } catch (e) { return Promise.reject(e); } };
 	core["fs/promises"] = promisified;
 	fsMod.promises = promisified;

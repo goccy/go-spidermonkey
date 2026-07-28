@@ -27,6 +27,8 @@
 	// registered after them and before any macrotask; a tick queued BY a
 	// promise job runs after the current promise batch (Node proper
 	// interleaves per-job — a documented deviation, see the plan).
+	// The process working directory, tracked guest-side (see chdir).
+	let __cwd = "/";
 	const tickQueue = [];
 	let tickScheduled = false;
 	const runTicks = () => {
@@ -96,8 +98,28 @@
 		ppid: 0,
 		title: "node",
 		exitCode: undefined,
-		cwd: () => "/",
-		chdir: () => { throw new Error("process.chdir is not supported in this runtime"); },
+		// The working directory is a guest-side notion: this runtime's filesystem
+		// is Config.FS, whose root IS "/", so a cwd is just the prefix relative
+		// paths resolve against. Refusing chdir outright made any program that
+		// organizes itself by directory fail at the first call, for no reason
+		// other than that nothing tracked the value.
+		cwd: () => __cwd,
+		chdir: (dir) => {
+			if (typeof dir !== "string") {
+				throw Object.assign(new TypeError("The \"directory\" argument must be of type string"), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			const next = dir.startsWith("/") ? dir : __cwd.replace(/\/$/, "") + "/" + dir;
+			const norm = core.path.resolve(next);
+			// chdir to a path that is not a directory is ENOENT/ENOTDIR, as in Node.
+			let st;
+			try { st = core.fs.statSync(norm); } catch (e) {
+				throw Object.assign(new Error(`ENOENT: no such file or directory, chdir '${dir}'`), { code: "ENOENT", path: dir });
+			}
+			if (!st.isDirectory()) {
+				throw Object.assign(new Error(`ENOTDIR: not a directory, chdir '${dir}'`), { code: "ENOTDIR", path: dir });
+			}
+			__cwd = norm;
+		},
 		umask: () => 0o022,
 		nextTick(cb, ...args) {
 			if (typeof cb !== "function") throw new TypeError("callback is not a function");
