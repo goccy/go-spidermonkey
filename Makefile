@@ -86,8 +86,18 @@ nodetest-fetch:
 ## nodetest: run the Node.js project's own test suite against compat/nodejs.
 ## Tests addressed to the node binary itself (private internals, respawn, V8
 ## flags) are skipped with an accounted reason; see nodetest/policy.go.
+##
+## It runs in SHARDS, one process each, because a long single-process run stops
+## making progress (docs/engine-followups.md); sharding bounds that to one
+## shard. Sequential, so the shards do not oversubscribe the machine.
+NODETEST_SHARDS ?= 4
 nodetest: nodetest-fetch
-	NODETEST=1 go test ./nodetest/ -run TestNodeSuite -v -timeout 3h
+	@set -e; fail=0; i=0; while [ $$i -lt $(NODETEST_SHARDS) ]; do \
+		echo "==> nodetest shard $$i/$(NODETEST_SHARDS)"; \
+		NODETEST=1 NODETEST_SHARD=$$i/$(NODETEST_SHARDS) \
+			go test ./nodetest/ -run TestNodeSuite -v -timeout 1h || fail=1; \
+		i=$$((i + 1)); \
+	done; exit $$fail
 
 ## wpt-fetch: check out the pinned web-platform-tests tree into wpt/suite.
 wpt-fetch:
