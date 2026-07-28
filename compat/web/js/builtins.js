@@ -2230,6 +2230,76 @@
 	// FormData / Blob as init.body; the native path only understands a plain
 	// {string:string} headers object and a Uint8Array body. Normalize both here (and
 	// accept a Request as input) so those common shapes don't throw at the boundary.
+	// requestOrigin/requestReferrer implement the two headers every fetch
+	// carries and this one did not send at all, which is why the suite's
+	// fixtures reported them as absent.
+	//
+	// The environment's own URL is `location.href`; an embedding with no
+	// location has no origin to speak for, so both headers are omitted rather
+	// than invented.
+	function environmentURL() {
+		try {
+			const href = globalThis.location && globalThis.location.href;
+			return href ? new URL(href) : null;
+		} catch { return null; }
+	}
+
+	// Origin travels with a CORS request and with any method outside the
+	// safelist — a POST states its origin even in no-cors mode.
+	function originHeaderFor(mode, method, envURL) {
+		if (!envURL) return null;
+		const m = String(method || "GET").toUpperCase();
+		if (mode === "cors" || (m !== "GET" && m !== "HEAD")) return envURL.origin;
+		return null;
+	}
+
+	// Referer under the default policy, strict-origin-when-cross-origin: the
+	// full URL to a same-origin peer, the bare origin cross-origin, and nothing
+	// at all when stepping down from https to http.
+	function referrerHeaderFor(policy, envURL, targetURL) {
+		if (!envURL || !targetURL) return null;
+		const p = String(policy || "strict-origin-when-cross-origin");
+		if (p === "no-referrer") return null;
+		// The referrer never carries credentials or a fragment.
+		const full = envURL.origin + envURL.pathname + envURL.search;
+		if (p === "unsafe-url") return full;
+		const downgrade = envURL.protocol === "https:" && targetURL.protocol === "http:";
+		if (downgrade && (p === "strict-origin-when-cross-origin" || p === "strict-origin" ||
+			p === "no-referrer-when-downgrade")) {
+			return null;
+		}
+		const originRef = envURL.origin + "/";
+		if (p === "origin") return originRef;
+		if (p === "same-origin") return envURL.origin === targetURL.origin ? full : null;
+		if (p === "origin-when-cross-origin" || p === "strict-origin-when-cross-origin") {
+			return envURL.origin === targetURL.origin ? full : originRef;
+		}
+		if (p === "strict-origin") return originRef;
+		return full; // "no-referrer-when-downgrade" and anything unrecognized
+	}
+
+	// checkCORS enforces the part of the Fetch spec that decides whether a
+	// cross-origin response may be handed to the caller at all. None of it was
+	// enforced: every cross-origin fetch resolved, so the ~265 subtests that
+	// assert a request MUST be rejected all reported "Should have rejected".
+	//
+	// A request whose mode is "same-origin" never leaves the origin; a "cors"
+	// request needs the server's permission in Access-Control-Allow-Origin; a
+	// "no-cors" request is allowed but its response is opaque.
+	function corsError(what) {
+		return new TypeError("Failed to fetch: " + what);
+	}
+
+	function corsAllowsResponse(res, origin) {
+		const allow = res.headers && res.headers.get("access-control-allow-origin");
+		if (!allow) return false;
+		if (allow === "*") {
+			// A wildcard cannot authorize a credentialed request.
+			return true;
+		}
+		return allow === origin;
+	}
+
 	globalThis.fetch = function fetch(input, init) {
 		// fetch must ALWAYS return a promise: a normalization failure (a malformed
 		// headers init, an unsupported ReadableStream body) must reject, not throw
@@ -2253,6 +2323,40 @@
 			const nInit = {};
 			const method = init.method || (isReq ? input.method : undefined);
 			if (method !== undefined) nInit.method = method;
+			// Origin and Referer are set by the user agent, not by the caller, so
+			// an explicit header of either wins and is left alone.
+			const envURL = environmentURL();
+			const mode = String(init.mode ?? (isReq ? input.mode : undefined) ?? "cors");
+			if (!headers.has("origin")) {
+				const origin = originHeaderFor(mode, method, envURL);
+				if (origin) headers.set("origin", origin);
+			}
+			// Only a network scheme can be cross-origin. data:, blob: and file:
+			// are fetched by their own scheme handler, not through CORS — judging
+			// them by origin rejected every data: URL, since its origin is "null".
+			const networkScheme = !!parsed && (parsed.protocol === "http:" || parsed.protocol === "https:");
+			const crossOrigin = !!(envURL && networkScheme && envURL.origin !== parsed.origin);
+			if (mode === "same-origin" && crossOrigin) {
+				throw corsError("a same-origin request cannot go to " + parsed.origin);
+			}
+			if (!headers.has("referer")) {
+				const explicit = init.referrer ?? (isReq ? input.referrer : undefined);
+				const policy = init.referrerPolicy ?? (isReq ? input.referrerPolicy : undefined);
+				let ref = null;
+				if (explicit !== undefined && explicit !== "about:client") {
+					ref = null;
+					if (String(explicit) !== "") {
+						try {
+							const u = new URL(String(explicit), envURL ? envURL.href : undefined);
+							u.username = ""; u.password = ""; u.hash = "";
+							ref = u.href;
+						} catch { ref = String(explicit); }
+					}
+				} else {
+					ref = referrerHeaderFor(policy, envURL, parsed);
+				}
+				if (ref) headers.set("referer", ref);
+			}
 			if (init.redirect !== undefined && init.redirect !== null) nInit.redirect = String(init.redirect);
 			const signal = init.signal || (isReq ? input.signal : undefined);
 			// A signal already aborted at call time rejects immediately with its reason
@@ -2279,7 +2383,18 @@
 				nInit.headers = hdrObj;
 				if (signal && onAbort) signal.addEventListener("abort", onAbort);
 				return globalThis.__native_fetch(url, nInit).then(
-					(res) => { cleanup(); return trackBodyUsed(res); },
+					(res) => {
+						cleanup();
+						const tracked = trackBodyUsed(res);
+						if (crossOrigin && mode === "cors" && !corsAllowsResponse(tracked, envURL.origin)) {
+							throw corsError("no Access-Control-Allow-Origin for " + envURL.origin);
+						}
+						if (crossOrigin && mode === "no-cors") return opaqueResponse(tracked);
+						if (crossOrigin) {
+							try { Object.defineProperty(tracked, "type", { configurable: true, value: "cors" }); } catch { /* ignore */ }
+						}
+						return tracked;
+					},
 					(err) => {
 						cleanup();
 						// A mid-flight abort surfaces from the host as a context-cancel
@@ -2355,6 +2470,18 @@
 			Object.defineProperty(res, "bodyUsed", { configurable: true, get: () => used });
 		} catch { /* leave the native field as-is */ }
 		return res;
+	}
+
+	// opaqueResponse is what a no-cors cross-origin fetch hands back: status 0,
+	// no headers, an empty body and type "opaque". The bytes were fetched, but
+	// the spec says the page may not see them.
+	function opaqueResponse(res) {
+		const empty = new Response(null, { status: 200 });
+		for (const [k] of [...empty.headers]) empty.headers.delete(k);
+		for (const [name, value] of [["type", "opaque"], ["status", 0], ["ok", false], ["statusText", ""], ["url", ""]]) {
+			try { Object.defineProperty(empty, name, { configurable: true, value }); } catch { /* ignore */ }
+		}
+		return empty;
 	}
 
 	// parseMultipartForm parses a multipart/form-data body into a FormData. Bytes

@@ -373,6 +373,9 @@ func checkRequestPermission(cfg spidermonkey.Config, req *http.Request) error {
 
 // sameOrigin reports whether two URLs share an origin (scheme + hostname +
 // effective port), the unit fetch uses to decide cross-origin header stripping.
+// fetchUserAgent is what this runtime calls itself on the wire.
+const fetchUserAgent = "go-spidermonkey"
+
 func sameOrigin(a, b *url.URL) bool {
 	return a.Scheme == b.Scheme && a.Hostname() == b.Hostname() && originPort(a) == originPort(b)
 }
@@ -494,6 +497,12 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	// Identify the runtime. Go's transport otherwise sends "Go-http-client/1.1",
+	// which names the transport rather than the platform, and a fetch with no
+	// User-Agent at all is something no user agent does.
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", fetchUserAgent)
 	}
 	// A per-request client selects the redirect policy without disturbing the
 	// shared transport (its connection pool is reused). Go's redirect handling
