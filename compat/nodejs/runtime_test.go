@@ -408,7 +408,7 @@ func TestESMImportsCJS(t *testing.T) {
 	r, err := rt.RunModule(context.Background(), "main.mjs", `
 		import math from "mathpkg";
 		import greet from "./lib/greet.js";
-		import cfg from "./config.json";
+		import cfg from "./config.json" with { type: "json" };
 		globalThis.result = [math.double(4), greet("esm"), cfg.version].join("|");
 	`)
 	if err != nil {

@@ -167,7 +167,7 @@ func (rt *Runtime) cjsExportNames(fsys fs.FS, p string, src []byte, seen map[str
 // named exports: core-module export lists come from the runtime's collected
 // tables, CJS files recurse into the analyzer.
 func (rt *Runtime) cjsReexportNames(fsys fs.FS, spec, parent string, seen map[string]bool, depth int) []string {
-	r, err := resolveModule(fsys, spec, parent, true)
+	r, err := resolveModule(fsys, spec, parent, flavorNodeCJS)
 	if err != nil {
 		return nil
 	}

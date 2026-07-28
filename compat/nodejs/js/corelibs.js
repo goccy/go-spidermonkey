@@ -541,13 +541,20 @@
 		seen.add(v);
 		try {
 			if (Array.isArray(v)) {
-				return v.length ? `[ ${v.map((x) => inspect(x, opts, depth + 1, seen)).join(", ")} ]` : "[]";
+				if (!v.length) return "[]";
+				const cap = inspectCap(opts);
+				const shown = v.slice(0, cap).map((x) => inspect(x, opts, depth + 1, seen));
+				return `[ ${shown.join(", ")}${inspectMore(v.length, cap)} ]`;
 			}
 			if (v instanceof Map) {
-				return `Map(${v.size}) {${[...v].map(([k, x]) => ` ${inspect(k, opts, depth + 1, seen)} => ${inspect(x, opts, depth + 1, seen)}`).join(",")} }`;
+				const cap = inspectCap(opts);
+				const items = inspectTake(v, cap).map(([k, x]) => ` ${inspect(k, opts, depth + 1, seen)} => ${inspect(x, opts, depth + 1, seen)}`);
+				return `Map(${v.size}) {${items.join(",")}${inspectMore(v.size, cap)} }`;
 			}
 			if (v instanceof Set) {
-				return `Set(${v.size}) {${[...v].map((x) => " " + inspect(x, opts, depth + 1, seen)).join(",")} }`;
+				const cap = inspectCap(opts);
+				const items = inspectTake(v, cap).map((x) => " " + inspect(x, opts, depth + 1, seen));
+				return `Set(${v.size}) {${items.join(",")}${inspectMore(v.size, cap)} }`;
 			}
 			const keys = Object.keys(v);
 			if (!keys.length) return "{}";
@@ -561,6 +568,32 @@
 		} finally {
 			seen.delete(v);
 		}
+	}
+
+	// Node's util.inspect renders at most maxArrayLength (default 100) entries of
+	// an array, Map or Set and reports the rest as "... N more items". Formatting
+	// all of them builds an intermediate proportional to the collection, which is
+	// how console.log of a ten-million-element array exhausted the interpreter's
+	// whole memory budget instead of printing a line. null means "no limit", as
+	// in Node.
+	function inspectCap(opts) {
+		const n = opts && opts.maxArrayLength;
+		if (n === null) return Infinity;
+		return typeof n === "number" && n >= 0 ? n : 100;
+	}
+
+	function inspectMore(total, cap) {
+		const n = total - cap;
+		return n > 0 ? `, ... ${n} more item${n === 1 ? "" : "s"}` : "";
+	}
+
+	function inspectTake(it, cap) {
+		const out = [];
+		for (const x of it) {
+			if (out.length >= cap) break;
+			out.push(x);
+		}
+		return out;
 	}
 
 	function format(f, ...args) {

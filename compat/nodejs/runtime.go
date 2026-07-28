@@ -234,8 +234,13 @@ func (rt *Runtime) Wait(ctx context.Context) error {
 	if err == nil && !rt.Exited() {
 		// Loop drained without error or process.exit: fire 'beforeExit'. If a
 		// listener exists (and may have scheduled work), drain once more.
+		// A 'beforeExit' listener may itself throw; that is a guest exception to
+		// report, not a host failure to ignore (ignoring it read r.Value, which
+		// a throw leaves empty).
 		if r, e := rt.js.Eval(ctx, "!!(globalThis.__node_emit_before_exit && globalThis.__node_emit_before_exit())"); e != nil {
 			err = e
+		} else if r.Error != nil {
+			err = r.Error
 		} else if r.Value.Bool() {
 			err = rt.web.Wait(ctx)
 		}
@@ -335,7 +340,15 @@ func (rt *Runtime) RunModule(ctx context.Context, specifier, src string) (spider
 // module loader cannot re-enter the interpreter.)
 func (rt *Runtime) collectCoreExports(ctx context.Context) error {
 	for name := range coreModules {
-		r, err := rt.js.Eval(ctx, `Object.keys(globalThis.__node_core(`+strconv.Quote(name)+`)).join(",")`)
+		// getOwnPropertyNames, not Object.keys: a core module's export may be a
+		// non-enumerable accessor (node:module defines `builtinModules` with
+		// Object.defineProperty), and Object.keys skipped exactly those — so
+		// `import { builtinModules } from "node:module"` failed to link, which is
+		// what @babel/core does. The intrinsic properties of a function-valued
+		// module object (node:module IS the Module class) are excluded; they are
+		// not exports.
+		r, err := rt.js.Eval(ctx, `Object.getOwnPropertyNames(globalThis.__node_core(`+strconv.Quote(name)+
+			`)).filter((k) => !["length", "name", "prototype", "caller", "arguments", "constructor"].includes(k)).join(",")`)
 		if err != nil {
 			return err
 		}
@@ -382,7 +395,7 @@ func (rt *Runtime) coreShim(name string) string {
 // ESM⇄CJS interop (a CJS target evaluates through require and surfaces as
 // the default export plus statically detected named exports).
 func (rt *Runtime) esmLoader(cfg spidermonkey.Config, specifier, referrer string) (string, error) {
-	r, err := resolveModule(cfg.FS, specifier, referrer, false)
+	r, err := resolveModule(cfg.FS, specifier, referrer, flavorNodeESM)
 	if err != nil {
 		return "", err
 	}
@@ -419,14 +432,10 @@ func (rt *Runtime) esmLoader(cfg spidermonkey.Config, specifier, referrer string
 }
 
 // canonicalESMShim re-exports the module registered at its canonical file://
-// URL. `export * from` cannot forward a default export, so one is added when
-// the target visibly declares it.
+// URL, default included (see reexportShim for why that is read off the
+// namespace rather than detected in the source).
 func canonicalESMShim(canonical string, src []byte) string {
-	shim := fmt.Sprintf("export * from %q;\n", canonical)
-	if hasDefaultExport(src) {
-		shim += fmt.Sprintf("export { default } from %q;\n", canonical)
-	}
-	return shim
+	return reexportShim(canonical)
 }
 
 // ---------------------------------------------------------------- host ops
@@ -562,7 +571,7 @@ func (rt *Runtime) opResolve(cfg spidermonkey.Config, args []spidermonkey.Value)
 	if len(args) < 2 {
 		return nil, fmt.Errorf("node_resolve: (specifier, parent) required")
 	}
-	r, err := resolveModule(cfg.FS, args[0].String(), guestPath(args[1].String()), true)
+	r, err := resolveModule(cfg.FS, args[0].String(), guestPath(args[1].String()), flavorNodeCJS)
 	if err != nil {
 		return spidermonkey.ValueOf(map[string]any{"code": "MODULE_NOT_FOUND", "message": err.Error()}), nil
 	}

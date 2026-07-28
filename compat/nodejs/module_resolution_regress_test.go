@@ -5,10 +5,12 @@ package nodejs_test
 // matching by object key order.
 
 import (
+	"context"
 	"testing"
 	"testing/fstest"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
+	"github.com/goccy/go-spidermonkey/compat/nodejs"
 )
 
 // require('.') and require('..') resolve relative to the requiring module's
@@ -115,22 +117,22 @@ func TestPackageSelfReferenceNameMismatchFallsThrough(t *testing.T) {
 
 // Node matches export conditions by the CONDITION OBJECT'S KEY ORDER against
 // the enabled-conditions set — not by a fixed engine-side preference list.
-// With both "import" and "workerd" enabled, whichever the package lists first
+// With both "node" and "import" enabled, whichever the package lists first
 // wins.
 func TestExportConditionsMatchInKeyOrderESM(t *testing.T) {
 	fsys := fstest.MapFS{
-		// import listed before workerd: import must win.
+		// import listed before node: import must win.
 		"node_modules/first/package.json": {Data: []byte(`{
-			"exports": { ".": { "import": "./import.mjs", "workerd": "./workerd.mjs" } }
+			"exports": { ".": { "import": "./import.mjs", "node": "./node.mjs" } }
 		}`)},
-		"node_modules/first/import.mjs":  {Data: []byte(`export const which = "import";`)},
-		"node_modules/first/workerd.mjs": {Data: []byte(`export const which = "workerd";`)},
-		// workerd listed before import: workerd must win.
+		"node_modules/first/import.mjs": {Data: []byte(`export const which = "import";`)},
+		"node_modules/first/node.mjs":   {Data: []byte(`export const which = "node";`)},
+		// node listed before import: node must win.
 		"node_modules/second/package.json": {Data: []byte(`{
-			"exports": { ".": { "workerd": "./workerd.mjs", "import": "./import.mjs" } }
+			"exports": { ".": { "node": "./node.mjs", "import": "./import.mjs" } }
 		}`)},
-		"node_modules/second/import.mjs":  {Data: []byte(`export const which = "import";`)},
-		"node_modules/second/workerd.mjs": {Data: []byte(`export const which = "workerd";`)},
+		"node_modules/second/import.mjs": {Data: []byte(`export const which = "import";`)},
+		"node_modules/second/node.mjs":   {Data: []byte(`export const which = "node";`)},
 	}
 	js, rt := newRuntime(t, spidermonkey.Config{FS: fsys})
 	runModuleOK(t, rt, "main.mjs", `
@@ -138,8 +140,30 @@ func TestExportConditionsMatchInKeyOrderESM(t *testing.T) {
 		import { which as b } from "second";
 		globalThis.r = a + "|" + b;
 	`)
-	if got := evalStr(t, js, `r`); got != "import|workerd" {
-		t.Errorf("ESM condition key-order = %q, want \"import|workerd\"", got)
+	if got := evalStr(t, js, `r`); got != "import|node" {
+		t.Errorf("ESM condition key-order = %q, want \"import|node\"", got)
+	}
+}
+
+// The full runtime must NOT take a package's browser build: a browser bundle is
+// not an equivalent spelling of the node one (@babel/core's cannot load plugins
+// at all), and every node API it avoids is present here.
+func TestFullRuntimePrefersNodeOverBrowserBuild(t *testing.T) {
+	fsys := fstest.MapFS{
+		"node_modules/dual/package.json": {Data: []byte(`{
+			"exports": { ".": { "browser": "./browser.mjs", "node": "./node.mjs", "default": "./default.mjs" } }
+		}`)},
+		"node_modules/dual/browser.mjs": {Data: []byte(`export const which = "browser";`)},
+		"node_modules/dual/node.mjs":    {Data: []byte(`export const which = "node";`)},
+		"node_modules/dual/default.mjs": {Data: []byte(`export const which = "default";`)},
+	}
+	js, rt := newRuntime(t, spidermonkey.Config{FS: fsys})
+	runModuleOK(t, rt, "main.mjs", `
+		import { which } from "dual";
+		globalThis.r = which;
+	`)
+	if got := evalStr(t, js, `r`); got != "node" {
+		t.Errorf("dual-build package resolved to %q, want \"node\"", got)
 	}
 }
 
@@ -190,5 +214,42 @@ func TestExportConditionsSkipDisabledAndRecurse(t *testing.T) {
 	runScript(t, rt, `globalThis.r = require("nest");`)
 	if got := evalStr(t, js, `r`); got != "prod" {
 		t.Errorf("nested condition resolution = %q, want \"prod\"", got)
+	}
+}
+
+// The standalone ESMLoader is the OTHER half of the condition split: a web-only
+// embedding (compat/web, no node core modules) must take the browser/Workers
+// build, because a package's node build would import node:buffer and fail.
+// jose is the package this is measured on; the fixture reproduces its shape.
+func TestStandaloneESMLoaderPrefersBrowserBuild(t *testing.T) {
+	fsys := fstest.MapFS{
+		"node_modules/dual/package.json": {Data: []byte(`{
+			"exports": { ".": { "browser": "./browser.mjs", "node": "./node.mjs" } }
+		}`)},
+		"node_modules/dual/browser.mjs": {Data: []byte(`export const which = "browser";`)},
+		"node_modules/dual/node.mjs":    {Data: []byte(`import "node:buffer"; export const which = "node";`)},
+	}
+	js, err := spidermonkey.New(spidermonkey.Config{FS: fsys})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { js.Close() })
+	js.SetModuleLoader(nodejs.ESMLoader)
+	r, err := js.EvalModule(context.Background(), "main.mjs", `
+		import { which } from "dual";
+		globalThis.r = which;
+	`)
+	if err != nil {
+		t.Fatalf("EvalModule: %v", err)
+	}
+	if r.Error != nil {
+		t.Fatalf("module threw: %v", r.Error)
+	}
+	v, err := js.Eval(context.Background(), "globalThis.r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.Value.String(); got != "browser" {
+		t.Errorf("web-only loader resolved to %q, want \"browser\"", got)
 	}
 }

@@ -9,6 +9,7 @@ package nodejs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -69,6 +70,10 @@ type httpPending struct {
 	wroteHeader bool          // only touched by the serving goroutine
 	resume      chan struct{} // buffered(1): the guest asks the body pump for the next chunk
 }
+
+// errRuntimeClosed is the abort cause reported to a request still in flight
+// when the Runtime is closed.
+var errRuntimeClosed = errors.New("nodejs: runtime closed with the response unfinished")
 
 func (p *httpPending) finish() { p.closeOnce.Do(func() { close(p.done) }) }
 
@@ -141,6 +146,14 @@ func (p *httpPending) serve(ctx context.Context) {
 		case <-p.wake:
 		case <-ctx.Done():
 			p.shutdown(ctx.Err())
+			return
+		case <-p.done:
+			// Runtime.Close signals every in-flight request by closing done, and
+			// this is what honours it. Otherwise the only way out is the client
+			// disconnecting — which never happens for a request whose server the
+			// guest already closed gracefully, because that server is no longer in
+			// the runtime's table for Close to hard-close.
+			p.shutdown(errRuntimeClosed)
 			return
 		}
 	}

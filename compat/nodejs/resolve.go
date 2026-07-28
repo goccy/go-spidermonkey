@@ -62,21 +62,60 @@ var coreModules = map[string]bool{
 // Enabled export/import conditions. Node semantics: a conditions object is
 // iterated IN KEY ORDER and the first key present in the enabled set wins —
 // the set only says which conditions are enabled, the package.json's key
-// order decides preference. The ESM set additionally enables the
-// Workers/browser-style conditions (this runtime is Workers/browser-like, so
-// packages shipping such builds can serve them when they list them first).
+// order decides preference.
+//
+// WHICH conditions are enabled depends on what the embedder installed, because
+// that is what decides which of a package's builds can actually run:
+//
+//   - Under the full runtime (nodejs.Install) these are NODE's conditions. fs,
+//     net, http, child_process, os and worker_threads are all really there, so
+//     a package's node build is the one that works. Enabling browser/workerd
+//     conditions here instead — which this did, on the theory that the sandbox
+//     is Workers-like — silently selected browser bundles, and a browser bundle
+//     is not just a different spelling of the same code: @babel/core's refuses
+//     to load plugins by name at all ("Cannot load plugin … in a browser"), so
+//     the whole toolchain was unusable.
+//   - Under the standalone ESMLoader (a web-only embedding, compat/web with no
+//     node core modules) the browser/Workers conditions are the correct ones:
+//     a node build there would import node:buffer and fail. jose is the
+//     worked example — it ships both, and only its browser build can run.
 var (
-	esmConditions = map[string]bool{
+	nodeESMConditions = map[string]bool{
+		"node": true, "import": true, "module-sync": true,
+		"module": true, "default": true,
+	}
+	nodeCJSConditions = map[string]bool{
+		"node": true, "require": true, "module-sync": true, "default": true,
+	}
+	webESMConditions = map[string]bool{
 		"worker": true, "workerd": true, "browser": true, "deno": true,
 		"bun": true, "import": true, "module": true, "default": true,
 	}
-	cjsConditions = map[string]bool{"require": true, "node": true, "default": true}
 )
 
+// flavor selects the export/import conditions a resolution runs with: the
+// three sets above, chosen by what the embedder installed rather than guessed.
+type flavor int
+
+const (
+	flavorNodeESM flavor = iota // nodejs.Install's ESM loader
+	flavorNodeCJS               // require() and its resolver op
+	flavorWebESM                // the standalone ESMLoader (no node core modules)
+)
+
+func (f flavor) conditions() map[string]bool {
+	switch f {
+	case flavorNodeCJS:
+		return nodeCJSConditions
+	case flavorWebESM:
+		return webESMConditions
+	}
+	return nodeESMConditions
+}
+
 // resolveModule resolves specifier from the module at parent (an fs path, or
-// any registered specifier for root modules). cjs selects require-flavored
-// export conditions.
-func resolveModule(fsys fs.FS, specifier, parent string, cjs bool) (resolution, error) {
+// any registered specifier for root modules). f selects the export conditions.
+func resolveModule(fsys fs.FS, specifier, parent string, f flavor) (resolution, error) {
 	if name, ok := strings.CutPrefix(specifier, "node:"); ok {
 		if coreModules[name] {
 			return resolution{Core: name}, nil
@@ -89,10 +128,7 @@ func resolveModule(fsys fs.FS, specifier, parent string, cjs bool) (resolution, 
 	if fsys == nil {
 		return resolution{}, fmt.Errorf("cannot resolve %q: no FS configured", specifier)
 	}
-	conds := esmConditions
-	if cjs {
-		conds = cjsConditions
-	}
+	conds := f.conditions()
 	// The parent may be a registered file: URL specifier (ESM modules register
 	// under their canonical file:// URL so import.meta.url is a real URL) or
 	// an absolute path; map it onto the rootless fs.FS namespace before any

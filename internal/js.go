@@ -21,7 +21,9 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync/atomic"
 
 	wasm2go "github.com/goccy/spidermonkeywasm2go"
 	"github.com/goccy/spidermonkeywasm2go/base"
@@ -160,6 +162,10 @@ type JS struct {
 	// mmapped is the linear memory when it came from a shared copy-on-write
 	// image; Go's GC does not manage it, so Close must unmap it explicitly.
 	mmapped []byte
+	// trapped records that a call into this instance ended in a wasm trap. The
+	// guest's allocator aborted mid-operation, so its linear memory is in an
+	// undefined state and NOTHING may call in again — see invokeMethod/Close.
+	trapped atomic.Bool
 }
 
 // interrupter holds the pre-resolved interrupt addresses so fire can run
@@ -613,8 +619,17 @@ func (js *JS) UnlockForHostCallback() (relock func()) {
 // invokeMethod runs one RPC on THIS instance's module and folds in the standard
 // bridge error check. The single seam every method funnels through.
 func (js *JS) invokeMethod(mid int32, req []byte) ([]byte, error) {
+	if js.trapped.Load() {
+		return nil, errors.New("spidermonkey: instance is spent (a previous call trapped)")
+	}
 	resp, err := js.m.invoke(0, mid, req, invokers[mid])
 	if err != nil {
+		// A trap is not a JavaScript exception (those come back in the envelope):
+		// the guest aborted, typically because its allocator ran into the memory
+		// cap. Its heap is now inconsistent, so no further call may run — the
+		// teardown call in Close included, which used to fault with a SIGSEGV
+		// that took the host process down with it.
+		js.trapped.Store(true)
 		return nil, err
 	}
 	if e := pbExtractError(resp); e != nil {
@@ -636,10 +651,18 @@ func (js *JS) jsNew(maxHeapBytes, nativeStackQuotaBytes uint32) (uint64, error) 
 
 // Close destroys the runtime (JS_DestroyContext) and unmaps the linear memory if
 // it came from a shared copy-on-write image.
+//
+// After a trap the guest teardown is SKIPPED: JS_DestroyContext would walk a
+// heap whose allocator has already aborted. The host-side resources are still
+// released, so a spent instance is closable — it just cannot be asked to tidy
+// up after itself.
 func (js *JS) Close() error {
-	buf := pbNewBuf()
-	buf = pbAppendUint64(buf, 1, js.h)
-	_, err := js.invokeMethod(midClose, buf)
+	var err error
+	if !js.trapped.Load() {
+		buf := pbNewBuf()
+		buf = pbAppendUint64(buf, 1, js.h)
+		_, err = js.invokeMethod(midClose, buf)
+	}
 	if js.mmapped != nil {
 		base.UnmapMemory(js.mmapped)
 		js.mmapped = nil

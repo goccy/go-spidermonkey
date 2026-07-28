@@ -16,25 +16,38 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
-	"regexp"
 	"strings"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
 
-// jsonModuleSource wraps raw .json file bytes as an ES module that parses them
-// at runtime with JSON.parse. Interpolating the bytes into `export default (…)`
-// would EVALUATE the file as a JavaScript expression — any executable content
-// (or a `__proto__` key) would run/apply on import, turning an attacker-
-// influenced data file into code execution. JSON.parse keeps the data inert and
-// matches Node's JSON-module semantics. The source is embedded as a JS string
-// literal via json.Marshal so it is safely escaped.
+// jsonModuleSource answers a JSON import with the file's bytes VERBATIM once
+// they are known to be JSON.
+//
+// A JSON module is imported as `import data from "./x.json" with { type:
+// "json" }` — the only form Node accepts, an attribute-less JSON import being
+// ERR_IMPORT_ATTRIBUTE_MISSING. The ENGINE implements that attribute: it
+// JSON-parses whatever the loader returns. So the loader must hand over the raw
+// text; wrapping it in `export default JSON.parse("…")` made the engine parse
+// that JavaScript as JSON and every attributed JSON import failed with
+// "JSON.parse: unexpected character at line 1 column 1" (which is what kept
+// @babel/core, whose graph imports .json data modules, from loading at all).
+//
+// The bytes must be VALIDATED before they are handed over, because the loader
+// cannot see the import attribute and the engine treats the same answer two
+// different ways: as JSON when the attribute is present, as JavaScript SOURCE
+// when it is not. Valid JSON is inert either way — a JSON document contains
+// only literals, so as JavaScript it is at worst a block of labelled literals
+// with no side effects. Bytes that are NOT valid JSON could be an executable
+// expression (`(globalThis.pwned = 1, {})`), and handing those over would run
+// them on the attribute-less path, so they are replaced with a source that
+// fails as JavaScript AND as JSON. Either way the import errors; in neither
+// case does a data file execute.
 func jsonModuleSource(src []byte) (string, error) {
-	lit, err := json.Marshal(string(src))
-	if err != nil {
-		return "", err
+	if !json.Valid(src) {
+		return `throw new SyntaxError("Unexpected token in JSON module");`, nil
 	}
-	return "export default JSON.parse(" + string(lit) + ");", nil
+	return string(src), nil
 }
 
 // ESMLoader is a spidermonkey.ModuleLoader for PURE-ESM resolution over
@@ -48,7 +61,7 @@ func jsonModuleSource(src []byte) (string, error) {
 // (nodejs.Install, whose loader supersedes this one). Access control lives
 // in Config.FS.
 func ESMLoader(cfg spidermonkey.Config, specifier, referrer string) (string, error) {
-	r, err := resolveModule(cfg.FS, specifier, referrer, false)
+	r, err := resolveModule(cfg.FS, specifier, referrer, flavorWebESM)
 	if err != nil {
 		return "", err
 	}
@@ -92,26 +105,30 @@ func registeredPath(specifier, referrer string) string {
 // relative imports, intact.
 func esmShimFor(specifier, realPath string, src []byte) string {
 	up := strings.Repeat("../", strings.Count(specifier, "/"))
-	target := "./" + up + realPath
-	shim := fmt.Sprintf("export * from %q;\n", target)
-	if hasDefaultExport(src) {
-		shim += fmt.Sprintf("export { default } from %q;\n", target)
-	}
-	return shim
+	return reexportShim("./" + up + realPath)
 }
 
-// defaultExportRE spots a default export declaration: `export default …`,
-// `export { default } from …`, `export { x as default }`, `export * as
-// default from …` — including minified one-liners. In the braces form,
-// `default` must be the EXPORTED name (followed by `,` or `}`): `export {
-// default as x }` re-exports x, not default, and must not match.
-var defaultExportRE = regexp.MustCompile(`\bexport\s+default\b|\bexport\s*\{[^{}]*\bdefault\s*[,}]|\bas\s+default\b`)
-
-// hasDefaultExport is a textual heuristic good enough for dist builds:
-// `export * from` cannot forward a default export, so the shim adds it only
-// when the target visibly declares one.
-func hasDefaultExport(src []byte) bool {
-	return defaultExportRE.Match(src)
+// reexportShim re-exports everything a module at target exports, INCLUDING a
+// default it may or may not have.
+//
+// `export * from` deliberately does not forward `default`, so a shim has to
+// mention it — but `export { default } from target` is a static link that FAILS
+// TO COMPILE when the target has no default export. Deciding by scanning the
+// target's source for `export default` is what this used to do, and it is
+// wrong in both directions: @babel/parser (and any module that merely mentions
+// the phrase in a string or a comment — a parser's error messages do) got a
+// default re-export it does not have, and every import of the package died with
+// "doesn't provide an export named: 'default'".
+//
+// Reading the default off the namespace object instead is structural rather
+// than textual: a namespace's missing property is simply undefined, so the same
+// shim is correct whether or not the target has a default, with no source
+// inspection at all. The one difference from Node is that importing a default
+// that does not exist yields undefined here instead of a link error — a
+// forgiving answer where the alternative was a wrong one.
+func reexportShim(target string) string {
+	return fmt.Sprintf(
+		"import * as __ns from %[1]q;\nexport * from %[1]q;\nexport default __ns.default;\n", target)
 }
 
 // readModuleFile reads p from Config.FS. Access control lives in the FS (it

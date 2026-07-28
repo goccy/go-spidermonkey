@@ -69,7 +69,10 @@ func parseResult(js *JS, raw string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	r := Result{Error: jsErr(e)}
+	// Value defaults to undefined rather than a nil interface: a script that
+	// threw has no completion value, and a caller that reaches for one anyway
+	// must get JS's answer for "no value" instead of a Go nil-pointer panic.
+	r := Result{Value: primitive{nil}, Error: jsErr(e)}
 	if e.Ok {
 		// The envelope's result field carries the completion value's encoding.
 		v, verr := decodeValue(js, e.Result)

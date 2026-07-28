@@ -19,6 +19,30 @@
 
 	// --------------------------------------------------------------- console
 
+	// How many entries of an array, Map or Set are rendered, matching Node's
+	// util.inspect maxArrayLength default. This is not cosmetic: formatting every
+	// element of a large collection builds an intermediate proportional to it, and
+	// `console.log(new Array(10_000_000).fill("x"))` — which WPT's
+	// console-log-large-array test does — exhausted the interpreter's memory
+	// outright.
+	const MAX_ENTRIES = 100;
+
+	function moreItems(total) {
+		const n = total - MAX_ENTRIES;
+		return n > 0 ? `, ... ${n} more item${n === 1 ? "" : "s"}` : "";
+	}
+
+	// take reads at most MAX_ENTRIES entries from an iterable without
+	// materializing all of it.
+	function take(it) {
+		const out = [];
+		for (const x of it) {
+			if (out.length >= MAX_ENTRIES) break;
+			out.push(x);
+		}
+		return out;
+	}
+
 	function inspect(v, depth, seen) {
 		switch (typeof v) {
 			case "string": return depth === 0 ? v : JSON.stringify(v);
@@ -41,7 +65,9 @@
 		seen.add(v);
 		try {
 			if (Array.isArray(v)) {
-				return v.length ? `[ ${v.map((x) => inspect(x, depth + 1, seen)).join(", ")} ]` : "[]";
+				if (!v.length) return "[]";
+				const shown = v.slice(0, MAX_ENTRIES).map((x) => inspect(x, depth + 1, seen));
+				return `[ ${shown.join(", ")}${moreItems(v.length)} ]`;
 			}
 			if (ArrayBuffer.isView(v)) {
 				const items = Array.prototype.slice.call(v, 0, 32).join(", ");
@@ -49,12 +75,14 @@
 				return `${v.constructor.name}(${v.length}) [ ${items}${more} ]`;
 			}
 			if (v instanceof Map) {
-				const items = [...v].map(([k, x]) => `${inspect(k, depth + 1, seen)} => ${inspect(x, depth + 1, seen)}`);
-				return `Map(${v.size}) {${items.length ? " " + items.join(", ") + " " : ""}}`;
+				const items = take(v).map(([k, x]) => `${inspect(k, depth + 1, seen)} => ${inspect(x, depth + 1, seen)}`);
+				const body = items.join(", ") + moreItems(v.size);
+				return `Map(${v.size}) {${items.length ? " " + body + " " : ""}}`;
 			}
 			if (v instanceof Set) {
-				const items = [...v].map((x) => inspect(x, depth + 1, seen));
-				return `Set(${v.size}) {${items.length ? " " + items.join(", ") + " " : ""}}`;
+				const items = take(v).map((x) => inspect(x, depth + 1, seen));
+				const body = items.join(", ") + moreItems(v.size);
+				return `Set(${v.size}) {${items.length ? " " + body + " " : ""}}`;
 			}
 			const keys = Object.keys(v);
 			if (!keys.length) return "{}";

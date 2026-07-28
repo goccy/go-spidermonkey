@@ -816,6 +816,12 @@
 		return this;
 	};
 
+	// Happy-eyeballs settings. Address selection happens host-side (one dial per
+	// connect), so these hold the configured value and report it back rather
+	// than steering a race the guest does not run.
+	let autoSelectFamily = true;
+	let autoSelectFamilyAttemptTimeout = 250;
+
 	core.net = {
 		isIPv4,
 		isIPv6,
@@ -826,6 +832,16 @@
 		createServer: (options, listener) => new NetServer(options, listener),
 		createConnection: (...args) => new Socket().connect(...args),
 		connect: (...args) => new Socket().connect(...args),
+		getDefaultAutoSelectFamily: () => autoSelectFamily,
+		setDefaultAutoSelectFamily: (v) => { autoSelectFamily = !!v; },
+		getDefaultAutoSelectFamilyAttemptTimeout: () => autoSelectFamilyAttemptTimeout,
+		setDefaultAutoSelectFamilyAttemptTimeout: (v) => {
+			v = Number(v);
+			if (!Number.isInteger(v) || v <= 0) {
+				throw Object.assign(new RangeError(`The value of "value" is out of range. Received ${v}`), { code: "ERR_OUT_OF_RANGE" });
+			}
+			autoSelectFamilyAttemptTimeout = Math.max(10, v);
+		},
 	};
 
 	// --------------------------------------------------------------- dgram
