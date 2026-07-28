@@ -14,6 +14,29 @@ than tests written here:
 
 `make suites` runs all four.
 
+## Where they stand (measured 2026-07-28, on the pinned revisions)
+
+| suite | result |
+|---|---|
+| test262 | 52,266 / 53,329 = **98.0%** |
+| Babel | 4,170 / 4,189 fixtures = **99.55%** (890 skipped) |
+| WPT | 18,751 / 40,942 subtests = **45.8%** |
+| Node.js | see `nodetest/expectations.json` |
+
+The Babel figure comes with a cross-check worth repeating whenever the pin
+moves: every one of the 19 remaining failures ALSO fails under real Node.js
+running the same published `@babel/*` packages — they are fixtures that moved
+ahead of the released packages, or that depend on the Babel monorepo's own
+layout. On that corpus this runtime is behaviourally identical to Node. To
+redo it, run `babeltest/js/fixtures.js` under `node` with `__babeltest_root`
+set to a fixtures directory and diff its failures against `expectations.json`.
+
+WPT's 45.8% is dominated by whole APIs that are not implemented rather than by
+subtle divergences: `WebCryptoAPI` alone is 35.9k of the 40.9k subtests, and
+`urlpattern` (0.6%) has no implementation at all. The directories that ARE
+implemented score far higher — `url` 81%, `performance-timeline` 78%,
+`dom/events` 78%, `FileAPI` 68%, `html/webappapis` 63%.
+
 ## How they are wired
 
 Each suite is **pinned to an exact upstream revision** in the Makefile and
