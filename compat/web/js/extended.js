@@ -304,4 +304,79 @@
 	};
 
 	// CountQueuingStrategy / ByteLengthQueuingStrategy are defined in builtins.js.
+
+	// ------------------------------ Compression/DecompressionStream
+	// WHATWG compression streams over the shared host codec. They belong HERE:
+	// they are web APIs, and defining them only in compat/nodejs (where the zlib
+	// op used to live) left a web-only embedding without them.
+	//
+	// The transform buffers the input and codes it on close. That is observably
+	// different from a streaming implementation only in when output appears, not
+	// in what it is — the formats involved have no partial-flush semantics a
+	// consumer can rely on anyway.
+	// Captured now: __web_ops is deleted once the builtins have been evaluated.
+	const compressOp = __web_ops.compress;
+	const COMPRESS = { gzip: "gzip", deflate: "deflate", "deflate-raw": "deflateRaw" };
+	const DECOMPRESS = { gzip: "gunzip", deflate: "inflate", "deflate-raw": "inflateRaw" };
+
+	function compressionTransform(table, format, name) {
+		if (arguments.length < 3 || format === undefined) {
+			throw new TypeError(`Failed to construct '${name}': 1 argument required`);
+		}
+		const method = table[String(format)];
+		if (!method) {
+			throw new TypeError(`Failed to construct '${name}': Unsupported compression format`);
+		}
+		const chunks = [];
+		let rc, cancelled = false;
+		const readable = new ReadableStream({
+			start(c) { rc = c; },
+			cancel() { cancelled = true; },
+		});
+		const writable = new WritableStream({
+			write(chunk) {
+				// The spec accepts only BufferSource; anything else is a TypeError
+				// on the write, which is what the tests assert.
+				if (chunk instanceof Uint8Array) { chunks.push(chunk); return; }
+				if (ArrayBuffer.isView(chunk)) {
+					chunks.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+					return;
+				}
+				if (chunk instanceof ArrayBuffer) { chunks.push(new Uint8Array(chunk)); return; }
+				throw new TypeError("Can only write BufferSource to a compression stream");
+			},
+			close() {
+				// A cancelled readable no longer accepts chunks; close() still
+				// resolves cleanly rather than throwing from enqueue.
+				if (cancelled) return;
+				let total = 0;
+				for (const c of chunks) total += c.length;
+				const joined = new Uint8Array(total);
+				let off = 0;
+				for (const c of chunks) { joined.set(c, off); off += c.length; }
+				const out = compressOp(method, joined);
+				if (out && out.error !== undefined) {
+					// A codec failure must ERROR the readable side, or a consumer
+					// waits on it forever.
+					const e = new TypeError(out.error);
+					rc.error(e);
+					throw e;
+				}
+				rc.enqueue(out);
+				rc.close();
+			},
+		});
+		return { readable, writable };
+	}
+
+	globalThis.CompressionStream = class CompressionStream {
+		constructor(format) {
+			return compressionTransform(COMPRESS, format, "CompressionStream");
+		}
+	};
+	globalThis.DecompressionStream = class DecompressionStream {
+		constructor(format) {
+			return compressionTransform(DECOMPRESS, format, "DecompressionStream");
+		}
+	};
 })();
