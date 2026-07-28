@@ -96,18 +96,25 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	st.writers[id] = w
 	st.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("tls")
 	go func() {
-		addr, derr := resolveDialAddr(cfg, "tcp", host, port)
+		addrs, derr := resolveDialAddrs(cfg, "tcp", host, port)
 		var conn net.Conn
 		if derr == nil {
-			// Dial the exact authorized IP (addr) but keep ServerName = verifyName
-			// so SNI and certificate verification validate against the hostname.
-			conn, derr = tls.DialWithDialer(&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, &tls.Config{
-				ServerName:         verifyName,
-				InsecureSkipVerify: insecure,
-				RootCAs:            rootCAs,
-			})
+			// Dial the exact authorized IPs (in order, so a loopback name whose
+			// first family refuses still connects) but keep ServerName =
+			// verifyName so SNI and certificate verification validate against
+			// the hostname.
+			for _, addr := range addrs {
+				conn, derr = tls.DialWithDialer(&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, &tls.Config{
+					ServerName:         verifyName,
+					InsecureSkipVerify: insecure,
+					RootCAs:            rootCAs,
+				})
+				if derr == nil {
+					break
+				}
+			}
 		}
 		if derr != nil {
 			st.mu.Lock()
@@ -118,7 +125,7 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			// socket's Writable hangs on a stranded _write callback).
 			go w.run(func(error) {})
 			rt.loop.Post(func() error {
-				defer rt.loop.DonePending()
+				defer rt.loop.DonePending("tls")
 				if onError != nil {
 					// A certificate/verification failure must NOT masquerade as
 					// ECONNREFUSED; map it to a TLS-ish code so guests can tell a
@@ -147,7 +154,7 @@ func (rt *Runtime) opTLSConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			conn.Close()
 			go w.run(func(error) {}) // ack any writes queued before destroy
 			rt.loop.Post(func() error {
-				defer rt.loop.DonePending()
+				defer rt.loop.DonePending("tls")
 				for _, o := range []*spidermonkey.Object{onData, onEnd, onError, onConnect} {
 					if o != nil {
 						o.Free()
@@ -202,7 +209,7 @@ func (rt *Runtime) opTLSListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 	st.mu.Unlock()
 
 	onConn := args[4].Object()
-	rt.loop.AddPending()
+	rt.loop.AddPending("tls")
 	go func() {
 		for {
 			conn, aerr := ln.Accept()
@@ -210,7 +217,7 @@ func (rt *Runtime) opTLSListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 				// Listener closed: free the accept callback (posted after any
 				// queued onConn.Call), then release the pending.
 				rt.loop.Post(func() error { freeObjects(onConn); return nil })
-				rt.loop.DonePending()
+				rt.loop.DonePending("tls")
 				return
 			}
 			st.mu.Lock()
@@ -261,7 +268,7 @@ func (rt *Runtime) opHTTPSListen(cfg spidermonkey.Config, args []spidermonkey.Va
 	hs.servers[s.id] = s
 	hs.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("tls")
 	go s.srv.Serve(ln)
 	return spidermonkey.ValueOf(map[string]any{"id": s.id, "port": ln.Addr().(*net.TCPAddr).Port}), nil
 }

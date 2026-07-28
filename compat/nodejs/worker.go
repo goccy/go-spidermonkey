@@ -182,7 +182,7 @@ func (rt *Runtime) opWorkerSpawn(cfg spidermonkey.Config, args []spidermonkey.Va
 	initObj.Free()
 	freeWorkerData() // cloned into initObj by Send; the arg pin is no longer needed
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("worker")
 	rt.loop.Post(func() error { wm.emit(inst, "online", spidermonkey.Undefined()); return nil })
 
 	return spidermonkey.ValueOf(map[string]any{"id": float64(id), "threadId": tid}), nil
@@ -315,7 +315,7 @@ func (wm *workerManager) reapDead() {
 			if inst != nil {
 				wm.emit(inst, "exit", spidermonkey.ValueOf(1))
 				inst.Free()
-				wm.rt.loop.DonePending()
+				wm.rt.loop.DonePending("worker")
 			}
 			return nil
 		})
@@ -369,7 +369,7 @@ func (wm *workerManager) dispatch(from spidermonkey.AgentID, inst *spidermonkey.
 		if still {
 			wm.emit(inst, "exit", code)
 			inst.Free()
-			wm.rt.loop.DonePending()
+			wm.rt.loop.DonePending("worker")
 		}
 		return
 	}

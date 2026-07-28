@@ -63,7 +63,7 @@ func (rt *Runtime) opUDPBind(cfg spidermonkey.Config, args []spidermonkey.Value)
 	st.udp[id] = conn
 	st.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("dgram")
 	go rt.pumpUDP(id, conn, onMessage)
 	local := conn.LocalAddr().(*net.UDPAddr)
 	family := "IPv6"
@@ -128,7 +128,7 @@ func (rt *Runtime) pumpUDP(id int64, conn *net.UDPConn, onMessage *spidermonkey.
 			if onMessage != nil {
 				rt.loop.Post(func() error { onMessage.Free(); return nil })
 			}
-			rt.loop.DonePending()
+			rt.loop.DonePending("dgram")
 			return
 		}
 	}
@@ -170,13 +170,13 @@ func (rt *Runtime) opUDPSend(cfg spidermonkey.Config, args []spidermonkey.Value)
 		})
 	}
 	if conn == nil {
-		rt.loop.AddPending()
-		go func() { defer rt.loop.DonePending(); fire(fmt.Errorf("socket closed")) }()
+		rt.loop.AddPending("dgram")
+		go func() { defer rt.loop.DonePending("dgram"); fire(fmt.Errorf("socket closed")) }()
 		return spidermonkey.Undefined(), nil
 	}
-	rt.loop.AddPending()
+	rt.loop.AddPending("dgram")
 	go func() {
-		defer rt.loop.DonePending()
+		defer rt.loop.DonePending("dgram")
 		// Resolve+authorize once, then send only to the approved IP.
 		// Resolve in the SOCKET's family, taken from what it is bound to: sending
 		// an IPv6 destination from a udp4 socket is an error, not a fallback.

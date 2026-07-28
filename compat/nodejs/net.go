@@ -8,6 +8,8 @@ package nodejs
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -445,7 +447,7 @@ func (rt *Runtime) opNetAttach(cfg spidermonkey.Config, args []spidermonkey.Valu
 		freeObjects(args[1].Object(), args[2].Object(), args[3].Object())
 		return spidermonkey.Undefined(), nil
 	}
-	rt.loop.AddPending()
+	rt.loop.AddPending("net.conn")
 	go rt.pumpConn(id, conn, args[1].Object(), args[2].Object(), args[3].Object())
 	return spidermonkey.Undefined(), nil
 }
@@ -461,19 +463,19 @@ func (rt *Runtime) opNetAttach(cfg spidermonkey.Config, args []spidermonkey.Valu
 // dial needs both Config.Resolve (to permit the lookup) and Config.Dial (to
 // permit at least one resolved address, WITH the requested host so a policy can
 // match host and port jointly).
-func resolveDialAddr(cfg spidermonkey.Config, network, host string, port int) (string, error) {
+func resolveDialAddrs(cfg spidermonkey.Config, network, host string, port int) ([]string, error) {
 	portStr := strconv.Itoa(port)
 	if ip := net.ParseIP(host); ip != nil {
 		if cfg.Dial == nil || !cfg.Dial(network, "", ip.String(), port) {
-			return "", fmt.Errorf("dial %s:%d: permission denied", host, port)
+			return nil, fmt.Errorf("dial %s:%d: permission denied", host, port)
 		}
-		return net.JoinHostPort(ip.String(), portStr), nil
+		return []string{net.JoinHostPort(ip.String(), portStr)}, nil
 	}
 	if cfg.Resolve == nil || !cfg.Resolve(host) {
-		return "", fmt.Errorf("resolve %q: permission denied", host)
+		return nil, fmt.Errorf("resolve %q: permission denied", host)
 	}
 	if cfg.Dial == nil {
-		return "", fmt.Errorf("dial %s:%d: permission denied (no Dial policy)", host, port)
+		return nil, fmt.Errorf("dial %s:%d: permission denied (no Dial policy)", host, port)
 	}
 	// Resolve in the CALLER'S family. "udp4"/"tcp4" means IPv4 only: a name that
 	// also has an AAAA record (localhost, always) would otherwise come back as
@@ -487,14 +489,49 @@ func resolveDialAddr(cfg spidermonkey.Config, network, host string, port int) (s
 	}
 	ips, err := net.DefaultResolver.LookupIP(context.Background(), family, host)
 	if err != nil {
-		return "", fmt.Errorf("resolve %q: %w", host, err)
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
 	}
+	var addrs []string
 	for _, ip := range ips {
 		if cfg.Dial(network, host, ip.String(), port) {
-			return net.JoinHostPort(ip.String(), portStr), nil
+			addrs = append(addrs, net.JoinHostPort(ip.String(), portStr))
 		}
 	}
-	return "", fmt.Errorf("dial %s:%d: permission denied", host, port)
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("dial %s:%d: permission denied", host, port)
+	}
+	return addrs, nil
+}
+
+// resolveDialAddr keeps the single-address form for callers that cannot retry
+// (a connectionless socket's peer address).
+func resolveDialAddr(cfg spidermonkey.Config, network, host string, port int) (string, error) {
+	addrs, err := resolveDialAddrs(cfg, network, host, port)
+	if err != nil {
+		return "", err
+	}
+	return addrs[0], nil
+}
+
+// dialAuthorized connects to the first of the authorized addresses that
+// accepts. Trying only the first is what Node's autoSelectFamily exists to
+// avoid: "localhost" resolves to ::1 AND 127.0.0.1, and a server bound to one
+// of them refuses the other — a whole family of tests connects to a loopback
+// server by name and hangs on exactly that.
+func dialAuthorized(cfg spidermonkey.Config, network, host string, port int, timeout time.Duration) (net.Conn, error) {
+	addrs, err := resolveDialAddrs(cfg, network, host, port)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, addr := range addrs {
+		conn, derr := net.DialTimeout(network, addr, timeout)
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+	}
+	return nil, lastErr
 }
 
 // maxClientBody caps a buffered node:http client response so an
@@ -518,11 +555,22 @@ func gatedTransport(cfg spidermonkey.Config) *http.Transport {
 				return nil, err
 			}
 			port, _ := strconv.Atoi(portStr)
-			dialAddr, err := resolveDialAddr(cfg, network, host, port)
+			addrs, err := resolveDialAddrs(cfg, network, host, port)
 			if err != nil {
 				return nil, err
 			}
-			return dialer.DialContext(ctx, network, dialAddr)
+			// Every authorized address in turn, as in dialAuthorized: an HTTP
+			// client asking for a loopback server by name must not fail because
+			// ::1 came back before 127.0.0.1.
+			var lastErr error
+			for _, a := range addrs {
+				conn, derr := dialer.DialContext(ctx, network, a)
+				if derr == nil {
+					return conn, nil
+				}
+				lastErr = derr
+			}
+			return nil, lastErr
 		},
 	}
 }
@@ -544,6 +592,46 @@ type agentConfig struct {
 	KeepAlive      bool  `json:"keepAlive"`
 	MaxSockets     int   `json:"maxSockets"`
 	MaxFreeSockets int   `json:"maxFreeSockets"`
+	// TLS carries the request's https options. Without them every https
+	// request verified against the system roots, so a self-signed server —
+	// which is what `rejectUnauthorized: false` exists for, and what most
+	// https tests and dev setups use — failed the handshake.
+	TLS *clientTLSOptions `json:"tls,omitempty"`
+}
+
+type clientTLSOptions struct {
+	RejectUnauthorized *bool  `json:"rejectUnauthorized,omitempty"`
+	CA                 string `json:"ca,omitempty"`         // PEM
+	Servername         string `json:"servername,omitempty"` // SNI override
+}
+
+// tlsConfigFor turns the guest's https options into a *tls.Config, or nil when
+// the defaults (verify against the system roots) are what was asked for.
+func tlsConfigFor(o *clientTLSOptions) *tls.Config {
+	if o == nil {
+		return nil
+	}
+	c := &tls.Config{}
+	used := false
+	if o.RejectUnauthorized != nil && !*o.RejectUnauthorized {
+		c.InsecureSkipVerify = true
+		used = true
+	}
+	if o.CA != "" {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM([]byte(o.CA)) {
+			c.RootCAs = pool
+			used = true
+		}
+	}
+	if o.Servername != "" {
+		c.ServerName = o.Servername
+		used = true
+	}
+	if !used {
+		return nil
+	}
+	return c
 }
 
 // clientForAgent returns an http.Client for the given agent descriptor and a
@@ -559,6 +647,9 @@ func (rt *Runtime) clientForAgent(cfg spidermonkey.Config, agentJSON string) (*h
 	}
 	if !a.KeepAlive || a.ID == 0 {
 		c := gatedHTTPClient(cfg)
+		if tc := tlsConfigFor(a.TLS); tc != nil {
+			c.Transport.(*http.Transport).TLSClientConfig = tc
+		}
 		return c, func() { c.CloseIdleConnections() }
 	}
 	st := rt.net
@@ -567,6 +658,7 @@ func (rt *Runtime) clientForAgent(cfg spidermonkey.Config, agentJSON string) (*h
 	if tr == nil {
 		tr = gatedTransport(cfg)
 		tr.DisableKeepAlives = false
+		tr.TLSClientConfig = tlsConfigFor(a.TLS)
 		if a.MaxSockets > 0 {
 			tr.MaxConnsPerHost = a.MaxSockets
 		}
@@ -609,13 +701,9 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 	st.writers[id] = w
 	st.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("net.conn")
 	go func() {
-		addr, derr := resolveDialAddr(cfg, "tcp", host, port)
-		var conn net.Conn
-		if derr == nil {
-			conn, derr = net.DialTimeout("tcp", addr, 30*time.Second)
-		}
+		conn, derr := dialAuthorized(cfg, "tcp", host, port, 30*time.Second)
 		if derr != nil {
 			st.mu.Lock()
 			delete(st.writers, id)
@@ -627,7 +715,7 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			// callbacks and exits.
 			go w.run(func(error) {})
 			rt.loop.Post(func() error {
-				defer rt.loop.DonePending()
+				defer rt.loop.DonePending("net.conn")
 				if onError != nil {
 					onError.Call(netErr(derr)) // {code, message} so the guest sees EACCES/ECONNREFUSED
 				}
@@ -658,7 +746,7 @@ func (rt *Runtime) opNetConnect(cfg spidermonkey.Config, args []spidermonkey.Val
 			// acked instead of stranding a guest awaiting them.
 			go w.run(func(error) {})
 			rt.loop.Post(func() error {
-				defer rt.loop.DonePending()
+				defer rt.loop.DonePending("net.conn")
 				for _, o := range []*spidermonkey.Object{onData, onEnd, onError, onConnect} {
 					if o != nil {
 						o.Free()
@@ -755,7 +843,7 @@ func (rt *Runtime) pumpConn(id int64, conn net.Conn, onData, onEnd, onError *spi
 			// the full-close paths (opNetEnd/opNetClose/closeNet) that consume the
 			// readEnded flag.
 			if !keepWriter {
-				rt.loop.DonePending()
+				rt.loop.DonePending("net.conn")
 			}
 			return
 		}
@@ -845,8 +933,8 @@ func (rt *Runtime) opNetEnd(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	}
 	rt.net.mu.Unlock()
 	if w != nil && readEnded {
-		w.requestClose()      // flush queued writes, then close the conn
-		rt.loop.DonePending() // release the pending the read pump left with the write half
+		w.requestClose()                // flush queued writes, then close the conn
+		rt.loop.DonePending("net.conn") // release the pending the read pump left with the write half
 	}
 	return spidermonkey.Undefined(), nil
 }
@@ -875,7 +963,7 @@ func (rt *Runtime) opNetClose(cfg spidermonkey.Config, args []spidermonkey.Value
 	if readEnded {
 		// The read pump already exited (peer FIN) leaving its pending with the
 		// write half; this destroy consumes it.
-		rt.loop.DonePending()
+		rt.loop.DonePending("net.conn")
 	}
 	// If the pump is parked waiting for the guest to ask for more, wake it so it
 	// observes the closed conn and unwinds (frees handles, DonePending).
@@ -916,7 +1004,7 @@ func (rt *Runtime) opNetListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 	st.listeners[id] = ln
 	st.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("net.server")
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -925,7 +1013,7 @@ func (rt *Runtime) opNetListen(cfg spidermonkey.Config, args []spidermonkey.Valu
 				// callback the goroutine held. Post it so it runs after any
 				// already-queued onConn.Call, then release the pending.
 				rt.loop.Post(func() error { freeObjects(onConn); return nil })
-				rt.loop.DonePending()
+				rt.loop.DonePending("net.server")
 				return
 			}
 			st.mu.Lock()
@@ -1166,7 +1254,7 @@ func (rt *Runtime) startClientRoundTrip(cfg spidermonkey.Config, req *http.Reque
 		}
 	}
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("http.client")
 	go func() {
 		defer cancel() // release the request context on every exit (idempotent with finish())
 		defer clientCleanup()
@@ -1174,7 +1262,7 @@ func (rt *Runtime) startClientRoundTrip(cfg spidermonkey.Config, req *http.Reque
 		resp, derr := client.Do(req)
 		if derr != nil {
 			rt.loop.Post(func() error {
-				defer rt.loop.DonePending()
+				defer rt.loop.DonePending("http.client")
 				defer freeObjects(onResponse, onError)
 				cleanup()
 				if onError != nil {
@@ -1220,7 +1308,7 @@ func (rt *Runtime) startClientRoundTrip(cfg spidermonkey.Config, req *http.Reque
 
 		// Pump the body incrementally, gated by the guest asking for more. onError
 		// outlives onResponse so a mid-body read failure can still be surfaced.
-		defer rt.loop.DonePending()
+		defer rt.loop.DonePending("http.client")
 		// Free onError ON the loop, never on this goroutine: closeNet() wakes this
 		// pump during rt.Close() teardown, and freeing a guest handle off-loop then
 		// races the engine shutdown -> SIGSEGV. A post that doesn't run at teardown
@@ -1335,7 +1423,7 @@ func (rt *Runtime) closeNet() {
 	// Release the pending each half-open write half still holds (its read pump
 	// exited on peer FIN and left the pending with the writer — see pumpConn).
 	for i := 0; i < halfOpen; i++ {
-		rt.loop.DonePending()
+		rt.loop.DonePending("net.conn")
 	}
 	// Stop any client body pump so its goroutine unwinds and releases AddPending.
 	for _, cb := range bodies {

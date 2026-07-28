@@ -12,6 +12,7 @@ package eventloop
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,8 @@ type Loop struct {
 	batch      []*immediate // check-phase snapshot currently executing
 	posts      []func() error
 	pending    int
+	// pendingBy counts the live AddPending handles by label, for Alive().
+	pendingBy map[string]int
 	// unrefPending is the number of AddPending handles that have been unref'd
 	// (server.unref() etc.). Unref'd work still runs, but it does not by itself
 	// keep the loop alive: the idle check uses pending-unrefPending. Kept
@@ -166,12 +169,23 @@ func (l *Loop) Alive() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var parts []string
-	// Naming WHICH op would need a handle threaded through every release site;
-	// the category alone already separates "a socket/server is still open" from
-	// "a timer is armed" from "an immediate is queued", which is the first fork
-	// in diagnosing any hang.
 	if active := l.pending - l.unrefPending; active > 0 {
-		parts = append(parts, fmt.Sprintf("%d pending host op(s)", active))
+		// Name the kinds too: "2 pending host op(s) [net.conn x2]" says where to
+		// look, where a bare count does not.
+		kinds := make([]string, 0, len(l.pendingBy))
+		for label, n := range l.pendingBy {
+			if n == 1 {
+				kinds = append(kinds, label)
+			} else {
+				kinds = append(kinds, fmt.Sprintf("%s x%d", label, n))
+			}
+		}
+		sort.Strings(kinds)
+		if len(kinds) > 0 {
+			parts = append(parts, fmt.Sprintf("%d pending host op(s) [%s]", active, strings.Join(kinds, ", ")))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d pending host op(s)", active))
+		}
 	}
 	refTimers := 0
 	for _, t := range l.timers {
@@ -263,6 +277,7 @@ func (l *Loop) Reset() {
 	l.batch = nil
 	l.posts = nil
 	l.pending = 0
+	l.pendingBy = nil
 	l.unrefPending = 0
 	l.mu.Unlock()
 	// The loop is idle here (Run has returned), so nothing is mid-callback and
@@ -328,16 +343,33 @@ func (l *Loop) Post(f func() error) {
 
 // AddPending marks an in-flight async op: the loop stays alive until a
 // matching DonePending, even with no timers due. Safe to call concurrently.
-func (l *Loop) AddPending() {
+//
+// The label names the KIND of handle ("net.conn", "dgram", "worker", ...) and
+// exists so Alive() can say what is keeping a guest from exiting. A count
+// alone says only "something"; with a hundred tests that never finish, the
+// label is the difference between a list and a diagnosis. Labels are matched
+// by string between Add and Done, and a mismatch costs only diagnostic
+// accuracy — the count that decides whether the loop stays alive is separate.
+func (l *Loop) AddPending(label string) {
 	l.mu.Lock()
 	l.pending++
+	if l.pendingBy == nil {
+		l.pendingBy = map[string]int{}
+	}
+	l.pendingBy[label]++
 	l.mu.Unlock()
 }
 
-// DonePending releases an AddPending.
-func (l *Loop) DonePending() {
+// DonePending releases an AddPending. The label must match the one it was
+// added with.
+func (l *Loop) DonePending(label string) {
 	l.mu.Lock()
 	l.pending--
+	if l.pendingBy != nil {
+		if l.pendingBy[label]--; l.pendingBy[label] <= 0 {
+			delete(l.pendingBy, label)
+		}
+	}
 	l.mu.Unlock()
 	l.wakeup()
 }

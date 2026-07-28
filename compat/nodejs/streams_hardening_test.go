@@ -76,14 +76,20 @@ func TestTransformDestroyStopsReadable(t *testing.T) {
 // A throw in one nextTick callback must not drop the ticks queued after it.
 func TestNextTickExceptionIsolation(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
-	// The propagated error is expected; we only care that "good" still ran.
+	// With NO uncaughtException handler the throw is fatal, so the tick queued
+	// after it never runs and the runtime exits 1 — checked against real Node,
+	// which prints the error and dies with `ran = bad`. (The handler case, where
+	// later ticks DO run, is TestNextTickUncaughtExceptionHandler.)
 	rt.RunScript(context.Background(), `
 		globalThis.__ran = [];
 		process.nextTick(() => { __ran.push("bad"); throw new Error("boom"); });
 		process.nextTick(() => { __ran.push("good"); });
 	`)
-	if got := evalStr(t, js, `(__ran||[]).join(",")`); got != "bad,good" {
-		t.Fatalf("ticks ran = %q, want bad,good (a throw must not drop later ticks)", got)
+	if got := evalStr(t, js, `(__ran||[]).join(",")`); got != "bad" {
+		t.Fatalf("ticks ran = %q, want bad (an unhandled throw is fatal)", got)
+	}
+	if !rt.Exited() || rt.ExitCode() != 1 {
+		t.Fatalf("exited=%v code=%d, want a fatal exit with code 1", rt.Exited(), rt.ExitCode())
 	}
 }
 

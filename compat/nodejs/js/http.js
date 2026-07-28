@@ -505,6 +505,11 @@
 			const port = o.port ? ":" + o.port : "";
 			this._url = o.href || `${scheme}://${host}${port}${o.path || "/"}`;
 			this._agentOpt = o.agent; // false = no pooling; undefined = globalAgent
+			// https options travel with the request, not the agent: an https
+			// request against a self-signed server passes rejectUnauthorized /
+			// ca / servername here, and without forwarding them every such
+			// request failed the handshake against the system roots.
+			this._tls = tlsOptionsOf(o);
 			this._chunks = [];
 			this._streaming = false; // switched on by an explicit write() before end()
 			this._started = false;   // the streaming request op has been dispatched
@@ -521,7 +526,11 @@
 		// The keep-alive pool descriptor for this request: an explicit `agent:false`
 		// disables pooling; otherwise the request's agent (or the globalAgent).
 		_agentConfig() {
-			if (this._agentOpt === false) return "{}";
+			// A keep-alive transport is cached per agent id, so a request with
+			// its own TLS options must not reuse (or poison) the shared one.
+			if (this._agentOpt === false || this._tls) {
+				return JSON.stringify(this._tls ? { tls: this._tls } : {});
+			}
 			const agent = this._agentOpt || core.http.globalAgent;
 			return agent && typeof agent._config === "function" ? JSON.stringify(agent._config()) : "{}";
 		}
@@ -716,6 +725,21 @@
 			if (this.__id === undefined) this.__id = (globalThis.__node_next_https = (globalThis.__node_next_https || 900000) + 1);
 			return this.__id;
 		}
+	}
+
+	// tlsOptionsOf picks the https settings out of a request's options. It
+	// returns undefined when none were given, so an ordinary request keeps
+	// using the shared keep-alive transport.
+	function tlsOptionsOf(o) {
+		if (!o || typeof o !== "object") return undefined;
+		const out = {};
+		if (o.rejectUnauthorized !== undefined) out.rejectUnauthorized = !!o.rejectUnauthorized;
+		if (o.ca !== undefined && o.ca !== null) {
+			const list = Array.isArray(o.ca) ? o.ca : [o.ca];
+			out.ca = list.map((c) => (typeof c === "string" ? c : Buffer.from(c).toString("utf8"))).join("\n");
+		}
+		if (typeof o.servername === "string") out.servername = o.servername;
+		return Object.keys(out).length ? out : undefined;
 	}
 
 	// https defaults an options object with no explicit protocol to "https:" —

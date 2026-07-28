@@ -631,6 +631,10 @@
 		// writable side is auto-ended so 'finish'/'close' fire (libraries key their
 		// reconnect/cleanup on 'close').
 		this.allowHalfOpen = !!(options && options.allowHalfOpen);
+		// A socket owns a host connection, so it takes Node's autoDestroy: once
+		// both halves are done the socket is destroyed, which is what releases
+		// the connection and the event-loop handle with it.
+		this.autoDestroy = true;
 	}
 	// endOnPeerFin ends the writable half when the readable half ends, unless the
 	// socket is in half-open mode — the missing transition that left 'close' unfired.
@@ -666,6 +670,7 @@
 			socketTimeoutTouch(this); // connect counts as activity for the idle timer
 			this.emit("connect");
 			this.emit("ready");
+			startReading(this);
 		};
 		const r = ops.net_connect(String(host), Number(port), onData, onEnd, onError, onConnect);
 		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); return this; }
@@ -683,6 +688,14 @@
 	// drains, releasing one more host read (net_read_resume). Without this a fast
 	// peer would stream unbounded data into the host regardless of guest demand.
 	Socket.prototype._read = function _read() { if (this._id !== null) ops.net_read_resume(this._id); };
+	// startReading kicks the read side once the socket is live. read(0) consumes
+	// nothing but makes the Readable call _read, which is what tells the host to
+	// start reading — the guest equivalent of libuv's readStart. A socket the
+	// caller explicitly paused is left alone.
+	function startReading(sock) {
+		if (sock._id === null || sock.destroyed || sock.isPaused()) return;
+		sock.read(0);
+	}
 	// _final runs on socket.end(): half-close the write side (send FIN) so an
 	// EOF-delimited peer sees end-of-request; the read side stays open for its
 	// reply. Without this, end() never sent a FIN and such peers hung.
@@ -690,12 +703,21 @@
 		if (this._id !== null) ops.net_end(this._id);
 		callback();
 	};
-	Socket.prototype.destroy = function destroy(err) {
+	Socket.prototype._destroy = function _destroy(err, callback) {
 		socketTimeoutClear(this);
 		if (this._id !== null) { ops.net_close(this._id); this._id = null; }
+		this.__handle = null;
+		if (callback) callback(err);
+	};
+	Socket.prototype.destroy = function destroy(err) {
 		core.stream.Duplex.prototype.destroy.call(this, err);
 		return this;
 	};
+	Object.defineProperty(Socket.prototype, "_handle", {
+		configurable: true,
+		get() { return this._id === null ? null : (this.__handle ||= { fd: this._id }); },
+		set(v) { if (v === null) this.__handle = null; },
+	});
 	Socket.prototype.setTimeout = socketSetTimeout;
 	Socket.prototype.setNoDelay = function () { return this; };
 	Socket.prototype.setKeepAlive = function () { return this; };
@@ -774,6 +796,7 @@
 			ops.net_attach(id, onData, onEnd, onError);
 			trackServerConn(this, sock);
 			this.emit("connection", sock);
+			startReading(sock);
 		};
 		const r = ops.net_listen(String(host), Number(port) || 0, onConnection);
 		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); return this; }
@@ -1548,13 +1571,19 @@
 		// (no client-cert verification here).
 		this.authorized = false;
 		this.authorizationError = null;
+		this.autoDestroy = true; // owns a host connection, as net.Socket does
 	}
 	Object.setPrototypeOf(TLSSocket.prototype, core.stream.Duplex.prototype);
 	Object.setPrototypeOf(TLSSocket, core.stream.Duplex);
 	TLSSocket.prototype._write = function (chunk, enc, cb) { if (this._id !== null) { socketTimeoutTouch(this); ops.net_write(this._id, chunk, cb); } else cb(); };
 	TLSSocket.prototype._read = function () { if (this._id !== null) ops.net_read_resume(this._id); };
 	TLSSocket.prototype._final = function (cb) { if (this._id !== null) ops.net_end(this._id); cb(); };
-	TLSSocket.prototype.destroy = function (err) { socketTimeoutClear(this); if (this._id !== null) { ops.net_close(this._id); this._id = null; } core.stream.Duplex.prototype.destroy.call(this, err); return this; };
+	TLSSocket.prototype._destroy = function (err, callback) {
+		socketTimeoutClear(this);
+		if (this._id !== null) { ops.net_close(this._id); this._id = null; }
+		if (callback) callback(err);
+	};
+	TLSSocket.prototype.destroy = function (err) { core.stream.Duplex.prototype.destroy.call(this, err); return this; };
 	TLSSocket.prototype.setEncoding = core.stream.Readable.prototype.setEncoding;
 	TLSSocket.prototype.end = core.stream.Writable.prototype.end;
 	TLSSocket.prototype.setTimeout = socketSetTimeout;

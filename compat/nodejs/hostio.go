@@ -50,7 +50,7 @@ func (rt *Runtime) opStdinStart(cfg spidermonkey.Config, args []spidermonkey.Val
 	started := false
 	rt.io.stdinOnce.Do(func() {
 		started = true
-		rt.loop.AddPending()
+		rt.loop.AddPending("stdio")
 		go func() {
 			buf := make([]byte, 8<<10)
 			for {
@@ -81,7 +81,7 @@ func (rt *Runtime) opStdinStart(cfg spidermonkey.Config, args []spidermonkey.Val
 						}
 						return nil
 					})
-					rt.loop.DonePending()
+					rt.loop.DonePending("stdio")
 					return
 				}
 			}
@@ -194,7 +194,7 @@ func (rt *Runtime) opFSWatch(cfg spidermonkey.Config, args []spidermonkey.Value)
 		return out
 	}
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("stdio")
 	go func() {
 		prev := snapshot()
 		ticker := time.NewTicker(200 * time.Millisecond)
@@ -210,7 +210,7 @@ func (rt *Runtime) opFSWatch(cfg spidermonkey.Config, args []spidermonkey.Value)
 					}
 					return nil
 				})
-				rt.loop.DonePending()
+				rt.loop.DonePending("stdio")
 				return
 			case <-ticker.C:
 				cur := snapshot()

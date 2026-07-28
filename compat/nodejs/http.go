@@ -250,7 +250,7 @@ func (rt *Runtime) opHTTPListen(cfg spidermonkey.Config, args []spidermonkey.Val
 	st.servers[s.id] = s
 	st.mu.Unlock()
 
-	rt.loop.AddPending() // a listening server keeps the loop alive
+	rt.loop.AddPending("http") // a listening server keeps the loop alive
 	go s.srv.Serve(ln)
 	return spidermonkey.ValueOf(map[string]any{
 		"id": s.id, "port": ln.Addr().(*net.TCPAddr).Port,
@@ -311,7 +311,7 @@ func (rt *Runtime) opHTTPClose(cfg spidermonkey.Config, args []spidermonkey.Valu
 	go func() {
 		_ = s.srv.Shutdown(context.Background())
 		rt.loop.Post(func() error {
-			rt.loop.DonePending()
+			rt.loop.DonePending("http")
 			if cb != nil {
 				cb.Call()
 				cb.Free()
@@ -580,6 +580,6 @@ func (rt *Runtime) closeHTTP() {
 	}
 	for _, s := range servers {
 		s.srv.Close()
-		rt.loop.DonePending()
+		rt.loop.DonePending("http")
 	}
 }

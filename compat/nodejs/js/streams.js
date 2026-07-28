@@ -99,10 +99,25 @@
 		const rs = self._rs, ws = self._ws;
 		const rDone = !rs || rs.endEmitted || rs.destroyed;
 		const wDone = !ws || ws.finishEmitted || ws.destroyed;
-		if (rDone && wDone) {
-			self._closeEmitted = true;
-			self.emit("close");
+		if (!rDone || !wDone) return;
+		// Node's autoDestroy: a stream whose halves have BOTH completed is
+		// destroyed, and 'close' is emitted by that destroy. Emitting 'close'
+		// without destroying left `destroyed` false and, more importantly, never
+		// ran _destroy — so a net.Socket that ended normally kept its host
+		// connection (and the event loop) alive for good.
+		//
+		// It is opt-in rather than Node's blanket default because this layer
+		// reaches "both halves done" earlier than Node does for the HTTP
+		// messages: a ClientRequest is a Writable that finishes as soon as the
+		// body is sent, long before its response arrives, and destroying it
+		// there would cancel the request.
+		const alreadyDestroyed = (rs && rs.destroyed) || (ws && ws.destroyed);
+		if (!alreadyDestroyed && self.autoDestroy === true && typeof self.destroy === "function") {
+			self.destroy();
+			return; // destroy() calls back here once _destroy has run
 		}
+		self._closeEmitted = true;
+		self.emit("close");
 	}
 
 	function toChunk(chunk, encoding) {

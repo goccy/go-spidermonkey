@@ -439,7 +439,16 @@
 			process.emit("uncaughtException", e, "uncaughtException");
 			return true;
 		}
-		return false;
+		// No handler: this is a FATAL exception, and Node's contract is that the
+		// process prints it and dies with code 1. Reporting it and carrying on
+		// leaves every handle the program had opened — a listening server, a
+		// socket, a timer — holding the loop open forever, so a program that
+		// threw simply never finishes. That is the single largest cause of
+		// non-terminating runs in the Node test suite.
+		// SpiderMonkey's .stack omits the name/message line that Node prints.
+		try { console.error(e instanceof Error ? `${e.name}: ${e.message}\n${e.stack}` : String(e)); } catch { /* ignore */ }
+		process.exitCode = 1;
+		process.exit(1);
 	};
 	// The unhandled-rejection channel. The host calls this once per promise
 	// rejection that reached a microtask checkpoint with nothing to handle it;
@@ -454,6 +463,10 @@
 	// the loop continues, so an unhandled rejection is loud but never turns a
 	// working embedding into a crashing one.
 	globalThis.__unhandled_rejection = (reason, promise) => {
+		// The exit sentinel travels out through the tick queue's microtask, so it
+		// arrives here as a rejection. It is a control-flow signal, not an error
+		// to report.
+		if (reason && reason.__nodeExit) return;
 		if (process.listenerCount && process.listenerCount("unhandledRejection") > 0) {
 			process.emit("unhandledRejection", reason, promise);
 			return;

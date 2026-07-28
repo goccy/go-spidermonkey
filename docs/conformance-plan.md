@@ -14,90 +14,90 @@ number so the ordering can be re-checked when the numbers move.
 | item | was | now |
 |---|---|---|
 | 1. Web APIs in the wrong layer | compression 0%, webmessaging 0% | 74%, 39% |
-| 4. Web Crypto validation | WebCryptoAPI 46% | 63% |
+| 4. Web Crypto validation and key agreement | WebCryptoAPI 46% | 80%+ |
 | 5. URLPattern | 0.6% | 49% |
 | 6. `data:` URLs in fetch | 1.3% | 79% |
 | (found on the way) media types | mimesniff 13% | 99% |
 | 3. `process.execPath` | 648 tests skipped | runs as a nested interpreter |
-| 2. quarantined hangs | — | 3 causes fixed (`abort` event, address family, dgram parts) |
+| 2. quarantined hangs | 477 never finished | see "The hangs" below |
 
-WPT total over the same period: **45.8% -> 63.8%**, measured over a corpus that
-also grew from 40,888 to 43,065 subtests.
+WPT total over the same period: **45.8% -> 63.8% -> higher**, measured over a
+corpus that also grew from 40,888 to 43,065 subtests.
 
-## Where we start
+## The hangs: what the event loop was holding
 
-| | today | bar |
+`nodetest/quarantine.txt` listed 477 tests that never finish. Diagnosing them
+one at a time was hopeless while the only evidence was `3 pending host op(s)`,
+so `Loop.Alive()` now names the KIND of handle held — `net.conn`, `net.server`,
+`http`, `tls`, `dgram`, `worker`, `stdio`, `http.client`. That turned the list
+into a histogram, and the histogram into four causes:
+
+1. **A connected socket never started reading.** Node calls `self.read(0)` in
+   `afterConnect`, which is what makes libuv start reading; without it a peer's
+   FIN on an otherwise-idle connection was never seen, so `'end'`/`'close'`
+   never fired and the socket stayed open forever.
+2. **A stream that finished was never destroyed.** `'close'` was emitted when
+   both halves completed, but `_destroy` never ran — so the host connection (and
+   the loop handle with it) was never released. Node's `autoDestroy` destroys
+   the stream and emits `'close'` from that; sockets now do the same.
+3. **Only the first resolved address was dialled.** `localhost` resolves to
+   `::1` and `127.0.0.1`, and a loopback server bound to one refuses the other.
+   Node tries them in turn (`autoSelectFamily`); so does every dial path here.
+4. **An unhandled exception was reported and execution continued.** Node's
+   contract is that an uncaught exception with no `'uncaughtException'` listener
+   prints and exits 1. Carrying on left every handle the program had opened
+   holding the loop, so any test that threw simply never terminated. This was
+   the single largest cause.
+
+A fifth, narrower one: an https request's own TLS settings
+(`rejectUnauthorized`, `ca`, `servername`) never reached the host transport, so
+every request to a self-signed server failed the handshake — which is how
+essentially every https test is set up.
+
+## Where the remaining WPT gap is
+
+WebCryptoAPI is 35.9k of the 43.1k subtests, so it dominates the total. Split
+by whether the spec is stable:
+
+| | subtests | passing |
 |---|---|---|
-| Node tests judged | ~2,100 of 4,883 | Deno runs 3,411 |
-| Node tests passing | see `nodetest/expectations.json` | — |
-| WPT subtests | 21,857 / 43,133 = 50.7% | Deno tracks 26 dirs, we track 21 |
-| Babel fixtures | 4,170 / 4,189 = 99.55% | (already at parity with Node) |
+| `.tentative.` files (draft algorithms) | 8,544 | 39% |
+| the stable Web Crypto spec | 27,378 | **93%** |
 
-## 1. Web APIs that live in the wrong layer — 323 WPT subtests
+The tentative set is ML-KEM, ML-DSA, AES-OCB, KMAC, cSHAKE, X448, Ed448 and
+ChaCha20-Poly1305 — draft algorithms that neither Node nor Deno implements
+either. ML-KEM is now implemented for the two parameter sets Go's `crypto/mlkem`
+provides (768 and 1024; there is no 512, and it reports that rather than faking
+it), which is the largest of them.
 
-`CompressionStream`/`DecompressionStream` and `MessageChannel`/`MessagePort`
-exist only under `compat/nodejs`, but both are WinterTC web APIs. `compression`
-scores 0/303 and `webmessaging` 0/20 purely because they are not defined in
-`compat/web`.
+## Remaining, ordered by measured tests
 
-Smallest work in this document for the largest immediate gain, and it corrects
-an architectural mistake rather than adding a feature.
-
-## 2. The 409 quarantined hangs — 409 Node tests
-
-`nodetest/quarantine.txt` lists tests that never finish. They are BUGS, not
-missing features: the test's own logic completes and the runtime never decides
-it is done, which points at reference counting in the event loop (a handle that
-is never released, or an op counted twice).
-
-These are worth attacking as a group rather than one at a time: the list is
-dominated by a few families (`dgram`, `net`, `http`, `worker`, crypto streams),
-so one ref-counting fix plausibly clears dozens. `NODETEST_QUARANTINE=only`
-runs just this set and names every test that starts completing.
-
-## 3. `process.execPath` — 648 Node tests
-
-The single biggest skip bucket, and the main reason Deno runs 3,411 tests where
-we judge ~2,100. Those tests re-execute the node binary to check flag handling,
-exit codes, stdio and crash behaviour.
-
-Deno passes them because the `deno` binary answers as a node-compatible
-executable. The equivalent here is a host that re-enters this runtime: a
-`child_process` spawn of `process.execPath` starts a NESTED interpreter (a fresh
-instance on a goroutine, wired to pipes) instead of an OS process. The pieces
-already exist — `spidermonkey.New` per instance, the agent machinery for
-goroutine-hosted interpreters, and `Config.Exec` as the policy gate.
-
-Note it is a real capability, not test scaffolding: tooling that shells out to
-`node` (npm scripts, Next.js's own build steps) needs exactly this.
-
-## 4. WebCryptoAPI validation order — ~3,700 WPT subtests
-
-The suite asks for `SyntaxError` when key usages are wrong and `TypeError` for a
-malformed algorithm; we answer `NotSupportedError` because support is checked
-before the shape. Fixing the order in `compat/web`'s subtle entry points is
-mechanical and the corpus is enormous (WebCryptoAPI is 35.9k of the 43.1k
-subtests).
-
-Careful: a share of the remaining WebCryptoAPI failures are genuinely
-unimplemented algorithms, several of them `.tentative` (AES-OCB, Argon2). Those
-are not in this item.
-
-## 5. `URLPattern` — 809 WPT subtests
-
-Not implemented at all (`urlpattern` scores 5/814). A self-contained,
-spec-driven implementation with no host dependencies.
-
-## 6. `data:` URLs in fetch — 152 WPT subtests
-
-`fetch/data-urls` scores 2/154. Parsing and decoding a data URL is small and
-entirely local.
-
-## 7. `node:http2` — 276 Node tests
+### `node:http2` — 276 Node tests
 
 Go's `net/http2` provides the transport; the work is Node's `Http2Session` /
-`Http2Stream` surface over it. Large, but it is the last big skip bucket after
-execPath.
+`Http2Stream` surface over it. The last big skip bucket after execPath.
+
+### `child_process.fork` IPC — 164 Node tests
+
+`fork()` needs an IPC channel between parent and child. The nested-interpreter
+machinery already exists (`compat/nodejs/nested.go`); what is missing is the
+message channel and `process.send`/`'message'` on both sides.
+
+### Individual API gaps surfaced by the hang triage
+
+Each is small, and each was found by reading what a hanging test actually
+printed rather than by guessing:
+
+- `net.connect({ lookup })` — a caller-supplied resolver.
+- `req.addTrailers` on the server request object.
+- `server.on('connection')` for http/https servers: the Go `http.Server` owns
+  the connection, so the guest never sees a socket to track or destroy. Tests
+  that shut down by destroying tracked connections cannot terminate.
+- IPv6 loopback listen/connect paths.
+
+### Streams — WPT `streams` is at 48%
+
+A whole-subsystem gap rather than a set of fixes.
 
 ## Not on this list, and why
 

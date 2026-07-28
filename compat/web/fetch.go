@@ -155,7 +155,7 @@ func (a *fetchAPI) asyncPromiseCtx(ctx context.Context, cancel context.CancelFun
 	a.mu.Lock()
 	a.calls[call] = struct{}{}
 	a.mu.Unlock()
-	a.loop.AddPending()
+	a.loop.AddPending("fetch")
 	go func() {
 		// NOTE: asyncPromise does NOT cancel `cancel` itself — for a round-trip the
 		// response body is tied to ctx and is read LATER, so cancelling here would
@@ -182,7 +182,7 @@ func (a *fetchAPI) asyncPromiseCtx(ctx context.Context, cancel context.CancelFun
 				// touch the loop's accounting or settle a promise nobody awaits.
 				return nil
 			}
-			defer a.loop.DonePending()
+			defer a.loop.DonePending("fetch")
 			target := d.resolve
 			if isReject {
 				target = d.reject

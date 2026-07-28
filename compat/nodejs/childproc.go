@@ -155,7 +155,7 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	}
 	st.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("childproc")
 	wgOut := rt.pipeToCallback(stdout, onStdout)
 	wgErr := rt.pipeToCallback(stderr, onStderr)
 
@@ -183,7 +183,7 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 			}
 			return nil
 		})
-		rt.loop.DonePending()
+		rt.loop.DonePending("childproc")
 	}()
 
 	return spidermonkey.ValueOf(map[string]any{"pid": id}), nil
@@ -375,7 +375,7 @@ func (rt *Runtime) spawnNested(cfg spidermonkey.Config, opts *spidermonkey.Objec
 	st.stdin[id] = w
 	st.mu.Unlock()
 
-	rt.loop.AddPending()
+	rt.loop.AddPending("childproc")
 	wgOut := rt.pipeToCallback(outR, onStdout)
 	wgErr := rt.pipeToCallback(errR, onStderr)
 
@@ -404,7 +404,7 @@ func (rt *Runtime) spawnNested(cfg spidermonkey.Config, opts *spidermonkey.Objec
 			freeObjects(onStdout, onStderr, onExit, onError)
 			return nil
 		})
-		rt.loop.DonePending()
+		rt.loop.DonePending("childproc")
 	}()
 	return spidermonkey.ValueOf(map[string]any{"pid": id}), nil
 }
