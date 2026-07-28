@@ -165,6 +165,28 @@ with a lenient check.
 make test262   # inits the submodule, then TEST262=1 go test -run TestTest262 .
 ```
 
+## Conformance: the compat layers
+
+test262 measures the ENGINE. It says nothing about the Node.js, Web and
+Workers layers in `compat/`, which is where a real application actually lands,
+so those are measured the same way — against each upstream project's own
+tests, not against tests written here:
+
+| run | suite | measures |
+|---|---|---|
+| `make nodetest` | [nodejs/node](https://github.com/nodejs/node)'s own test suite | `compat/nodejs` |
+| `make wpt` | [web-platform-tests](https://github.com/web-platform-tests/wpt) | `compat/web` |
+| `make babeltest` | [Babel](https://github.com/babel/babel)'s fixture corpus | the whole stack under a real workload |
+
+Each is pinned to an exact upstream revision and fetched on demand (nothing is
+vendored), runs every test in a fresh interpreter, skips what this embedding
+genuinely cannot host WITH AN ACCOUNTED REASON rather than silently passing it,
+and fails on a regression or a stale expectation — never on a remembered
+number. `make suites` runs all four.
+
+See [docs/external-suites.md](docs/external-suites.md) for the skip policies,
+how each harness drives its suite, and the gaps they have surfaced.
+
 ## Bounding what a script consumes
 
 | `Config` field | Bounds | On breach |

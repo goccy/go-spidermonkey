@@ -55,7 +55,10 @@ type Options struct {
 const (
 	// DefaultTimeout is Node's own per-test budget scaled for a wasm engine.
 	DefaultTimeout = 60 * time.Second
-	defaultMemory  = 512 << 20
+	// A Node test is small; the cap is deliberately modest because a test that
+	// blocks in a host op is ABANDONED with its interpreter still alive (see
+	// JS.Close), so every such test holds its cap for the rest of the run.
+	defaultMemory = 192 << 20
 )
 
 // skipMarker is what a Node test prints when it decides it cannot run in the

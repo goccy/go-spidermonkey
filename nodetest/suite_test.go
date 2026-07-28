@@ -132,6 +132,10 @@ func TestNodeSuite(t *testing.T) {
 					flightMu.Lock()
 					delete(inFlight, p)
 					flightMu.Unlock()
+					// Name it as it happens: a test that has to be abandoned is the
+					// one worth looking at, and waiting for the summary hides it
+					// behind however long the rest of the run takes.
+					t.Logf("hard timeout, abandoned: %s", p)
 					results <- nodetest.Result{Path: p, Status: nodetest.StatusFail,
 						Reason: "hard timeout: uninterruptible block; abandoned"}
 				}
@@ -145,6 +149,34 @@ func TestNodeSuite(t *testing.T) {
 		close(jobs)
 		wg.Wait()
 		close(results)
+	}()
+
+	// Report what is still running whenever the run goes quiet, so a stall names
+	// the tests responsible instead of just stopping.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tick := time.NewTicker(60 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				flightMu.Lock()
+				var slow []string
+				for p, since := range inFlight {
+					if d := time.Since(since); d > timeout {
+						slow = append(slow, fmt.Sprintf("%s (%v)", p, d.Round(time.Second)))
+					}
+				}
+				flightMu.Unlock()
+				if len(slow) > 0 {
+					sort.Strings(slow)
+					t.Logf("still running past the deadline: %s", strings.Join(slow, ", "))
+				}
+			}
+		}
 	}()
 
 	counts := map[string]map[nodetest.Status]int{} // directory -> status -> n

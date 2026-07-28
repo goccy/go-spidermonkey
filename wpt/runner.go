@@ -208,6 +208,16 @@ const collector = `
 })();
 `
 
+// importScriptsShim satisfies the call a classic-worker test makes for scripts
+// the harness has already loaded (see importedScripts) and fails loudly for any
+// other, so a missed dependency cannot look like a passing test.
+const importScriptsShim = `
+globalThis.importScripts = function importScripts() {
+  // The harness pre-loads what a .worker.js file imports; re-loading here would
+  // re-register testharness and lose the collected results.
+};
+`
+
 // Run executes one .any.js test file and returns its per-subtest verdicts.
 func Run(ctx context.Context, opts Options, rel string) FileResult {
 	start := time.Now()
@@ -277,7 +287,15 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 		struct{ name, src string }{"resources/testharness.js", string(harness)},
 		struct{ name, src string }{"<collector>", collector},
 	)
-	for _, s := range m.scripts {
+	scripts := m.scripts
+	if strings.HasSuffix(rel, ".worker.js") {
+		// A classic worker test bootstraps itself with importScripts instead of
+		// META directives; those files are loaded here, and the call is defined so
+		// that anything NOT pre-loaded is reported rather than silently skipped.
+		steps = append(steps, struct{ name, src string }{"<importScripts>", importScriptsShim})
+		scripts = append(importedScripts(string(src)), scripts...)
+	}
+	for _, s := range scripts {
 		p := resolveScript(rel, s)
 		b, err := os.ReadFile(path.Join(opts.Root, p))
 		if err != nil {
@@ -331,10 +349,51 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 // resolveScript maps a META script reference to a suite-relative path: a
 // leading "/" is suite-absolute, anything else is relative to the test file.
 func resolveScript(testRel, script string) string {
+	if p, ok := scriptAliases[script]; ok {
+		return p
+	}
 	if strings.HasPrefix(script, "/") {
 		return strings.TrimPrefix(script, "/")
 	}
 	return path.Join(path.Dir(testRel), script)
+}
+
+// scriptAliases are the suite paths that no longer name a real file. WPT's own
+// server rewrites them; offline, the mapping has to be stated.
+var scriptAliases = map[string]string{
+	"/resources/WebIDLParser.js": "resources/webidl2/lib/webidl2.js",
+}
+
+// importScriptsRE finds the classic-worker bootstrap a .worker.js file opens
+// with. Those files are not preceded by META directives — they pull their
+// dependencies in at run time — so the harness has to read the calls out of the
+// source and load them the same way it loads META scripts.
+var importScriptsRE = regexp.MustCompile(`importScripts\(([^)]*)\)`)
+
+// importedScripts returns the references a .worker.js file imports, in order and
+// unresolved (the caller resolves them like any other script reference).
+// testharness.js is dropped: the harness has already loaded it, and loading it
+// twice would reset the results it has collected.
+func importedScripts(src string) []string {
+	var out []string
+	for _, m := range importScriptsRE.FindAllStringSubmatch(src, -1) {
+		for _, arg := range strings.Split(m[1], ",") {
+			arg = strings.TrimSpace(arg)
+			if len(arg) < 2 {
+				continue
+			}
+			q := arg[0]
+			if q != '"' && q != '\'' {
+				continue
+			}
+			ref := strings.Trim(arg, string(q))
+			if strings.HasSuffix(ref, "/testharness.js") {
+				continue
+			}
+			out = append(out, ref)
+		}
+	}
+	return out
 }
 
 // List walks dir and returns every runnable test file, suite-relative.

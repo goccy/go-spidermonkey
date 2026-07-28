@@ -172,11 +172,11 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Root cause:** a wasi-threads / agent structured-clone race in the engine.
 - **Engine fix needed:** fix the race in the engine's agent clone transport.
 
-## 3. Two module-loader heuristics no module compile can answer
+## 3. A module-loader heuristic no module compile can answer
 
-- **Symptom:** the module loader still extracts a CommonJS module's export
-  names, and detects whether a target has a default export, by matching source
-  text. These are the load-bearing exceptions to the "no heuristics" rule.
+- **Symptom:** the module loader still extracts a CommonJS module's export names
+  by matching source text. This is the load-bearing exception to the "no
+  heuristics" rule.
 - **`cjs_exports.go`** asks which string keys a CommonJS module would end up
   putting on `module.exports` — `exports.foo = …`,
   `Object.defineProperty(exports, …)`, `module.exports = {…}`. None of that is
@@ -184,13 +184,42 @@ NO symptom — no error, no log line, memory simply unchanged:
   RUNNING the module, which the loader (synchronous and re-entrancy-locked)
   cannot do. Removing it needs either a script-AST introspection primitive or a
   `cjs-module-lexer` equivalent in C++ — module introspection does not reach it.
-- **`hasDefaultExport`** (`nodejs.go`) needs a module's export-name set, which
-  the public JSAPI only exposes through a module NAMESPACE — and that requires
-  the whole dependency graph to be loaded and linked, far more than a
-  classification sniff should cost. It stays a heuristic until that trade
-  changes.
+- **`hasDefaultExport` is CLOSED.** It used to grep a target module for
+  "export default" to decide whether a re-export shim should forward one; that
+  was wrong in both directions (@babel/parser mentions the phrase in an error
+  message, so every import of it failed to link). The shim now reads the default
+  off the module NAMESPACE — a missing property is simply undefined — which
+  needs no source inspection and no engine change. See `reexportShim`.
 
-## 4. Temporal's non-ISO calendars lag the ICU data behind them
+## 4. Import attributes are invisible to the module loader
+
+- **Symptom:** an attribute-less JSON import (`import x from "./a.json"`, with
+  no `with { type: "json" }`) cannot report Node's `ERR_IMPORT_ATTRIBUTE_MISSING`
+  and surfaces as a confusing SyntaxError instead.
+- **Root cause:** the engine implements the `type: "json"` attribute itself and
+  JSON-parses whatever the loader returns, but the loader signature
+  (`func(cfg, specifier, referrer)`) is never told which form the import used.
+  It therefore cannot distinguish a JSON import from a JavaScript one. The
+  compat layer keeps both cases SAFE by validating the bytes before handing them
+  over (see `jsonModuleSource`), but it cannot make the error message right.
+- **Engine fix needed:** pass the import attributes through to the host module
+  loader.
+
+## 5. `require()` of an ES module
+
+- **Symptom:** `require()` of an ESM-only package throws "import declarations
+  may only appear at top level of a module". Node >= 22 supports requiring a
+  synchronous ES module, and modern packages rely on it — Babel loads every one
+  of its (ESM) plugins through `require()` first, so `@babel/core` cannot
+  resolve a plugin by name at all on this runtime.
+- **Root cause:** there is no synchronous path from CJS into a module graph. The
+  engine's dynamic import is asynchronous, and the module loader cannot re-enter
+  the interpreter to instantiate and evaluate a graph mid-call.
+- **Engine fix needed:** a synchronous instantiate-and-evaluate entry point the
+  host can call re-entrantly from a host function, or a bridge primitive that
+  evaluates a module graph and returns its namespace.
+
+## 6. Temporal's non-ISO calendars lag the ICU data behind them
 
 - **Symptom:** 258 of the 328 expected `intl402` failures are Temporal, and all
   of them are its calendar layer. `Intl` itself is fine — ICU has the data and
@@ -223,7 +252,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   the Temporal implementation are what needs correcting — the ICU data they read
   from is already present and already right.
 
-## 5. `async_hooks`: a store cannot outlive the call that established it
+## 7. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.
