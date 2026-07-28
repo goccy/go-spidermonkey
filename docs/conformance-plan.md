@@ -9,6 +9,21 @@ Everything below is ordered by MEASURED tests unlocked per unit of work, taken
 from the runs in this repository rather than from intuition. Each item names the
 number so the ordering can be re-checked when the numbers move.
 
+## Done so far
+
+| item | was | now |
+|---|---|---|
+| 1. Web APIs in the wrong layer | compression 0%, webmessaging 0% | 74%, 39% |
+| 4. Web Crypto validation | WebCryptoAPI 46% | 63% |
+| 5. URLPattern | 0.6% | 49% |
+| 6. `data:` URLs in fetch | 1.3% | 79% |
+| (found on the way) media types | mimesniff 13% | 99% |
+| 3. `process.execPath` | 648 tests skipped | runs as a nested interpreter |
+| 2. quarantined hangs | — | 3 causes fixed (`abort` event, address family, dgram parts) |
+
+WPT total over the same period: **45.8% -> 63.8%**, measured over a corpus that
+also grew from 40,888 to 43,065 subtests.
+
 ## Where we start
 
 | | today | bar |

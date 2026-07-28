@@ -7,6 +7,7 @@ package nodejs
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -41,6 +42,10 @@ type procState struct {
 	mu    sync.Mutex
 	procs map[int64]*exec.Cmd
 	stdin map[int64]*connWriter // async stdin pipe writer (off-loop, ordered)
+	// nextNestedPID numbers the children that are nested interpreters rather
+	// than OS processes; their ids are negative so they can never collide with
+	// a real pid.
+	nextNestedPID int64
 }
 
 func newProcState() *procState {
@@ -113,6 +118,12 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	onExit := args[3].Object()
 	onError := args[4].Object()
 
+	// Spawning THIS runtime runs a nested interpreter (see nested.go) with the
+	// same pipes an OS process would have had.
+	if isSelfExec(file) {
+		return rt.spawnNested(cfg, opts, argv, onStdout, onStderr, onExit, onError)
+	}
+
 	cmd := exec.Command(file, argv...)
 	applyCwdEnv(cmd, opts, cfg.Env)
 	stdin, _ := cmd.StdinPipe()
@@ -145,37 +156,8 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	st.mu.Unlock()
 
 	rt.loop.AddPending()
-	pipe := func(r interface{ Read([]byte) (int, error) }, cb *spidermonkey.Object) *sync.WaitGroup {
-		wg := &sync.WaitGroup{}
-		if r == nil || cb == nil {
-			return wg
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			buf := make([]byte, 32<<10)
-			for {
-				n, rerr := r.Read(buf)
-				if n > 0 {
-					chunk := append([]byte(nil), buf[:n]...)
-					rt.loop.Post(func() error {
-						u8, e := rt.js.NewBytes(chunk)
-						if e == nil {
-							cb.Call(u8)
-							u8.Free()
-						}
-						return nil
-					})
-				}
-				if rerr != nil {
-					return
-				}
-			}
-		}()
-		return wg
-	}
-	wgOut := pipe(stdout, onStdout)
-	wgErr := pipe(stderr, onStderr)
+	wgOut := rt.pipeToCallback(stdout, onStdout)
+	wgErr := rt.pipeToCallback(stderr, onStderr)
 
 	go func() {
 		wgOut.Wait()
@@ -205,6 +187,38 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	}()
 
 	return spidermonkey.ValueOf(map[string]any{"pid": id}), nil
+}
+
+// pipeToCallback streams a child's output to a guest callback, one chunk per
+// read, on the loop goroutine.
+func (rt *Runtime) pipeToCallback(r interface{ Read([]byte) (int, error) }, cb *spidermonkey.Object) *sync.WaitGroup {
+	wg := &sync.WaitGroup{}
+	if r == nil || cb == nil {
+		return wg
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 32<<10)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				chunk := append([]byte(nil), buf[:n]...)
+				rt.loop.Post(func() error {
+					u8, e := rt.js.NewBytes(chunk)
+					if e == nil {
+						cb.Call(u8)
+						u8.Free()
+					}
+					return nil
+				})
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+	return wg
 }
 
 func (rt *Runtime) opChildStdin(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -282,6 +296,22 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 		freeInput()
 		return childErr(err), nil
 	}
+	// Spawning THIS runtime runs a nested interpreter rather than an OS process
+	// (see nested.go): there is no node binary to exec, and a child "node" is
+	// what a large part of Node's own suite is written against.
+	if isSelfExec(file) {
+		var stdout, stderr bytes.Buffer
+		var stdin io.Reader
+		if len(args) > 1 && !args[1].IsUndefined() {
+			if in, ierr := valueBytes(args[1]); ierr == nil && len(in) > 0 {
+				stdin = bytes.NewReader(in)
+			}
+		}
+		res := rt.runNested(cfg, argv, envList(opts, cfg.Env), optString(opts, "cwd"),
+			stdin, &stdout, &stderr, 0)
+		return rt.spawnSyncResult(stdout.Bytes(), stderr.Bytes(), res.exitCode, res.err)
+	}
+
 	cmd := exec.Command(file, argv...)
 	applyCwdEnv(cmd, opts, cfg.Env)
 	if len(args) > 1 && !args[1].IsUndefined() {
@@ -325,6 +355,109 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 
 // applyCwdEnv reads opts.cwd and opts.envArray (the JS side flattens an env
 // object into a ["KEY=VALUE", ...] array, undefined when inheriting).
+// spawnNested is opChildSpawn's path for a child "node": a fresh interpreter on
+// a goroutine, its stdout/stderr streamed to the same callbacks a real process
+// would have fed, and an exit code delivered the same way.
+func (rt *Runtime) spawnNested(cfg spidermonkey.Config, opts *spidermonkey.Object, argv []string,
+	onStdout, onStderr, onExit, onError *spidermonkey.Object,
+) (spidermonkey.Value, error) {
+	outR, outW := io.Pipe()
+	errR, errW := io.Pipe()
+	inR, inW := io.Pipe()
+
+	st := rt.child
+	st.mu.Lock()
+	st.nextNestedPID++
+	id := -st.nextNestedPID // negative: not an OS pid, and never collides with one
+	w := newConnWriter()
+	w.attach(inW)
+	go w.run(func(error) {})
+	st.stdin[id] = w
+	st.mu.Unlock()
+
+	rt.loop.AddPending()
+	wgOut := rt.pipeToCallback(outR, onStdout)
+	wgErr := rt.pipeToCallback(errR, onStderr)
+
+	env := envList(opts, cfg.Env)
+	cwd := optString(opts, "cwd")
+	go func() {
+		res := rt.runNested(cfg, argv, env, cwd, inR, outW, errW, 0)
+		outW.Close()
+		errW.Close()
+		wgOut.Wait()
+		wgErr.Wait()
+		st.mu.Lock()
+		sw := st.stdin[id]
+		delete(st.stdin, id)
+		st.mu.Unlock()
+		if sw != nil {
+			sw.requestClose()
+		}
+		rt.loop.Post(func() error {
+			if res.err != nil && onError != nil {
+				onError.Call(spidermonkey.ValueOf(res.err.Error()))
+			}
+			if onExit != nil {
+				onExit.Call(spidermonkey.ValueOf(res.exitCode), spidermonkey.ValueOf(nil))
+			}
+			freeObjects(onStdout, onStderr, onExit, onError)
+			return nil
+		})
+		rt.loop.DonePending()
+	}()
+	return spidermonkey.ValueOf(map[string]any{"pid": id}), nil
+}
+
+// envList reads the spawn options' environment the same way applyCwdEnv does,
+// for the nested-interpreter path (which has no exec.Cmd to fill in).
+func envList(opts *spidermonkey.Object, defaultEnv []string) []string {
+	if envV, _ := opts.Get("envArray"); envV != nil {
+		if a := envV.Object(); a != nil {
+			defer a.Free()
+			lenV, _ := a.Get("length")
+			env := make([]string, 0, lenV.Int())
+			for i := 0; i < lenV.Int(); i++ {
+				iv, _ := a.Get(fmt.Sprint(i))
+				env = append(env, iv.String())
+			}
+			return env
+		}
+	}
+	if defaultEnv == nil {
+		return []string{}
+	}
+	return defaultEnv
+}
+
+func optString(opts *spidermonkey.Object, name string) string {
+	if v, ok := optScalar(opts, name); ok {
+		return v.String()
+	}
+	return ""
+}
+
+// spawnSyncResult builds the object spawnSync returns.
+func (rt *Runtime) spawnSyncResult(stdout, stderr []byte, code int, err error) (spidermonkey.Value, error) {
+	outObj, oerr := rt.js.NewObject()
+	if oerr != nil {
+		return nil, oerr
+	}
+	outObj.Set("status", spidermonkey.ValueOf(code))
+	outObj.Set("signal", spidermonkey.ValueOf(nil))
+	outObj.Set("pid", spidermonkey.ValueOf(0))
+	if err != nil {
+		outObj.Set("error", spidermonkey.ValueOf(err.Error()))
+	}
+	so, _ := rt.js.NewBytes(stdout)
+	se, _ := rt.js.NewBytes(stderr)
+	defer so.Free()
+	defer se.Free()
+	outObj.Set("stdout", so)
+	outObj.Set("stderr", se)
+	return rt.trackReturn(outObj), nil
+}
+
 func applyCwdEnv(cmd *exec.Cmd, opts *spidermonkey.Object, defaultEnv []string) {
 	if cwd, ok := optScalar(opts, "cwd"); ok {
 		cmd.Dir = cwd.String()

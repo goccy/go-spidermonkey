@@ -89,16 +89,11 @@ func skipReason(rel, src string) string {
 		strings.Contains(src, "internalBinding(") {
 		return "tests node-private internals"
 	}
-	// Respawning the node binary: this runtime is a library, not an executable,
-	// so there is no process.execPath to re-exec. (A test that only *mentions*
-	// execPath in a message is rare enough to be caught by the marker.)
-	if strings.Contains(src, "process.execPath") {
-		return "respawns the node binary"
-	}
-	// child_process.fork re-executes the node binary with a new script; there is
-	// no binary to execute (the same reason process.execPath tests are skipped).
+	// child_process.fork needs an IPC channel to the child, which the nested
+	// interpreter does not have yet. Spawning process.execPath itself DOES work
+	// now (see compat/nodejs/nested.go), so those tests are no longer skipped.
 	if strings.Contains(src, ".fork(") || strings.Contains(src, "fork(__filename") {
-		return "respawns the node binary"
+		return "child_process.fork needs an IPC channel"
 	}
 	// Native addons cannot exist in a wasm sandbox.
 	if strings.Contains(src, ".node')") || strings.Contains(src, `.node")`) ||
