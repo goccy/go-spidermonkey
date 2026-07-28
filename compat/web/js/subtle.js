@@ -188,6 +188,31 @@
 		return list;
 	}
 
+	// Algorithms whose parameters name ANOTHER algorithm — the hash — which has
+	// to be a real one. `{name:"HMAC", hash:"MD5"}` is NotSupportedError, and it
+	// is decided BEFORE the usages: the suite pairs a bad algorithm with bad
+	// usages precisely to check that order.
+	const KNOWN_HASHES = new Set(["SHA-1", "SHA-256", "SHA-384", "SHA-512"]);
+	// HKDF and PBKDF2 are NOT here: their key carries no hash — it is chosen at
+	// derive time — so requiring one at import rejects every correct call.
+	const NEEDS_HASH = new Set([
+		"HMAC", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP",
+	]);
+
+	function checkInnerAlgorithms(alg, name, op) {
+		if (!NEEDS_HASH.has(String(name).toUpperCase())) return;
+		if (alg === null || typeof alg !== "object") return;
+		const h = alg.hash;
+		// The hash is required for these, and must name a hash this platform has.
+		const hName = h === null || h === undefined
+			? undefined
+			: String(typeof h === "object" ? h.name : h).toUpperCase();
+		if (hName === undefined || !KNOWN_HASHES.has(hName)) {
+			throw new DOMException(
+				`Failed to execute '${op}': unsupported hash ${hName ?? "(missing)"}`, "NotSupportedError");
+		}
+	}
+
 	// A derivation's base key must belong to the algorithm being asked for:
 	// handing ECDH an RSA key (or an ECDH key to HKDF) is an InvalidAccessError,
 	// not an unsupported-algorithm error. Unchecked, those calls proceeded and
@@ -222,6 +247,7 @@
 			// A key pair may leave one half with no usages, so the empty check
 			// applies to the pair as a whole rather than to each side.
 			const isPair = ["ECDSA", "ECDH", "ED25519", "X25519", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP"].includes(name);
+			checkInnerAlgorithms(alg, name, "generateKey");
 			usages = checkUsages(declared, usages, "generateKey", { allowEmpty: isPair && false });
 			if (name === "HMAC") {
 				const hash = hashName(alg.hash);
@@ -280,6 +306,7 @@
 			const declared = normalizeAlgorithm(alg, "importKey");
 			const name = String(declared).toUpperCase();
 			// A public key may legitimately be imported with no usages.
+			checkInnerAlgorithms(alg, name, "importKey");
 			usages = checkUsages(declared, usages, "importKey", { allowEmpty: true });
 			if (name === "HMAC") {
 				let raw;
