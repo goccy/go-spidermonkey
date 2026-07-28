@@ -65,3 +65,56 @@ jobs:
       - name: Test example
         working-directory: examples/${{ matrix.example }}
         run: make test
+
+  wpt:
+    name: Web Platform Tests
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Cache the pinned WPT checkout
+        uses: actions/cache@v4
+        with:
+          path: wpt/suite
+          key: wpt-${{ hashFiles('Makefile') }}
+      - run: make wpt
+
+  nodetest:
+    name: Node.js test suite
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Cache the pinned Node checkout
+        uses: actions/cache@v4
+        with:
+          path: nodetest/suite
+          key: nodetest-${{ hashFiles('Makefile') }}
+      - run: make nodetest
+
+  babeltest:
+    name: Babel fixture corpus
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache the pinned Babel checkout and its packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            babeltest/suite
+            babeltest/node_modules
+          key: babeltest-${{ hashFiles('Makefile', 'scripts/babel-suite-deps.sh') }}
+      - run: make babeltest
