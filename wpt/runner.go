@@ -67,6 +67,12 @@ type Options struct {
 	// against. Empty means the tests run without a server (fetching tests will
 	// report their own failures).
 	BaseURL string
+	// SubVars are the suite's server-side `{{name}}` substitutions (see
+	// Server.SubVars). The runner loads a test and its META scripts from disk
+	// rather than through the server, so a ".sub." file arriving that way —
+	// common/get-host-info.sub.js above all — needs the same treatment or every
+	// URL it builds is unparseable.
+	SubVars map[string]string
 }
 
 const (
@@ -243,11 +249,12 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 		mem = defaultMemory
 	}
 
-	src, err := os.ReadFile(path.Join(opts.Root, rel))
+	srcBytes, err := os.ReadFile(path.Join(opts.Root, rel))
 	if err != nil {
 		res.Harness, res.Message = string(StatusError), err.Error()
 		return res
 	}
+	src := substituteWPT(rel, srcBytes, opts.SubVars)
 	m := parseMeta(string(src))
 	if !scopeSupported(m) {
 		res.Harness = "SKIP"
@@ -316,7 +323,7 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 			res.Harness, res.Message = string(StatusError), "META script "+s+": "+err.Error()
 			return res
 		}
-		steps = append(steps, struct{ name, src string }{p, string(b)})
+		steps = append(steps, struct{ name, src string }{p, string(substituteWPT(p, b, opts.SubVars))})
 	}
 	steps = append(steps, struct{ name, src string }{rel, string(src)})
 

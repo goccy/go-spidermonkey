@@ -45,7 +45,7 @@ func TestWPTFailureBuckets(t *testing.T) {
 	counts := map[string]int{}
 	failing := 0
 	for _, p := range paths {
-		r := wpt.Run(context.Background(), wpt.Options{Root: suiteDir, BaseURL: srv.BaseURL()}, p)
+		r := wpt.Run(context.Background(), wpt.Options{Root: suiteDir, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}, p)
 		for _, s := range r.Subtests {
 			if s.Status == wpt.StatusPass || !strings.Contains(s.Message, grep) {
 				continue

@@ -123,7 +123,7 @@ func TestWPTSuite(t *testing.T) {
 	}
 	defer srv.Close()
 
-	opts := wpt.Options{Root: root, BaseURL: srv.BaseURL()}
+	opts := wpt.Options{Root: root, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}
 	if s := os.Getenv("WPT_TIMEOUT"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
