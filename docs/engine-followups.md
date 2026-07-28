@@ -219,7 +219,29 @@ NO symptom — no error, no log line, memory simply unchanged:
   host can call re-entrantly from a host function, or a bridge primitive that
   evaluates a module graph and returns its namespace.
 
-## 6. Temporal's non-ISO calendars lag the ICU data behind them
+## 6. A long multi-instance run stops making progress
+
+- **Symptom:** running the Node.js suite in one process, after some hundreds to
+  thousands of tests, every goroutine is parked, the process sits at no CPU, and
+  even a plain `time.After` in the harness's own watchdog does not fire. A
+  goroutine dump shows the workers parked in that watchdog `select`, the event
+  loops parked in theirs, and nothing runnable.
+- **What is known:** the tests involved are ones that block inside a HOST CALL
+  (a socket read, a subprocess wait, an `Atomics.wait` nobody notifies). The
+  engine's interrupt cannot reach those, so `withContext` abandons the call at
+  its deadline and its goroutine — and its interpreter — stay alive. The working
+  theory is that enough abandoned instances exhaust something shared, but that
+  is a hypothesis, not a measurement: the resource has not been identified, and
+  nothing in the dump names it. Lowering the worker count delays it rather than
+  preventing it.
+- **Next step:** run under `GODEBUG=schedtrace=1000` through a stall and see
+  whether the scheduler has runnable work it is not running; if it does, the
+  problem is below this repository (wasm2go's thread/lock discipline), and if it
+  does not, the abandoned goroutines are holding something this repository owns.
+- **Mitigation meanwhile:** `NODETEST_SHARD=i/n` spreads the suite over separate
+  processes, bounding a stall to one shard.
+
+## 7. Temporal's non-ISO calendars lag the ICU data behind them
 
 - **Symptom:** 258 of the 328 expected `intl402` failures are Temporal, and all
   of them are its calendar layer. `Intl` itself is fine — ICU has the data and
@@ -252,7 +274,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   the Temporal implementation are what needs correcting — the ICU data they read
   from is already present and already right.
 
-## 7. `async_hooks`: a store cannot outlive the call that established it
+## 8. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.

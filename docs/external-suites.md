@@ -83,6 +83,27 @@ The policy is mechanical (source markers and the test's own `// Flags:` line)
 rather than a hand-maintained list of filenames, so it cannot quietly go stale
 as the suite moves.
 
+### Run it in shards
+
+`NODETEST_SHARD=i/n` takes every n-th test, so the suite can be spread over
+separate PROCESSES:
+
+```sh
+for i in $(seq 0 7); do
+  NODETEST=1 NODETEST_SHARD=$i/8 NODETEST_REPORT=shard-$i.json \
+    go test ./nodetest/ -run TestNodeSuite -v -timeout 40m &
+done; wait
+```
+
+This is not only about speed. Some Node tests block inside a host call — a
+socket read, a subprocess wait, an `Atomics.wait` nobody notifies — and the
+engine's interrupt cannot reach those, so the call is abandoned at its deadline
+with its interpreter still alive (see `JS.Close`). Enough abandoned
+interpreters in ONE process and that process stops making progress: every
+goroutine parks and even the harness's own watchdog timer stops firing. The
+cause is not yet understood; it is under `docs/engine-followups.md`. Sharding
+bounds it to one shard's worth of results while it is open.
+
 ## wpt — the Web Platform Tests
 
 Only the `.any.js` / `.worker.js` forms can run without a browser, and only the
@@ -149,5 +170,12 @@ for what it covers. The ones that are not yet closed:
   `ERR_IMPORT_ATTRIBUTE_MISSING` for an attribute-less JSON import (it currently
   surfaces as a SyntaxError). See `jsonModuleSource` for how both cases are kept
   safe meanwhile.
+- **A long single-process Node run stops making progress.** After some hundreds
+  to thousands of tests, every goroutine is parked, the process sits at no CPU,
+  and even a plain `time.After` in the harness does not fire. The tests involved
+  are ones that block in a host call, which are abandoned at their deadline with
+  their interpreter still live; the working theory is that enough of those
+  exhaust something shared, but that is not yet demonstrated. Run the suite in
+  shards (above) until it is understood.
 - Engine-side items live in [engine-followups.md](engine-followups.md); compat
   API coverage lives in [compat-gaps.md](compat-gaps.md).

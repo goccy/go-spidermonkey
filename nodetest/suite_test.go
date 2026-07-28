@@ -78,6 +78,27 @@ func TestNodeSuite(t *testing.T) {
 		paths = keep
 	}
 	sort.Strings(paths)
+	// NODETEST_SHARD=i/n runs only every n-th test, so the suite can be spread
+	// over separate PROCESSES. That is not just parallelism: a test that blocks
+	// in a host call is abandoned with its interpreter still live (see
+	// JS.Close), and enough of those in one process eventually stop it making
+	// progress. Sharding bounds the blast radius of that to one shard.
+	if sh := os.Getenv("NODETEST_SHARD"); sh != "" {
+		i, n, ok := strings.Cut(sh, "/")
+		idx, err1 := strconv.Atoi(i)
+		total, err2 := strconv.Atoi(n)
+		if !ok || err1 != nil || err2 != nil || total <= 0 || idx < 0 || idx >= total {
+			t.Fatalf("NODETEST_SHARD=%q: want i/n with 0 <= i < n", sh)
+		}
+		var keep []string
+		for j, p := range paths {
+			if j%total == idx {
+				keep = append(keep, p)
+			}
+		}
+		paths = keep
+		t.Logf("shard %d of %d: %d tests", idx, total, len(paths))
+	}
 	if len(paths) == 0 {
 		t.Fatalf("no tests selected (dirs=%v filter=%q)", dirs, filter)
 	}
