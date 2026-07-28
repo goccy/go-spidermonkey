@@ -21,12 +21,15 @@ import (
 // when the attribute is wrong. A plain `globalThis.X = …` creates an enumerable
 // property, which is what both compat layers were doing.
 //
-// The list is Node's, read off a real node binary rather than assumed.
+// The list is Node's, read off a real node binary running a FILE. Reading it
+// from `node -e` instead is a trap: that form reports require, module, exports,
+// __filename and __dirname as well, but in a real file those are CommonJS
+// wrapper parameters rather than globals, and Node's leaked-globals check
+// rejects them.
 var enumerableGlobals = []string{
-	"__dirname", "__filename", "atob", "btoa", "clearImmediate",
-	"clearInterval", "clearTimeout", "crypto", "exports", "fetch", "global",
-	"globalThis", "localStorage", "module", "navigator", "performance",
-	"queueMicrotask", "require", "sessionStorage", "setImmediate",
+	"atob", "btoa", "clearImmediate", "clearInterval", "clearTimeout",
+	"crypto", "fetch", "global", "globalThis", "localStorage", "navigator",
+	"performance", "queueMicrotask", "sessionStorage", "setImmediate",
 	"setInterval", "setTimeout", "structuredClone",
 }
 

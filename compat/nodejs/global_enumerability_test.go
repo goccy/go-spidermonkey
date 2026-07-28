@@ -34,9 +34,10 @@ func TestGlobalsAreNonEnumerableLikeNode(t *testing.T) {
 	if err := json.Unmarshal([]byte(r.Value.String()), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// Node's list, minus the CommonJS wrapper variables that only exist inside a
-	// module (this walk runs at the top level) and the storage globals this
-	// runtime does not provide.
+	// What a real `node` prints for this walk in a FILE. The CommonJS wrapper
+	// variables are deliberately absent: in a file they are wrapper parameters,
+	// not globals, and Node's own leaked-globals check rejects them as globals.
+	// (`node -e` does report them, which is why the list was read from a file.)
 	want := []string{
 		"atob", "btoa", "clearImmediate", "clearInterval", "clearTimeout",
 		"crypto", "fetch", "global", "performance", "queueMicrotask",
@@ -50,10 +51,8 @@ func TestGlobalsAreNonEnumerableLikeNode(t *testing.T) {
 	for _, w := range want {
 		delete(extra, w)
 	}
-	// Globals this runtime legitimately adds to the enumerable set.
-	for _, ok := range []string{"require", "module", "exports", "__filename", "__dirname", "navigator"} {
-		delete(extra, ok)
-	}
+	// navigator is conditionally present in Node and is fine either way.
+	delete(extra, "navigator")
 	if len(extra) > 0 {
 		var names []string
 		for n := range extra {
