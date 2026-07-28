@@ -55,9 +55,7 @@
 	// plain property — exportKey (which enforces `extractable`) is the only path
 	// out. HMAC/EC/RSA keep opaque host handles (_h) and were never leakable.
 	const keyRaw = new WeakMap(); // CryptoKey -> raw Uint8Array
-	const keyJwk = new WeakMap(); // CryptoKey -> JWK object
 	const rawOf = (k) => keyRaw.get(k);
-	const jwkObjOf = (k) => keyJwk.get(k);
 
 	const need = (key, usage) => {
 		if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
@@ -72,10 +70,24 @@
 	// only "deriveKey", per spec).
 	function deriveBitsRaw(alg, baseKey, length) {
 		const name = algName(alg).toUpperCase();
+		if (name === "X25519") {
+			if (!alg.public || !(alg.public instanceof CryptoKey)) {
+				throw new TypeError("X25519 deriveBits needs a public key");
+			}
+			return toBuf(subtleFail(ops.subtle_x25519_derive(baseKey._h, alg.public._h, length ?? 0)));
+		}
 		if (name === "ECDH") {
-			const privJWK = jwkOf(baseKey);
-			const pubJWK = jwkOf(alg.public);
-			return toBuf(subtleFail(ops.subtle_ecdh(privJWK, pubJWK, length ?? 0)));
+			if (!alg.public || !(alg.public instanceof CryptoKey)) {
+				throw new TypeError("ECDH deriveBits needs a public key");
+			}
+			return toBuf(subtleFail(ops.subtle_ecdh(baseKey._h, alg.public._h, length ?? 0)));
+		}
+		// A KDF has no natural output size, so it cannot fall back to "all of it"
+		// the way ECDH can: a null or zero length is an OperationError.
+		if (name === "HKDF" || name === "PBKDF2") {
+			if (length === null || length === undefined || Number(length) === 0) {
+				throw new DOMException(`Failed to execute 'deriveBits': ${name} requires a non-zero length`, "OperationError");
+			}
 		}
 		if (name === "HKDF") {
 			return toBuf(subtleFail(ops.subtle_hkdf(hashName(alg.hash), rawOf(baseKey), toU8(alg.salt), toU8(alg.info), length)));
@@ -109,6 +121,12 @@
 
 	// The key usages each algorithm accepts, per operation. A key type that is
 	// not here is validated only for "usages must be recognized".
+	// ML-KEM (FIPS 203). Only the two parameter sets the host can actually do
+	// are listed: claiming ML-KEM-512 and then failing every operation would be
+	// worse than reporting it unsupported.
+	const MLKEM_NAMES = ["ML-KEM-768", "ML-KEM-1024"];
+	const MLKEM_USAGES = ["encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits"];
+
 	const GENERATE_USAGES = {
 		"ED448": ["sign", "verify"],
 		"X448": ["deriveKey", "deriveBits"],
@@ -127,6 +145,9 @@
 		"RSA-OAEP": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		HKDF: ["deriveKey", "deriveBits"],
 		PBKDF2: ["deriveKey", "deriveBits"],
+		"ML-KEM-512": MLKEM_USAGES,
+		"ML-KEM-768": MLKEM_USAGES,
+		"ML-KEM-1024": MLKEM_USAGES,
 	};
 	// Every algorithm the Web Crypto spec defines, whether or not this runtime
 	// implements it. The distinction decides the ERROR ORDER: an algorithm the
@@ -137,6 +158,7 @@
 		"RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP",
 		"ECDSA", "ECDH", "ED25519", "ED448", "X25519", "X448",
 		"AES-CTR", "AES-CBC", "AES-GCM", "AES-KW",
+		"ML-KEM-512", "ML-KEM-768", "ML-KEM-1024",
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
 	]);
@@ -144,7 +166,9 @@
 	const ALL_USAGES = [
 		"encrypt", "decrypt", "sign", "verify",
 		"deriveKey", "deriveBits", "wrapKey", "unwrapKey",
+		"encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits",
 	];
+
 
 	// normalizeAlgorithm: a missing or malformed algorithm is a TypeError, which
 	// is checked BEFORE support (an unsupported name is NotSupportedError).
@@ -226,6 +250,43 @@
 		}
 	}
 
+	// RSA generateKey parameters that the platform cannot honour are an
+	// OperationError: a modulus that is not a whole number of bytes (or is far
+	// too small), or a public exponent outside the two values every
+	// implementation supports.
+	function checkRSAParams(alg, op) {
+		const bits = Number(alg.modulusLength);
+		if (!Number.isFinite(bits) || bits < 256 || bits % 8 !== 0) {
+			throw new DOMException(`Failed to execute '${op}': unsupported RSA modulus length`, "OperationError");
+		}
+		const e = alg.publicExponent;
+		if (!(e instanceof Uint8Array) && !ArrayBuffer.isView(e) && !(e instanceof ArrayBuffer)) {
+			throw new TypeError(`Failed to execute '${op}': publicExponent must be a BufferSource`);
+		}
+		const bytes = toU8(e);
+		// Strip leading zeros. Only 65537 (0x010001) is accepted, because that
+		// is the only exponent the host generator can produce — claiming to
+		// honour another value and returning a 65537 key would be worse than
+		// refusing it.
+		let i = 0;
+		while (i < bytes.length - 1 && bytes[i] === 0) i++;
+		const v = bytes.slice(i);
+		if (!(v.length === 3 && v[0] === 1 && v[1] === 0 && v[2] === 1)) {
+			throw new DOMException(`Failed to execute '${op}': unsupported RSA public exponent`, "OperationError");
+		}
+	}
+
+	// A derivation produces whole bytes, so a bit length that is not a multiple
+	// of 8 is an OperationError rather than a silently rounded result.
+	function checkDerivedLength(length, op) {
+		if (length === null || length === undefined) return length;
+		const n = Number(length);
+		if (!Number.isFinite(n) || n < 0 || n % 8 !== 0) {
+			throw new DOMException(`Failed to execute '${op}': length must be a multiple of 8`, "OperationError");
+		}
+		return n;
+	}
+
 	// AES accepts exactly these key lengths; anything else is an OperationError
 	// (not a TypeError — the call was well formed, the value was not).
 	function checkAESLength(length, op) {
@@ -234,6 +295,61 @@
 			throw new DOMException(`Failed to execute '${op}': invalid AES key length`, "OperationError");
 		}
 		return n;
+	}
+
+	// A JWK carries its own policy, and importKey must honour it: a key marked
+	// non-extractable cannot be imported as extractable, key_ops must cover
+	// every requested usage, and "use" must agree with them. Each mismatch is a
+	// DataError. Unchecked, all of these imports SUCCEEDED, which is the
+	// "operation succeeded, but should not have" family in the suite.
+	const JWK_USE_USAGES = {
+		enc: ["encrypt", "decrypt", "wrapKey", "unwrapKey", "deriveKey", "deriveBits"],
+		sig: ["sign", "verify"],
+	};
+
+	function checkJWKConsistency(jwk, usages, extractable) {
+		if (!jwk || typeof jwk !== "object") {
+			throw new DOMException("importKey: JWK must be an object", "DataError");
+		}
+		if (jwk.ext === false && extractable) {
+			throw new DOMException("importKey: JWK is not extractable", "DataError");
+		}
+		if (jwk.key_ops !== undefined) {
+			if (!Array.isArray(jwk.key_ops)) {
+				throw new DOMException("importKey: JWK key_ops must be a sequence", "DataError");
+			}
+			if (new Set(jwk.key_ops).size !== jwk.key_ops.length) {
+				throw new DOMException("importKey: JWK key_ops has duplicates", "DataError");
+			}
+			for (const u of usages) {
+				if (!jwk.key_ops.includes(u)) {
+					throw new DOMException(`importKey: JWK key_ops does not permit '${u}'`, "DataError");
+				}
+			}
+		}
+		if (jwk.use !== undefined && usages.length > 0) {
+			const allowed = JWK_USE_USAGES[jwk.use];
+			if (!allowed) throw new DOMException(`importKey: unrecognized JWK use '${jwk.use}'`, "DataError");
+			for (const u of usages) {
+				if (!allowed.includes(u)) {
+					throw new DOMException(`importKey: JWK use '${jwk.use}' does not permit '${u}'`, "DataError");
+				}
+			}
+		}
+	}
+
+	// An operation names an algorithm, and the key names one too; WebCrypto
+	// requires them to be the SAME and rejects the call with InvalidAccessError
+	// when they are not. Unchecked, encrypting with (say) an AES-CBC key under
+	// {name:"AES-GCM"} reached the cipher and failed with whatever the host
+	// happened to say.
+	function checkKeyAlgMatches(alg, key, op) {
+		const want = String(algName(alg)).toUpperCase();
+		const have = String((key && key.algorithm && key.algorithm.name) || "").toUpperCase();
+		if (have && want && have !== want) {
+			throw new DOMException(
+				`Failed to execute '${op}': the key is for ${have}, not ${want}`, "InvalidAccessError");
+		}
 	}
 
 	const subtle = {
@@ -247,7 +363,13 @@
 			// A key pair may leave one half with no usages, so the empty check
 			// applies to the pair as a whole rather than to each side.
 			const isPair = ["ECDSA", "ECDH", "ED25519", "X25519", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP"].includes(name);
+			// The ALGORITHM is validated in full before the usages are looked at:
+			// WebCrypto normalizes (and so rejects) the algorithm first, and the
+			// suite pairs a bad parameter with bad usages precisely to check which
+			// error wins.
 			checkInnerAlgorithms(alg, name, "generateKey");
+			if (RSA_ALL.includes(name)) checkRSAParams(alg, "generateKey");
+			if (AES_ALL.includes(name)) checkAESLength(alg.length === undefined ? 256 : alg.length, "generateKey");
 			usages = checkUsages(declared, usages, "generateKey", { allowEmpty: isPair && false });
 			if (name === "HMAC") {
 				const hash = hashName(alg.hash);
@@ -268,7 +390,7 @@
 			if (RSA_ALL.includes(name)) {
 				const hash = hashName(alg.hash);
 				const bits = Number(alg.modulusLength);
-				const r = ops.subtle_rsa_generate(bits);
+				const r = subtleFail(ops.subtle_rsa_generate(bits));
 				const algo = { name: algName(alg), hash: { name: hash }, modulusLength: bits, publicExponent: new Uint8Array([1, 0, 1]) };
 				const isOAEP = name === "RSA-OAEP";
 				return {
@@ -291,13 +413,32 @@
 					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
+			if (MLKEM_NAMES.includes(algName(alg))) {
+				const r = subtleFail(ops.subtle_mlkem_generate(algName(alg)));
+				const algo = { name: r.name };
+				return {
+					privateKey: new CryptoKey("private", extractable, algo,
+						usages.filter((u) => u === "decapsulateKey" || u === "decapsulateBits"), r.priv),
+					publicKey: new CryptoKey("public", true, algo,
+						usages.filter((u) => u === "encapsulateKey" || u === "encapsulateBits"), r.pub),
+				};
+			}
+			if (name === "X25519") {
+				const r = subtleFail(ops.subtle_x25519_generate());
+				const algo = { name: "X25519" };
+				return {
+					privateKey: new CryptoKey("private", extractable, algo, usages, r.priv),
+					publicKey: new CryptoKey("public", true, algo, [], r.pub),
+				};
+			}
 			if (name === "ECDH") {
 				const crv = String(alg.namedCurve);
-				const r = ops.subtle_ec_generate(crv); // reuse EC keygen (same curves)
-				const algo = { name: "ECDH", namedCurve: crv };
-				const priv = new CryptoKey("private", extractable, algo, usages, r.priv);
-				const pub = new CryptoKey("public", true, algo, [], r.pub);
-				return { privateKey: priv, publicKey: pub };
+				const r = subtleFail(ops.subtle_ec_generate(crv)); // reuse EC keygen (same curves)
+				const algo = { name: algName(alg), namedCurve: crv };
+				return {
+					privateKey: new CryptoKey("private", extractable, algo, usages, r.priv),
+					publicKey: new CryptoKey("public", true, algo, [], r.pub),
+				};
 			}
 			unsupported(`algorithm ${algName(alg)}`);
 		},
@@ -305,9 +446,33 @@
 		async importKey(format, keyData, alg, extractable, usages) {
 			const declared = normalizeAlgorithm(alg, "importKey");
 			const name = String(declared).toUpperCase();
-			// A public key may legitimately be imported with no usages.
 			checkInnerAlgorithms(alg, name, "importKey");
-			usages = checkUsages(declared, usages, "importKey", { allowEmpty: true });
+			// Empty usages are legal ONLY for a public key — a secret or private
+			// key that can do nothing is a SyntaxError. Which one is being
+			// imported follows from the format, except for JWK where the payload
+			// says so ("oct" is secret, a private JWK carries "d").
+			const isPublicImport = format === "spki" ||
+				(format === "jwk" && keyData && keyData.kty !== "oct" && keyData.d === undefined) ||
+				(format === "raw" && ["ECDH", "ECDSA", "X25519", "ED25519", "X448", "ED448"].includes(name));
+			usages = checkUsages(declared, usages, "importKey", { allowEmpty: isPublicImport });
+			if (format === "jwk") checkJWKConsistency(keyData, usages, extractable);
+			if (MLKEM_NAMES.includes(algName(alg))) {
+				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
+				const r = subtleFail(ops.subtle_mlkem_import(algName(alg), format, payload));
+				const isPub = r.type === "public";
+				return new CryptoKey(r.type, isPub ? true : extractable, { name: r.name },
+					usages.filter((u) => isPub
+						? u === "encapsulateKey" || u === "encapsulateBits"
+						: u === "decapsulateKey" || u === "decapsulateBits"), r.id);
+			}
+			if (name === "X25519") {
+				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
+				const r = subtleFail(ops.subtle_x25519_import(format, payload));
+				const algo = { name: "X25519" };
+				return r.priv !== undefined
+					? new CryptoKey("private", extractable, algo, usages, r.priv)
+					: new CryptoKey("public", true, algo, [], r.pub);
+			}
 			if (name === "HMAC") {
 				let raw;
 				if (format === "raw") raw = toU8(keyData);
@@ -317,16 +482,12 @@
 					}
 					raw = b64uDecode(keyData.k);
 				} else unsupported(`HMAC key format ${format}`);
+				if (raw.length === 0) {
+					throw new DOMException("importKey: HMAC key data is empty", "DataError");
+				}
 				const hash = hashName(alg.hash);
 				const h = ops.subtle_hmac_import(raw);
 				return new CryptoKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: raw.length * 8 }, usages, h);
-			}
-			if (name === "ECDSA") {
-				let r;
-				if (format === "jwk") r = ops.subtle_ec_import_jwk(JSON.stringify(keyData));
-				else if (format === "pkcs8" || format === "spki") r = ops.subtle_ec_import_der(format, toU8(keyData));
-				else unsupported(`EC key format ${format}`);
-				return new CryptoKey(r.type, extractable, { name: "ECDSA", namedCurve: r.crv }, usages, r.id);
 			}
 			if (RSA_ALL.includes(name)) {
 				let r;
@@ -339,8 +500,15 @@
 			if (AES_ALL.includes(name)) {
 				let raw;
 				if (format === "raw") raw = toU8(keyData);
-				else if (format === "jwk") raw = b64uDecode(keyData.k);
-				else unsupported(`AES key format ${format}`);
+				else if (format === "jwk") {
+					if (!keyData || keyData.kty !== "oct" || typeof keyData.k !== "string") {
+						throw new DOMException("importKey: not an oct JWK", "DataError");
+					}
+					raw = b64uDecode(keyData.k);
+				} else unsupported(`AES key format ${format}`);
+				if (raw.length !== 16 && raw.length !== 24 && raw.length !== 32) {
+					throw new DOMException("importKey: invalid AES key length", "DataError");
+				}
 				const key = new CryptoKey("secret", extractable, { name, length: raw.length * 8 }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
@@ -352,16 +520,15 @@
 				else unsupported(`Ed25519 key format ${format}`);
 				return new CryptoKey(r.type, extractable, { name: "Ed25519" }, usages, r.id);
 			}
-			if (name === "ECDH") {
-				if (format !== "jwk") {
-					if (format === "raw") {
-						// raw public point: keep as JWK-less handle via EC import DER path unsupported; require jwk
-					}
-					unsupported(`ECDH key format ${format}`);
-				}
-				const key = new CryptoKey(keyData.d ? "private" : "public", extractable, { name: "ECDH", namedCurve: keyData.crv }, usages, null);
-				keyJwk.set(key, { ...keyData, crv: keyData.crv });
-				return key;
+			if (name === "ECDH" || name === "ECDSA") {
+				let r;
+				if (format === "jwk") r = subtleFail(ops.subtle_ec_import_jwk(JSON.stringify(keyData)));
+				else if (format === "raw") r = subtleFail(ops.subtle_ec_import_der("raw", toU8(keyData), String(alg.namedCurve)));
+				else if (format === "pkcs8" || format === "spki") r = subtleFail(ops.subtle_ec_import_der(format, toU8(keyData)));
+				else unsupported(`EC key format ${format}`);
+				// A public key carries no usages in WebCrypto, whatever was asked for.
+				const kUsages = r.type === "public" ? usages.filter((u) => name === "ECDSA" && u === "verify") : usages;
+				return new CryptoKey(r.type, extractable, { name: algName(alg), namedCurve: r.crv }, kUsages, r.id);
 			}
 			if (name === "HKDF" || name === "PBKDF2") {
 				if (format !== "raw") unsupported(`${name} key format ${format}`);
@@ -376,15 +543,24 @@
 			if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
 			if (!key.extractable) throw new DOMException("key is not extractable", "InvalidAccessError");
 			const name = key.algorithm.name.toUpperCase();
+			if (MLKEM_NAMES.includes(key.algorithm.name)) {
+				const r = subtleFail(ops.subtle_mlkem_export(format, key._h));
+				return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+			}
+			if (name === "X25519") {
+				const r = subtleFail(ops.subtle_x25519_export(format, key._h));
+				return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+			}
 			if (name === "HMAC") {
 				const raw = Uint8Array.from(ops.subtle_hmac_export(key._h));
 				if (format === "raw") return raw.buffer;
 				if (format === "jwk") return { kty: "oct", k: b64uEncode(raw), ext: true, key_ops: [...key.usages] };
 				unsupported(`HMAC export format ${format}`);
 			}
-			if (name === "ECDSA") {
+			if (name === "ECDSA" || name === "ECDH") {
 				if (format === "jwk") return JSON.parse(ops.subtle_ec_export_jwk(key._h));
-				if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_ec_export_der(format, key._h));
+				if (format === "raw") return toBuf(subtleFail(ops.subtle_ec_export_der("raw", key._h)));
+				if (format === "pkcs8" || format === "spki") return toBuf(subtleFail(ops.subtle_ec_export_der(format, key._h)));
 				unsupported(`EC export format ${format}`);
 			}
 			if (RSA_ALL.includes(name)) {
@@ -415,6 +591,7 @@
 
 		async sign(alg, key, data) {
 			need(key, "sign");
+			checkKeyAlgMatches(alg, key, "sign");
 			const name = algName(alg).toUpperCase();
 			if (name === "HMAC") return toBuf(ops.subtle_hmac_sign(key.algorithm.hash.name, key._h, toU8(data)));
 			if (name === "ECDSA") return toBuf(ops.subtle_ec_sign(hashName(alg.hash), key._h, toU8(data)));
@@ -427,6 +604,7 @@
 
 		async verify(alg, key, signature, data) {
 			need(key, "verify");
+			checkKeyAlgMatches(alg, key, "verify");
 			const name = algName(alg).toUpperCase();
 			if (name === "HMAC") return ops.subtle_hmac_verify(key.algorithm.hash.name, key._h, toU8(signature), toU8(data));
 			if (name === "ECDSA") return ops.subtle_ec_verify(hashName(alg.hash), key._h, toU8(signature), toU8(data));
@@ -439,6 +617,7 @@
 
 		async encrypt(alg, key, data) {
 			need(key, "encrypt");
+			checkKeyAlgMatches(alg, key, "encrypt");
 			const name = algName(alg).toUpperCase();
 			if (AES_NAMES.includes(name)) {
 				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
@@ -455,6 +634,7 @@
 
 		async decrypt(alg, key, data) {
 			need(key, "decrypt");
+			checkKeyAlgMatches(alg, key, "decrypt");
 			const name = algName(alg).toUpperCase();
 			if (AES_NAMES.includes(name)) {
 				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
@@ -475,6 +655,7 @@
 		// key only carries wrapKey/unwrapKey usages.
 		async wrapKey(format, key, wrappingKey, wrapAlg) {
 			need(wrappingKey, "wrapKey");
+			checkKeyAlgMatches(wrapAlg, wrappingKey, "wrapKey");
 			const exported = await subtle.exportKey(format, key);
 			const bytes = format === "jwk" ? new TextEncoder().encode(JSON.stringify(exported)) : new Uint8Array(exported);
 			return toBuf(rawCrypt(true, wrapAlg, wrappingKey, bytes));
@@ -482,6 +663,7 @@
 
 		async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlg, keyAlg, extractable, usages) {
 			need(unwrappingKey, "unwrapKey");
+			checkKeyAlgMatches(unwrapAlg, unwrappingKey, "unwrapKey");
 			const decrypted = new Uint8Array(rawCrypt(false, unwrapAlg, unwrappingKey, toU8(wrappedKey)));
 			const material = format === "jwk"
 				? JSON.parse(new TextDecoder().decode(decrypted))
@@ -489,10 +671,45 @@
 			return subtle.importKey(format, material, keyAlg, extractable, usages);
 		},
 
+		// ------------------------------------------------- ML-KEM encapsulation
+		// encapsulate produces a fresh shared secret plus the ciphertext that
+		// lets the holder of the private key recover it; decapsulate is the
+		// inverse. The *Bits forms hand back raw bytes, the *Key forms import
+		// them as a CryptoKey of the caller's chosen algorithm.
+		async encapsulateBits(alg, encapsulationKey) {
+			need(encapsulationKey, "encapsulateBits");
+			checkKeyAlgMatches(alg, encapsulationKey, "encapsulateBits");
+			const r = encapsulate(encapsulationKey);
+			return { sharedKey: r.shared.buffer, ciphertext: r.ct.buffer };
+		},
+
+		async encapsulateKey(alg, encapsulationKey, sharedKeyAlg, extractable, usages) {
+			need(encapsulationKey, "encapsulateKey");
+			checkKeyAlgMatches(alg, encapsulationKey, "encapsulateKey");
+			const r = encapsulate(encapsulationKey);
+			return {
+				sharedKey: await sharedKeyFrom(r.shared, sharedKeyAlg, extractable, usages),
+				ciphertext: r.ct.buffer,
+			};
+		},
+
+		async decapsulateBits(alg, decapsulationKey, ciphertext) {
+			need(decapsulationKey, "decapsulateBits");
+			checkKeyAlgMatches(alg, decapsulationKey, "decapsulateBits");
+			return toBuf(subtleFail(ops.subtle_mlkem_decapsulate(decapsulationKey._h, toU8(ciphertext))));
+		},
+
+		async decapsulateKey(alg, decapsulationKey, ciphertext, sharedKeyAlg, extractable, usages) {
+			need(decapsulationKey, "decapsulateKey");
+			checkKeyAlgMatches(alg, decapsulationKey, "decapsulateKey");
+			const bits = subtleFail(ops.subtle_mlkem_decapsulate(decapsulationKey._h, toU8(ciphertext)));
+			return sharedKeyFrom(bits, sharedKeyAlg, extractable, usages);
+		},
+
 		async deriveBits(alg, baseKey, length) {
 			need(baseKey, "deriveBits");
 			checkDeriveKeyMatches(alg, baseKey, "deriveBits");
-			return deriveBitsRaw(alg, baseKey, length);
+			return deriveBitsRaw(alg, baseKey, checkDerivedLength(length, "deriveBits"));
 		},
 
 		async deriveKey(alg, baseKey, derivedKeyAlg, extractable, usages) {
@@ -517,7 +734,7 @@
 				}
 			}
 			const bits = await deriveBitsRaw(alg, baseKey, length);
-			if (AES_NAMES.includes(derivedName)) {
+			if (AES_ALL.includes(derivedName)) {
 				return subtle.importKey("raw", bits, { name: derivedName }, extractable, usages);
 			}
 			if (derivedName === "HMAC") {
@@ -549,12 +766,27 @@
 		throw new DOMException(`unsupported wrap algorithm ${name}`, "NotSupportedError");
 	}
 
-	// jwkOf returns a key's JWK JSON string, whether it was imported (has
-	// _jwk) or generated (has an EC handle to export).
-	function jwkOf(key) {
-		const j = jwkObjOf(key); if (j) return JSON.stringify(j);
-		if (key._h != null) return ops.subtle_ec_export_jwk(key._h);
-		throw new DOMException("key has no derivable material", "InvalidAccessError");
+	// encapsulate splits the host's one flat buffer: the 32-byte shared key
+	// first, then the ciphertext.
+	function encapsulate(key) {
+		const all = Uint8Array.from(subtleFail(ops.subtle_mlkem_encapsulate(key._h)));
+		return { shared: all.slice(0, 32), ct: all.slice(32) };
+	}
+
+	// sharedKeyFrom turns 32 encapsulated bytes into the key the caller asked
+	// for. HKDF/PBKDF2 take the secret whole; a fixed-size algorithm takes the
+	// prefix its length names, as WebCrypto's "get key length" prescribes.
+	function sharedKeyFrom(bits, alg, extractable, usages) {
+		const raw = Uint8Array.from(bits);
+		const name = String(algName(alg)).toUpperCase();
+		if (AES_ALL.includes(name)) {
+			const len = checkAESLength(alg.length === undefined ? 256 : alg.length, "encapsulateKey") / 8;
+			if (len > raw.length) {
+				throw new DOMException("encapsulateKey: shared secret is shorter than the requested key", "OperationError");
+			}
+			return subtle.importKey("raw", raw.slice(0, len), alg, extractable, usages);
+		}
+		return subtle.importKey("raw", raw, alg, extractable, usages);
 	}
 
 	globalThis.crypto.subtle = subtle;

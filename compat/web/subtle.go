@@ -8,6 +8,7 @@ package web
 import (
 	"container/list"
 	"crypto"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -51,6 +52,9 @@ type subtleKey struct {
 	ecPub   *ecdsa.PublicKey
 	edPriv  ed25519.PrivateKey
 	edPub   ed25519.PublicKey
+	xPriv   *ecdh.PrivateKey // X25519
+	xPub    *ecdh.PublicKey
+	mlkem   *mlkemKey
 }
 
 // maxSubtleKeys bounds the host key table. The table has no engine-driven free
@@ -416,14 +420,35 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 		return nil, err
 	}
 	switch args[0].String() {
+	case "raw":
+		// A raw EC key is a bare uncompressed point, so the curve cannot be
+		// recovered from the bytes — the caller names it.
+		if len(args) < 3 {
+			return subtleErr("DataError: raw EC import needs a named curve"), nil
+		}
+		curve, cerr := ecdhCurve(args[2].String())
+		if cerr != nil {
+			return subtleErr("DataError: " + cerr.Error()), nil
+		}
+		pt, perr := curve.NewPublicKey(der)
+		if perr != nil {
+			return subtleErr("DataError: " + perr.Error()), nil
+		}
+		pub, perr := ecdsaFromECDHPublic(pt, args[2].String())
+		if perr != nil {
+			return subtleErr("DataError: " + perr.Error()), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{
+			"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": args[2].String(),
+		}), nil
 	case "pkcs8":
 		key, err := x509.ParsePKCS8PrivateKey(der)
 		if err != nil {
-			return nil, err
+			return subtleErr("DataError: " + err.Error()), nil
 		}
 		priv, ok := key.(*ecdsa.PrivateKey)
 		if !ok {
-			return nil, fmt.Errorf("pkcs8 key is not EC")
+			return subtleErr("DataError: pkcs8 key is not EC"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{ecPriv: priv}), "type": "private", "crv": curveName(priv.Curve),
@@ -431,17 +456,17 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 	case "spki":
 		key, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
-			return nil, err
+			return subtleErr("DataError: " + err.Error()), nil
 		}
 		pub, ok := key.(*ecdsa.PublicKey)
 		if !ok {
-			return nil, fmt.Errorf("spki key is not EC")
+			return subtleErr("DataError: spki key is not EC"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": curveName(pub.Curve),
 		}), nil
 	}
-	return nil, fmt.Errorf("ec import: unsupported format")
+	return subtleErr("NotSupportedError: unsupported EC key format"), nil
 }
 
 func (s *subtleAPI) opECExportJWK(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -481,9 +506,22 @@ func (s *subtleAPI) opECExportDER(cfg spidermonkey.Config, args []spidermonkey.V
 		return nil, err
 	}
 	switch args[0].String() {
+	case "raw":
+		pub := k.ecPub
+		if pub == nil && k.ecPriv != nil {
+			pub = &k.ecPriv.PublicKey
+		}
+		if pub == nil {
+			return subtleErr("InvalidAccessError: raw export needs a public key"), nil
+		}
+		pt, perr := pub.ECDH()
+		if perr != nil {
+			return subtleErr("OperationError: " + perr.Error()), nil
+		}
+		return bytesValue(pt.Bytes()), nil
 	case "pkcs8":
 		if k.ecPriv == nil {
-			return nil, fmt.Errorf("pkcs8 export needs a private key")
+			return subtleErr("InvalidAccessError: pkcs8 export needs a private key"), nil
 		}
 		der, err := x509.MarshalPKCS8PrivateKey(k.ecPriv)
 		if err != nil {
@@ -504,7 +542,7 @@ func (s *subtleAPI) opECExportDER(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		return bytesValue(der), nil
 	}
-	return nil, fmt.Errorf("ec export: unsupported format")
+	return subtleErr("NotSupportedError: unsupported EC export format"), nil
 }
 
 func (s *subtleAPI) opECSign(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -1046,29 +1084,33 @@ func (s *subtleAPI) opEdVerify(cfg spidermonkey.Config, args []spidermonkey.Valu
 // ops returns the host-function table js/subtle.js expects on __web_ops.
 func (s *subtleAPI) ops() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
-		"subtle_digest":         s.opDigest,
-		"subtle_hmac_import":    s.opHMACImport,
-		"subtle_hmac_export":    s.opHMACExport,
-		"subtle_hmac_sign":      s.opHMACSign,
-		"subtle_hmac_verify":    s.opHMACVerify,
-		"subtle_ec_generate":    s.opECGenerate,
-		"subtle_ec_import_jwk":  s.opECImportJWK,
-		"subtle_ec_import_der":  s.opECImportDER,
-		"subtle_ec_export_jwk":  s.opECExportJWK,
-		"subtle_ec_export_der":  s.opECExportDER,
-		"subtle_ec_sign":        s.opECSign,
-		"subtle_ec_verify":      s.opECVerify,
-		"subtle_rsa_generate":   s.opRSAGenerate,
-		"subtle_rsa_import_jwk": s.opRSAImportJWK,
-		"subtle_rsa_import_der": s.opRSAImportDER,
-		"subtle_rsa_export_jwk": s.opRSAExportJWK,
-		"subtle_rsa_export_der": s.opRSAExportDER,
-		"subtle_rsa_sign":       s.opRSASign,
-		"subtle_rsa_verify":     s.opRSAVerify,
-		"subtle_ed_generate":    s.opEdGenerate,
-		"subtle_ed_import":      s.opEdImport,
-		"subtle_ed_export":      s.opEdExport,
-		"subtle_ed_sign":        s.opEdSign,
-		"subtle_ed_verify":      s.opEdVerify,
+		"subtle_digest":          s.opDigest,
+		"subtle_hmac_import":     s.opHMACImport,
+		"subtle_hmac_export":     s.opHMACExport,
+		"subtle_hmac_sign":       s.opHMACSign,
+		"subtle_hmac_verify":     s.opHMACVerify,
+		"subtle_ec_generate":     s.opECGenerate,
+		"subtle_ec_import_jwk":   s.opECImportJWK,
+		"subtle_ec_import_der":   s.opECImportDER,
+		"subtle_ec_export_jwk":   s.opECExportJWK,
+		"subtle_ec_export_der":   s.opECExportDER,
+		"subtle_ec_sign":         s.opECSign,
+		"subtle_ec_verify":       s.opECVerify,
+		"subtle_rsa_generate":    s.opRSAGenerate,
+		"subtle_rsa_import_jwk":  s.opRSAImportJWK,
+		"subtle_rsa_import_der":  s.opRSAImportDER,
+		"subtle_rsa_export_jwk":  s.opRSAExportJWK,
+		"subtle_rsa_export_der":  s.opRSAExportDER,
+		"subtle_rsa_sign":        s.opRSASign,
+		"subtle_rsa_verify":      s.opRSAVerify,
+		"subtle_x25519_generate": s.opX25519Generate,
+		"subtle_x25519_import":   s.opX25519Import,
+		"subtle_x25519_export":   s.opX25519Export,
+		"subtle_x25519_derive":   s.opX25519Derive,
+		"subtle_ed_generate":     s.opEdGenerate,
+		"subtle_ed_import":       s.opEdImport,
+		"subtle_ed_export":       s.opEdExport,
+		"subtle_ed_sign":         s.opEdSign,
+		"subtle_ed_verify":       s.opEdVerify,
 	}
 }

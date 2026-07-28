@@ -8,12 +8,13 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
-	"encoding/json"
 	"fmt"
 	"hash"
+	"math/big"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"golang.org/x/crypto/hkdf"
@@ -211,19 +212,30 @@ func unpad7(data []byte, bs int) ([]byte, error) {
 	return data[:len(data)-n], nil
 }
 
-// opECDHDerive(privJWK, pubJWK, bits) -> shared secret bytes. Keys arrive as
-// JWK JSON so no host key table is needed.
+// opECDHDerive(privHandle, pubHandle, bits) -> shared secret bytes.
+//
+// It takes handles rather than JWK because generateKey produces handles: the
+// JWK-only form meant a generated ECDH key pair — the common case — could not
+// derive anything at all.
 func (s *subtleAPI) opECDHDerive(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 3 {
-		return nil, fmt.Errorf("ecdh: (privJWK, pubJWK, bits) required")
+		return nil, fmt.Errorf("ecdh: (priv, pub, bits) required")
 	}
-	priv, err := ecdhPrivFromJWK(args[0].String())
-	if err != nil {
-		return subtleErr(err.Error()), nil
+	privKey, perr := s.get(args[0])
+	pubKey, uerr := s.get(args[1])
+	if perr != nil || uerr != nil || privKey.ecPriv == nil || pubKey.ecPub == nil {
+		return subtleErr("InvalidAccessError: ECDH needs a private and a public EC key"), nil
 	}
-	pub, err := ecdhPubFromJWK(args[1].String())
+	if privKey.ecPriv.Curve != pubKey.ecPub.Curve {
+		return subtleErr("InvalidAccessError: ECDH keys are on different curves"), nil
+	}
+	priv, err := privKey.ecPriv.ECDH()
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr("InvalidAccessError: " + err.Error()), nil
+	}
+	pub, err := pubKey.ecPub.ECDH()
+	if err != nil {
+		return subtleErr("InvalidAccessError: " + err.Error()), nil
 	}
 	secret, err := priv.ECDH(pub)
 	if err != nil {
@@ -242,6 +254,25 @@ func (s *subtleAPI) opECDHDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	return bytesValue(secret), nil
 }
 
+// ecdsaFromECDHPublic converts a crypto/ecdh point back to the ecdsa form the
+// host key table stores, so raw and JWK imports produce the same kind of key.
+func ecdsaFromECDHPublic(pt *ecdh.PublicKey, crv string) (*ecdsa.PublicKey, error) {
+	b := pt.Bytes()
+	if len(b) == 0 || b[0] != 4 {
+		return nil, fmt.Errorf("expected an uncompressed EC point")
+	}
+	curve, err := curveByName(crv)
+	if err != nil {
+		return nil, err
+	}
+	half := (len(b) - 1) / 2
+	return &ecdsa.PublicKey{
+		Curve: curve,
+		X:     new(big.Int).SetBytes(b[1 : 1+half]),
+		Y:     new(big.Int).SetBytes(b[1+half:]),
+	}, nil
+}
+
 func ecdhCurve(crv string) (ecdh.Curve, error) {
 	switch crv {
 	case "P-256":
@@ -252,44 +283,6 @@ func ecdhCurve(crv string) (ecdh.Curve, error) {
 		return ecdh.P521(), nil
 	}
 	return nil, fmt.Errorf("unsupported ECDH curve %q", crv)
-}
-
-func ecdhPrivFromJWK(s string) (*ecdh.PrivateKey, error) {
-	var j jwkDoc
-	if err := json.Unmarshal([]byte(s), &j); err != nil {
-		return nil, err
-	}
-	curve, err := ecdhCurve(j.Crv)
-	if err != nil {
-		return nil, err
-	}
-	d, err := b64u.DecodeString(j.D)
-	if err != nil {
-		return nil, fmt.Errorf("bad JWK d: %w", err)
-	}
-	return curve.NewPrivateKey(d)
-}
-
-func ecdhPubFromJWK(s string) (*ecdh.PublicKey, error) {
-	var j jwkDoc
-	if err := json.Unmarshal([]byte(s), &j); err != nil {
-		return nil, err
-	}
-	curve, err := ecdhCurve(j.Crv)
-	if err != nil {
-		return nil, err
-	}
-	x, err := b64u.DecodeString(j.X)
-	if err != nil {
-		return nil, fmt.Errorf("bad JWK x: %w", err)
-	}
-	y, err := b64u.DecodeString(j.Y)
-	if err != nil {
-		return nil, fmt.Errorf("bad JWK y: %w", err)
-	}
-	// Uncompressed point: 0x04 || X || Y.
-	point := append([]byte{0x04}, append(x, y...)...)
-	return curve.NewPublicKey(point)
 }
 
 // opHKDFDerive(hash, ikm, salt, info, bits) -> bytes.
@@ -305,7 +298,7 @@ func (s *subtleAPI) opHKDFDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	salt, _ := argBytes(args[2])
 	info, _ := argBytes(args[3])
 	length := intArg(args[4]) / 8
-	if length < 0 || length > maxSubtleKDFBytes {
+	if length < 1 || length > maxSubtleKDFBytes {
 		return subtleErr("OperationError: invalid derived-bits length"), nil
 	}
 	r := hkdf.New(newHash, ikm, salt, info)
@@ -334,7 +327,7 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 		return subtleErr("OperationError: PBKDF2 iterations out of range"), nil
 	}
 	length := intArg(args[4]) / 8
-	if length < 0 || length > maxSubtleKDFBytes {
+	if length < 1 || length > maxSubtleKDFBytes {
 		return subtleErr("OperationError: invalid derived-bits length"), nil
 	}
 	return bytesValue(pbkdf2.Key(pw, salt, iter, length, newHash)), nil
@@ -482,8 +475,14 @@ func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 		"subtle_aes_decrypt": s.opAESDecrypt,
 		"subtle_aes_kw":      s.opAESKW,
 		"subtle_ecdh":        s.opECDHDerive,
-		"subtle_hkdf":        s.opHKDFDerive,
-		"subtle_pbkdf2":      s.opPBKDF2Derive,
-		"subtle_rsa_oaep":    s.opRSAOAEP,
+
+		"subtle_mlkem_generate":    s.opMLKEMGenerate,
+		"subtle_mlkem_import":      s.opMLKEMImport,
+		"subtle_mlkem_export":      s.opMLKEMExport,
+		"subtle_mlkem_encapsulate": s.opMLKEMEncapsulate,
+		"subtle_mlkem_decapsulate": s.opMLKEMDecapsulate,
+		"subtle_hkdf":              s.opHKDFDerive,
+		"subtle_pbkdf2":            s.opPBKDF2Derive,
+		"subtle_rsa_oaep":          s.opRSAOAEP,
 	}
 }
