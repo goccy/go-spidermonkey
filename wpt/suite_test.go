@@ -17,13 +17,20 @@
 // results are judged PER SUBTEST so one unimplemented corner cannot hide the
 // rest of a file.
 //
-// expectations.json lists the subtests known to fail; the run FAILS on any
-// regression and on any stale expectation.
+// expectations.json records one line per FILE — the number of failing subtests
+// and a digest of which ones — and the run FAILS on any change to it: a new
+// failing file, a file that stopped failing, or the same count with a different
+// set of subtests. Per-subtest keys would be the precise form, but this suite
+// has ~22,000 known failures (mostly whole APIs that are not implemented) and
+// 6 MB of them is a file nobody can review; the digest keeps the precision
+// without the bulk, and WPT_REPORT still dumps the detail.
 package wpt_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path"
 	"sort"
@@ -144,10 +151,19 @@ func TestWPTSuite(t *testing.T) {
 
 	type stat struct{ pass, fail, files, broken, skipped int }
 	byArea := map[string]*stat{}
+	// One line per FILE, not per subtest. Per-subtest keys are the precise form,
+	// but this suite has ~22,000 known failures — mostly whole APIs that are not
+	// implemented — and 6 MB of them is a file nobody can read or review. Each
+	// line therefore carries the count AND a digest of exactly WHICH subtests
+	// failed, so a swap (one fixed, one broken, same count) still shows up; the
+	// run itself prints the individual failures, and WPT_REPORT dumps them all.
 	failures := map[string]string{}
 	harnessReasons := map[string]int{}
 	done, start := 0, time.Now()
 	for r := range results {
+		if done++; done%100 == 0 {
+			t.Logf("%d/%d files in %v", done, len(paths), time.Since(start).Round(time.Second))
+		}
 		area := topDir(r.Path)
 		s := byArea[area]
 		if s == nil {
@@ -164,17 +180,22 @@ func TestWPTSuite(t *testing.T) {
 			s.broken++
 			harnessReasons[r.Harness+": "+bucket(r.Message)]++
 			failures[r.Path] = r.Harness + ": " + bucket(r.Message)
+			continue
 		}
+		var failed []string
 		for _, sub := range r.Subtests {
 			if sub.Status == wpt.StatusPass {
 				s.pass++
 				continue
 			}
 			s.fail++
-			failures[r.Path+" :: "+sub.Name] = string(sub.Status) + ": " + bucket(sub.Message)
+			failed = append(failed, string(sub.Status)+" "+sub.Name)
 		}
-		if done++; done%100 == 0 {
-			t.Logf("%d/%d files in %v", done, len(paths), time.Since(start).Round(time.Second))
+		if len(failed) > 0 {
+			sort.Strings(failed)
+			sum := sha256.Sum256([]byte(strings.Join(failed, "\n")))
+			failures[r.Path] = fmt.Sprintf("%d/%d subtests fail (%x)",
+				len(failed), len(r.Subtests), sum[:6])
 		}
 	}
 
@@ -228,8 +249,15 @@ func TestWPTSuite(t *testing.T) {
 	}
 	var regressions, stale []string
 	for k, detail := range failures {
-		if _, ok := expected[k]; !ok {
+		want, ok := expected[k]
+		if !ok {
 			regressions = append(regressions, k+": "+detail)
+			continue
+		}
+		// The value carries the count and a digest of WHICH subtests failed, so a
+		// change here is a change in outcome even when the count is identical.
+		if want != detail {
+			regressions = append(regressions, k+": was "+want+", now "+detail)
 		}
 	}
 	for k := range expected {
