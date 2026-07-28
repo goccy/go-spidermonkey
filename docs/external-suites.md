@@ -20,7 +20,7 @@ than tests written here:
 |---|---|
 | test262 | 52,266 / 53,329 = **98.0%** |
 | Babel | 4,170 / 4,189 fixtures = **99.55%** (890 skipped) |
-| WPT | 18,751 / 40,942 subtests = **45.8%** |
+| WPT | 21,595 / 40,888 subtests = **52.8%** |
 | Node.js | see `nodetest/expectations.json` |
 
 The Babel figure comes with a cross-check worth repeating whenever the pin
@@ -31,11 +31,16 @@ layout. On that corpus this runtime is behaviourally identical to Node. To
 redo it, run `babeltest/js/fixtures.js` under `node` with `__babeltest_root`
 set to a fixtures directory and diff its failures against `expectations.json`.
 
-WPT's 45.8% is dominated by whole APIs that are not implemented rather than by
+WPT's 52.8% is dominated by whole APIs that are not implemented rather than by
 subtle divergences: `WebCryptoAPI` alone is 35.9k of the 40.9k subtests, and
 `urlpattern` (0.6%) has no implementation at all. The directories that ARE
 implemented score far higher — `url` 81%, `performance-timeline` 78%,
 `dom/events` 78%, `FileAPI` 68%, `html/webappapis` 63%.
+
+It is also worth knowing how fast that number moves for a small fix: giving
+`CryptoKey` its `Symbol.toStringTag` — one property, which the suite checks on
+every key it produces and which everything downstream of a key then trips over
+— took the total from 45.8% to 52.8% on its own.
 
 ## How they are wired
 
