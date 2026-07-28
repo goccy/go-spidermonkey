@@ -110,6 +110,9 @@
 	// The key usages each algorithm accepts, per operation. A key type that is
 	// not here is validated only for "usages must be recognized".
 	const GENERATE_USAGES = {
+		"ED448": ["sign", "verify"],
+		"X448": ["deriveKey", "deriveBits"],
+		"SHA-1": [], "SHA-256": [], "SHA-384": [], "SHA-512": [],
 		"AES-CBC": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
@@ -125,6 +128,19 @@
 		HKDF: ["deriveKey", "deriveBits"],
 		PBKDF2: ["deriveKey", "deriveBits"],
 	};
+	// Every algorithm the Web Crypto spec defines, whether or not this runtime
+	// implements it. The distinction decides the ERROR ORDER: an algorithm the
+	// spec does not know is NotSupportedError before usages are looked at, while
+	// one it does know has its usages validated first — so a bad usage on
+	// AES-KW is a SyntaxError even here, where AES-KW is not implemented.
+	const KNOWN_ALGORITHMS = new Set([
+		"RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP",
+		"ECDSA", "ECDH", "ED25519", "ED448", "X25519", "X448",
+		"AES-CTR", "AES-CBC", "AES-GCM", "AES-KW",
+		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
+		"HKDF", "PBKDF2",
+	]);
+
 	const ALL_USAGES = [
 		"encrypt", "decrypt", "sign", "verify",
 		"deriveKey", "deriveBits", "wrapKey", "unwrapKey",
@@ -147,6 +163,11 @@
 	// an algorithm we know, one it can actually have. An EMPTY list is a
 	// SyntaxError too for anything that produces a secret or private key.
 	function checkUsages(name, usages, op, { allowEmpty = false } = {}) {
+		// An algorithm the spec does not define fails as unsupported FIRST: the
+		// usages of a nonexistent algorithm are not a meaningful question.
+		if (!KNOWN_ALGORITHMS.has(String(name).toUpperCase())) {
+			throw new DOMException(`Failed to execute '${op}': unsupported algorithm ${name}`, "NotSupportedError");
+		}
 		const list = usages === undefined || usages === null ? [] : Array.from(usages);
 		for (const u of list) {
 			if (!ALL_USAGES.includes(String(u))) {
@@ -165,6 +186,19 @@
 			throw new SyntaxError(`Failed to execute '${op}': usages cannot be empty`);
 		}
 		return list;
+	}
+
+	// A derivation's base key must belong to the algorithm being asked for:
+	// handing ECDH an RSA key (or an ECDH key to HKDF) is an InvalidAccessError,
+	// not an unsupported-algorithm error. Unchecked, those calls proceeded and
+	// the suite's "wrong key" cases all reported "should have thrown".
+	function checkDeriveKeyMatches(alg, baseKey, op) {
+		const want = String(normalizeAlgorithm(alg, op)).toUpperCase();
+		const have = String((baseKey && baseKey.algorithm && baseKey.algorithm.name) || "").toUpperCase();
+		if (have && want && have !== want) {
+			throw new DOMException(
+				`Failed to execute '${op}': the key is for ${have}, not ${want}`, "InvalidAccessError");
+		}
 	}
 
 	// AES accepts exactly these key lengths; anything else is an OperationError
@@ -430,6 +464,7 @@
 
 		async deriveBits(alg, baseKey, length) {
 			need(baseKey, "deriveBits");
+			checkDeriveKeyMatches(alg, baseKey, "deriveBits");
 			return deriveBitsRaw(alg, baseKey, length);
 		},
 
@@ -439,6 +474,7 @@
 			// key imported with just ["deriveKey"] (the canonical PBKDF2 pattern)
 			// works, mirroring how wrapKey uses rawCrypt.
 			need(baseKey, "deriveKey");
+			checkDeriveKeyMatches(alg, baseKey, "deriveKey");
 			const derivedName = algName(derivedKeyAlg).toUpperCase();
 			// WebCrypto "get key length": for HMAC an omitted length defaults to the
 			// hash's BLOCK size (512 bits for SHA-1/SHA-256, 1024 for SHA-384/SHA-512),
