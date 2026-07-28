@@ -208,15 +208,27 @@ const collector = `
 })();
 `
 
-// importScriptsShim satisfies the call a classic-worker test makes for scripts
-// the harness has already loaded (see importedScripts) and fails loudly for any
-// other, so a missed dependency cannot look like a passing test.
-const importScriptsShim = `
-globalThis.importScripts = function importScripts() {
-  // The harness pre-loads what a .worker.js file imports; re-loading here would
-  // re-register testharness and lose the collected results.
-};
+// importScriptsShimFor satisfies the call a classic-worker test makes for the
+// scripts the harness has already loaded (see importedScripts), and THROWS for
+// any other — a dependency the static scan missed must surface as a harness
+// error, not as a test that quietly ran without it.
+func importScriptsShimFor(loaded []string) string {
+	list, _ := json.Marshal(loaded)
+	return `
+(function () {
+  // Re-evaluating a pre-loaded script here would re-register testharness and
+  // lose the results collected so far, so the call is satisfied, not replayed.
+  const loaded = new Set(` + string(list) + `);
+  globalThis.importScripts = function importScripts(...urls) {
+    for (const u of urls) {
+      if (!loaded.has(String(u))) {
+        throw new Error("importScripts(" + u + "): not pre-loaded by the harness");
+      }
+    }
+  };
+})();
 `
+}
 
 // Run executes one .any.js test file and returns its per-subtest verdicts.
 func Run(ctx context.Context, opts Options, rel string) FileResult {
@@ -292,8 +304,10 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 		// A classic worker test bootstraps itself with importScripts instead of
 		// META directives; those files are loaded here, and the call is defined so
 		// that anything NOT pre-loaded is reported rather than silently skipped.
-		steps = append(steps, struct{ name, src string }{"<importScripts>", importScriptsShim})
-		scripts = append(importedScripts(string(src)), scripts...)
+		imported := importedScripts(string(src))
+		steps = append(steps, struct{ name, src string }{
+			"<importScripts>", importScriptsShimFor(append(imported, "/resources/testharness.js"))})
+		scripts = append(imported, scripts...)
 	}
 	for _, s := range scripts {
 		p := resolveScript(rel, s)

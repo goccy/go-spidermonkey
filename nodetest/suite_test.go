@@ -288,11 +288,16 @@ func TestNodeSuite(t *testing.T) {
 			regressions = append(regressions, p+": "+detail)
 		}
 	}
+	// Staleness is only meaningful for tests this invocation actually RAN.
+	// Without that, every shard would report the other shards' expectations as
+	// stale, and a filtered run would report the whole file.
+	ran := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		ran[filepath.ToSlash(p)] = true
+	}
 	for p := range expected {
-		if _, ok := failures[p]; !ok {
-			if filter == "" || strings.Contains(p, filter) {
-				stale = append(stale, p)
-			}
+		if _, ok := failures[p]; !ok && ran[p] {
+			stale = append(stale, p)
 		}
 	}
 	sort.Strings(regressions)

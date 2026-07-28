@@ -174,11 +174,14 @@ func TestBabelSuite(t *testing.T) {
 			regressions = append(regressions, k+": "+detail)
 		}
 	}
+	// Staleness is only meaningful for the packages this invocation actually RAN.
+	ranPkg := make(map[string]bool, len(shards))
+	for _, sh := range shards {
+		ranPkg[shardLabelOf(sh)] = true
+	}
 	for k := range expected {
-		if _, ok := failures[k]; !ok {
-			if filter == "" || strings.Contains(k, filter) {
-				stale = append(stale, k)
-			}
+		if _, ok := failures[k]; !ok && ranPkg[strings.SplitN(k, "/", 2)[0]] {
+			stale = append(stale, k)
 		}
 	}
 	sort.Strings(regressions)
@@ -197,6 +200,18 @@ func TestBabelSuite(t *testing.T) {
 		}
 		t.Errorf("expected failure now passes (update %s): %s", expectationsFile, k)
 	}
+}
+
+// shardLabelOf is the Babel package name a fixtures root belongs to (the prefix
+// every result from that shard carries).
+func shardLabelOf(shard string) string {
+	parts := strings.Split(shard, "/")
+	for i, p := range parts {
+		if p == "packages" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return shard
 }
 
 func firstLine(s string) string {

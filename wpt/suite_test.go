@@ -262,11 +262,16 @@ func TestWPTSuite(t *testing.T) {
 			changed = append(changed, k+": was "+want+", now "+detail)
 		}
 	}
+	// Staleness is only meaningful for files this invocation actually RAN: a
+	// narrowed run (WPT_DIRS, WPT_FILTER) must not report every other directory's
+	// expectations as stale.
+	ran := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		ran[p] = true
+	}
 	for k := range expected {
-		if _, ok := failures[k]; !ok {
-			if filter == "" || strings.Contains(k, filter) {
-				stale = append(stale, k)
-			}
+		if _, ok := failures[k]; !ok && ran[k] {
+			stale = append(stale, k)
 		}
 	}
 	sort.Strings(regressions)
