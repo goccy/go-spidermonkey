@@ -1,0 +1,21 @@
+{
+ "babel-generator/comments/comment-only-with-space": "output mismatch",
+ "babel-plugin-transform-react-constant-elements/integration/issue-10879": "output mismatch",
+ "babel-plugin-transform-react-constant-elements/integration/issue-7610": "output mismatch",
+ "babel-plugin-transform-regenerator/misc/existing-regeneratorRuntime-usage-with-polyfill-provider": "threw: could not load babel-plugin-polyfill-regenerator: cannot find package \"babel-plugin-polyfill-regenerator\" (imported from \"babeltest-harness.mjs\")",
+ "babel-plugin-transform-runtime/absoluteRuntime/complex-options": "output mismatch",
+ "babel-plugin-transform-runtime/absoluteRuntime/relative": "output mismatch",
+ "babel-plugin-transform-runtime/absoluteRuntime/true": "output mismatch",
+ "babel-plugin-transform-runtime/moduleName/with-absoluteRuntime": "threw: /suite/packages/babel-plugin-transform-runtime/test/fixtures/moduleName/with-absoluteRuntime/input.js: Failed to resolve \"lol\" relative to \"/suite/packages/babel-plugin-transform-runtime/test/fixtures/moduleName/with-absoluteRuntime\"",
+ "babel-plugin-transform-typescript/imports/import=-declaration": "threw: /suite/packages/babel-plugin-transform-typescript/test/fixtures/imports/import=-declaration/input.ts: expect is not defined",
+ "babel-preset-env/dynamic-import/auto-esm-unsupported-import-unsupported": "output mismatch",
+ "babel-preset-env/dynamic-import/modules-amd": "output mismatch",
+ "babel-preset-env/dynamic-import/modules-cjs": "output mismatch",
+ "babel-preset-env/preset-options/empty-options": "output mismatch",
+ "babel-preset-env/preset-options/no-options": "output mismatch",
+ "babel-preset-env/preset-options/shippedProposals": "output mismatch",
+ "babel-preset-env/preset-options/useBuiltIns-false": "output mismatch",
+ "babel-preset-react/regression/another-preset-with-custom-jsx-keep-source-self": "threw: [BABEL]: import declarations may only appear at top level of a module (While processing: /node_modules/@babel/plugin-transform-react-jsx/lib/index.js)",
+ "babel-preset-react/regression/runtime-classic-allow-multiple-source-self": "threw: [BABEL] /suite/packages/babel-preset-react/test/fixtures/regression/runtime-classic-allow-multiple-source-self/input.mjs: cannot resolve \"../../../../lib/index.js\" (from \"node_modules/@babel/core/lib/config/files/index.js\")",
+ "babel-traverse/scope/remove-var-in-block": "threw: /suite/packages/babel-traverse/test/fixtures/scope/remove-var-in-block/input.js: expect is not defined"
+}
