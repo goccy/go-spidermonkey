@@ -170,6 +170,19 @@ func (js *JS) TakeUnhandledRejections() ([]Rejection, error) {
 	return out, nil
 }
 
+// SourceIsModule reports whether src needs ES-module semantics — Node's own
+// ESM-vs-CommonJS rule, decided by the engine's parser rather than by a syntax
+// sniff. The engine compiles src twice, once as a module and once inside the
+// CommonJS wrapper function, and reports which one it parses as; nothing is
+// executed. Source that is not valid JavaScript at all is not a module.
+//
+// A module loader uses this to classify a `.js` file that no package.json
+// "type" field covers. It is strictly more accurate than matching for
+// import/export: a regex over source text cannot tell those keywords from the
+// same words inside a comment or a string literal, and a line-anchored one
+// misses a minified single-line bundle entirely.
+func (js *JS) SourceIsModule(src string) (bool, error) { return js.raw.SourceIsModule(src) }
+
 // Close destroys the interpreter and releases its resources. Agents blocked
 // in receive are released first (they unwind with an error) so the engine's
 // shutdown join can complete.

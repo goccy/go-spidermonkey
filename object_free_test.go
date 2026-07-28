@@ -45,3 +45,16 @@ func TestObjectFreeIsIdempotent(t *testing.T) {
 		t.Fatalf("Eval after repeated frees: %v", err)
 	}
 }
+
+// Freeing the nil *Object that Value.Object returns for a non-object must be a
+// no-op too: "release this argument if it brought a handle" is the natural way
+// to write an op's error path, and it should not have to nil-check first.
+func TestFreeingNilObjectIsANoOp(t *testing.T) {
+	var o *spidermonkey.Object
+	if err := o.Free(); err != nil {
+		t.Fatalf("Free on a nil *Object: %v", err)
+	}
+	if err := spidermonkey.ValueOf(42).Object().Free(); err != nil {
+		t.Fatalf("Free on a primitive's nil *Object: %v", err)
+	}
+}

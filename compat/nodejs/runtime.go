@@ -393,6 +393,7 @@ func (rt *Runtime) esmLoader(cfg spidermonkey.Config, specifier, referrer string
 	if err != nil {
 		return "", err
 	}
+	rt.refineKind(cfg.FS, &r, src)
 	switch r.Kind {
 	case kindJSON:
 		return jsonModuleSource(src)
@@ -500,7 +501,7 @@ func (rt *Runtime) opRawWrite(cfg spidermonkey.Config, args []spidermonkey.Value
 	// A Buffer/Uint8Array chunk is written as raw bytes so binary stdout (gzip,
 	// images, protobuf) isn't corrupted by a UTF-8 round-trip; a string is written
 	// verbatim.
-	if o := args[1].Object(); o != nil {
+	if args[1].IsObject() {
 		if b, err := valueBytes(args[1]); err == nil {
 			out.Write(b)
 			return spidermonkey.Undefined(), nil
@@ -516,6 +517,7 @@ func (rt *Runtime) opImmediateSet(cfg spidermonkey.Config, args []spidermonkey.V
 	}
 	fn := args[0].Object()
 	if fn == nil || !fn.IsFunction() {
+		fn.Free() // taken but unusable; releasing it keeps the error path leak-free
 		return nil, fmt.Errorf("setImmediate: callback is not a function")
 	}
 	return spidermonkey.ValueOf(rt.loop.PostImmediate(fn)), nil
@@ -567,6 +569,7 @@ func (rt *Runtime) opResolve(cfg spidermonkey.Config, args []spidermonkey.Value)
 	if r.Core != "" {
 		return spidermonkey.ValueOf(map[string]any{"core": r.Core}), nil
 	}
+	rt.refineKind(cfg.FS, &r, nil)
 	kind := "cjs"
 	switch r.Kind {
 	case kindESM:

@@ -13,6 +13,11 @@ type Object struct {
 	js       *JS
 	handle   uint64
 	callable bool // true when the value decoded as a function
+	// taken records that someone asked for this value AS an object — the point
+	// at which ownership of the handle passes to them. It matters only for a
+	// host call's arguments, whose unclaimed roots the dispatcher releases; see
+	// releaseArgRoots.
+	taken bool
 }
 
 // Object implements Value.
@@ -22,8 +27,8 @@ func (o *Object) Float() float64    { return 0 }
 func (o *Object) Int() int          { return 0 }
 func (o *Object) Bool() bool        { return true } // objects are truthy
 func (o *Object) IsObject() bool    { return true }
-func (o *Object) Object() *Object   { return o }
-func (o *Object) Export() any       { return o }
+func (o *Object) Object() *Object   { o.taken = true; return o }
+func (o *Object) Export() any       { o.taken = true; return o }
 
 // IsFunction reports whether the object is callable (Call will work).
 func (o *Object) IsFunction() bool { return o.callable }
@@ -192,7 +197,10 @@ func (o *Object) call(self *Object, args []Value) (Value, error) {
 // teardown. Ownership of a handle is easy to lose track of across the host's
 // close paths, so the primitive absorbs it instead of every caller having to.
 func (o *Object) Free() error {
-	if o.handle == 0 {
+	// A nil *Object is what Value.Object returns for a non-object, and freeing
+	// one is the natural way to write "release this argument if it brought a
+	// handle" — so it absorbs that too rather than faulting.
+	if o == nil || o.handle == 0 {
 		return nil
 	}
 	h := o.handle

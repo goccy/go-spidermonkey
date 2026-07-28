@@ -31,6 +31,12 @@ func monotonicMs() float64 { return float64(time.Since(agentClock0)) / float64(t
 // back into the engine. *Object arguments also stay valid after the evaluation
 // returns (their handles pin the objects), so retaining them for later works
 // too.
+//
+// Ownership of an argument's handle: taking an argument AS an object — with
+// Value.Object or Value.Export — transfers the handle's GC pin to fn, which
+// must Free it (immediately, or once it is done with a retained callback).
+// Every other argument is released when the call returns, so an op that reads
+// an argument as a primitive need not care whether the guest passed one.
 type Func func(cfg Config, args []Value) (Value, error)
 
 // hostEnv implements base.EnvImports — the host side of the guest's env imports.
@@ -183,7 +189,12 @@ func (e *hostEnv) dispatch(key string, argsJSON []byte) []byte {
 			relock := e.js.raw.UnlockForHostCallback()
 			defer relock()
 		}
-		return fn(e.cfg, args)
+		v, verr := fn(e.cfg, args)
+		// Still inside the unlocked window: releasing a root re-enters the
+		// interpreter exactly as the op's own Free calls do, and doing it after
+		// the relock would deadlock against the paused guest.
+		releaseArgRoots(args, v)
+		return v, verr
 	}()
 	if err != nil {
 		// A Throw(v) surfaces the wrapped value verbatim (its JS type intact);
@@ -202,6 +213,38 @@ func (e *hostEnv) dispatch(key string, argsJSON []byte) []byte {
 		return append([]byte{'E'}, ("host result unencodable: " + eerr.Error())...)
 	}
 	return append([]byte{'R'}, enc...)
+}
+
+// releaseArgRoots drops the GC roots the argument decoder minted for the
+// object-typed arguments a host Func did not take ownership of.
+//
+// Every non-primitive argument crosses the bridge as a handle, and a handle IS
+// a persistent GC root: decoding one pins that object — and everything it
+// reaches, which for a typed array is its whole backing store — until someone
+// releases it. An op that reads such an argument as a PRIMITIVE (Int, String,
+// Float, Bool) never sees the handle and so cannot release it, and a guest can
+// reach that path deliberately: pass an object where a number is expected,
+// through a JS wrapper that forwards the value uncoerced, and every call leaks
+// a root. Unbounded, guest-triggerable, and no host code is at fault.
+//
+// So ownership is explicit at the one place it can be: asking for the argument
+// AS an object (Value.Object or Value.Export) takes the handle and the duty to
+// Free it; anything else leaves it here, and it is released when the call
+// returns. The op's own return value is never released — it is about to cross
+// back to the guest — and a handle the op already freed releases as a no-op.
+func releaseArgRoots(args []Value, ret Value) {
+	for _, a := range args {
+		switch v := a.(type) {
+		case *Object:
+			if !v.taken && Value(v) != ret {
+				v.Free()
+			}
+		case opaqueValue: // a symbol or bigint: by handle, but with no *Object
+			if Value(v) != ret {
+				v.free()
+			}
+		}
+	}
 }
 
 func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
@@ -225,7 +268,17 @@ func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
 	if load == nil {
 		return nil // no loader → total==0 → C++ falls back to missing-modules
 	}
-	src, err := load(e.cfg, spec, ref)
+	// Release the invoke lock for the loader, exactly as an ordinary host call
+	// does: the guest is paused inside this call, so the loader may re-enter the
+	// interpreter — which is what lets it ask SourceIsModule to classify a file
+	// instead of guessing from the source text.
+	src, err := func() (string, error) {
+		if e.js != nil {
+			relock := e.js.raw.UnlockForHostCallback()
+			defer relock()
+		}
+		return load(e.cfg, spec, ref)
+	}()
 	if err != nil {
 		return append([]byte{'E'}, err.Error()...)
 	}
