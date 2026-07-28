@@ -69,6 +69,15 @@ var DefaultDirs = []string{
 	"html/webappapis/timers",
 	"html/webappapis/structured-clone",
 	"html/webappapis/atob",
+	// Directories Deno also tracks whose APIs this embedding claims to provide.
+	// They are listed even where the score is currently zero: a capability that
+	// is documented as present and scores nothing is exactly what a conformance
+	// run exists to surface (CompressionStream and MessageChannel turned out to
+	// live only in compat/nodejs, though both are web APIs).
+	"compression",
+	"user-timing",
+	"webmessaging",
+	"mimesniff",
 }
 
 func TestWPTSuite(t *testing.T) {

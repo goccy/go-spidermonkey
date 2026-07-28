@@ -42,6 +42,39 @@ It is also worth knowing how fast that number moves for a small fix: giving
 every key it produces and which everything downstream of a key then trips over
 — took the total from 45.8% to 52.8% on its own.
 
+## The bar: what Bun and Deno measure themselves against
+
+These suites are the ones the other Node-compatible runtimes are held to, so
+their coverage is the target — not a number of our own choosing. Measured from
+their repositories (2026-07-28):
+
+| | Node tests registered | actually run |
+|---|---|---|
+| Deno (`tests/node_compat/config.jsonc`) | 3,786 | **3,411** (375 disabled, each with a reason) |
+| Bun (`test/js/node/test/parallel`, vendored) | 3,505 (+67 sequential) | ~all of them |
+| here | 4,883 (the whole upstream corpus) | see `nodetest/expectations.json` |
+
+Deno's disabled reasons read almost identically to ours — Node internals, CLI
+flags, the inspector, its own permission model. The difference in what RUNS is
+mostly one bucket: the ~650 tests that re-execute `process.execPath`. Deno runs
+them because the `deno` binary answers as a node-compatible executable. Nothing
+prevents the same here — a host can re-enter this runtime — so those are
+counted as unimplemented, not impossible.
+
+For WPT, Deno tracks **26 directories** (`tests/wpt/runner/expectations/`) with
+the same per-file expectation approach used here. The ones it tracks that this
+run does not, and why:
+
+- **APIs we have, so these are simply not measured yet**: `compression`,
+  `user-timing`, `webmessaging`, `mimesniff` — turning them on immediately
+  showed `CompressionStream` and `MessageChannel` missing from `compat/web`
+  (both exist only under `compat/nodejs`, though both are WinterTC web APIs).
+- **APIs we do not have**: `websockets`, `webstorage`, `web-locks`,
+  `eventsource`, `xhr`, `workers` (Web Workers, as opposed to
+  `worker_threads`), `service-workers`.
+- **Not applicable to this embedding**: `css`, `wasm` (no WebAssembly in this
+  engine build), `schema`.
+
 ## How they are wired
 
 Each suite is **pinned to an exact upstream revision** in the Makefile and

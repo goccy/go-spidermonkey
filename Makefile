@@ -30,7 +30,8 @@ WPT_SUITE_REPO ?= https://github.com/web-platform-tests/wpt.git
 WPT_SUITE_REV  ?= f4b24b414258bfdca10fbb0f8d646b97fc6657ec
 WPT_SUITE_DIRS := resources common url encoding streams WebCryptoAPI console \
                   hr-time performance-timeline FileAPI urlpattern fetch dom \
-                  html/webappapis service-workers/service-worker/resources
+                  html/webappapis service-workers/service-worker/resources \
+                  compression user-timing webmessaging mimesniff
 
 BABEL_SUITE_REPO ?= https://github.com/babel/babel.git
 BABEL_SUITE_REV  ?= 6d0dbd2a92aefe03cf1f7d49ebb39acd56e11c72   # v8.0.4
@@ -84,18 +85,21 @@ nodetest-fetch:
 	./scripts/fetch-suite.sh $(NODE_SUITE_REPO) $(NODE_SUITE_REV) nodetest/suite $(NODE_SUITE_DIRS)
 
 ## nodetest: run the Node.js project's own test suite against compat/nodejs.
-## Tests addressed to the node binary itself (private internals, respawn, V8
-## flags) are skipped with an accounted reason; see nodetest/policy.go.
+## Takes about a minute. Tests addressed to the node binary itself (private
+## internals, respawn, V8 flags) are skipped with an accounted reason
+## (nodetest/policy.go), and the tests that HANG are quarantined by name
+## (nodetest/quarantine.txt) — a list to shrink, not a permanent allowance.
 ##
-## It runs in SHARDS, one process each, because a long single-process run stops
-## making progress (docs/engine-followups.md); sharding bounds that to one
-## shard. Sequential, so the shards do not oversubscribe the machine.
+## Run in a few SEQUENTIAL shards, not one process: a single process that gets
+## through several thousand tests intermittently stops making progress near the
+## end (docs/engine-followups.md), while a shard of ~1100 never has. Sequential
+## because the stall also gets likelier the more processes run at once.
 NODETEST_SHARDS ?= 4
 nodetest: nodetest-fetch
 	@set -e; fail=0; i=0; while [ $$i -lt $(NODETEST_SHARDS) ]; do \
 		echo "==> nodetest shard $$i/$(NODETEST_SHARDS)"; \
 		NODETEST=1 NODETEST_SHARD=$$i/$(NODETEST_SHARDS) \
-			go test ./nodetest/ -run TestNodeSuite -v -timeout 1h || fail=1; \
+			go test ./nodetest/ -run TestNodeSuite -v -timeout 20m || fail=1; \
 		i=$$((i + 1)); \
 	done; exit $$fail
 
