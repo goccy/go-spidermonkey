@@ -464,6 +464,24 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 		}
 	}
 
+	// A data: URL carries its own body: there is nothing to request, nothing to
+	// resolve and nothing to authorize, so it resolves here rather than going
+	// near the transport.
+	if strings.HasPrefix(strings.ToLower(url), "data:") {
+		resp, derr := dataResponse(url, method)
+		if derr != nil {
+			if te, terr := a.typeErrorCls.New(spidermonkey.ValueOf(derr.Error())); terr == nil {
+				return a.promise("reject", te)
+			}
+			return a.promise("reject", spidermonkey.ValueOf(derr.Error()))
+		}
+		respObj, oerr := a.newResponse(resp, false, func() {})
+		if oerr != nil {
+			return a.promise("reject", spidermonkey.ValueOf(oerr.Error()))
+		}
+		return a.promise("resolve", respObj)
+	}
+
 	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
 		return a.promise("reject", spidermonkey.ValueOf(err.Error()))
