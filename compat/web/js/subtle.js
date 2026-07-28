@@ -99,13 +99,96 @@
 		return r;
 	};
 
+	// ------------------------------------------------- argument validation
+	// Web Crypto rejects a bad call BEFORE it looks at whether the algorithm is
+	// supported, and each error type is specified: a malformed algorithm is a
+	// TypeError, a usage the algorithm cannot have is a SyntaxError, a bad key
+	// length is an OperationError. None of this was checked, so calls that must
+	// fail SUCCEEDED — the largest single group of WebCryptoAPI failures in the
+	// Web Platform Tests, which run these cases for every algorithm.
+
+	// The key usages each algorithm accepts, per operation. A key type that is
+	// not here is validated only for "usages must be recognized".
+	const GENERATE_USAGES = {
+		"AES-CBC": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+		"AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+		"AES-KW": ["wrapKey", "unwrapKey"],
+		HMAC: ["sign", "verify"],
+		ECDSA: ["sign", "verify"],
+		ED25519: ["sign", "verify"],
+		ECDH: ["deriveKey", "deriveBits"],
+		X25519: ["deriveKey", "deriveBits"],
+		"RSASSA-PKCS1-V1_5": ["sign", "verify"],
+		"RSA-PSS": ["sign", "verify"],
+		"RSA-OAEP": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+		HKDF: ["deriveKey", "deriveBits"],
+		PBKDF2: ["deriveKey", "deriveBits"],
+	};
+	const ALL_USAGES = [
+		"encrypt", "decrypt", "sign", "verify",
+		"deriveKey", "deriveBits", "wrapKey", "unwrapKey",
+	];
+
+	// normalizeAlgorithm: a missing or malformed algorithm is a TypeError, which
+	// is checked BEFORE support (an unsupported name is NotSupportedError).
+	function normalizeAlgorithm(alg, op) {
+		if (typeof alg === "string") return alg;
+		if (alg === null || alg === undefined || typeof alg !== "object") {
+			throw new TypeError(`Failed to execute '${op}': algorithm must be an object or a string`);
+		}
+		if (alg.name === undefined || alg.name === null) {
+			throw new TypeError(`Failed to execute '${op}': algorithm has no name`);
+		}
+		return String(alg.name);
+	}
+
+	// checkUsages: every entry must be a recognized usage (SyntaxError), and for
+	// an algorithm we know, one it can actually have. An EMPTY list is a
+	// SyntaxError too for anything that produces a secret or private key.
+	function checkUsages(name, usages, op, { allowEmpty = false } = {}) {
+		const list = usages === undefined || usages === null ? [] : Array.from(usages);
+		for (const u of list) {
+			if (!ALL_USAGES.includes(String(u))) {
+				throw new SyntaxError(`Failed to execute '${op}': invalid key usage '${u}'`);
+			}
+		}
+		const allowed = GENERATE_USAGES[String(name).toUpperCase()];
+		if (allowed) {
+			for (const u of list) {
+				if (!allowed.includes(String(u))) {
+					throw new SyntaxError(`Failed to execute '${op}': ${name} keys cannot be used for '${u}'`);
+				}
+			}
+		}
+		if (!allowEmpty && list.length === 0) {
+			throw new SyntaxError(`Failed to execute '${op}': usages cannot be empty`);
+		}
+		return list;
+	}
+
+	// AES accepts exactly these key lengths; anything else is an OperationError
+	// (not a TypeError — the call was well formed, the value was not).
+	function checkAESLength(length, op) {
+		const n = Number(length);
+		if (n !== 128 && n !== 192 && n !== 256) {
+			throw new DOMException(`Failed to execute '${op}': invalid AES key length`, "OperationError");
+		}
+		return n;
+	}
+
 	const subtle = {
 		async digest(alg, data) {
 			return toBuf(ops.subtle_digest(hashName(alg), toU8(data)));
 		},
 
 		async generateKey(alg, extractable, usages) {
-			const name = algName(alg).toUpperCase();
+			const declared = normalizeAlgorithm(alg, "generateKey");
+			const name = String(declared).toUpperCase();
+			// A key pair may leave one half with no usages, so the empty check
+			// applies to the pair as a whole rather than to each side.
+			const isPair = ["ECDSA", "ECDH", "ED25519", "X25519", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP"].includes(name);
+			usages = checkUsages(declared, usages, "generateKey", { allowEmpty: isPair && false });
 			if (name === "HMAC") {
 				const hash = hashName(alg.hash);
 				const lenBits = alg.length || (hash === "SHA-384" || hash === "SHA-512" ? 1024 : 512);
@@ -134,7 +217,7 @@
 				};
 			}
 			if (AES_ALL.includes(name)) {
-				const length = Number(alg.length) || 256;
+				const length = checkAESLength(alg.length === undefined ? 256 : alg.length, "generateKey");
 				const raw = crypto.getRandomValues(new Uint8Array(length / 8));
 				const key = new CryptoKey("secret", extractable, { name, length }, usages, null);
 				keyRaw.set(key, raw);
@@ -160,7 +243,10 @@
 		},
 
 		async importKey(format, keyData, alg, extractable, usages) {
-			const name = algName(alg).toUpperCase();
+			const declared = normalizeAlgorithm(alg, "importKey");
+			const name = String(declared).toUpperCase();
+			// A public key may legitimately be imported with no usages.
+			usages = checkUsages(declared, usages, "importKey", { allowEmpty: true });
 			if (name === "HMAC") {
 				let raw;
 				if (format === "raw") raw = toU8(keyData);
