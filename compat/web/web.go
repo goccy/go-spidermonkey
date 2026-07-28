@@ -34,6 +34,9 @@ var builtinsJS string
 //go:embed js/subtle.js
 var subtleJS string
 
+//go:embed js/urlpattern.js
+var urlpatternJS string
+
 //go:embed js/extended.js
 var extendedJS string
 
@@ -88,7 +91,7 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
