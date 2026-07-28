@@ -50,6 +50,12 @@ type Web struct {
 // the event loop (Wait) and cleanup (Close). Install once per interpreter.
 func Install(js *spidermonkey.JS) (*Web, error) {
 	w := &Web{js: js, loop: eventloop.New(js), start: time.Now()}
+	// What existed before this installation, so the globals it adds can be given
+	// the property attributes a real runtime gives them (see HideNewGlobals).
+	preexisting, err := SnapshotGlobals(js)
+	if err != nil {
+		return nil, fmt.Errorf("web: reading globals: %w", err)
+	}
 
 	ops, err := js.NewObject()
 	if err != nil {
@@ -94,6 +100,9 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 	w.fetch, err = installFetch(js, w.loop)
 	if err != nil {
 		return nil, fmt.Errorf("web: installing fetch: %w", err)
+	}
+	if err := HideNewGlobals(js, preexisting); err != nil {
+		return nil, err
 	}
 	w.loop.SetRejectionReporter(w.reportRejections)
 	return w, nil

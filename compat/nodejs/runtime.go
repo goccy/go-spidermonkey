@@ -144,6 +144,12 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Snapshot AFTER compat/web has installed and fixed up its own globals, so
+	// this layer only hides the ones it adds itself.
+	preexisting, err := web.SnapshotGlobals(js)
+	if err != nil {
+		return nil, err
+	}
 	rt.web = w
 	rt.loop = w.Loop()
 	rt.workers = newWorkerManager(rt)
@@ -221,6 +227,11 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 		return rt.coreShim(name), nil
 	})
 	js.SetModuleLoader(rt.esmLoader)
+	// process, Buffer and the rest are non-enumerable globals in Node; matching
+	// that is what makes `for (const k in globalThis)` agree with a real node.
+	if err := web.HideNewGlobals(js, preexisting); err != nil {
+		return nil, err
+	}
 	return rt, nil
 }
 
