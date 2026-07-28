@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	wasm2go "github.com/goccy/spidermonkeywasm2go"
 	"github.com/goccy/spidermonkeywasm2go/base"
@@ -162,10 +163,9 @@ type JS struct {
 	// mmapped is the linear memory when it came from a shared copy-on-write
 	// image; Go's GC does not manage it, so Close must unmap it explicitly.
 	mmapped []byte
-	// trapped records that a call into this instance ended in a wasm trap. The
-	// guest's allocator aborted mid-operation, so its linear memory is in an
-	// undefined state and NOTHING may call in again — see invokeMethod/Close.
-	trapped atomic.Bool
+	// spent records that this instance can never be called again, and why. The two
+	// reasons need different teardown, so they are kept apart — see Close.
+	spent atomic.Int32
 }
 
 // interrupter holds the pre-resolved interrupt addresses so fire can run
@@ -220,10 +220,32 @@ func (js *JS) withContext(ctx context.Context, run func() (string, error)) (stri
 		return o.raw, o.err
 	case <-ctx.Done():
 		js.intr.fire()
-		o := <-ch // interrupt stops the script; wait for the call to unwind
-		return o.raw, ctx.Err()
+		select {
+		case o := <-ch: // the interrupt stopped the script and it unwound
+			return o.raw, ctx.Err()
+		case <-time.After(unwindGrace):
+			// The interrupt is checked at bytecode loop heads, so it cannot reach a
+			// guest that is blocked INSIDE A HOST CALL — a socket read, a
+			// subprocess wait, an Atomics.wait nobody notifies. Waiting for that
+			// unwind means ctx does not bound Eval at all, and a single such call
+			// stalls the caller forever (a whole conformance run, in the case that
+			// found this).
+			//
+			// So the call is abandoned: its goroutine keeps running and keeps this
+			// instance's linear memory alive — nothing can kill a wasm call from
+			// outside — but the CALLER gets control back, and the instance is
+			// marked spent so no later call (Close included, which would deadlock
+			// on the lock the abandoned call still holds) touches it.
+			js.spent.Store(spentAbandoned)
+			return "", ctx.Err()
+		}
 	}
 }
+
+// unwindGrace is how long a cancelled call is given to unwind after the
+// interrupt is fired. An interrupted script unwinds in microseconds; anything
+// still running after this is blocked somewhere the interrupt cannot reach.
+const unwindGrace = 2 * time.Second
 
 // EvalContext runs src under ctx (see withContext).
 func (js *JS) EvalContext(ctx context.Context, src string) (string, error) {
@@ -619,8 +641,8 @@ func (js *JS) UnlockForHostCallback() (relock func()) {
 // invokeMethod runs one RPC on THIS instance's module and folds in the standard
 // bridge error check. The single seam every method funnels through.
 func (js *JS) invokeMethod(mid int32, req []byte) ([]byte, error) {
-	if js.trapped.Load() {
-		return nil, errors.New("spidermonkey: instance is spent (a previous call trapped)")
+	if r := spentReason(js.spent.Load()); r != "" {
+		return nil, errors.New("spidermonkey: instance is spent (" + r + ")")
 	}
 	resp, err := js.m.invoke(0, mid, req, invokers[mid])
 	if err != nil {
@@ -629,7 +651,7 @@ func (js *JS) invokeMethod(mid int32, req []byte) ([]byte, error) {
 		// cap. Its heap is now inconsistent, so no further call may run — the
 		// teardown call in Close included, which used to fault with a SIGSEGV
 		// that took the host process down with it.
-		js.trapped.Store(true)
+		js.spent.Store(spentTrapped)
 		return nil, err
 	}
 	if e := pbExtractError(resp); e != nil {
@@ -652,22 +674,52 @@ func (js *JS) jsNew(maxHeapBytes, nativeStackQuotaBytes uint32) (uint64, error) 
 // Close destroys the runtime (JS_DestroyContext) and unmaps the linear memory if
 // it came from a shared copy-on-write image.
 //
-// After a trap the guest teardown is SKIPPED: JS_DestroyContext would walk a
-// heap whose allocator has already aborted. The host-side resources are still
-// released, so a spent instance is closable — it just cannot be asked to tidy
-// up after itself.
+// A SPENT instance is closable but cannot be asked to tidy up after itself, and
+// what is safe to release depends on why it is spent:
+//
+//   - TRAPPED: the guest aborted, so JS_DestroyContext would walk a heap whose
+//     allocator is already broken. Skip it; the memory is nobody's now, so it is
+//     still released.
+//   - ABANDONED: a cancelled call is still running and still owns this
+//     instance's linear memory — a host callback that unblocks later WILL write
+//     its reply into it. Releasing that memory turns the write into a
+//     segmentation fault, so the instance is deliberately leaked instead. It
+//     lasts until the process exits; nothing can kill a wasm call from outside.
 func (js *JS) Close() error {
-	var err error
-	if !js.trapped.Load() {
-		buf := pbNewBuf()
-		buf = pbAppendUint64(buf, 1, js.h)
-		_, err = js.invokeMethod(midClose, buf)
+	switch js.spent.Load() {
+	case spentAbandoned:
+		return nil
+	case spentTrapped:
+		if js.mmapped != nil {
+			base.UnmapMemory(js.mmapped)
+			js.mmapped = nil
+		}
+		return nil
 	}
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, js.h)
+	_, err := js.invokeMethod(midClose, buf)
 	if js.mmapped != nil {
 		base.UnmapMemory(js.mmapped)
 		js.mmapped = nil
 	}
 	return err
+}
+
+// Why an instance is spent. Zero is "live" so the zero value needs no init.
+const (
+	spentTrapped   = 1 // a call ended in a wasm trap; the guest heap is undefined
+	spentAbandoned = 2 // a cancelled call could not be unwound and is still running
+)
+
+func spentReason(state int32) string {
+	switch state {
+	case spentTrapped:
+		return "a previous call trapped"
+	case spentAbandoned:
+		return "a previous call was abandoned at its deadline"
+	}
+	return ""
 }
 
 // Eval runs src as a classic script and returns the {ok,result,error} JSON
