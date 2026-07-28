@@ -48,6 +48,11 @@ func SkipReason(rel, src string) string {
 	if strings.Contains(src, "process.execPath") {
 		return "respawns the node binary"
 	}
+	// child_process.fork re-executes the node binary with a new script; there is
+	// no binary to execute (the same reason process.execPath tests are skipped).
+	if strings.Contains(src, ".fork(") || strings.Contains(src, "fork(__filename") {
+		return "respawns the node binary"
+	}
 	// Native addons cannot exist in a wasm sandbox.
 	if strings.Contains(src, ".node')") || strings.Contains(src, `.node")`) ||
 		strings.Contains(src, "process.dlopen") {

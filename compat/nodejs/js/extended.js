@@ -228,6 +228,37 @@
 		return open + text + close;
 	};
 
+	// util.getCallSites (Node >= 22): the current call stack as structured
+	// frames. Node builds it from V8's structured API; there is no equivalent
+	// here, so it is parsed out of the engine's own stack string
+	// ("name@file:line:col" per frame, "@file:line:col" for an anonymous one).
+	// The frame for this function itself is dropped, as Node drops its own.
+	util.getCallSites = (frameCount, options) => {
+		if (typeof frameCount === "object" && frameCount !== null) {
+			options = frameCount;
+			frameCount = undefined;
+		}
+		const limit = typeof frameCount === "number" && frameCount > 0 ? frameCount : 10;
+		const frames = String(new Error().stack || "").split("\n").slice(1);
+		const out = [];
+		for (const line of frames) {
+			const at = line.lastIndexOf("@");
+			if (at < 0) continue;
+			const m = /^(.*):(\d+):(\d+)$/.exec(line.slice(at + 1));
+			if (!m) continue;
+			out.push({
+				functionName: line.slice(0, at),
+				scriptId: "0",
+				scriptName: m[1],
+				lineNumber: Number(m[2]),
+				columnNumber: Number(m[3]),
+				column: Number(m[3]),
+			});
+			if (out.length >= limit) break;
+		}
+		return out;
+	};
+
 	// util.parseArgs — the common subset (options with type string|boolean,
 	// short, multiple, default; positionals; strict).
 	util.parseArgs = (config = {}) => {
