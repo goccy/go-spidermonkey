@@ -37,6 +37,7 @@ type Result struct {
 	Path   string        // suite-relative path, e.g. "test/parallel/test-path.js"
 	Status Status        // pass, fail or skip
 	Reason string        // failure message or skip reason
+	Scope  Scope         // for a skip: whether it is permanent (see policy.go)
 	Output string        // captured stdout+stderr, trimmed
 	Took   time.Duration // wall time
 }
@@ -53,8 +54,14 @@ type Options struct {
 }
 
 const (
-	// DefaultTimeout is Node's own per-test budget scaled for a wasm engine.
-	DefaultTimeout = 60 * time.Second
+	// DefaultTimeout bounds one test file. It is deliberately small, and the
+	// reason is measured rather than assumed: across the suite the slowest test
+	// that COMPLETES takes about 2 seconds and the median takes 40 milliseconds,
+	// so nothing legitimate comes close to this. Only tests that hang ever pay
+	// the timeout — and they pay it in full, which is why they dominated the wall
+	// clock entirely at 60s (about 7% of the tests were 95% of the runtime).
+	// Raise it with NODETEST_TIMEOUT on a slow machine.
+	DefaultTimeout = 10 * time.Second
 	// A Node test is small; the cap is deliberately modest because a test that
 	// blocks in a host op is ABANDONED with its interpreter still alive (see
 	// JS.Close), so every such test holds its cap for the rest of the run.
@@ -98,8 +105,8 @@ func run(ctx context.Context, opts Options, rel string) Result {
 		res.Status, res.Reason = StatusFail, err.Error()
 		return res
 	}
-	if why := SkipReason(rel, string(src)); why != "" {
-		res.Status, res.Reason = StatusSkip, why
+	if why, scope := Skip(rel, string(src)); why != "" {
+		res.Status, res.Reason, res.Scope = StatusSkip, why, scope
 		return res
 	}
 

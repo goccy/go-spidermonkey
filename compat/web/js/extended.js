@@ -305,6 +305,101 @@
 
 	// CountQueuingStrategy / ByteLengthQueuingStrategy are defined in builtins.js.
 
+	// ------------------------------------------- MessageChannel/MessagePort
+	// Web APIs, and they belong here for the same reason the compression streams
+	// do: they existed only under compat/nodejs (built on Node's EventEmitter
+	// for worker_threads), so a web-only embedding had no MessageChannel at all
+	// and the whole WPT `webmessaging` directory scored zero.
+	//
+	// This pair is SAME-REALM: it is the in-page channel, not a transport to
+	// another thread. compat/nodejs still installs its own worker_threads
+	// version over these, which is what carries messages across an agent.
+
+	globalThis.MessageEvent ??= class MessageEvent extends Event {
+		constructor(type, init = {}) {
+			super(type, init);
+			this.data = init.data ?? null;
+			this.origin = init.origin ?? "";
+			this.lastEventId = init.lastEventId ?? "";
+			this.source = init.source ?? null;
+			this.ports = init.ports ? [...init.ports] : [];
+		}
+	};
+
+	globalThis.MessagePort ??= class MessagePort extends EventTarget {
+		constructor() {
+			super();
+			// A port only delivers once it is started — explicitly, or implicitly
+			// by assigning onmessage (the spec's "start()" side effect).
+			this._peer = null;
+			this._started = false;
+			this._closed = false;
+			this._queue = [];
+			this._onmessage = null;
+			this._onmessageerror = null;
+		}
+		postMessage(value, options) {
+			if (this._closed) return;
+			const transfer = Array.isArray(options) ? options : options && options.transfer;
+			let cloned;
+			try {
+				cloned = structuredClone(value, transfer ? { transfer } : undefined);
+			} catch (e) {
+				// A value that cannot be cloned is a DataCloneError on the CALLER,
+				// not a silent drop.
+				throw e;
+			}
+			const peer = this._peer;
+			if (!peer || peer._closed) return;
+			queueMicrotask(() => peer._deliver(cloned));
+		}
+		_deliver(data) {
+			if (this._closed) return;
+			if (!this._started) { this._queue.push(data); return; }
+			const ev = new MessageEvent("message", { data });
+			if (this._onmessage) this._onmessage.call(this, ev);
+			this.dispatchEvent(ev);
+		}
+		start() {
+			if (this._started || this._closed) return;
+			this._started = true;
+			const queued = this._queue;
+			this._queue = [];
+			for (const d of queued) this._deliver(d);
+		}
+		close() {
+			if (this._closed) return;
+			this._closed = true;
+			this._queue.length = 0;
+		}
+		get onmessage() { return this._onmessage; }
+		set onmessage(fn) {
+			this._onmessage = typeof fn === "function" ? fn : null;
+			if (this._onmessage) this.start();
+		}
+		get onmessageerror() { return this._onmessageerror; }
+		set onmessageerror(fn) { this._onmessageerror = typeof fn === "function" ? fn : null; }
+		addEventListener(type, cb, opts) {
+			super.addEventListener(type, cb, opts);
+			if (String(type) === "message") this.start();
+		}
+	};
+	Object.defineProperty(globalThis.MessagePort.prototype, Symbol.toStringTag, {
+		value: "MessagePort", configurable: true,
+	});
+
+	globalThis.MessageChannel ??= class MessageChannel {
+		constructor() {
+			this.port1 = new MessagePort();
+			this.port2 = new MessagePort();
+			this.port1._peer = this.port2;
+			this.port2._peer = this.port1;
+		}
+	};
+	Object.defineProperty(globalThis.MessageChannel.prototype, Symbol.toStringTag, {
+		value: "MessageChannel", configurable: true,
+	});
+
 	// ------------------------------ Compression/DecompressionStream
 	// WHATWG compression streams over the shared host codec. They belong HERE:
 	// they are web APIs, and defining them only in compat/nodejs (where the zlib

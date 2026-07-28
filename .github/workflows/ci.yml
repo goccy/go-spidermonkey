@@ -83,13 +83,9 @@ jobs:
       - run: make wpt
 
   nodetest:
-    name: Node.js test suite (shard ${{ matrix.shard }})
+    name: Node.js test suite
     runs-on: ubuntu-latest
     needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -100,10 +96,7 @@ jobs:
         with:
           path: nodetest/suite
           key: nodetest-${{ hashFiles('Makefile') }}
-      - run: make nodetest-fetch
-      # One shard per job: a long single-process run stops making progress
-      # (docs/engine-followups.md), and this bounds that to one shard.
-      - run: NODETEST=1 NODETEST_SHARD=${{ matrix.shard }}/4 go test ./nodetest/ -run TestNodeSuite -v -timeout 1h
+      - run: make nodetest
 
   babeltest:
     name: Babel fixture corpus

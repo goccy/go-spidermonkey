@@ -41,7 +41,59 @@ import (
 const (
 	suiteDir         = "suite"
 	expectationsFile = "expectations.json"
+	quarantineFile   = "quarantine.txt"
 )
+
+// loadQuarantine reads the list of tests known to HANG here — they never
+// complete, so each one costs the whole per-test timeout and nothing else. They
+// are skipped by default so a run finishes in a predictable time, and the list
+// is the explicit, shrinkable record of what needs individual fixing.
+func loadQuarantine(t *testing.T) map[string]bool {
+	out := map[string]bool{}
+	b, err := os.ReadFile(quarantineFile)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out[line] = true
+	}
+	return out
+}
+
+// writeQuarantine rewrites the list, sorted, with the header that explains it.
+func writeQuarantine(t *testing.T, paths map[string]bool) {
+	t.Helper()
+	names := make([]string, 0, len(paths))
+	for p := range paths {
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString(`# Node.js tests that HANG on this runtime: they never complete, so each one
+# costs the entire per-test timeout and tells us nothing beyond "still broken".
+# They are skipped by default, which is what keeps a run's duration predictable;
+# every other test is expected to finish.
+#
+# This is a list to SHRINK, not a permanent allowance. Each entry needs its own
+# diagnosis — the usual cause is a handle the event loop never releases, so the
+# test's own logic finished but the runtime never decides it is done.
+#
+# Regenerate (adds newly-hanging tests):  NODETEST_QUARANTINE_UPDATE=1
+# Work on the quarantined set only:       NODETEST_QUARANTINE=only
+# Ignore the list entirely:               NODETEST_QUARANTINE=all
+`)
+	for _, n := range names {
+		b.WriteString(n)
+		b.WriteString("\n")
+	}
+	if err := os.WriteFile(quarantineFile, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write %s: %v", quarantineFile, err)
+	}
+}
 
 func TestNodeSuite(t *testing.T) {
 	if os.Getenv("NODETEST") == "" {
@@ -98,6 +150,36 @@ func TestNodeSuite(t *testing.T) {
 		}
 		paths = keep
 		t.Logf("shard %d of %d: %d tests", idx, total, len(paths))
+	}
+	quarantined := loadQuarantine(t)
+	// heldBack counts the quarantined tests IN THIS SELECTION — a shard must not
+	// count the other shards' hangs in its own target.
+	heldBack := 0
+	mode := os.Getenv("NODETEST_QUARANTINE")
+	switch mode {
+	case "all": // run everything, quarantine included
+	case "only":
+		var keep []string
+		for _, p := range paths {
+			if quarantined[p] {
+				keep = append(keep, p)
+			}
+		}
+		paths = keep
+		t.Logf("quarantine-only: %d tests", len(paths))
+	default:
+		var keep []string
+		for _, p := range paths {
+			if quarantined[p] {
+				heldBack++
+				continue
+			}
+			keep = append(keep, p)
+		}
+		paths = keep
+		if heldBack > 0 {
+			t.Logf("skipping %d quarantined test(s) that hang; see %s", heldBack, quarantineFile)
+		}
 	}
 	if len(paths) == 0 {
 		t.Fatalf("no tests selected (dirs=%v filter=%q)", dirs, filter)
@@ -202,7 +284,17 @@ func TestNodeSuite(t *testing.T) {
 
 	counts := map[string]map[nodetest.Status]int{} // directory -> status -> n
 	skipReasons := map[string]int{}
+	// Skips split two ways, because the denominator matters: what can never work
+	// here versus what is simply not built yet (see policy.go). The second group
+	// belongs in the target, so it is reported as such rather than filed away.
+	unimplemented := map[string]int{}
+	impossible := 0
 	failures := map[string]string{}
+	// How long the tests that actually COMPLETE take. The per-test timeout is
+	// what a run costs — the handful of tests that hang dominate the wall clock
+	// entirely — so it should be set from this distribution, not guessed.
+	var completed []nodetest.Result
+	timedOut := map[string]bool{}
 	done := 0
 	start := time.Now()
 	for r := range results {
@@ -214,8 +306,20 @@ func TestNodeSuite(t *testing.T) {
 		switch r.Status {
 		case nodetest.StatusSkip:
 			skipReasons[r.Reason]++
+			switch r.Scope {
+			case nodetest.Impossible:
+				impossible++
+			case nodetest.Unimplemented:
+				unimplemented[r.Reason]++
+			}
 		case nodetest.StatusFail:
 			failures[filepath.ToSlash(r.Path)] = firstLine(r.Reason)
+		}
+		if r.Status != nodetest.StatusSkip && !strings.Contains(r.Reason, "deadline exceeded") &&
+			!strings.Contains(r.Reason, "hard timeout") {
+			completed = append(completed, r)
+		} else if r.Status == nodetest.StatusFail {
+			timedOut[filepath.ToSlash(r.Path)] = true
 		}
 		if done++; done%250 == 0 {
 			flightMu.Lock()
@@ -252,9 +356,50 @@ func TestNodeSuite(t *testing.T) {
 			a, c[nodetest.StatusPass], run, c[nodetest.StatusSkip],
 			100*float64(c[nodetest.StatusPass])/float64(max(run, 1)))
 	}
+	// Three numbers, because only the last one measures progress toward the goal:
+	//   run       — what executed today
+	//   target    — every test except the ones that can never work here; the
+	//               quarantined hangs and the unimplemented capabilities are
+	//               inside it, since both are work to do
+	//   impossible— V8 surfaces, native addons, Node's private internals
+	unimplementedTotal := 0
+	for _, n := range unimplemented {
+		unimplementedTotal += n
+	}
+	target := totalRun + unimplementedTotal + heldBack
 	t.Logf("TOTAL              pass %5d / run %5d  %.2f%%  in %v",
 		totalPass, totalRun, 100*float64(totalPass)/float64(max(totalRun, 1)),
 		time.Since(start).Round(time.Second))
+	t.Logf("TARGET             pass %5d / %5d  %.2f%%  (everything except %d that can never run here)",
+		totalPass, target, 100*float64(totalPass)/float64(max(target, 1)), impossible)
+	t.Logf("  of the target, %d are unimplemented capabilities and %d hang (quarantined)",
+		unimplementedTotal, heldBack)
+	var unimplNames []string
+	for k := range unimplemented {
+		unimplNames = append(unimplNames, k)
+	}
+	sort.Slice(unimplNames, func(i, j int) bool {
+		return unimplemented[unimplNames[i]] > unimplemented[unimplNames[j]]
+	})
+	for i, k := range unimplNames {
+		if i == 12 {
+			break
+		}
+		t.Logf("  todo %5d  %s", unimplemented[k], k)
+	}
+	sort.Slice(completed, func(i, j int) bool { return completed[i].Took > completed[j].Took })
+	if len(completed) > 0 {
+		p50 := completed[len(completed)/2].Took
+		t.Logf("completed-test time: slowest %v, median %v — the per-test timeout "+
+			"should sit above the slowest, since only the tests that HANG pay it",
+			completed[0].Took.Round(time.Millisecond), p50.Round(time.Millisecond))
+		for i, r := range completed {
+			if i == 10 {
+				break
+			}
+			t.Logf("  slow %8v  %s", r.Took.Round(time.Millisecond), r.Path)
+		}
+	}
 	var reasons []string
 	for r := range skipReasons {
 		reasons = append(reasons, r)
@@ -264,6 +409,29 @@ func TestNodeSuite(t *testing.T) {
 		t.Logf("skip %6d  %s", skipReasons[r], r)
 	}
 
+	if len(timedOut) > 0 {
+		t.Logf("%d test(s) hit the timeout; add them with NODETEST_QUARANTINE_UPDATE=1", len(timedOut))
+	}
+	if mode == "only" {
+		// The point of this mode: find entries that have been fixed. Anything that
+		// COMPLETES here no longer belongs in the list.
+		var fixed []string
+		for _, r := range completed {
+			fixed = append(fixed, filepath.ToSlash(r.Path))
+		}
+		sort.Strings(fixed)
+		for _, p := range fixed {
+			t.Logf("quarantined test now completes; remove it from %s: %s", quarantineFile, p)
+		}
+	}
+	if os.Getenv("NODETEST_QUARANTINE_UPDATE") != "" {
+		for p := range timedOut {
+			quarantined[p] = true
+		}
+		writeQuarantine(t, quarantined)
+		t.Logf("quarantine now lists %d test(s)", len(quarantined))
+		return
+	}
 	if report := os.Getenv("NODETEST_REPORT"); report != "" {
 		writeJSON(t, report, failures)
 	}

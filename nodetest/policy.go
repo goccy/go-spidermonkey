@@ -33,9 +33,56 @@ var flagsHonored = map[string]bool{
 	"--expose-internals":            false, // explicit: the big one
 }
 
+// Scope says whether a skipped test is skipped FOREVER or merely for now. The
+// distinction decides the denominator: a pass rate over "tests that happen to
+// run today" flatters itself, because most of what is skipped is not impossible
+// here — it is unimplemented. Progress is measured against everything except
+// what this architecture can never do.
+type Scope int
+
+const (
+	Runnable      Scope = iota // nothing stops this test from running
+	Impossible                 // cannot work here, ever: no V8, no native code, no second process to be
+	Unimplemented              // a capability this runtime could have and does not yet
+)
+
 // SkipReason returns why this embedding cannot host rel, or "" when it can.
 // src is the test's source text.
 func SkipReason(rel, src string) string {
+	reason, _ := Skip(rel, src)
+	return reason
+}
+
+// Skip returns why a test is skipped and whether that is permanent.
+func Skip(rel, src string) (string, Scope) {
+	reason := skipReason(rel, src)
+	if reason == "" {
+		return "", Runnable
+	}
+	for _, p := range impossibleReasons {
+		if strings.Contains(reason, p) {
+			return reason, Impossible
+		}
+	}
+	return reason, Unimplemented
+}
+
+// impossibleReasons are the substrings of a skip reason that mean "never here":
+// V8's own surfaces (this engine is SpiderMonkey), native code in a wasm
+// sandbox, and Node's private module graph (a test of Node's implementation
+// rather than of the API this layer provides). EVERYTHING ELSE is work not yet
+// done — including respawning a node binary, which a host could serve by
+// re-entering the runtime, and node:test, which is ordinary JavaScript.
+var impossibleReasons = []string{
+	"native addon",
+	"node-private internals",
+	"V8 debugger protocol",
+	"V8 internals",
+	"V8 tracing",
+	"allow-natives-syntax",
+}
+
+func skipReason(rel, src string) string {
 	// A test that reaches into Node's private module graph is testing Node's
 	// implementation, not the API this layer provides.
 	if strings.Contains(src, "require('internal/") || strings.Contains(src, `require("internal/`) ||

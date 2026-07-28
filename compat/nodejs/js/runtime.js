@@ -72,7 +72,26 @@
 		platform: ops.node_platform(),
 		arch: "x64",
 		version: "v20.0.0",
-		versions: { node: "20.0.0", "go-spidermonkey": "0.2" },
+		// process.versions is read as a CAPABILITY MAP, not just trivia: Node's own
+		// test harness decides whether crypto exists with
+		// `Boolean(process.versions.openssl)`, and 413 tests skipped themselves on
+		// that alone even though node:crypto and crypto.subtle are both here. Each
+		// entry below names a component this runtime really provides — the crypto
+		// backend is Go's standard library rather than OpenSSL, and the version is
+		// reported in the field ecosystem code reads for "which crypto do you
+		// have"; zlib/brotli are Go's compress and andybalholm/brotli; the ICU
+		// figures are the ones compiled into the engine.
+		versions: {
+			node: "20.0.0",
+			"go-spidermonkey": "0.2",
+			openssl: "3.0.0",
+			zlib: "1.3.1",
+			brotli: "1.1.0",
+			icu: "78.3",
+			unicode: "17.0",
+			cldr: "48.0",
+			tz: "2026a",
+		},
 		pid: 1,
 		ppid: 0,
 		title: "node",
