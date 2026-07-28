@@ -604,7 +604,17 @@
 			this._reqId = ops.http_client_req(this.method, this._url, JSON.stringify(this._headers), body, this._agentConfig(), onResponse, onError);
 			callback();
 		}
-		abort() { this.destroy(); }
+		// Node's abort(): ONE 'abort' event however many times it is called, on the
+		// next tick, plus the deprecated `aborted` flag — then the destroy. It used
+		// to only destroy, so `req.on('abort', …)` never fired and any test (or
+		// application) waiting for it waited forever, which is what left ~195
+		// quarantined http tests hanging with their servers still open.
+		abort() {
+			if (this.aborted) return;
+			this.aborted = true;
+			process.nextTick(() => this.emit("abort"));
+			this.destroy();
+		}
 		_destroy(err, cb) {
 			idleTimeoutClear(this);
 			// Cancel the round-trip so an aborted/unconsumed response releases the

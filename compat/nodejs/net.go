@@ -475,7 +475,17 @@ func resolveDialAddr(cfg spidermonkey.Config, network, host string, port int) (s
 	if cfg.Dial == nil {
 		return "", fmt.Errorf("dial %s:%d: permission denied (no Dial policy)", host, port)
 	}
-	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	// Resolve in the CALLER'S family. "udp4"/"tcp4" means IPv4 only: a name that
+	// also has an AAAA record (localhost, always) would otherwise come back as
+	// ::1 and every send from a v4 socket would fail with "no suitable address".
+	family := "ip"
+	switch {
+	case strings.HasSuffix(network, "4"):
+		family = "ip4"
+	case strings.HasSuffix(network, "6"):
+		family = "ip6"
+	}
+	ips, err := net.DefaultResolver.LookupIP(context.Background(), family, host)
 	if err != nil {
 		return "", fmt.Errorf("resolve %q: %w", host, err)
 	}

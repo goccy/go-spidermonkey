@@ -32,18 +32,26 @@ func (rt *Runtime) opUDPBind(cfg spidermonkey.Config, args []spidermonkey.Value)
 	}
 	port := args[1].Int()
 	onMessage := args[2].Object()
+	// The socket's family: a udp4 socket resolves and binds as IPv4 only, which
+	// is what makes "localhost" mean 127.0.0.1 rather than ::1 for it.
+	network := "udp"
+	if len(args) > 3 {
+		if n := args[3].String(); n == "udp4" || n == "udp6" {
+			network = n
+		}
+	}
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	if cfg.Listen == nil || !cfg.Listen("udp", addr) {
 		freeObjects(onMessage) // no pump will hold this callback for its lifetime
 		return spidermonkey.ValueOf(map[string]any{"code": "EACCES", "message": "bind " + addr + ": permission denied"}), nil
 	}
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	udpAddr, err := net.ResolveUDPAddr(network, addr)
 	if err != nil {
 		freeObjects(onMessage)
 		return netErr(err), nil
 	}
-	conn, err := net.ListenUDP("udp", udpAddr)
+	conn, err := net.ListenUDP(network, udpAddr)
 	if err != nil {
 		freeObjects(onMessage)
 		return spidermonkey.ValueOf(map[string]any{"code": "EADDRINUSE", "message": err.Error()}), nil
@@ -170,10 +178,20 @@ func (rt *Runtime) opUDPSend(cfg spidermonkey.Config, args []spidermonkey.Value)
 	go func() {
 		defer rt.loop.DonePending()
 		// Resolve+authorize once, then send only to the approved IP.
-		dialAddr, e := resolveDialAddr(cfg, "udp", host, port)
+		// Resolve in the SOCKET's family, taken from what it is bound to: sending
+		// an IPv6 destination from a udp4 socket is an error, not a fallback.
+		network := "udp"
+		if la, ok := conn.LocalAddr().(*net.UDPAddr); ok && la.IP != nil {
+			if la.IP.To4() != nil {
+				network = "udp4"
+			} else {
+				network = "udp6"
+			}
+		}
+		dialAddr, e := resolveDialAddr(cfg, network, host, port)
 		if e == nil {
 			var dst *net.UDPAddr
-			if dst, e = net.ResolveUDPAddr("udp", dialAddr); e == nil {
+			if dst, e = net.ResolveUDPAddr(network, dialAddr); e == nil {
 				_, e = conn.WriteToUDP(data, dst)
 			}
 		}

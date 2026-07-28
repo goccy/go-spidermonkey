@@ -867,7 +867,11 @@
 		if (typeof address === "function") { cb = address; address = undefined; }
 		if (typeof port === "function") { cb = port; port = undefined; }
 		const onMessage = (data, rinfo) => this.emit("message", Buffer.from(data), rinfo);
-		const r = ops.udp_bind(String(address || ""), Number(port) || 0, onMessage);
+		// The socket TYPE goes to the host: a udp4 socket must resolve and bind in
+		// the IPv4 family. Without it "localhost" resolved to ::1 for a udp4
+		// socket and every send failed with "non-IPv4 address" — the message never
+		// arrived, so nothing closed the socket and the loop never went idle.
+		const r = ops.udp_bind(String(address || ""), Number(port) || 0, onMessage, this.type || "udp4");
 		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; process.nextTick(() => this.emit("error", e)); return this; }
 		this._id = r.id;
 		this._port = r.port;
@@ -895,7 +899,13 @@
 			}
 			port = this._remote.port; address = this._remote.address;
 		}
-		let buf = Buffer.from(msg);
+		// Node accepts a LIST of message parts and sends their concatenation as one
+		// datagram (send(['foo','bar'], …) is one "foobar" packet). Buffer.from of
+		// an array of strings produced an empty buffer instead, so the datagram
+		// arrived with no payload.
+		let buf = Array.isArray(msg)
+			? Buffer.concat(msg.map((part) => Buffer.from(part)))
+			: Buffer.from(msg);
 		// The (msg, offset, length, ...) overload sends only that slice.
 		if (offset !== undefined) {
 			const o = offset || 0;
