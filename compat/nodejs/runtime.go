@@ -246,10 +246,19 @@ func (rt *Runtime) Wait(ctx context.Context) error {
 		}
 	}
 	err = rt.exitFilter(err)
-	// Fire 'exit' exactly once (the JS side guards re-entry). Best-effort on the
-	// teardown path; a ctx error still returns below.
-	if _, e := rt.js.Eval(context.Background(), "globalThis.__node_emit_exit && globalThis.__node_emit_exit()"); e != nil && err == nil {
-		err = e
+	// Fire 'exit' exactly once (the JS side guards re-entry). A THROW from an
+	// 'exit' listener is a real failure, not teardown noise: Node treats it as an
+	// uncaught exception and exits non-zero, and it is how a whole test suite
+	// reports itself — the assertions common.mustCall registers all run here. It
+	// used to be dropped (only the host-side error was checked), which turned
+	// every failed mustCall into a silent pass.
+	r, e := rt.js.Eval(context.Background(), "globalThis.__node_emit_exit && globalThis.__node_emit_exit()")
+	if err == nil {
+		if e != nil {
+			err = e
+		} else if r.Error != nil {
+			err = r.Error
+		}
 	}
 	return err
 }
