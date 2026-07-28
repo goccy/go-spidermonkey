@@ -66,3 +66,32 @@ func TestParseMIMEType(t *testing.T) {
 		}
 	}
 }
+
+// A Blob reports its media type PARSED and SERIALIZED BACK, and "" when it does
+// not parse — the same algorithm data: URLs use, which is why there is one
+// implementation and both go through it. Blob, File, Request and Response are
+// all checked against the same table by the mimesniff tests.
+func TestMIMENormalizationForBlobTypes(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"text/html", "text/html"},
+		{"TEXT/HTML;Charset=GBK", "text/html;charset=GBK"},
+		{"text/html;charset=gbk;charset=windows-1255", "text/html;charset=gbk"},
+		// The parameter NAME is collected up to "=" with no trimming, so
+		// "charset " is not a token and the parameter is dropped. (Only the
+		// whitespace AFTER ";" is skipped, and only trailing whitespace is
+		// trimmed from an unquoted value.)
+		{"text/html ; charset = gbk ", "text/html"},
+		{"", ""},
+		{"bogus", ""},
+		{"text/html(", ""},
+	} {
+		m, ok := parseMIMEType(tc.in)
+		got := ""
+		if ok {
+			got = m.String()
+		}
+		if got != tc.want {
+			t.Errorf("%q -> %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

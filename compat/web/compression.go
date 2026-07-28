@@ -15,6 +15,21 @@ import (
 	"github.com/goccy/go-spidermonkey/compat/internal/compress"
 )
 
+// opMIMEType normalizes a media type the way the platform does everywhere it
+// appears: parsed and serialized back, or "" when it does not parse. Blob,
+// File, Request and Response all report their type in that form, and the
+// mimesniff tests check every one of them against the same table.
+func (w *Web) opMIMEType(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 1 {
+		return spidermonkey.ValueOf(""), nil
+	}
+	m, ok := parseMIMEType(args[0].String())
+	if !ok {
+		return spidermonkey.ValueOf(""), nil
+	}
+	return spidermonkey.ValueOf(m.String()), nil
+}
+
 // opCompress runs one buffer through a named codec ("gzip", "gunzip",
 // "deflate", "inflate", "deflateRaw", "inflateRaw"). A codec failure — corrupt
 // input to DecompressionStream, most often — comes back as an error object the

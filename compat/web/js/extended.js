@@ -7,6 +7,12 @@
 
 	// -------------------------------------------------------------- Blob/File
 
+	// A media type is reported PARSED and SERIALIZED BACK, never as given: that
+	// is what lowercases it, normalizes parameter whitespace and yields "" for
+	// one that does not parse. Captured here because __web_ops is deleted once
+	// the builtins have run.
+	const mimeType = __web_ops.mime_type;
+
 	const encodePart = (part) => {
 		if (part instanceof Uint8Array) return part.slice();
 		if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
@@ -30,7 +36,7 @@
 			}
 			this._blobParts = [...(parts || [])];
 			this._bytes = concatBytes(this._blobParts);
-			this.type = options.type ? String(options.type).toLowerCase() : "";
+			this.type = options && options.type !== undefined ? mimeType(String(options.type)) : "";
 		}
 		get size() { return this._bytes.length; }
 		async arrayBuffer() { return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.byteLength); }
