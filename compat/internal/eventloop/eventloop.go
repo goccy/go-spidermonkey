@@ -11,6 +11,8 @@ package eventloop
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,6 +155,48 @@ func (l *Loop) ClearTimer(id int64) {
 // pumps only the engine job queue; compat/nodejs installs a hook that
 // interleaves the process.nextTick queue with it. fn should call
 // DrainEngineJobs itself. Not safe to call concurrently with Run.
+// Alive reports what is currently keeping the loop from going idle, as a short
+// human-readable phrase, or "" when nothing is.
+//
+// This exists for diagnosis: a guest that never finishes is almost always
+// holding ONE kind of handle open, and without this the only evidence is that
+// the deadline passed. Naming the category — a pending host op, an armed timer,
+// a queued immediate — turns "it hangs" into a place to look.
+func (l *Loop) Alive() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var parts []string
+	// Naming WHICH op would need a handle threaded through every release site;
+	// the category alone already separates "a socket/server is still open" from
+	// "a timer is armed" from "an immediate is queued", which is the first fork
+	// in diagnosing any hang.
+	if active := l.pending - l.unrefPending; active > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending host op(s)", active))
+	}
+	refTimers := 0
+	for _, t := range l.timers {
+		if !t.unref {
+			refTimers++
+		}
+	}
+	if refTimers > 0 {
+		parts = append(parts, fmt.Sprintf("%d armed timer(s)", refTimers))
+	}
+	if n := len(l.posts); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d queued post(s)", n))
+	}
+	if n := len(l.immediates); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d queued immediate(s)", n))
+	}
+	if len(parts) == 0 {
+		if l.unrefPending > 0 {
+			return fmt.Sprintf("nothing (%d unref'd op(s) only)", l.unrefPending)
+		}
+		return ""
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (l *Loop) SetMicroDrain(fn func(context.Context) error) { l.microDrain = fn }
 
 // DrainEngineJobs pumps the engine's own job queue to exhaustion — the

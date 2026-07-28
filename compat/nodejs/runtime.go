@@ -274,6 +274,11 @@ func (rt *Runtime) Wait(ctx context.Context) error {
 	return err
 }
 
+// Alive reports what is keeping the event loop from going idle, or "" when
+// nothing is. It answers the only question a hang leaves open: which handle is
+// still open.
+func (rt *Runtime) Alive() string { return rt.loop.Alive() }
+
 // Web returns the underlying compat/web installation.
 func (rt *Runtime) Web() *web.Web { return rt.web }
 

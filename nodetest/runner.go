@@ -173,6 +173,11 @@ func run(ctx context.Context, opts Options, rel string) Result {
 	case runErr != nil:
 		res.Status = StatusFail
 		res.Reason = runErr.Error()
+		// A deadline says nothing on its own. Name what the loop is still
+		// holding, which is where the fix for a hang always is.
+		if alive := rt.Alive(); alive != "" {
+			res.Reason += " (loop still holds: " + alive + ")"
+		}
 	case evalErr != nil:
 		res.Status = StatusFail
 		res.Reason = evalErr.Error()
