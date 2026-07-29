@@ -482,7 +482,26 @@
 				maxFreeSockets: Number.isFinite(this.maxFreeSockets) ? (this.maxFreeSockets | 0) : 0,
 			};
 		}
-		getName() { return "agent"; }
+		getName(options = {}) {
+			// Node's pool key: host:port:localAddress plus the family, which is
+			// what a caller inspects to reason about which socket it will get.
+			const parts = [options.host || "localhost", options.port ?? "", options.localAddress ?? ""];
+			if (options.family === 4 || options.family === 6) parts.push(options.family);
+			return parts.join(":");
+		}
+		// createConnection is the hook a caller overrides to supply its own
+		// socket; the default opens one through net, which is what an agent
+		// with no override does.
+		createConnection(options, callback) {
+			const socket = core.net.createConnection(options);
+			if (typeof callback === "function") {
+				socket.once("connect", () => callback(null, socket));
+				socket.once("error", (e) => callback(e));
+			}
+			return socket;
+		}
+		reuseSocket() {}
+		keepSocketAlive() { return true; }
 		destroy() { if (ops.http_agent_close) ops.http_agent_close(this._agentId); }
 	}
 	const isErr = (r) => r !== null && typeof r === "object" && typeof r.code === "string" && !(r instanceof Uint8Array);
