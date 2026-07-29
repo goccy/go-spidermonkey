@@ -58,6 +58,7 @@ type subtleKey struct {
 	xPriv   *ecdh.PrivateKey // X25519
 	xPub    *ecdh.PublicKey
 	mlkem   *mlkemKey
+	mldsa   *mldsaKey
 	// The 448 curves come from CIRCL; the standard library has neither.
 	ed448Priv ed448.PrivateKey
 	ed448Pub  ed448.PublicKey

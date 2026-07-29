@@ -271,6 +271,12 @@
 	// typed arrays/Blob/File, cycles preserved. Functions/symbols/WeakMap
 	// throw DataCloneError per spec.
 
+	// The hook a serializable platform object defines to clone itself. A
+	// registry symbol rather than a global so the interfaces that use it stay
+	// reachable across these files without adding an enumerable property to
+	// anything the suite inspects.
+	const CLONEABLE = Symbol.for("go-spidermonkey.structuredClone");
+
 	function fullClone(value, seen) {
 		if (value === null || typeof value !== "object") {
 			if (typeof value === "function" || typeof value === "symbol") {
@@ -341,6 +347,17 @@
 				if (k === "message" || k === "stack" || k === "cause") continue;
 				out[k] = fullClone(value[k], seen);
 			}
+			return out;
+		}
+
+		// A platform object the spec marks [[Serializable]] carries its own
+		// cloner. The plain-object path below copies own enumerable properties,
+		// which is not enough for one whose state lives elsewhere: a CryptoKey
+		// cloned that way came back as an empty {}.
+		const custom = value[CLONEABLE];
+		if (typeof custom === "function") {
+			const out = custom.call(value, (v) => fullClone(v, seen));
+			seen.set(value, out);
 			return out;
 		}
 

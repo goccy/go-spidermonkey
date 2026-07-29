@@ -10,6 +10,7 @@ package web
 import (
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -33,7 +34,7 @@ func (s *subtleAPI) opX25519Generate(cfg spidermonkey.Config, args []spidermonke
 }
 
 // opX25519Import accepts the formats Web Crypto defines for this curve: "raw"
-// (a 32-byte public key) and "jwk" (OKP with crv X25519).
+// (a 32-byte public key), "spki", "pkcs8", and "jwk" (OKP with crv X25519).
 func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("x25519 import: (format, keyData) required")
@@ -49,6 +50,34 @@ func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.
 			return subtleErr("DataError: " + err.Error()), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{xPub: pub})}), nil
+	case "spki":
+		der, err := argBytes(args[1])
+		if err != nil {
+			return subtleErr(err.Error()), nil
+		}
+		parsed, err := x509.ParsePKIXPublicKey(der)
+		if err != nil {
+			return subtleErr("DataError: " + err.Error()), nil
+		}
+		pub, ok := parsed.(*ecdh.PublicKey)
+		if !ok || pub.Curve() != ecdh.X25519() {
+			return subtleErr("DataError: spki key is not X25519"), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{xPub: pub})}), nil
+	case "pkcs8":
+		der, err := argBytes(args[1])
+		if err != nil {
+			return subtleErr(err.Error()), nil
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(der)
+		if err != nil {
+			return subtleErr("DataError: " + err.Error()), nil
+		}
+		priv, ok := parsed.(*ecdh.PrivateKey)
+		if !ok || priv.Curve() != ecdh.X25519() {
+			return subtleErr("DataError: pkcs8 key is not X25519"), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{xPriv: priv})}), nil
 	case "jwk":
 		var jwk struct {
 			Kty, Crv, X, D string
@@ -83,7 +112,8 @@ func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.
 	return subtleErr("NotSupportedError: unsupported X25519 key format"), nil
 }
 
-// opX25519Export writes a key back out in "raw" (public only) or "jwk".
+// opX25519Export writes a key back out as "raw" (public only), "spki",
+// "pkcs8" (private only) or "jwk".
 func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("x25519 export: (format, handle) required")
@@ -100,6 +130,25 @@ func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.
 	case format == "raw" && k.xPriv != nil:
 		// "raw" of a private key is not exportable in Web Crypto.
 		return subtleErr("InvalidAccessError: cannot export a private key as raw"), nil
+	case format == "spki":
+		pub := k.xPub
+		if pub == nil && k.xPriv != nil {
+			pub = k.xPriv.PublicKey()
+		}
+		if pub == nil {
+			break
+		}
+		der, err := x509.MarshalPKIXPublicKey(pub)
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		return bytesValueOK(der)
+	case format == "pkcs8" && k.xPriv != nil:
+		der, err := x509.MarshalPKCS8PrivateKey(k.xPriv)
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		return bytesValueOK(der)
 	case format == "jwk" && k.xPriv != nil:
 		return spidermonkey.ValueOf(map[string]any{
 			"kty": "OKP", "crv": "X25519",

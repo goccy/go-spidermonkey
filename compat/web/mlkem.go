@@ -152,73 +152,36 @@ func mlkemFromPublic(set mlkemParams, b []byte) (*mlkemKey, error) {
 }
 
 // -------------------------------------------------------------------- DER
+//
+// The encoding itself is in akp.go, shared with ML-DSA. What is ML-KEM's own is
+// the mapping from OID back to parameter set: an import must not trust the
+// caller's algorithm, so the key says which set it belongs to.
 
-type pkixAlgorithm struct {
-	Algorithm asn1.ObjectIdentifier
-}
-
-type spkiDoc struct {
-	Algorithm pkixAlgorithm
-	PublicKey asn1.BitString
-}
-
-type pkcs8Doc struct {
-	Version    int
-	Algorithm  pkixAlgorithm
-	PrivateKey []byte // an OCTET STRING holding the [0] seed choice
-}
-
-// mlkemSPKI encodes an encapsulation key as SubjectPublicKeyInfo.
-func mlkemSPKI(set mlkemParams, pub []byte) ([]byte, error) {
-	return asn1.Marshal(spkiDoc{
-		Algorithm: pkixAlgorithm{set.oid},
-		PublicKey: asn1.BitString{Bytes: pub, BitLength: len(pub) * 8},
-	})
-}
-
-// mlkemPKCS8 encodes a seed as a PrivateKeyInfo. The inner value is the
-// ML-KEM private-key CHOICE, whose seed alternative is context tag 0.
-func mlkemPKCS8(set mlkemParams, seed []byte) ([]byte, error) {
-	inner := append([]byte{0x80, byte(len(seed))}, seed...)
-	return asn1.Marshal(pkcs8Doc{Version: 0, Algorithm: pkixAlgorithm{set.oid}, PrivateKey: inner})
-}
-
-// mlkemParseSPKI reads back what mlkemSPKI wrote, and reports the parameter set
-// the OID names so an import does not have to trust the caller's algorithm.
-func mlkemParseSPKI(der []byte) (mlkemParams, []byte, error) {
-	var doc spkiDoc
-	if _, err := asn1.Unmarshal(der, &doc); err != nil {
-		return mlkemParams{}, nil, err
-	}
+func mlkemByOID(oid asn1.ObjectIdentifier) (mlkemParams, error) {
 	for _, p := range mlkemSets {
-		if p.oid.Equal(doc.Algorithm.Algorithm) {
-			return p, doc.PublicKey.Bytes, nil
+		if p.oid.Equal(oid) {
+			return p, nil
 		}
 	}
-	return mlkemParams{}, nil, fmt.Errorf("not an ML-KEM key this build supports")
+	return mlkemParams{}, fmt.Errorf("not an ML-KEM key this build supports")
+}
+
+func mlkemParseSPKI(der []byte) (mlkemParams, []byte, error) {
+	oid, pub, err := akpParseSPKI(der)
+	if err != nil {
+		return mlkemParams{}, nil, err
+	}
+	set, err := mlkemByOID(oid)
+	return set, pub, err
 }
 
 func mlkemParsePKCS8(der []byte) (mlkemParams, []byte, error) {
-	var doc pkcs8Doc
-	if _, err := asn1.Unmarshal(der, &doc); err != nil {
+	oid, seed, err := akpParsePKCS8(der)
+	if err != nil {
 		return mlkemParams{}, nil, err
 	}
-	var set mlkemParams
-	found := false
-	for _, p := range mlkemSets {
-		if p.oid.Equal(doc.Algorithm.Algorithm) {
-			set, found = p, true
-		}
-	}
-	if !found {
-		return mlkemParams{}, nil, fmt.Errorf("not an ML-KEM key this build supports")
-	}
-	// The seed alternative: [0] IMPLICIT OCTET STRING (64 bytes).
-	b := doc.PrivateKey
-	if len(b) < 2 || b[0] != 0x80 || int(b[1]) != len(b)-2 {
-		return mlkemParams{}, nil, fmt.Errorf("ML-KEM private key is not a seed")
-	}
-	return set, b[2:], nil
+	set, err := mlkemByOID(oid)
+	return set, seed, err
 }
 
 // -------------------------------------------------------------------- ops
@@ -383,7 +346,7 @@ func (s *subtleAPI) opMLKEMExport(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		return bytesValueOK(k.seed())
 	case "spki":
-		der, err := mlkemSPKI(k.set, k.publicBytes())
+		der, err := akpSPKI(k.set.oid, k.publicBytes())
 		if err != nil {
 			return subtleErr("OperationError: " + err.Error()), nil
 		}
@@ -392,7 +355,7 @@ func (s *subtleAPI) opMLKEMExport(cfg spidermonkey.Config, args []spidermonkey.V
 		if !k.private() {
 			return subtleErr("InvalidAccessError: pkcs8 export needs a private key"), nil
 		}
-		der, err := mlkemPKCS8(k.set, k.seed())
+		der, err := akpPKCS8(k.set.oid, k.seed())
 		if err != nil {
 			return subtleErr("OperationError: " + err.Error()), nil
 		}
@@ -461,7 +424,7 @@ func (s *subtleAPI) opMLKEMDecapsulate(cfg spidermonkey.Config, args []spidermon
 	switch {
 	case sk.mlkem.dk512 != nil:
 		if len(ct) != mlkem512.CiphertextSize {
-			return subtleErr("OperationError: ML-KEM-512 ciphertext must be %d bytes"), nil
+			return subtleErr(fmt.Sprintf("OperationError: ML-KEM-512 ciphertext must be %d bytes", mlkem512.CiphertextSize)), nil
 		}
 		shared = make([]byte, mlkem512.SharedKeySize)
 		sk.mlkem.dk512.DecapsulateTo(shared, ct)

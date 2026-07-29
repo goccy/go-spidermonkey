@@ -67,6 +67,23 @@
 	const keyRaw = new WeakMap(); // CryptoKey -> raw Uint8Array
 	const rawOf = (k) => keyRaw.get(k);
 
+	// CryptoKey is [[Serializable]]: structuredClone (and postMessage) must
+	// produce a key that still works, so the clone needs the parts that are not
+	// own properties of the object. The host handle is SHARED — handles are owned
+	// by the host's key table, not by the JS object that names one — while raw
+	// material is copied, because it lives in the WeakMap above and a clone that
+	// shared the array would let a write through one key be seen through the
+	// other.
+	Object.defineProperty(CryptoKey.prototype, Symbol.for("go-spidermonkey.structuredClone"), {
+		value(deep) {
+			const out = new CryptoKey(this.type, this.extractable, deep(this.algorithm), this.usages, this._h);
+			const raw = keyRaw.get(this);
+			if (raw !== undefined) keyRaw.set(out, raw.slice());
+			return out;
+		},
+		configurable: true,
+	});
+
 	const need = (key, usage) => {
 		if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
 		if (!key.usages.includes(usage)) {
@@ -172,11 +189,12 @@
 
 	// The key usages each algorithm accepts, per operation. A key type that is
 	// not here is validated only for "usages must be recognized".
-	// ML-KEM (FIPS 203). Only the two parameter sets the host can actually do
-	// are listed: claiming ML-KEM-512 and then failing every operation would be
-	// worse than reporting it unsupported.
+	// The post-quantum key pairs: ML-KEM (FIPS 203) encapsulates, ML-DSA
+	// (FIPS 204) signs. Both use the "AKP" key type, whose private form is the
+	// generation seed rather than an expanded key.
 	const MLKEM_NAMES = ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"];
 	const MLKEM_USAGES = ["encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits"];
+	const MLDSA_NAMES = ["ML-DSA-44", "ML-DSA-65", "ML-DSA-87"];
 
 	const GENERATE_USAGES = {
 		"ED448": ["sign", "verify"],
@@ -220,11 +238,6 @@
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
 		"CHACHA20-POLY1305", "KMAC128", "KMAC256", "AES-OCB",
-		// Registered but not yet implemented here. Knowing the NAME is what lets
-		// a bad call be judged on its merits: usages and parameters are checked
-		// against the algorithm's own definition, and only a request that is
-		// otherwise valid gets "not supported". Leaving them unknown reported
-		// every mistake as the same one.
 		"ML-DSA-44", "ML-DSA-65", "ML-DSA-87",
 	]);
 
@@ -450,6 +463,12 @@
 		}
 	}
 
+	// ML-DSA signs over an optional context string, which binds a signature to
+	// the protocol that asked for it. It is absent far more often than not.
+	function mldsaContext(alg) {
+		return alg && alg.context !== undefined ? toU8(alg.context) : new Uint8Array(0);
+	}
+
 	function checkKeyAlgMatches(name, key, op) {
 		const want = String(name).toUpperCase();
 		const have = String((key && key.algorithm && key.algorithm.name) || "").toUpperCase();
@@ -567,6 +586,14 @@
 					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
+			if (MLDSA_NAMES.includes(name)) {
+				const r = subtleFail(ops.subtle_mldsa_generate(name));
+				const algo = { name: r.name };
+				return {
+					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
+					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+				};
+			}
 			if (MLKEM_NAMES.includes(algName(alg))) {
 				const r = subtleFail(ops.subtle_mlkem_generate(algName(alg)));
 				const algo = { name: r.name };
@@ -621,11 +648,20 @@
 			// though the algorithm has that usage.
 			checkHalfUsages(name, isPublicImport, usages, format);
 			if (format === "jwk") checkJWKConsistency(keyData, usages, extractable);
+			if (MLDSA_NAMES.includes(name)) {
+				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
+				const r = subtleFail(ops.subtle_mldsa_import(name, format, payload));
+				const isPub = r.type === "public";
+				// extractable is what the CALLER asked for, for either half. Only
+				// generateKey forces a public key to be extractable.
+				return new CryptoKey(r.type, extractable, { name: r.name },
+					usages.filter((u) => (isPub ? u === "verify" : u === "sign")), r.id);
+			}
 			if (MLKEM_NAMES.includes(algName(alg))) {
 				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
 				const r = subtleFail(ops.subtle_mlkem_import(algName(alg), format, payload));
 				const isPub = r.type === "public";
-				return new CryptoKey(r.type, isPub ? true : extractable, { name: r.name },
+				return new CryptoKey(r.type, extractable, { name: r.name },
 					usages.filter((u) => isPub
 						? u === "encapsulateKey" || u === "encapsulateBits"
 						: u === "decapsulateKey" || u === "decapsulateBits"), r.id);
@@ -636,7 +672,7 @@
 				const algo = { name: "X25519" };
 				return r.priv !== undefined
 					? new CryptoKey("private", extractable, algo, usages, r.priv)
-					: new CryptoKey("public", true, algo, [], r.pub);
+					: new CryptoKey("public", extractable, algo, [], r.pub);
 			}
 			if (name === "HMAC") {
 				let raw;
@@ -721,7 +757,7 @@
 					? op("jwk", JSON.stringify(keyData))
 					: op(format, toU8(keyData)));
 				const type = r.priv !== undefined ? "private" : "public";
-				return new CryptoKey(type, type === "public" ? true : extractable,
+				return new CryptoKey(type, extractable,
 					{ name: canonicalName(name) }, usages, r.priv ?? r.pub);
 			}
 			if (name === "ED25519") {
@@ -754,6 +790,10 @@
 			if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
 			if (!key.extractable) throw new DOMException("key is not extractable", "InvalidAccessError");
 			const name = key.algorithm.name.toUpperCase();
+			if (MLDSA_NAMES.includes(name)) {
+				const r = subtleFail(ops.subtle_mldsa_export(format, key._h));
+				return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+			}
 			if (MLKEM_NAMES.includes(key.algorithm.name)) {
 				const r = subtleFail(ops.subtle_mlkem_export(format, key._h));
 				return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
@@ -825,6 +865,9 @@
 			if (KMAC_NAMES.includes(name)) return toBuf(kmacRun(name, alg, key, data));
 			if (name === "HMAC") return toBuf(ops.subtle_hmac_sign(key.algorithm.hash.name, key._h, toU8(data)));
 			if (name === "ECDSA") return toBuf(ops.subtle_ec_sign(hashName(alg.hash), key._h, toU8(data)));
+			if (MLDSA_NAMES.includes(name)) {
+				return toBuf(subtleFail(ops.subtle_mldsa_sign(key._h, toU8(data), mldsaContext(alg))));
+			}
 			if (name === "ED448") return toBuf(subtleFail(ops.subtle_ed448_sign(key._h, toU8(data))));
 			if (name === "ED25519") return toBuf(ops.subtle_ed_sign(key._h, toU8(data)));
 			if (RSA_NAMES.includes(name)) {
@@ -849,6 +892,9 @@
 			}
 			if (name === "HMAC") return ops.subtle_hmac_verify(key.algorithm.hash.name, key._h, toU8(signature), toU8(data));
 			if (name === "ECDSA") return ops.subtle_ec_verify(hashName(alg.hash), key._h, toU8(signature), toU8(data));
+			if (MLDSA_NAMES.includes(name)) {
+				return subtleFail(ops.subtle_mldsa_verify(key._h, toU8(signature), toU8(data), mldsaContext(alg)));
+			}
 			if (name === "ED448") return ops.subtle_ed448_verify(key._h, toU8(signature), toU8(data));
 			if (name === "ED25519") return ops.subtle_ed_verify(key._h, toU8(signature), toU8(data));
 			if (RSA_NAMES.includes(name)) {

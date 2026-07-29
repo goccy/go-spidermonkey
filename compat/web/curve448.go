@@ -10,6 +10,7 @@ package web
 
 import (
 	"crypto/rand"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,48 @@ import (
 	"github.com/cloudflare/circl/sign/ed448"
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
+
+// The RFC 8410 OIDs. crypto/x509 marshals the 25519 curves but knows neither of
+// these, so their SPKI and PKCS#8 are encoded here — the same two shapes, with
+// the seed inside a CurvePrivateKey (see akp.go).
+var (
+	oidEd448 = asn1.ObjectIdentifier{1, 3, 101, 113}
+	oidX448  = asn1.ObjectIdentifier{1, 3, 101, 111}
+)
+
+// curveSPKI/curvePKCS8 and their parsers name the OID they expect, so importing
+// an X448 key as Ed448 is refused rather than reinterpreted.
+func curvePKCS8(oid asn1.ObjectIdentifier, seed []byte) ([]byte, error) {
+	return derPKCS8(oid, curveSeedTag, seed)
+}
+
+func curveParsePKCS8(der []byte, want asn1.ObjectIdentifier, size int) ([]byte, error) {
+	oid, seed, err := derParsePKCS8(der, curveSeedTag)
+	if err != nil {
+		return nil, err
+	}
+	if !oid.Equal(want) {
+		return nil, fmt.Errorf("pkcs8 key is not %v", want)
+	}
+	if len(seed) != size {
+		return nil, fmt.Errorf("private key must be %d bytes", size)
+	}
+	return seed, nil
+}
+
+func curveParseSPKI(der []byte, want asn1.ObjectIdentifier, size int) ([]byte, error) {
+	oid, pub, err := akpParseSPKI(der)
+	if err != nil {
+		return nil, err
+	}
+	if !oid.Equal(want) {
+		return nil, fmt.Errorf("spki key is not %v", want)
+	}
+	if len(pub) != size {
+		return nil, fmt.Errorf("public key must be %d bytes", size)
+	}
+	return pub, nil
+}
 
 // ---------------------------------------------------------------- Ed448
 
@@ -56,6 +99,26 @@ func (s *subtleAPI) opEd448Import(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		priv := ed448.NewKeyFromSeed(raw)
 		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{ed448Priv: priv})}), nil
+	case "spki":
+		der, err := argBytes(args[1])
+		if err != nil {
+			return subtleErr(err.Error()), nil
+		}
+		pub, err := curveParseSPKI(der, oidEd448, ed448.PublicKeySize)
+		if err != nil {
+			return subtleErr("DataError: " + err.Error()), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{ed448Pub: ed448.PublicKey(pub)})}), nil
+	case "pkcs8":
+		der, err := argBytes(args[1])
+		if err != nil {
+			return subtleErr(err.Error()), nil
+		}
+		seed, err := curveParsePKCS8(der, oidEd448, ed448.SeedSize)
+		if err != nil {
+			return subtleErr("DataError: " + err.Error()), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{ed448Priv: ed448.NewKeyFromSeed(seed)})}), nil
 	case "jwk":
 		var jwk struct{ Kty, Crv, X, D string }
 		if err := json.Unmarshal([]byte(args[1].String()), &jwk); err != nil {
@@ -101,6 +164,21 @@ func (s *subtleAPI) opEd448Export(cfg spidermonkey.Config, args []spidermonkey.V
 			return subtleErr("InvalidAccessError: raw-seed export needs a private key"), nil
 		}
 		return bytesValueOK(k.ed448Priv.Seed())
+	case "spki":
+		der, err := akpSPKI(oidEd448, pub)
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		return bytesValueOK(der)
+	case "pkcs8":
+		if k.ed448Priv == nil {
+			return subtleErr("InvalidAccessError: pkcs8 export needs a private key"), nil
+		}
+		der, err := curvePKCS8(oidEd448, k.ed448Priv.Seed())
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		return bytesValueOK(der)
 	case "jwk":
 		out := map[string]any{"kty": "OKP", "crv": "Ed448", "x": b64(pub)}
 		if k.ed448Priv != nil {
@@ -189,6 +267,26 @@ func (s *subtleAPI) opX448Import(cfg spidermonkey.Config, args []spidermonkey.Va
 			return subtleErr(fmt.Sprintf("DataError: X448 private key must be %d bytes", x448.Size)), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{x448Priv: asKey(raw)})}), nil
+	case "spki":
+		der, err := argBytes(args[1])
+		if err != nil {
+			return subtleErr(err.Error()), nil
+		}
+		pub, err := curveParseSPKI(der, oidX448, x448.Size)
+		if err != nil {
+			return subtleErr("DataError: " + err.Error()), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{x448Pub: asKey(pub)})}), nil
+	case "pkcs8":
+		der, err := argBytes(args[1])
+		if err != nil {
+			return subtleErr(err.Error()), nil
+		}
+		d, err := curveParsePKCS8(der, oidX448, x448.Size)
+		if err != nil {
+			return subtleErr("DataError: " + err.Error()), nil
+		}
+		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{x448Priv: asKey(d)})}), nil
 	case "jwk":
 		var jwk struct{ Kty, Crv, X, D string }
 		if err := json.Unmarshal([]byte(args[1].String()), &jwk); err != nil {
@@ -236,6 +334,21 @@ func (s *subtleAPI) opX448Export(cfg spidermonkey.Config, args []spidermonkey.Va
 			return subtleErr("InvalidAccessError: raw-seed export needs a private key"), nil
 		}
 		return bytesValueOK(k.x448Priv[:])
+	case "spki":
+		der, err := akpSPKI(oidX448, pub[:])
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		return bytesValueOK(der)
+	case "pkcs8":
+		if k.x448Priv == nil {
+			return subtleErr("InvalidAccessError: pkcs8 export needs a private key"), nil
+		}
+		der, err := curvePKCS8(oidX448, k.x448Priv[:])
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		return bytesValueOK(der)
 	case "jwk":
 		out := map[string]any{"kty": "OKP", "crv": "X448", "x": b64(pub[:])}
 		if k.x448Priv != nil {
