@@ -199,8 +199,14 @@ func (rt *Runtime) opFSWatch(cfg spidermonkey.Config, args []spidermonkey.Value)
 	}
 
 	rt.loop.AddPending("stdio")
+	// The baseline is the state at the moment watch() was CALLED, not whenever
+	// the goroutine below happens to get scheduled. Taking it inside the
+	// goroutine lost every change that landed in between — and the guest's very
+	// next statement is often the change, as in `watchFile(f); unlinkSync(f)`:
+	// the delete would be absorbed into the baseline and no event would ever
+	// fire, leaving the watcher holding the loop open forever.
+	prev := snapshot()
 	go func() {
-		prev := snapshot()
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
