@@ -240,6 +240,32 @@
 		return e;
 	};
 
+	// Node reports a bad argument with a CODE, and callers — including every
+	// assert.throws in its own suite — match on that code rather than on the
+	// message. Throwing a bare TypeError, or not throwing at all, is what makes
+	// "Missing expected exception" the second-largest failure group.
+	function argTypeError(name, expected, actual) {
+		const got = actual === null ? "null" : Array.isArray(actual) ? "an instance of Array" : typeof actual;
+		return Object.assign(
+			new TypeError(`The "${name}" argument must be of type ${expected}. Received ${got}`),
+			{ code: "ERR_INVALID_ARG_TYPE" });
+	}
+	function rangeError(name, range, actual) {
+		return Object.assign(
+			new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${actual}`),
+			{ code: "ERR_OUT_OF_RANGE" });
+	}
+	// requireIndex validates one of Buffer's numeric offset/length arguments.
+	function requireIndex(name, value, max) {
+		if (value === undefined) return undefined;
+		if (typeof value !== "number") throw argTypeError(name, "number", value);
+		if (!Number.isInteger(value)) throw rangeError(name, "an integer", value);
+		if (value < 0 || (max !== undefined && value > max)) {
+			throw rangeError(name, `>= 0 and <= ${max ?? "the buffer length"}`, value);
+		}
+		return value;
+	}
+
 	class Buffer extends Uint8Array {
 		static from(value, encodingOrOffset, length) {
 			if (typeof value === "string") return encodeString(value, encodingOrOffset);
@@ -258,9 +284,11 @@
 			if (Array.isArray(value) || (value && typeof value.length === "number")) {
 				return wrap(Uint8Array.from(value));
 			}
-			throw new TypeError("Buffer.from: unsupported input");
+			throw argTypeError("first argument", "string, Buffer, ArrayBuffer, Array, or Array-like Object", value);
 		}
 		static alloc(size, fill, encoding) {
+			if (typeof size !== "number") throw argTypeError("size", "number", size);
+			if (!Number.isInteger(size) || size < 0) throw rangeError("size", ">= 0 and <= 2**32-1", size);
 			const b = wrap(new Uint8Array(size));
 			if (fill !== undefined && fill !== 0) {
 				if (typeof fill === "number") b.fill(fill);
@@ -280,9 +308,17 @@
 		}
 		static byteLength(v, encoding) {
 			if (typeof v === "string") return encodeString(v, encoding).length;
+			if (!ArrayBuffer.isView(v) && !(v instanceof ArrayBuffer)) {
+				throw argTypeError("string", "string, Buffer, or ArrayBuffer", v);
+			}
 			return v.byteLength ?? 0;
 		}
 		static concat(list, totalLength) {
+			if (!Array.isArray(list)) throw argTypeError("list", "Array", list);
+			for (const b of list) {
+				if (!ArrayBuffer.isView(b)) throw argTypeError("list[i]", "Buffer or Uint8Array", b);
+			}
+			if (totalLength !== undefined) requireIndex("totalLength", totalLength);
 			let len = totalLength ?? list.reduce((n, b) => n + b.length, 0);
 			const out = wrap(new Uint8Array(len));
 			let off = 0;
@@ -294,7 +330,11 @@
 			}
 			return out;
 		}
-		static compare(a, b) { return compareBytes(a, b); }
+		static compare(a, b) {
+			if (!ArrayBuffer.isView(a)) throw argTypeError("buf1", "Buffer or Uint8Array", a);
+			if (!ArrayBuffer.isView(b)) throw argTypeError("buf2", "Buffer or Uint8Array", b);
+			return compareBytes(a, b);
+		}
 
 		toString(encoding = "utf8", start = 0, end = this.length) {
 			const sub = start !== 0 || end !== this.length ? this.subarray(start, end) : this;
@@ -317,7 +357,14 @@
 		toJSON() { return { type: "Buffer", data: [...this] }; }
 		slice(start, end) { return this.subarray(start, end); } // Node slice shares memory
 		equals(other) { return compareBytes(this, other) === 0; }
-		compare(other) { return compareBytes(this, other); }
+		compare(other, targetStart, targetEnd, sourceStart, sourceEnd) {
+			if (!ArrayBuffer.isView(other)) throw argTypeError("target", "Buffer or Uint8Array", other);
+			targetStart = requireIndex("targetStart", targetStart, other.length) ?? 0;
+			targetEnd = requireIndex("targetEnd", targetEnd, other.length) ?? other.length;
+			sourceStart = requireIndex("sourceStart", sourceStart, this.length) ?? 0;
+			sourceEnd = requireIndex("sourceEnd", sourceEnd, this.length) ?? this.length;
+			return compareBytes(this.subarray(sourceStart, sourceEnd), other.subarray(targetStart, targetEnd));
+		}
 		copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
 			// Node copies only what fits in the target's remaining space and
 			// returns that count, rather than throwing when the source is larger.

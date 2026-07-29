@@ -131,6 +131,13 @@ func run(ctx context.Context, opts Options, rel string) Result {
 			return isLoopbackName(host) || isLoopbackIP(ip)
 		},
 		Listen: func(network, addr string) bool { return true },
+		// The Node suite spawns real subprocesses — /bin/sh, cat, grep, and the
+		// node binary itself — and a third of the tests that merely "exit with
+		// code 1" do so because the spawn was refused. Running the suite means
+		// running what it runs; the checkout is pinned, so this is the same
+		// trust level as `make nodetest` itself. A spawn of node re-enters this
+		// runtime rather than an OS process (see compat/nodejs/nested.go).
+		Exec: func(path string, argv []string) bool { return true },
 	})
 	if newErr != nil {
 		res.Status = StatusFail

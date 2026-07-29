@@ -1269,9 +1269,30 @@
 	// without this, process.chdir() would move the reported directory while
 	// every relative read kept resolving against the filesystem root, which is
 	// worse than not having chdir at all.
+	// Node validates a path before doing anything with it, and reports the
+	// failure with a CODE that callers (and its own suite) match on. Accepting
+	// anything and stringifying it turned "assert.throws(…, ERR_INVALID_ARG_TYPE)"
+	// into a silent success.
 	function fsResolve(p) {
-		if (p instanceof URL) return p.pathname;
-		const s = typeof p === "string" ? p : String(p);
+		if (p instanceof URL) {
+			if (p.protocol !== "file:") {
+				throw Object.assign(new TypeError(`The URL must be of scheme file`), { code: "ERR_INVALID_URL_SCHEME" });
+			}
+			return p.pathname;
+		}
+		if (typeof p !== "string" && !(p instanceof Uint8Array)) {
+			throw Object.assign(
+				new TypeError(`The "path" argument must be of type string or an instance of Buffer or URL. Received ${p === null ? "null" : typeof p}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		const s = typeof p === "string" ? p : new TextDecoder().decode(p);
+		// A NUL byte cannot appear in a path; Node rejects it explicitly rather
+		// than letting it truncate somewhere below.
+		if (s.includes("\u0000")) {
+			throw Object.assign(
+				new TypeError(`The argument 'path' must be a string, Uint8Array, or URL without null bytes. Received '${s}'`),
+				{ code: "ERR_INVALID_ARG_VALUE" });
+		}
 		if (s.startsWith("/")) return s;
 		const cwd = globalThis.process ? globalThis.process.cwd() : "/";
 		return (cwd === "/" ? "/" : cwd + "/") + s;

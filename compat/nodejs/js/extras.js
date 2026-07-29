@@ -672,6 +672,11 @@
 			this.emit("error", e);
 		};
 		const onConnect = () => {
+			// The dial completes off-loop, so its callback can be posted after the
+			// guest has already destroyed the socket — the guest destroys in the
+			// same tick, but the host goroutine may have passed its own check
+			// first. A destroyed socket never emits 'connect'.
+			if (this.destroyed || this._id === null) return;
 			this.connecting = false;
 			this.remoteAddress = host;
 			this.remotePort = port;
