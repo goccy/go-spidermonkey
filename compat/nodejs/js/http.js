@@ -642,7 +642,13 @@
 					}
 				});
 				openClientResponses.set(id, res);
-				this.emit("response", res);
+				// A response NOBODY is listening for still has to be drained. The
+				// host pump waits for the guest to ask for more, so an unread body
+				// parks it forever and the request's handle keeps the event loop
+				// alive — `http.request(url).end()` with no 'response' handler
+				// would never let the program exit. Node does exactly this: if the
+				// emit finds no listener, it dumps the body.
+				if (!this.emit("response", res)) res.resume();
 			};
 			// A user abort()/destroy() cancels the round-trip, which surfaces as a
 			// context-canceled onError; don't re-emit 'error' for the request the
