@@ -2235,8 +2235,10 @@
 	}
 
 	function tlsConnect(options, cb) {
-		if (typeof options === "number") { options = { port: options, host: arguments[1] }; cb = arguments[2]; }
-		if (typeof options !== "object" || options === null) options = {};
+		if (typeof options === "number") { options = { port: validatePort(options), host: arguments[1] }; cb = arguments[2]; }
+		if (options === undefined || options === null) options = {};
+		validateTLSOptions(options);
+		if (options.port !== undefined) validatePort(options.port);
 		const sock = new TLSSocket();
 		if (cb) sock.once("secureConnect", cb);
 		const onData = (chunk) => { socketTimeoutTouch(sock); sock.push(Buffer.from(chunk)); };
@@ -2331,10 +2333,48 @@
 		return this;
 	};
 
+	// TLS options decide whether a connection is SECURE, so a malformed one is
+	// worth naming rather than ignoring: a `ciphers: 1` that is silently dropped
+	// leaves the caller believing they restricted the suite when they did not.
+	function validateTLSOptions(options, name = "options") {
+		if (options === undefined || options === null) return {};
+		if (typeof options !== "object") {
+			throw Object.assign(new TypeError(`The "${name}" argument must be of type object. Received ${typeof options}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		for (const key of ["ciphers", "servername", "clientCertEngine", "privateKeyEngine", "privateKeyIdentifier", "sigalgs"]) {
+			if (options[key] !== undefined && options[key] !== null && typeof options[key] !== "string") {
+				throw Object.assign(new TypeError(`The "options.${key}" property must be of type string. Received ${typeof options[key]}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+		}
+		for (const key of ["sessionTimeout", "handshakeTimeout", "minVersion", "maxVersion"]) {
+			const v = options[key];
+			if (v === undefined || v === null) continue;
+			const numeric = key === "sessionTimeout" || key === "handshakeTimeout";
+			if (numeric ? typeof v !== "number" : typeof v !== "string") {
+				throw Object.assign(new TypeError(`The "options.${key}" property must be of type ${numeric ? "number" : "string"}. Received ${typeof v}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+		}
+		if (options.ticketKeys !== undefined && options.ticketKeys !== null && !ArrayBuffer.isView(options.ticketKeys)) {
+			throw Object.assign(new TypeError(`The "options.ticketKeys" property must be an instance of Buffer, TypedArray, or DataView. Received ${typeof options.ticketKeys}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		// An IP address cannot be an SNI servername — SNI carries a host NAME,
+		// and sending an address is both useless and a protocol violation.
+		if (typeof options.servername === "string" && options.servername !== ""
+			&& (isIPv4(options.servername) || isIPv6(options.servername))) {
+			throw Object.assign(new TypeError(`The "options.servername" property must not be an IP address. Received ${JSON.stringify(options.servername)}`),
+				{ code: "ERR_INVALID_ARG_VALUE" });
+		}
+		return options;
+	}
+
 	core.tls = {
 		connect: tlsConnect,
-		createServer: (options, listener) => new TLSServer(options, listener),
-		createSecureContext: (opts) => opts || {},
+		createServer: (options, listener) => new TLSServer(validateTLSOptions(options), listener),
+		createSecureContext: (opts) => validateTLSOptions(opts, "options"),
 		TLSSocket: callableClass(TLSSocket),
 		Server: callableClass(TLSServer),
 		rootCertificates: [],

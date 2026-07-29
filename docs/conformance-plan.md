@@ -13,15 +13,13 @@ from the runs in this repository rather than from intuition.
 | suite | measured |
 |---|---|
 | WPT | **35,694 / 43,142 subtests = 82.7%** |
-| Node.js | 2,611 tests run, **766 pass = 29.3%** (see the note below) |
+| Node.js | 2,611 tests run, **790 pass = 30.3%** (see the note below) |
 | Babel | 4,170 / 4,189 fixtures = 99.6% |
 | test262 | 52,266 / 53,329 = 98.0% |
 
 The Node figure is a full sharded sweep, and it is the number to quote. It
-lags HEAD slightly: a sweep takes about half an hour, so anything committed
-after its binary was built is measured per module instead — the callable
-constructors (`Buffer` 22 → 25) and the HTTP response validation (`http`
-83 → 85) are the two currently in that position. Re-run the sweep before
+lags HEAD: a sweep takes about half an hour, so anything committed after its
+binary was built is measured per module instead. Re-run the sweep before
 quoting a new total rather than adding module deltas to an old one.
 
 WPT by directory, largest first:
@@ -81,23 +79,28 @@ more than any single API:
   `assert.throws` saw nothing, however correct the check itself was.
 - A per-API check is worth a fraction of a test on its own, because each of
   these files asserts dozens of argument shapes. Whole FAMILIES have to be
-  covered before a file flips. Doing that for `fs` moved it from 66 to 124
-  passing, and for `Buffer` from 11 to 22.
+  covered before a file flips. Doing that for `fs` moved it from 66 to 125
+  passing, and for `Buffer` from 11 to 25.
 
 Per-module results from that pass, each measured with `NODETEST_FILTER` before
 and after:
 
 | module | before | after |
 |---|---|---|
-| `fs` | 66 | 124 |
+| `fs` | 66 | 125 |
 | `fs.cp` alone | 30 | 58 |
-| `Buffer` | 11 | 22 |
+| `Buffer` | 11 | 25 |
 | `repl` | 8 | 20 |
 | `process` | 21 | 27 |
 | `whatwg-url` | 9 | 16 |
 | `vm` | 31 | 34 |
 | `zlib` | 7 | 11 |
 | `crypto` | 28 | 31 |
+| `stream` | 31 | 38 |
+| `diagnostics_channel` | 9 | 14 |
+| `http` | 83 | 86 |
+| `dgram` | 33 | 35 |
+| `worker_threads` | 35 | 36 |
 
 Three of those were not validation at all but a defect the validation work
 exposed:
@@ -157,9 +160,12 @@ Go's `net/http2` provides the transport; the work is Node's `Http2Session` /
 
 ### Argument validation on what is left
 
-The mechanical pass above covered `fs`, `Buffer`, `zlib`, `vm`, `process`,
-`net` and `URLSearchParams`. `crypto` (50 remaining), `tls` and `child_process`
-still report the wrong error or none for a bad argument.
+The pass above covered `fs`, `Buffer`, `zlib`, `vm`, `process`, `net`, `dgram`,
+`crypto`, `child_process`, `worker_threads`, `tls` and `URLSearchParams` — every
+module where a bad argument used to reach the host and come back as an error
+about the transport rather than about the call. What remains in this row is
+mostly `http` and `stream`, where the checks live on many small methods rather
+than a few entry points.
 
 ### fetch/api — 530 subtests
 

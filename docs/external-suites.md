@@ -21,7 +21,7 @@ than tests written here:
 | test262 | 52,266 / 53,329 = **98.0%** |
 | Babel | 4,170 / 4,189 fixtures = **99.55%** (890 skipped) |
 | WPT | 35,694 / 43,142 subtests = **82.7%** |
-| Node.js | 2,611 tests run, **766 passing = 29.3%** |
+| Node.js | 2,611 tests run, **790 passing = 30.3%** |
 
 The Babel figure comes with a cross-check worth repeating whenever the pin
 moves: every one of the 19 remaining failures ALSO fails under real Node.js
