@@ -21,7 +21,7 @@ than tests written here:
 | test262 | 52,266 / 53,329 = **98.0%** |
 | Babel | 4,170 / 4,189 fixtures = **99.55%** (890 skipped) |
 | WPT | 35,694 / 43,142 subtests = **82.7%** |
-| Node.js | ~2,600 tests run, ~640 passing; 235 quarantined as hangs |
+| Node.js | 2,611 tests run, **766 passing = 29.3%** |
 
 The Babel figure comes with a cross-check worth repeating whenever the pin
 moves: every one of the 19 remaining failures ALSO fails under real Node.js
@@ -58,10 +58,10 @@ implements either.
 
 The Node number is the honest weak axis, and
 [conformance-plan.md](conformance-plan.md) records why with the measured
-failure histogram rather than an estimate: the single largest group is 327
-tests failing on `assert.throws`, because Node reports a bad argument with an
-`ERR_*` code that its own suite matches on and most of this runtime's APIs do
-not yet.
+failure histogram rather than an estimate, along with the per-module before and
+after of the argument-validation pass — `fs` 66 → 124, `Buffer` 11 → 25,
+`repl` 8 → 20 — and the three defects that pass exposed, of which the
+fork IPC deadlock was the one that mattered most.
 
 ## The bar: what Bun and Deno measure themselves against
 
@@ -148,10 +148,11 @@ as the suite moves.
 separate PROCESSES:
 
 ```sh
+go test -c -o /tmp/nodetest.bin ./nodetest        # build ONCE
 for i in $(seq 0 7); do
-  NODETEST=1 NODETEST_SHARD=$i/8 NODETEST_REPORT=shard-$i.json \
-    go test ./nodetest/ -run TestNodeSuite -v -timeout 40m &
-done; wait
+  ( cd nodetest && NODETEST=1 NODETEST_SHARD=$i/8 NODETEST_REPORT=/tmp/shard-$i.json \
+      /tmp/nodetest.bin -test.run TestNodeSuite -test.v -test.timeout 15m ) > /tmp/shard-$i.txt 2>&1
+done
 ```
 
 This is not only about speed. Some Node tests block inside a host call — a
@@ -162,6 +163,23 @@ interpreters in ONE process and that process stops making progress: every
 goroutine parks and even the harness's own watchdog timer stops firing. The
 cause is not yet understood; it is under `docs/engine-followups.md`. Sharding
 bounds it to one shard's worth of results while it is open.
+
+Two details of the loop above are deliberate, and both cost real debugging time
+on an Apple Silicon machine running an amd64 Go toolchain under Rosetta:
+
+- **Build the binary once and run it directly.** The `go` command there
+  reliably deadlocks in its own scheduler after a test binary exits, leaving
+  the binary unreaped and the shard apparently hung at 0% CPU. Every thread
+  sits in `findRunnable`/`stopm`; SIGQUIT clears it. Keeping the go command out
+  of the loop avoids it entirely (and skips eight rebuilds).
+- **`cd nodetest` first.** `go test` runs a test binary with the package
+  directory as its working directory; a prebuilt binary does not, and the suite
+  resolves its checkout relative to it.
+
+For an unattended run, wait on each shard's OUTPUT reaching `^(PASS|FAIL|ok)`
+rather than on its process: a test binary occasionally sticks in the kernel
+exit path in state `?E` — where even SIGKILL does not reach it — after the
+framework has already printed its verdict.
 
 ## wpt — the Web Platform Tests
 

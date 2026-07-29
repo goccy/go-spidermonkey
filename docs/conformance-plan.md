@@ -13,7 +13,7 @@ from the runs in this repository rather than from intuition.
 | suite | measured |
 |---|---|
 | WPT | **35,694 / 43,142 subtests = 82.7%** |
-| Node.js | 2,575 tests run, **558 pass**; 235 quarantined as hangs |
+| Node.js | 2,611 tests run, **766 pass = 29.3%** |
 | Babel | 4,170 / 4,189 fixtures = 99.6% |
 | test262 | 52,266 / 53,329 = 98.0% |
 
@@ -50,29 +50,62 @@ no 512, and that is reported rather than faked).
 
 ## The Node gap, stated plainly
 
-558 of 2,575 is 21.7%. Bun and Deno are far higher on the tests they run, and
-the reason is not one missing subsystem — it is per-API fidelity across the
-whole surface. The failure histogram, from a clean sharded run:
+Bun and Deno are far higher on the tests they run, and the reason is not one
+missing subsystem — it is per-API fidelity across the whole surface. The
+failure histogram, from a clean sharded run:
 
 | tests | first failure |
 |---|---|
-| 627 | exited with a non-zero code (a mix; the largest single cause was a refused subprocess, now fixed) |
-| 183 | `assert.throws` saw no exception |
-| 144 | `assert.throws` saw the wrong error |
-| 86 | a spawned process reported no status |
+| 572 | exited with a non-zero code (a mix, diagnosable only per test) |
+| 196 | `assert.throws` saw no exception |
+| 143 | `assert.throws` saw the wrong error |
+| 47 | a spawned process reported no status |
 | 38 | `node:repl` is not implemented |
-| 34 | a class was called without `new` |
-| 31 | `fs.symlink` is not supported |
-| 20 | `child_process.fork` has no IPC channel |
+| 14 | a class was called without `new` |
 
-The two `assert.throws` rows — 327 tests — are one thing: Node reports a bad
-argument with a CODE (`ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`), and its own
-suite matches on that code. Adding it to Buffer and to fs paths moved `test-fs-`
-from 59 to 61 passing and left `test-buffer-` unchanged, because each of those
-files checks dozens of argument shapes and one flipped assertion is not one
-flipped file. Closing that row means comprehensive validation on every API, not
-a few entry points. It is mechanical, it is large, and it is the single biggest
-lever on the Node number.
+The two `assert.throws` rows are one thing: Node reports a bad argument with a
+CODE (`ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`), and its own suite matches on
+that code. Two structural findings made that row tractable, and both were worth
+more than any single API:
+
+- The callback flavours must validate **synchronously**.
+  `fs.readFile(p, "bogus-encoding", cb)` throws at the call; it does not report
+  through `cb`. Running the checks inside the deferred operation meant
+  `assert.throws` saw nothing, however correct the check itself was.
+- A per-API check is worth a fraction of a test on its own, because each of
+  these files asserts dozens of argument shapes. Whole FAMILIES have to be
+  covered before a file flips. Doing that for `fs` moved it from 66 to 124
+  passing, and for `Buffer` from 11 to 22.
+
+Per-module results from that pass, each measured with `NODETEST_FILTER` before
+and after:
+
+| module | before | after |
+|---|---|---|
+| `fs` | 66 | 124 |
+| `fs.cp` alone | 30 | 58 |
+| `Buffer` | 11 | 22 |
+| `repl` | 8 | 20 |
+| `process` | 21 | 27 |
+| `whatwg-url` | 9 | 16 |
+| `vm` | 31 | 34 |
+| `zlib` | 7 | 11 |
+| `crypto` | 28 | 31 |
+
+Three of those were not validation at all but a defect the validation work
+exposed:
+
+- **fork's IPC channel deadlocked.** A child held a loop pending until the
+  channel closed, and the parent only closed it once the child finished — so a
+  child that finished *normally* never did. Only a crashing child ever
+  completed. Node's rule is that the channel keeps a child alive only while it
+  is listening.
+- **`readline.Interface.write()` had its direction backwards**, writing to the
+  output where Node writes to the input as if typed. Every caller that drives an
+  Interface programmatically echoed its script instead of running it.
+- **`assert.throws(fn, /regexp/)` matched against `err.message`** where Node
+  matches against the error's string representation — so an anchored pattern
+  could never match, and a bare `/ERR_X/` could not assert on a code.
 
 ## The hangs
 
@@ -103,20 +136,23 @@ distinct causes. There is no single lever left there.
 
 ## Remaining, ordered by measured tests
 
-### Node argument validation — 327 tests
+### `node:tls` — 106 tests
 
-See above. `fs` (65 files), `buffer` (27), `crypto` (25), `tls` (21) are the
-biggest clusters.
+The weakest module by a wide margin: 11 of 117 pass. Unlike the rest of this
+list it is not validation — `server.addContext`, SNI callbacks, session
+resumption, and upgrading an existing socket to TLS are all absent, and 18 of
+the failures are hangs. It needs host work, not JS.
 
 ### `node:http2` — 276 tests
 
 Go's `net/http2` provides the transport; the work is Node's `Http2Session` /
 `Http2Stream` surface over it.
 
-### `child_process.fork` IPC — 164 tests
+### Argument validation on what is left
 
-The nested-interpreter machinery exists (`compat/nodejs/nested.go`); what is
-missing is the message channel and `process.send`/`'message'` on both sides.
+The mechanical pass above covered `fs`, `Buffer`, `zlib`, `vm`, `process`,
+`net` and `URLSearchParams`. `crypto` (50 remaining), `tls` and `child_process`
+still report the wrong error or none for a bad argument.
 
 ### fetch/api — 530 subtests
 
@@ -124,9 +160,23 @@ Still the largest WPT directory gap after WebCryptoAPI's tentative set. What
 remains is spread thin: preflight cache semantics, upload streaming, a handful
 of unported wptserve handlers.
 
-### `node:repl` — 38 tests
-
 ### `fs.symlink` — 31 tests
+
+## The hang that is not ours
+
+On an Apple Silicon machine running an amd64 Go toolchain under Rosetta, two
+things below this code wedge a long run, and both cost real debugging time
+before they were identified:
+
+- the `go` command deadlocks in its own scheduler after a test binary exits,
+  leaving the binary unreaped;
+- a test binary itself sometimes sticks in the kernel exit path in state `?E`,
+  where even SIGKILL does not reach it — after the framework has already
+  printed its verdict.
+
+Neither is reproducible from a small run, and neither is a defect in the
+runtime. Shard the suite from a PREBUILT binary (`go test -c`) and wait on the
+shard's OUTPUT rather than on its process, and both stop mattering.
 
 ## Not on this list, and why
 
