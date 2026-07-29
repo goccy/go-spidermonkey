@@ -1340,6 +1340,28 @@
 			try { new URL(url, base); return true; } catch { return false; }
 		}
 	}
+	// createObjectURL hands out a blob: URL that names an in-memory Blob. It is
+	// how FileAPI expects a Blob to be read by anything that takes a URL —
+	// fetch, above all — and without it the whole FileAPI/url group could not
+	// even start.
+	const objectURLs = new Map(); // blob: URL -> Blob
+	URL.createObjectURL = function createObjectURL(obj) {
+		if (!(obj instanceof Blob)) {
+			throw new TypeError("createObjectURL expects a Blob or File");
+		}
+		let origin = "null";
+		try { origin = (globalThis.location && globalThis.location.origin) || "null"; } catch { /* no location */ }
+		const url = "blob:" + origin + "/" + crypto.randomUUID();
+		objectURLs.set(url, obj);
+		return url;
+	};
+	URL.revokeObjectURL = function revokeObjectURL(url) {
+		objectURLs.delete(String(url));
+	};
+	// blobForObjectURL is how fetch resolves one; the fragment is not part of
+	// the key, as for any URL.
+	globalThis.__blob_for_object_url = (url) => objectURLs.get(String(url).split("#")[0]);
+
 	globalThis.URL = URL;
 
 	// ------------------------------------------------------- ReadableStream
@@ -2487,6 +2509,24 @@
 			if (!headers.has("origin")) {
 				const origin = originHeaderFor(mode, method, envURL);
 				if (origin) headers.set("origin", origin);
+			}
+			// A blob: URL is served from memory, not the network.
+			if (parsed && parsed.protocol === "blob:") {
+				const blob = globalThis.__blob_for_object_url(url);
+				if (!blob) {
+					return Promise.reject(new TypeError("Failed to fetch: no object URL " + url));
+				}
+				const m = String(method || "GET").toUpperCase();
+				if (m !== "GET") {
+					return Promise.resolve(new Response(null, { status: 405, statusText: "Method Not Allowed" }));
+				}
+				return blob.arrayBuffer().then((buf) => new Response(buf, {
+					status: 200,
+					headers: {
+						"content-type": blob.type || "",
+						"content-length": String(blob.size),
+					},
+				}));
 			}
 			// Only a network scheme can be cross-origin. data:, blob: and file:
 			// are fetched by their own scheme handler, not through CORS — judging

@@ -76,6 +76,126 @@
 	}
 	globalThis.File = File;
 
+	// ----------------------------------------------------------- FileReader
+	// The event-based way to read a Blob. Blob's own promise methods cover the
+	// same ground, but FileReader is what the platform's own tests — and any
+	// code written against a browser — actually use, and it was absent.
+	class FileReader extends EventTarget {
+		constructor() {
+			super();
+			this.readyState = 0; // EMPTY
+			this.result = null;
+			this.error = null;
+			this._aborted = false;
+			// An onX property IS a listener, registered where it is assigned —
+			// so a handler added with addEventListener beforehand runs first.
+			for (const name of ["loadstart", "progress", "load", "abort", "error", "loadend"]) {
+				let current = null;
+				Object.defineProperty(this, "on" + name, {
+					enumerable: true,
+					configurable: true,
+					get: () => current,
+					set: (fn) => {
+						if (current) this.removeEventListener(name, current);
+						current = typeof fn === "function" ? fn : null;
+						if (current) this.addEventListener(name, current);
+					},
+				});
+			}
+		}
+		get [Symbol.toStringTag]() { return "FileReader"; }
+
+		_fire(type) {
+			const ev = new Event(type);
+			// The spec's ProgressEvent fields, which handlers read.
+			try {
+				Object.defineProperties(ev, {
+					lengthComputable: { value: false, configurable: true },
+					loaded: { value: 0, configurable: true },
+					total: { value: 0, configurable: true },
+				});
+			} catch { /* a plain Event is close enough */ }
+			this.dispatchEvent(ev);
+		}
+
+		// _read runs the common state machine: one read at a time, LOADING while
+		// it runs, then result-or-error and always loadend.
+		_read(blob, convert) {
+			if (this.readyState === 1) {
+				throw new DOMException("The object is in an invalid state.", "InvalidStateError");
+			}
+			if (!(blob instanceof Blob)) {
+				throw new TypeError("FileReader expects a Blob");
+			}
+			this.readyState = 1; // LOADING
+			this.result = null;
+			this.error = null;
+			this._aborted = false;
+			this._fire("loadstart");
+			blob.arrayBuffer().then(
+				(buf) => {
+					if (this._aborted) return;
+					this.readyState = 2; // DONE
+					try {
+						this.result = convert(new Uint8Array(buf), blob);
+					} catch (e) {
+						this.result = null;
+						this.error = e instanceof DOMException ? e : new DOMException(String(e && e.message || e), "EncodingError");
+						this._fire("error");
+						this._fire("loadend");
+						return;
+					}
+					this._fire("progress");
+					this._fire("load");
+					this._fire("loadend");
+				},
+				(e) => {
+					if (this._aborted) return;
+					this.readyState = 2;
+					this.result = null;
+					this.error = e instanceof DOMException ? e : new DOMException(String(e && e.message || e), "NotReadableError");
+					this._fire("error");
+					this._fire("loadend");
+				},
+			);
+		}
+
+		readAsArrayBuffer(blob) { this._read(blob, (bytes) => bytes.buffer.slice(0)); }
+		readAsText(blob, encoding) {
+			this._read(blob, (bytes) => new TextDecoder(encoding || "utf-8", { ignoreBOM: false }).decode(bytes));
+		}
+		readAsBinaryString(blob) {
+			this._read(blob, (bytes) => { let out = ""; for (const b of bytes) out += String.fromCharCode(b); return out; });
+		}
+		readAsDataURL(blob) {
+			this._read(blob, (bytes, b) => {
+				let bin = "";
+				for (const x of bytes) bin += String.fromCharCode(x);
+				return "data:" + (b.type || "application/octet-stream") + ";base64," + btoa(bin);
+			});
+		}
+		abort() {
+			if (this.readyState === 2 || this.readyState === 0) {
+				this.readyState = 2;
+				this.result = null;
+				return;
+			}
+			this._aborted = true;
+			this.readyState = 2;
+			this.result = null;
+			this.error = new DOMException("The user aborted a request.", "AbortError");
+			this._fire("abort");
+			this._fire("loadend");
+		}
+	}
+	FileReader.EMPTY = 0;
+	FileReader.LOADING = 1;
+	FileReader.DONE = 2;
+	for (const [k, v] of [["EMPTY", 0], ["LOADING", 1], ["DONE", 2]]) {
+		Object.defineProperty(FileReader.prototype, k, { value: v, enumerable: true });
+	}
+	globalThis.FileReader = FileReader;
+
 	// ------------------------------------------------------------- FormData
 
 	class FormData {
