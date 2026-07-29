@@ -537,8 +537,11 @@
 	// consumer can rely on anyway.
 	// Captured now: __web_ops is deleted once the builtins have been evaluated.
 	const compressOp = __web_ops.compress;
-	const COMPRESS = { gzip: "gzip", deflate: "deflate", "deflate-raw": "deflateRaw" };
-	const DECOMPRESS = { gzip: "gunzip", deflate: "inflate", "deflate-raw": "inflateRaw" };
+	// brotli is in the shared codec already (compat/internal/compress, which the
+	// Node zlib binding uses); the stream constructors just never offered the
+	// label, so every brotli case failed as an unsupported format.
+	const COMPRESS = { gzip: "gzip", deflate: "deflate", "deflate-raw": "deflateRaw", brotli: "brotliCompress" };
+	const DECOMPRESS = { gzip: "gunzip", deflate: "inflate", "deflate-raw": "inflateRaw", brotli: "brotliDecompress" };
 
 	function compressionTransform(table, format, name) {
 		if (arguments.length < 3 || format === undefined) {
