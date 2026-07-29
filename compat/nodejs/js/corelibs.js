@@ -1354,7 +1354,10 @@
 			if (p.protocol !== "file:") {
 				throw Object.assign(new TypeError(`The URL must be of scheme file`), { code: "ERR_INVALID_URL_SCHEME" });
 			}
-			return p.pathname;
+			// A URL pathname is percent-ENCODED. Handing it to the filesystem raw
+			// makes a directory literally named "copy_%251" out of "copy_%1", so
+			// every pathToFileURL round-trip missed its own target.
+			return decodeURIComponent(p.pathname);
 		}
 		if (typeof p !== "string" && !(p instanceof Uint8Array)) {
 			throw Object.assign(
@@ -1459,7 +1462,7 @@
 		rename: (a, b) => { validatePath(a); validatePath(b); },
 		link: (a, b) => { validatePath(a); validatePath(b); },
 		copyFile: (a, b) => { validatePath(a); validatePath(b); },
-		cp: (a, b) => { validatePath(a); validatePath(b); },
+		cp: (a, b, o) => { validatePath(a); validatePath(b); validateCpOptions(o); },
 		symlink: (t, p) => { validatePath(t); validatePath(p); },
 		chmod: (p, m) => { validatePath(p); validateMode(m); },
 		lchmod: (p, m) => { validatePath(p); validateMode(m); },
@@ -1502,6 +1505,74 @@
 		if (flag.includes("x") && ops.fs_exists(fsResolve(p))) {
 			throw fsError({ code: "EEXIST", message: "file already exists" }, "open", p);
 		}
+	}
+
+	// ---------------------------------------------------------------- fs.cp
+	// cp() is the one fs API with a whole error family of its own: every way a
+	// copy can be ill-formed gets its own ERR_FS_CP_* code, because "EINVAL"
+	// alone tells a caller nothing about which of the two paths was wrong.
+	// Ignoring the options bag entirely — as this did — made force:false
+	// overwrite, errorOnExist silent, and filter dead.
+	const cpError = (kind, message) => Object.assign(
+		new Error(message), { code: `ERR_FS_CP_${kind}`, name: "SystemError" });
+	function validateCpOptions(options) {
+		if (options === undefined || options === null) return {};
+		if (typeof options !== "object") throw errArgType("options", "of type object", options);
+		for (const k of ["dereference", "errorOnExist", "force", "preserveTimestamps", "recursive", "verbatimSymlinks"]) {
+			if (options[k] !== undefined && typeof options[k] !== "boolean") {
+				throw errArgType(`options.${k}`, "of type boolean", options[k]);
+			}
+		}
+		if (options.filter !== undefined) validateFunction(options.filter, "options.filter");
+		// `mode` is copyFile's flag set, not a permission mask.
+		if (options.mode !== undefined) validateInteger(options.mode, "mode", 0, 7);
+		if (options.dereference && options.verbatimSymlinks) {
+			throw Object.assign(new TypeError("Option pair dereference and verbatimSymlinks is incompatible"),
+				{ code: "ERR_INCOMPATIBLE_OPTION_PAIR" });
+		}
+		return { force: true, ...options };
+	}
+	// One source entry to one destination entry, recursing for directories.
+	function copyEntry(from, to, opts) {
+		if (opts.filter && !opts.filter(from, to)) return;
+		const st = fsSync.lstatSync(from);
+		let destSt = null;
+		try { destSt = fsSync.lstatSync(to); } catch { /* absent is the normal case */ }
+		if (st.isDirectory()) {
+			if (!opts.recursive) {
+				throw Object.assign(new Error(`Recursive option not enabled, current size of ${from} exceeds`),
+					{ code: "ERR_FS_EISDIR", name: "SystemError" });
+			}
+			if (destSt && !destSt.isDirectory()) {
+				throw cpError("DIR_TO_NON_DIR", `cannot overwrite non-directory ${to} with directory ${from}`);
+			}
+			fsSync.mkdirSync(to, { recursive: true });
+			for (const name of fsSync.readdirSync(from)) {
+				copyEntry(path.join(from, name), path.join(to, name), opts);
+			}
+			return;
+		}
+		if (destSt && destSt.isDirectory()) {
+			throw cpError("NON_DIR_TO_DIR", `cannot overwrite directory ${to} with non-directory ${from}`);
+		}
+		if (destSt) {
+			// force defaults to true (overwrite). With it off the entry is either
+			// an error or silently left alone — never overwritten.
+			if (opts.errorOnExist && !opts.force) throw cpError("EEXIST", `${to} already exists`);
+			if (!opts.force) return;
+		}
+		if (st.isSymbolicLink() && !opts.dereference) {
+			const target = fsSync.readlinkSync(from);
+			// A link that points into the source tree would, once copied, point
+			// back out of the destination — Node refuses rather than produce it.
+			if (!opts.verbatimSymlinks && path.resolve(path.dirname(from), target).startsWith(to)) {
+				throw cpError("SYMLINK_TO_SUBDIRECTORY", `cannot overwrite ${to} with ${from}`);
+			}
+			try { fsSync.unlinkSync(to); } catch { /* nothing to replace */ }
+			fsSync.symlinkSync(target, to);
+			return;
+		}
+		fsSync.copyFileSync(from, to);
 	}
 
 	// Active watchFile() host watchers keyed by path, so unwatchFile() can stop
@@ -1690,17 +1761,16 @@
 			if (isErr(r)) throw fsError(r, "mkdtemp", prefix);
 			return r;
 		},
-		cpSync(src, dest, options = {}) {
-			// Recursive directory copy over the primitive ops.
-			const st = fsSync.statSync(src);
-			if (st.isDirectory()) {
-				fsSync.mkdirSync(dest, { recursive: true });
-				for (const name of fsSync.readdirSync(src)) {
-					fsSync.cpSync(path.join(String(src), name), path.join(String(dest), name), options);
-				}
-			} else {
-				fsSync.copyFileSync(src, dest);
+		cpSync(src, dest, options) {
+			const opts = validateCpOptions(options);
+			const from = fsResolve(src), to = fsResolve(dest);
+			// Copying a tree onto itself, or into its own subtree, would recurse
+			// forever; Node names both cases before starting.
+			if (from === to) throw cpError("EINVAL", `src and dest cannot be the same ${from}`);
+			if (to.startsWith(from.endsWith("/") ? from : from + "/")) {
+				throw cpError("EINVAL", `cannot copy ${from} to a subdirectory of self ${to}`);
 			}
+			copyEntry(from, to, opts);
 		},
 		openSync(p, flags = "r") {
 			const f = String(flags);
