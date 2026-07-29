@@ -2794,7 +2794,14 @@
 			// by then — a body contributes a Content-Type, and that is one of the
 			// things the safelist is about.
 			const redirectMode = nInit.redirect || "follow";
-			const chained = crossOrigin && mode === "cors" && redirectMode === "follow";
+			// The chain is driven in the guest whenever the environment has an
+			// origin to judge hops against — not only when the FIRST hop is
+			// already cross-origin. A same-origin request that redirects to
+			// another origin needs exactly the same per-hop checks, and letting
+			// the host follow it hid them: a redirect to a URL carrying
+			// credentials, or one whose new origin does not permit us, went
+			// through unnoticed.
+			const chained = !!envURL && networkScheme && mode !== "no-cors" && redirectMode === "follow";
 			const send = () => {
 				const go = chained
 					? () => {
