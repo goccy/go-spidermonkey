@@ -1269,11 +1269,58 @@
 	// without this, process.chdir() would move the reported directory while
 	// every relative read kept resolving against the filesystem root, which is
 	// worse than not having chdir at all.
+	// Symbolic links live HERE, in the runtime, not in the filesystem: this
+	// embedding's FS is an abstract fs.FS with no link concept, and inventing
+	// one in the host would mean every backing store had to grow it. A link
+	// created by a program is therefore visible to that program (which is what
+	// symlink tests, build tools and package layouts need) and to nothing else.
+	// That limitation is the honest shape of the feature here, not a bug.
+	const symlinks = new Map(); // absolute link path -> target as given
+
+	// followLinks resolves a path through the link table, one component at a
+	// time so a link to a DIRECTORY works for paths beneath it. The hop cap is
+	// what turns a link cycle into ELOOP instead of a hang.
+	function followLinks(abs) {
+		if (symlinks.size === 0) return abs;
+		let path = abs;
+		for (let hop = 0; hop < 40; hop++) {
+			if (symlinks.has(path)) {
+				path = absoluteAgainst(symlinks.get(path), parentOf(path));
+				continue;
+			}
+			// A prefix of the path may itself be a link.
+			let replaced = false;
+			for (const [link, target] of symlinks) {
+				if (path.startsWith(link + "/")) {
+					path = absoluteAgainst(target, parentOf(link)) + path.slice(link.length);
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) return path;
+		}
+		throw fsError({ code: "ELOOP", message: "too many symbolic links" }, "stat", abs);
+	}
+	const parentOf = (p) => p.slice(0, Math.max(1, p.lastIndexOf("/")));
+	const absoluteAgainst = (target, dir) => {
+		if (target.startsWith("/")) return normalizePath(target);
+		return normalizePath((dir === "/" ? "" : dir) + "/" + target);
+	};
+	function normalizePath(p) {
+		const out = [];
+		for (const part of p.split("/")) {
+			if (part === "" || part === ".") continue;
+			if (part === "..") { out.pop(); continue; }
+			out.push(part);
+		}
+		return "/" + out.join("/");
+	}
+
 	// Node validates a path before doing anything with it, and reports the
 	// failure with a CODE that callers (and its own suite) match on. Accepting
 	// anything and stringifying it turned "assert.throws(…, ERR_INVALID_ARG_TYPE)"
 	// into a silent success.
-	function fsResolve(p) {
+	function fsResolveNoFollow(p) {
 		if (p instanceof URL) {
 			if (p.protocol !== "file:") {
 				throw Object.assign(new TypeError(`The URL must be of scheme file`), { code: "ERR_INVALID_URL_SCHEME" });
@@ -1297,6 +1344,11 @@
 		const cwd = globalThis.process ? globalThis.process.cwd() : "/";
 		return (cwd === "/" ? "/" : cwd + "/") + s;
 	}
+	// Every path-taking API resolves THROUGH links; lstat, readlink and symlink
+	// itself use the raw form, because they are about the link and not what it
+	// points at.
+	function fsResolve(p) { return followLinks(fsResolveNoFollow(p)); }
+
 
 	// flagOf extracts the string `flag` option ("w", "a", "wx", ...) from a
 	// writeFile/appendFile options bag; string opts are encodings, not flags.
@@ -1352,7 +1404,20 @@
 			if (isErr(r)) throw fsError(r, "stat", p);
 			return statsOf(r, !!(opts && opts.bigint));
 		},
-		lstatSync(p, opts) { return fsSync.statSync(p, opts); },
+		lstatSync(p, opts) {
+			const abs = fsResolveNoFollow(p);
+			if (symlinks.has(abs)) {
+				// A link's own stat: it IS a link, and its size is the target's
+				// length, as on a real filesystem.
+				const target = symlinks.get(abs);
+				const st = statsOf({ size: target.length, dir: false, mtimeMs: Date.now() }, !!(opts && opts.bigint));
+				st.isSymbolicLink = () => true;
+				st.isFile = () => false;
+				st.mode = 0o120777;
+				return st;
+			}
+			return fsSync.statSync(p, opts);
+		},
 		readdirSync(p, options) {
 			const base = String(p);
 			const dirent = (name, parentPath, isDir) => ({
@@ -1553,8 +1618,23 @@
 			if (isErr(r)) throw fsError(r, "utime", p);
 		},
 		lutimesSync(p, atime, mtime) { return fsSync.utimesSync(p, atime, mtime); },
-		symlinkSync() { throw fsError({ code: "ENOSYS", message: "symlink not supported" }, "symlink", ""); },
-		readlinkSync(p) { throw fsError({ code: "EINVAL", message: "not a symlink" }, "readlink", p); },
+		symlinkSync(target, linkPath) {
+			const abs = fsResolveNoFollow(linkPath);
+			if (symlinks.has(abs)) throw fsError({ code: "EEXIST", message: "file already exists" }, "symlink", linkPath);
+			symlinks.set(abs, typeof target === "string" ? target : String(target));
+		},
+		readlinkSync(p) {
+			const abs = fsResolveNoFollow(p);
+			if (!symlinks.has(abs)) throw fsError({ code: "EINVAL", message: "invalid argument" }, "readlink", p);
+			return symlinks.get(abs);
+		},
+		linkSync(existing, newPath) {
+			// A hard link is indistinguishable from a copy for a store with no
+			// inodes, so it is one — with the same visibility caveat as above.
+			const data = fsSync.readFileSync(existing);
+			fsSync.writeFileSync(newPath, data);
+		},
+		unlinkLink(p) { return symlinks.delete(fsResolveNoFollow(p)); },
 	};
 
 	// Callback flavors run the sync op and deliver on the microtask queue.
@@ -1581,6 +1661,9 @@
 		unlink: callbackify1(fsSync.unlinkSync),
 		rename: callbackify1(fsSync.renameSync),
 		realpath: callbackify1(fsSync.realpathSync),
+		symlink: callbackify1(fsSync.symlinkSync),
+		readlink: callbackify1(fsSync.readlinkSync),
+		link: callbackify1(fsSync.linkSync),
 		copyFile: callbackify1(fsSync.copyFileSync),
 		mkdtemp: callbackify1(fsSync.mkdtempSync),
 		cp: callbackify1(fsSync.cpSync),
@@ -1755,6 +1838,7 @@
 		["chmod", "chmodSync"], ["lchmod", "lchmodSync"],
 		["utimes", "utimesSync"], ["lutimes", "lutimesSync"],
 		["truncate", "truncateSync"],
+		["symlink", "symlinkSync"], ["readlink", "readlinkSync"], ["link", "linkSync"],
 	]) {
 		promisified[name] = (...args) => {
 			try { return Promise.resolve(fsSync[syncName](...args)); } catch (e) { return Promise.reject(e); }
