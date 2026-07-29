@@ -13,7 +13,7 @@ from the runs in this repository rather than from intuition.
 | suite | measured |
 |---|---|
 | WPT | **35,694 / 43,142 subtests = 82.7%** |
-| Node.js | 2,611 tests run, **790 pass = 30.3%** (see the note below) |
+| Node.js | 2,611 tests run, **795 pass = 30.4%** (see the note below) |
 | Babel | 4,170 / 4,189 fixtures = 99.6% |
 | test262 | 52,266 / 53,329 = 98.0% |
 
@@ -101,6 +101,9 @@ and after:
 | `http` | 83 | 86 |
 | `dgram` | 33 | 35 |
 | `worker_threads` | 35 | 36 |
+| `child_process` | 23 | 24 |
+| `console` | 7 | 8 |
+| `tls` | 11 | 13 |
 
 Three of those were not validation at all but a defect the validation work
 exposed:
