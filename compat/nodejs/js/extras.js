@@ -1821,9 +1821,41 @@
 		return new Error(String(value));
 	};
 
+	// The sentinel that asks a worker to share the parent's environment rather
+	// than be given one; declared here because the Worker constructor checks
+	// against it.
+	const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
+
 	class Worker extends core.events {
 		constructor(filename, options = {}) {
 			super();
+			// Every one of these reached the filesystem and came back as ENOENT,
+			// which says nothing about which argument was wrong — a Worker built
+			// with `{ env: 1 }` is not a missing file.
+			if (options === null || typeof options !== "object") {
+				throw Object.assign(new TypeError(`The "options" argument must be of type object. Received ${typeof options}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (!options.eval && typeof filename !== "string" && !(filename instanceof URL) && !(filename && filename.href)) {
+				throw Object.assign(new TypeError(`The "filename" argument must be of type string or an instance of URL. Received ${filename === null ? "null" : typeof filename}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			for (const [key, kind] of [["argv", "Array"], ["execArgv", "Array"], ["transferList", "Array"]]) {
+				if (options[key] !== undefined && options[key] !== null && !Array.isArray(options[key])) {
+					throw Object.assign(new TypeError(`The "options.${key}" property must be an instance of ${kind}. Received ${typeof options[key]}`),
+						{ code: "ERR_INVALID_ARG_TYPE" });
+				}
+			}
+			// SHARE_ENV is a sentinel, not an object of variables.
+			if (options.env !== undefined && options.env !== null
+				&& options.env !== SHARE_ENV && typeof options.env !== "object") {
+				throw Object.assign(new TypeError(`The "options.env" property must be an instance of Object. Received ${typeof options.env}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (options.resourceLimits !== undefined && options.resourceLimits !== null && typeof options.resourceLimits !== "object") {
+				throw Object.assign(new TypeError(`The "options.resourceLimits" property must be an instance of Object. Received ${typeof options.resourceLimits}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
 			let source;
 			if (options.eval) {
 				source = String(filename);
@@ -1954,7 +1986,7 @@
 		workerData: inWorker ? globalThis.__wt_workerData : null,
 		parentPort: inWorker ? globalThis.__wt_parentPort : null,
 		resourceLimits: {},
-		SHARE_ENV: Symbol.for("nodejs.worker_threads.SHARE_ENV"),
+		SHARE_ENV,
 		Worker,
 		MessageChannel,
 		MessagePort,
