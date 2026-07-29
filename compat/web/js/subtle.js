@@ -407,6 +407,43 @@
 	// can make it a getter with side effects, and the WPT suite does precisely
 	// that to detach a buffer mid-call. Reading it twice ran those side effects
 	// twice.
+	// What each half of an asymmetric key pair may be used for. Absent from the
+	// table means the algorithm has no halves (a secret key) and the union check
+	// already covered it.
+	const HALF_USAGES = {
+		ECDSA: { public: ["verify"], private: ["sign"] },
+		ECDH: { public: [], private: ["deriveKey", "deriveBits"] },
+		ED25519: { public: ["verify"], private: ["sign"] },
+		ED448: { public: ["verify"], private: ["sign"] },
+		X25519: { public: [], private: ["deriveKey", "deriveBits"] },
+		X448: { public: [], private: ["deriveKey", "deriveBits"] },
+		"RSASSA-PKCS1-V1_5": { public: ["verify"], private: ["sign"] },
+		"RSA-PSS": { public: ["verify"], private: ["sign"] },
+		"RSA-OAEP": { public: ["encrypt", "wrapKey"], private: ["decrypt", "unwrapKey"] },
+		"ML-DSA-44": { public: ["verify"], private: ["sign"] },
+		"ML-DSA-65": { public: ["verify"], private: ["sign"] },
+		"ML-DSA-87": { public: ["verify"], private: ["sign"] },
+		"ML-KEM-512": { public: ["encapsulateKey", "encapsulateBits"], private: ["decapsulateKey", "decapsulateBits"] },
+		"ML-KEM-768": { public: ["encapsulateKey", "encapsulateBits"], private: ["decapsulateKey", "decapsulateBits"] },
+		"ML-KEM-1024": { public: ["encapsulateKey", "encapsulateBits"], private: ["decapsulateKey", "decapsulateBits"] },
+	};
+
+	function checkHalfUsages(name, isPublic, usages, format) {
+		const halves = HALF_USAGES[name];
+		// A raw import of a secret key has no halves to distinguish.
+		if (!halves || format === "raw-secret") return;
+		// A seed IS the private key material, whatever the caller calls it.
+		if (format === "raw-seed") isPublic = false;
+		const allowed = isPublic ? halves.public : halves.private;
+		for (const u of usages) {
+			if (!allowed.includes(String(u))) {
+				throw new DOMException(
+					`Failed to execute 'importKey': ${isPublic ? "public" : "private"} ${name} keys cannot be used for ${u}`,
+					"SyntaxError");
+			}
+		}
+	}
+
 	function checkKeyAlgMatches(name, key, op) {
 		const want = String(name).toUpperCase();
 		const have = String((key && key.algorithm && key.algorithm.name) || "").toUpperCase();
@@ -545,10 +582,21 @@
 			// key that can do nothing is a SyntaxError. Which one is being
 			// imported follows from the format, except for JWK where the payload
 			// says so ("oct" is secret, a private JWK carries "d").
-			const isPublicImport = format === "spki" ||
-				(format === "jwk" && keyData && keyData.kty !== "oct" && keyData.d === undefined) ||
+			// "raw-public" and "raw-seed" name the half outright; the rest is
+			// inferred: spki is public, pkcs8 private, a bare "raw" is public for
+			// the algorithms whose raw form is a public point, and a JWK says so
+			// itself by carrying "d" or not.
+			const isPublicImport = format === "spki" || format === "raw-public" ||
+				// A private JWK carries "d" (EC/RSA/OKP) or "priv" (AKP, the
+				// post-quantum key type); either one means this is the private half.
+				(format === "jwk" && keyData && keyData.kty !== "oct" && keyData.d === undefined && keyData.priv === undefined) ||
 				(format === "raw" && ["ECDH", "ECDSA", "X25519", "ED25519", "X448", "ED448"].includes(name));
 			usages = checkUsages(declared, usages, "importKey", { allowEmpty: isPublicImport });
+			// A key's usages are bounded by what its HALF can do, not by what the
+			// algorithm can do overall: a public key cannot sign and a private one
+			// cannot verify, so importing an spki with ["sign"] is a mistake even
+			// though the algorithm has that usage.
+			checkHalfUsages(name, isPublicImport, usages, format);
 			if (format === "jwk") checkJWKConsistency(keyData, usages, extractable);
 			if (MLKEM_NAMES.includes(algName(alg))) {
 				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
