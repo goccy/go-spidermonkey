@@ -29,7 +29,7 @@ func TestMLKEM(t *testing.T) {
 		globalThis.__out = [];
 		globalThis.__done = (async () => {
 			const out = globalThis.__out;
-			for (const name of ["ML-KEM-768", "ML-KEM-1024"]) {
+			for (const name of ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"]) {
 				const kp = await crypto.subtle.generateKey({ name }, true,
 					["encapsulateBits", "decapsulateBits", "encapsulateKey", "decapsulateKey"]);
 
@@ -65,10 +65,7 @@ func TestMLKEM(t *testing.T) {
 				}
 			}
 
-			// ML-KEM-512 has no host implementation, and says so rather than
-			// producing a key from a different parameter set.
-			try { await crypto.subtle.generateKey({ name: "ML-KEM-512" }, true, ["decapsulateBits"]); out.push("512:NO-THROW"); }
-			catch (e) { out.push("512:" + e.name); }
+
 
 			// A usage ML-KEM cannot have is a SyntaxError, as for any algorithm.
 			try { await crypto.subtle.generateKey({ name: "ML-KEM-768" }, true, ["sign"]); out.push("usage:NO-THROW"); }
@@ -86,11 +83,15 @@ func TestMLKEM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ML-KEM-768:bits:32/1088:agree | ML-KEM-768:key:AES-GCM:agree | " +
+	// All three parameter sets round-trip. 512 comes from CIRCL, the other two
+	// from crypto/mlkem, and the shapes below are each set's own key sizes.
+	want := "ML-KEM-512:bits:32/768:agree | ML-KEM-512:key:AES-GCM:agree | " +
+		"ML-KEM-512:raw-seed:ok | ML-KEM-512:pkcs8:ok | ML-KEM-512:raw-public:ok | ML-KEM-512:spki:ok | ML-KEM-512:jwk:ok | " +
+		"ML-KEM-768:bits:32/1088:agree | ML-KEM-768:key:AES-GCM:agree | " +
 		"ML-KEM-768:raw-seed:ok | ML-KEM-768:pkcs8:ok | ML-KEM-768:raw-public:ok | ML-KEM-768:spki:ok | ML-KEM-768:jwk:ok | " +
 		"ML-KEM-1024:bits:32/1568:agree | ML-KEM-1024:key:AES-GCM:agree | " +
 		"ML-KEM-1024:raw-seed:ok | ML-KEM-1024:pkcs8:ok | ML-KEM-1024:raw-public:ok | ML-KEM-1024:spki:ok | ML-KEM-1024:jwk:ok | " +
-		"512:NotSupportedError | usage:SyntaxError"
+		"usage:SyntaxError"
 	if got := v.Value.String(); got != want {
 		t.Errorf("ML-KEM =\n %s\nwant\n %s", got, want)
 	}

@@ -378,32 +378,51 @@ func (s *subtleAPI) opECGenerate(cfg spidermonkey.Config, args []spidermonkey.Va
 	}), nil
 }
 
+// b64uLen is the byte length a base64url field decodes to, without decoding it
+// twice.
+func b64uLen(s string) int {
+	n, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return -1
+	}
+	return len(n)
+}
+
 func (s *subtleAPI) opECImportJWK(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("ec import: jwk required")
 	}
+	// Malformed key MATERIAL is a DataError, not a generic failure: the caller
+	// handed over something that does not decode as a key, and the suite (and
+	// any caller branching on the name) needs to be told which kind of mistake
+	// that was. Returning a bare Go error surfaced as a plain Error instead.
 	var j jwkDoc
 	if err := json.Unmarshal([]byte(args[0].String()), &j); err != nil {
-		return nil, fmt.Errorf("bad JWK: %w", err)
+		return subtleErr("DataError: bad JWK: " + err.Error()), nil
 	}
 	if j.Kty != "EC" {
-		return nil, fmt.Errorf("not an EC JWK (kty=%q)", j.Kty)
+		return subtleErr(fmt.Sprintf("DataError: not an EC JWK (kty=%q)", j.Kty)), nil
 	}
 	curve, err := curveByName(j.Crv)
 	if err != nil {
-		return nil, err
+		return subtleErr("DataError: " + err.Error()), nil
 	}
 	x, err := b64uBig(j.X)
 	if err != nil {
-		return nil, fmt.Errorf("bad JWK x: %w", err)
+		return subtleErr("DataError: bad JWK x: " + err.Error()), nil
 	}
 	y, err := b64uBig(j.Y)
 	if err != nil {
-		return nil, fmt.Errorf("bad JWK y: %w", err)
+		return subtleErr("DataError: bad JWK y: " + err.Error()), nil
+	}
+	// The coordinates must be exactly the curve's field width. A short or long
+	// one is a different point, or none — never something to zero-extend.
+	if size := (curve.Params().BitSize + 7) / 8; b64uLen(j.X) != size || b64uLen(j.Y) != size {
+		return subtleErr("DataError: JWK coordinate length does not match the curve"), nil
 	}
 	pub := ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 	if !curve.IsOnCurve(x, y) {
-		return nil, fmt.Errorf("JWK point is not on %s", j.Crv)
+		return subtleErr("DataError: JWK point is not on " + j.Crv), nil
 	}
 	if j.D == "" {
 		return spidermonkey.ValueOf(map[string]any{
@@ -412,7 +431,10 @@ func (s *subtleAPI) opECImportJWK(cfg spidermonkey.Config, args []spidermonkey.V
 	}
 	d, err := b64uBig(j.D)
 	if err != nil {
-		return nil, fmt.Errorf("bad JWK d: %w", err)
+		return subtleErr("DataError: bad JWK d: " + err.Error()), nil
+	}
+	if size := (curve.Params().BitSize + 7) / 8; b64uLen(j.D) != size {
+		return subtleErr("DataError: JWK private scalar length does not match the curve"), nil
 	}
 	priv := &ecdsa.PrivateKey{PublicKey: pub, D: d}
 	return spidermonkey.ValueOf(map[string]any{

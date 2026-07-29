@@ -5,8 +5,10 @@ package web
 // It is the largest single algorithm still missing from Web Crypto here: the
 // suite's ML-KEM files are ~1,600 subtests, every one of which failed as
 // "unsupported algorithm". Go's crypto/mlkem provides the primitive for the
-// ML-KEM-768 and ML-KEM-1024 parameter sets; it has no ML-KEM-512, so that one
-// is reported as unsupported rather than faked.
+// ML-KEM-768 and ML-KEM-1024 parameter sets. It has no ML-KEM-512 — the set is
+// deprecated for new use but still registered, and the suite exercises it — so
+// that one comes from CIRCL, whose ML-KEM is validated against the ACVP
+// vectors.
 //
 // The key formats are hand-encoded DER because crypto/x509 does not marshal
 // ML-KEM keys yet. Both are small and fully specified: an SPKI is the
@@ -16,11 +18,13 @@ package web
 
 import (
 	"crypto/mlkem"
+	"crypto/rand"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
+	mlkem512 "github.com/cloudflare/circl/kem/mlkem/mlkem512"
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
 
@@ -32,6 +36,7 @@ type mlkemParams struct {
 
 // The OID arc is 2.16.840.1.101.3.4.4.{1,2,3} for 512/768/1024.
 var mlkemSets = []mlkemParams{
+	{"ML-KEM-512", asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 4, 1}},
 	{"ML-KEM-768", asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 4, 2}},
 	{"ML-KEM-1024", asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 4, 3}},
 }
@@ -53,9 +58,14 @@ type mlkemKey struct {
 	ek768 *mlkem.EncapsulationKey768
 	dk1k  *mlkem.DecapsulationKey1024
 	ek1k  *mlkem.EncapsulationKey1024
+	// The 512 set keeps its seed alongside the key: CIRCL derives from a seed
+	// but does not hand it back, and raw-seed export needs it.
+	dk512   *mlkem512.PrivateKey
+	ek512   *mlkem512.PublicKey
+	seed512 []byte
 }
 
-func (k *mlkemKey) private() bool { return k.dk768 != nil || k.dk1k != nil }
+func (k *mlkemKey) private() bool { return k.dk768 != nil || k.dk1k != nil || k.dk512 != nil }
 
 // seed returns the 64-byte seed a private key was built from.
 func (k *mlkemKey) seed() []byte {
@@ -64,6 +74,8 @@ func (k *mlkemKey) seed() []byte {
 		return k.dk768.Bytes()
 	case k.dk1k != nil:
 		return k.dk1k.Bytes()
+	case k.dk512 != nil:
+		return k.seed512
 	}
 	return nil
 }
@@ -80,11 +92,26 @@ func (k *mlkemKey) publicBytes() []byte {
 		return k.ek768.Bytes()
 	case k.ek1k != nil:
 		return k.ek1k.Bytes()
+	case k.dk512 != nil:
+		buf := make([]byte, mlkem512.PublicKeySize)
+		k.dk512.Public().(*mlkem512.PublicKey).Pack(buf)
+		return buf
+	case k.ek512 != nil:
+		buf := make([]byte, mlkem512.PublicKeySize)
+		k.ek512.Pack(buf)
+		return buf
 	}
 	return nil
 }
 
 func mlkemFromSeed(set mlkemParams, seed []byte) (*mlkemKey, error) {
+	if set.name == "ML-KEM-512" {
+		if len(seed) != mlkem512.KeySeedSize {
+			return nil, fmt.Errorf("ML-KEM-512 seed must be %d bytes", mlkem512.KeySeedSize)
+		}
+		_, sk := mlkem512.NewKeyFromSeed(seed)
+		return &mlkemKey{set: set, dk512: sk, seed512: append([]byte(nil), seed...)}, nil
+	}
 	if set.name == "ML-KEM-768" {
 		dk, err := mlkem.NewDecapsulationKey768(seed)
 		if err != nil {
@@ -100,6 +127,16 @@ func mlkemFromSeed(set mlkemParams, seed []byte) (*mlkemKey, error) {
 }
 
 func mlkemFromPublic(set mlkemParams, b []byte) (*mlkemKey, error) {
+	if set.name == "ML-KEM-512" {
+		if len(b) != mlkem512.PublicKeySize {
+			return nil, fmt.Errorf("ML-KEM-512 encapsulation key must be %d bytes", mlkem512.PublicKeySize)
+		}
+		pk := new(mlkem512.PublicKey)
+		if err := pk.Unpack(b); err != nil {
+			return nil, err
+		}
+		return &mlkemKey{set: set, ek512: pk}, nil
+	}
 	if set.name == "ML-KEM-768" {
 		ek, err := mlkem.NewEncapsulationKey768(b)
 		if err != nil {
@@ -196,7 +233,19 @@ func (s *subtleAPI) opMLKEMGenerate(cfg spidermonkey.Config, args []spidermonkey
 		return subtleErr("NotSupportedError: unsupported algorithm " + args[0].String()), nil
 	}
 	var k *mlkemKey
-	if set.name == "ML-KEM-768" {
+	if set.name == "ML-KEM-512" {
+		// Generate from a fresh seed so the key can be exported as one, which is
+		// the format the spec prefers for a private ML-KEM key.
+		seed := make([]byte, mlkem512.KeySeedSize)
+		if _, err := rand.Read(seed); err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		gk, err := mlkemFromSeed(set, seed)
+		if err != nil {
+			return subtleErr("OperationError: " + err.Error()), nil
+		}
+		k = gk
+	} else if set.name == "ML-KEM-768" {
 		dk, err := mlkem.GenerateKey768()
 		if err != nil {
 			return subtleErr("OperationError: " + err.Error()), nil
@@ -374,9 +423,20 @@ func (s *subtleAPI) opMLKEMEncapsulate(cfg spidermonkey.Config, args []spidermon
 		return subtleErr("OperationError: " + perr.Error()), nil
 	}
 	var shared, ct []byte
-	if pub.ek768 != nil {
+	switch {
+	case pub.ek512 != nil:
+		// CIRCL writes into caller-provided buffers rather than returning them,
+		// and takes its own encapsulation randomness.
+		ct = make([]byte, mlkem512.CiphertextSize)
+		shared = make([]byte, mlkem512.SharedKeySize)
+		seed := make([]byte, mlkem512.EncapsulationSeedSize)
+		if _, rerr := rand.Read(seed); rerr != nil {
+			return subtleErr("OperationError: " + rerr.Error()), nil
+		}
+		pub.ek512.EncapsulateTo(ct, shared, seed)
+	case pub.ek768 != nil:
 		shared, ct = pub.ek768.Encapsulate()
-	} else {
+	default:
 		shared, ct = pub.ek1k.Encapsulate()
 	}
 	// One flat buffer, shared key first: a byte array nested inside a map does
@@ -398,9 +458,16 @@ func (s *subtleAPI) opMLKEMDecapsulate(cfg spidermonkey.Config, args []spidermon
 		return subtleErr("OperationError: " + err.Error()), nil
 	}
 	var shared []byte
-	if sk.mlkem.dk768 != nil {
+	switch {
+	case sk.mlkem.dk512 != nil:
+		if len(ct) != mlkem512.CiphertextSize {
+			return subtleErr("OperationError: ML-KEM-512 ciphertext must be %d bytes"), nil
+		}
+		shared = make([]byte, mlkem512.SharedKeySize)
+		sk.mlkem.dk512.DecapsulateTo(shared, ct)
+	case sk.mlkem.dk768 != nil:
 		shared, err = sk.mlkem.dk768.Decapsulate(ct)
-	} else {
+	default:
 		shared, err = sk.mlkem.dk1k.Decapsulate(ct)
 	}
 	if err != nil {

@@ -169,7 +169,7 @@
 	// ML-KEM (FIPS 203). Only the two parameter sets the host can actually do
 	// are listed: claiming ML-KEM-512 and then failing every operation would be
 	// worse than reporting it unsupported.
-	const MLKEM_NAMES = ["ML-KEM-768", "ML-KEM-1024"];
+	const MLKEM_NAMES = ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"];
 	const MLKEM_USAGES = ["encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits"];
 
 	const GENERATE_USAGES = {
