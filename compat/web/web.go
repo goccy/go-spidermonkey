@@ -74,6 +74,9 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		"timer_ref":     w.opTimerRef,
 		"compress":      w.opCompress,
 		"mime_type":     w.opMIMEType,
+
+		"text_encoding_name": w.opTextEncodingName,
+		"text_decode":        w.opTextDecode,
 	}
 	subtle := newSubtleAPI()
 	w.subtle = subtle

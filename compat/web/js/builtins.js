@@ -261,13 +261,26 @@
 	};
 	globalThis.TextDecoder = class TextDecoder {
 		constructor(label = "utf-8", options = {}) {
-			const enc = DECODER_LABELS[String(label).toLowerCase()];
-			if (!enc) throw new RangeError(`TextDecoder: unsupported encoding ${label}`);
-			this._enc = enc;
+			const normalized = String(label).trim().toLowerCase();
+			const enc = DECODER_LABELS[normalized];
+			if (enc) {
+				this._enc = enc;
+				this._name = enc === "utf8" ? "utf-8" : enc === "utf16le" ? "utf-16le" : "windows-1252";
+			} else {
+				// Every other encoding in the standard lives in a table on the
+				// host: Shift_JIS, GBK, Big5, EUC-KR, ISO-2022-JP, the ISO-8859
+				// and windows-125x families, utf-16be. The label is validated
+				// here so an unknown one is still a RangeError.
+				const name = ops.text_encoding_name(normalized);
+				if (!name) throw new RangeError(`TextDecoder: unsupported encoding ${label}`);
+				this._enc = "host";
+				this._name = name;
+				this._label = normalized;
+			}
 			this.fatal = !!options.fatal;
 			this.ignoreBOM = !!options.ignoreBOM;
 		}
-		get encoding() { return this._enc === "utf8" ? "utf-8" : this._enc === "utf16le" ? "utf-16le" : "windows-1252"; }
+		get encoding() { return this._name; }
 		decode(input, options = {}) {
 			const stream = !!options.stream;
 			let bytes;
@@ -284,6 +297,15 @@
 				bytes = merged;
 			}
 			this._pending = null;
+			if (this._enc === "host") {
+				// The host decodes whole buffers; a streaming call holds nothing
+				// back, so a multi-byte sequence split across chunks decodes as
+				// two malformed pieces. That is the one thing this path does not
+				// do that the built-in ones do.
+				const r = ops.text_decode(this._label, bytes, this.fatal);
+				if (r && typeof r === "object" && r.error) throw new TypeError(r.error);
+				return String(r);
+			}
 			if (this._enc === "win1252") {
 				let s = "";
 				for (let i = 0; i < bytes.length; i++) {
@@ -2429,7 +2451,7 @@
 	// mid-chain saw a resolved fetch.
 	const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-	async function followCORSRedirects(url, nInit, headers, envURL) {
+	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer) {
 		let current = url;
 		let origin = envURL.origin;
 		let hops = 0;
@@ -2440,6 +2462,15 @@
 			const hdrObj = {};
 			for (const [k, v] of headers) hdrObj[k] = v;
 			hdrObj.origin = origin;
+			// The referrer is decided per HOP, not once: a policy that gives the
+			// full URL to a same-origin peer gives only the origin to the next
+			// one. Computing it once sent the first hop's referrer all the way
+			// down the chain.
+			if (!explicitReferrer) {
+				const ref = referrerHeaderFor(referrerPolicy, envURL, new URL(current));
+				if (ref) hdrObj.referer = ref;
+				else delete hdrObj.referer;
+			}
 			const step = { ...nInit, redirect: "manual", headers: hdrObj };
 			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
 			const target = new URL(current);
@@ -2536,9 +2567,13 @@
 			if (mode === "same-origin" && crossOrigin) {
 				throw corsError("a same-origin request cannot go to " + parsed.origin);
 			}
+			const chainPolicy = init.referrerPolicy ?? (isReq ? input.referrerPolicy : undefined);
+			const chainExplicitReferrer = headers.has("referer") ||
+				((init.referrer ?? (isReq ? input.referrer : undefined)) !== undefined &&
+					(init.referrer ?? (isReq ? input.referrer : undefined)) !== "about:client");
 			if (!headers.has("referer")) {
 				const explicit = init.referrer ?? (isReq ? input.referrer : undefined);
-				const policy = init.referrerPolicy ?? (isReq ? input.referrerPolicy : undefined);
+				const policy = chainPolicy;
 				let ref = null;
 				if (explicit !== undefined && explicit !== "about:client") {
 					ref = null;
@@ -2615,7 +2650,7 @@
 				const go = chained
 					? () => {
 						if (signal && onAbort) signal.addEventListener("abort", onAbort);
-						return followCORSRedirects(url, nInit, headers, envURL).then(
+						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer).then(
 							(res) => { cleanup(); return res; },
 							(err) => {
 								cleanup();

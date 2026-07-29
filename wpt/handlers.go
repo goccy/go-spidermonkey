@@ -16,6 +16,7 @@ package wpt
 // through to being served as a file, exactly as before.
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -84,6 +85,14 @@ func handlerFor(rel string) wptHandler {
 		return trickleHandler
 	case "fetch/api/resources/cache.py":
 		return cacheHandler
+	case "fetch/api/resources/authentication.py":
+		return authenticationHandler
+	case "fetch/api/resources/redirect-empty-location.py":
+		return emptyLocationHandler
+	case "fetch/api/resources/infinite-slow-response.py":
+		return infiniteSlowHandler
+	case "fetch/api/request/resources/cache.py":
+		return requestCacheHandler
 	}
 	return nil
 }
@@ -532,5 +541,148 @@ func cacheHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, "lorem ipsum dolor sit amet")
+	return true
+}
+
+// authenticationHandler is resources/authentication.py: it challenges with
+// Basic auth and accepts exactly one credential pair, which is how the
+// credentials tests tell "sent" from "not sent".
+func authenticationHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	user, password, _ := r.BasicAuth()
+	if user == "user" && password == "password" {
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "Authentication done")
+		return true
+	}
+	realm := "test"
+	if v := r.URL.Query().Get("realm"); v != "" {
+		realm = v
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	io.WriteString(w, "Please login with credentials 'user' and 'password'")
+	return true
+}
+
+// emptyLocationHandler is resources/redirect-empty-location.py: a 302 whose
+// Location is empty, which a client must treat as a network error rather than
+// as a redirect to the current URL.
+func emptyLocationHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	w.Header()["Location"] = []string{""}
+	w.WriteHeader(http.StatusFound)
+	return true
+}
+
+// infiniteSlowHandler is resources/infinite-slow-response.py: a response that
+// never ends, so the abort tests have something to abort. It stops when the
+// client goes away rather than running forever.
+func infiniteSlowHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	if key := r.URL.Query().Get("stateKey"); key != "" {
+		st.put(key, "open")
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	// An initial 2k so the client believes the body has started.
+	io.WriteString(w, strings.Repeat(".", 2048))
+	if flusher != nil {
+		flusher.Flush()
+	}
+	// Bounded so a test that never aborts cannot stall the whole run: the
+	// suite's own cases abort within a second.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			return true
+		case <-r.Context().Done():
+			if key := r.URL.Query().Get("stateKey"); key != "" {
+				st.put(key, "aborted")
+			}
+			return true
+		case <-time.After(100 * time.Millisecond):
+			io.WriteString(w, ".")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+// requestCacheHandler is fetch/api/request/resources/cache.py. The whole
+// request-cache family drives it: each fetch records what conditional headers
+// arrived, and a final "querystate" request reads the record back as JSON. The
+// response itself is shaped by the query — an ETag, a Date, a Cache-Control —
+// so the client has something to revalidate against.
+func requestCacheHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	query := r.URL.Query()
+	token := query.Get("token")
+
+	if has(r, "querystate") {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		if v, ok := st.take(token); ok {
+			io.WriteString(w, v)
+		} else {
+			io.WriteString(w, "[]")
+		}
+		return true
+	}
+
+	// Record this request's conditional headers, appending to the JSON array
+	// the querystate call will read.
+	state := map[string]string{}
+	if v := r.Header.Get("If-None-Match"); v != "" {
+		state["If-None-Match"] = v
+	}
+	if v := r.Header.Get("If-Modified-Since"); v != "" {
+		state["If-Modified-Since"] = v
+	}
+	if v := r.Header.Get("Pragma"); v != "" {
+		state["Pragma"] = v
+	}
+	if v := r.Header.Get("Cache-Control"); v != "" {
+		state["Cache-Control"] = v
+	}
+	if token != "" {
+		prev, _ := st.take(token)
+		entry, _ := json.Marshal(state)
+		if prev == "" || prev == "[]" {
+			st.put(token, "["+string(entry)+"]")
+		} else {
+			st.put(token, strings.TrimSuffix(prev, "]")+","+string(entry)+"]")
+		}
+	}
+
+	tag := query.Get("tag")
+	if tag != "" {
+		tag = `"` + tag + `"`
+		w.Header().Set("ETag", tag)
+	}
+	if v := query.Get("date"); v != "" {
+		w.Header().Set("Last-Modified", v)
+	}
+	if v := query.Get("expires"); v != "" {
+		w.Header().Set("Expires", v)
+	}
+	if v := query.Get("vary"); v != "" {
+		w.Header().Set("Vary", v)
+	}
+	if v := query.Get("cache_control"); v != "" {
+		w.Header().Set("Cache-Control", v)
+	}
+	if v := query.Get("redirect"); v != "" {
+		w.Header().Set("Location", v)
+		w.WriteHeader(http.StatusFound)
+		return true
+	}
+	// A matching conditional is a 304, which is the point of the fixture.
+	if tag != "" && r.Header.Get("If-None-Match") == tag && !has(r, "ignore") {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, query.Get("content"))
 	return true
 }
