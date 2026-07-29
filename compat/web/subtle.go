@@ -27,6 +27,8 @@ import (
 	"math/big"
 	"sync"
 
+	"github.com/cloudflare/circl/dh/x448"
+	"github.com/cloudflare/circl/sign/ed448"
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
 
@@ -56,6 +58,11 @@ type subtleKey struct {
 	xPriv   *ecdh.PrivateKey // X25519
 	xPub    *ecdh.PublicKey
 	mlkem   *mlkemKey
+	// The 448 curves come from CIRCL; the standard library has neither.
+	ed448Priv ed448.PrivateKey
+	ed448Pub  ed448.PublicKey
+	x448Priv  *x448.Key
+	x448Pub   *x448.Key
 }
 
 // maxSubtleKeys bounds the host key table. The table has no engine-driven free

@@ -86,6 +86,12 @@
 			}
 			return toBuf(subtleFail(ops.subtle_x25519_derive(baseKey._h, alg.public._h, length ?? 0)));
 		}
+		if (name === "X448") {
+			if (!alg.public || !(alg.public instanceof CryptoKey)) {
+				throw new TypeError("X448 deriveBits needs a public key");
+			}
+			return toBuf(subtleFail(ops.subtle_x448_derive(baseKey._h, alg.public._h, length ?? 0)));
+		}
 		if (name === "ECDH") {
 			if (!alg.public || !(alg.public instanceof CryptoKey)) {
 				throw new TypeError("ECDH deriveBits needs a public key");
@@ -536,6 +542,23 @@
 				keyRaw.set(key, raw);
 				return key;
 			}
+			if (name === "ED448") {
+				const r = subtleFail(ops.subtle_ed448_generate());
+				const algo = { name: "Ed448" };
+				return {
+					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
+					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+				};
+			}
+			if (name === "X448") {
+				const r = subtleFail(ops.subtle_x448_generate());
+				const algo = { name: "X448" };
+				return {
+					privateKey: new CryptoKey("private", extractable, algo,
+						usages.filter((u) => u === "deriveKey" || u === "deriveBits"), r.priv),
+					publicKey: new CryptoKey("public", true, algo, [], r.pub),
+				};
+			}
 			if (name === "ED25519") {
 				const r = ops.subtle_ed_generate();
 				const algo = { name: "Ed25519" };
@@ -692,6 +715,15 @@
 				keyRaw.set(key, raw);
 				return key;
 			}
+			if (name === "ED448" || name === "X448") {
+				const op = name === "ED448" ? ops.subtle_ed448_import : ops.subtle_x448_import;
+				const r = subtleFail(format === "jwk"
+					? op("jwk", JSON.stringify(keyData))
+					: op(format, toU8(keyData)));
+				const type = r.priv !== undefined ? "private" : "public";
+				return new CryptoKey(type, type === "public" ? true : extractable,
+					{ name: canonicalName(name) }, usages, r.priv ?? r.pub);
+			}
 			if (name === "ED25519") {
 				let r;
 				if (format === "jwk") r = ops.subtle_ed_import("jwk", JSON.stringify(keyData));
@@ -728,6 +760,10 @@
 			}
 			if (name === "X25519") {
 				const r = subtleFail(ops.subtle_x25519_export(format, key._h));
+				return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+			}
+			if (name === "ED448" || name === "X448") {
+				const r = subtleFail((name === "ED448" ? ops.subtle_ed448_export : ops.subtle_x448_export)(format, key._h));
 				return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
 			}
 			if (name === "HMAC") {
@@ -789,6 +825,7 @@
 			if (KMAC_NAMES.includes(name)) return toBuf(kmacRun(name, alg, key, data));
 			if (name === "HMAC") return toBuf(ops.subtle_hmac_sign(key.algorithm.hash.name, key._h, toU8(data)));
 			if (name === "ECDSA") return toBuf(ops.subtle_ec_sign(hashName(alg.hash), key._h, toU8(data)));
+			if (name === "ED448") return toBuf(subtleFail(ops.subtle_ed448_sign(key._h, toU8(data))));
 			if (name === "ED25519") return toBuf(ops.subtle_ed_sign(key._h, toU8(data)));
 			if (RSA_NAMES.includes(name)) {
 				return toBuf(ops.subtle_rsa_sign(rsaScheme(name), key.algorithm.hash.name, alg.saltLength == null ? -1 : Number(alg.saltLength), key._h, toU8(data)));
@@ -812,6 +849,7 @@
 			}
 			if (name === "HMAC") return ops.subtle_hmac_verify(key.algorithm.hash.name, key._h, toU8(signature), toU8(data));
 			if (name === "ECDSA") return ops.subtle_ec_verify(hashName(alg.hash), key._h, toU8(signature), toU8(data));
+			if (name === "ED448") return ops.subtle_ed448_verify(key._h, toU8(signature), toU8(data));
 			if (name === "ED25519") return ops.subtle_ed_verify(key._h, toU8(signature), toU8(data));
 			if (RSA_NAMES.includes(name)) {
 				return ops.subtle_rsa_verify(rsaScheme(name), key.algorithm.hash.name, alg.saltLength == null ? -1 : Number(alg.saltLength), key._h, toU8(signature), toU8(data));

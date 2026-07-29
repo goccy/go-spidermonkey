@@ -506,6 +506,15 @@ func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 		"subtle_kmac":              s.opKMAC,
 		"subtle_aes_ocb":           s.opAESOCB,
 		"subtle_cshake":            s.opCShake,
+		"subtle_ed448_generate":    s.opEd448Generate,
+		"subtle_ed448_import":      s.opEd448Import,
+		"subtle_ed448_export":      s.opEd448Export,
+		"subtle_ed448_sign":        s.opEd448Sign,
+		"subtle_ed448_verify":      s.opEd448Verify,
+		"subtle_x448_generate":     s.opX448Generate,
+		"subtle_x448_import":       s.opX448Import,
+		"subtle_x448_export":       s.opX448Export,
+		"subtle_x448_derive":       s.opX448Derive,
 	}
 }
 
