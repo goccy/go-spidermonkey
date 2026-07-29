@@ -59,22 +59,33 @@
 	// Augment the plain console with the grouping/timing/table surface.
 
 	const con = globalThis.console;
-	const counts = new Map();
-	const timers = new Map();
-	let groupIndent = "";
-	// Keep the raw sinks; the public log/info/warn/error/debug re-apply the
-	// current group indent to every line.
-	const rawLog = con.log.bind(con);
-	const rawErr = con.error.bind(con);
-	const indent = (args) => {
-		// Route through util.format so printf specifiers (%s/%d/%j/...) substitute,
-		// matching Node's console.
-		const text = core.util.format(...args);
-		return groupIndent ? groupIndent + text.replace(/\n/g, "\n" + groupIndent) : text;
-	};
-	const writeOut = (s) => rawLog(groupIndent + String(s).replace(/\n/g, "\n" + groupIndent));
 
-	Object.assign(con, {
+	// The console surface, built over a pair of sinks. It is a FACTORY because
+	// `new console.Console({ stdout, stderr })` is a real thing callers do —
+	// a logger writing to a file, a test capturing output — and returning the
+	// global console instead, as this did, sent every such write to the wrong
+	// place. Each instance keeps its own counters, timers and group indent,
+	// since those are per-console state in Node too.
+	// A label goes through the IDL string conversion, which refuses a symbol
+	// rather than producing "Symbol(x)" — a counter named that is not one the
+	// caller can ever reset by name.
+	const labelKey = (label) => {
+		if (typeof label === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+		return String(label);
+	};
+	function makeConsole(rawLog, rawErr, groupIndentation = 2) {
+		const counts = new Map();
+		const timers = new Map();
+		const step = " ".repeat(groupIndentation);
+		let groupIndent = "";
+		const indent = (args) => {
+			// Route through util.format so printf specifiers (%s/%d/%j/...)
+			// substitute, matching Node's console.
+			const text = core.util.format(...args);
+			return groupIndent ? groupIndent + text.replace(/\n/g, "\n" + groupIndent) : text;
+		};
+		const writeOut = (s) => rawLog(groupIndent + String(s).replace(/\n/g, "\n" + groupIndent));
+		return {
 		log: (...a) => rawLog(indent(a)),
 		info: (...a) => rawLog(indent(a)),
 		debug: (...a) => rawLog(indent(a)),
@@ -82,24 +93,34 @@
 		error: (...a) => rawErr(indent(a)),
 		dir: (obj, opts) => writeOut(core.util.inspect(obj, opts || {})),
 		dirxml: (...a) => con.log(...a),
-		trace: (...a) => con.error("Trace:", ...a),
-		group: (...a) => { if (a.length) rawLog(indent(a)); groupIndent += "  "; },
-		groupCollapsed: (...a) => { if (a.length) rawLog(indent(a)); groupIndent += "  "; },
-		groupEnd: () => { groupIndent = groupIndent.slice(0, -2); },
+		trace: (...a) => rawErr(indent(["Trace:", ...a])),
+		// assert(value, ...message) reports a failed assertion and carries on —
+		// console.assert never throws, which is the whole difference between it
+		// and node:assert.
+		assert: (value, ...message) => { if (!value) rawErr(indent(["Assertion failed" + (message.length ? ":" : ""), ...message])); },
+		group: (...a) => { if (a.length) rawLog(indent(a)); groupIndent += step; },
+		groupCollapsed: (...a) => { if (a.length) rawLog(indent(a)); groupIndent += step; },
+		groupEnd: () => { groupIndent = groupIndent.slice(0, -step.length || undefined); },
+		// A label is keyed by its STRING form: console.count(null) and
+		// console.count("null") name the same counter, because that is the label
+		// the caller sees printed.
 		count: (label = "default") => {
-			const n = (counts.get(label) || 0) + 1;
-			counts.set(label, n);
-			writeOut(`${label}: ${n}`);
+			const key = labelKey(label);
+			const n = (counts.get(key) || 0) + 1;
+			counts.set(key, n);
+			writeOut(`${key}: ${n}`);
 		},
-		countReset: (label = "default") => counts.delete(label),
-		time: (label = "default") => timers.set(label, performance.now()),
+		countReset: (label = "default") => counts.delete(labelKey(label)),
+		time: (label = "default") => timers.set(labelKey(label), performance.now()),
 		timeEnd: (label = "default") => {
-			const t = timers.get(label);
-			if (t !== undefined) { writeOut(`${label}: ${(performance.now() - t).toFixed(3)}ms`); timers.delete(label); }
+			const key = labelKey(label);
+			const t = timers.get(key);
+			if (t !== undefined) { writeOut(`${key}: ${(performance.now() - t).toFixed(3)}ms`); timers.delete(key); }
 		},
 		timeLog: (label = "default", ...a) => {
-			const t = timers.get(label);
-			if (t !== undefined) writeOut(`${label}: ${(performance.now() - t).toFixed(3)}ms ${a.join(" ")}`);
+			const key = labelKey(label);
+			const t = timers.get(key);
+			if (t !== undefined) writeOut(`${key}: ${(performance.now() - t).toFixed(3)}ms ${a.join(" ")}`);
 		},
 		timeStamp: () => {},
 		clear: () => {},
@@ -121,8 +142,50 @@
 			}
 			writeOut(lines.join("\n"));
 		},
-	});
-	con.Console = function Console() { return con; };
+		};
+	}
+
+	// The global console writes THROUGH process.stdout/stderr, as Node's does.
+	// Writing straight to the host sink instead meant a caller who replaced
+	// process.stdout.write — log capture, redirection to a file, a test
+	// collecting output — saw nothing, because console never went that way.
+	// The raw sinks stay as the fallback for an embedding with no process.
+	const rawLog = con.log.bind(con);
+	const rawErr = con.error.bind(con);
+	const viaProcess = (which, raw) => (s) => {
+		const stream = globalThis.process && globalThis.process[which];
+		if (stream && typeof stream.write === "function") stream.write(String(s) + "\n");
+		else raw(s);
+	};
+	Object.assign(con, makeConsole(viaProcess("stdout", rawLog), viaProcess("stderr", rawErr)));
+
+	// A stream sink writes a line; Node appends the newline itself, which is why
+	// a caller's stream sees "default: 1\n" and not "default: 1".
+	//
+	// A write error is SWALLOWED by default (Node's ignoreErrors, which defaults
+	// to true): logging is a side channel, and a broken log stream must not take
+	// down the program that was only trying to report something.
+	const streamSink = (stream, ignoreErrors) => (s) => {
+		if (!stream || typeof stream.write !== "function") return;
+		if (!ignoreErrors) { stream.write(String(s) + "\n"); return; }
+		try { stream.write(String(s) + "\n"); } catch { /* a broken log sink is not fatal */ }
+	};
+	function Console(stdout, stderr, ignoreErrors) {
+		if (!new.target) return new Console(stdout, stderr, ignoreErrors);
+		const opts = (stdout && typeof stdout === "object" && (stdout.stdout || stdout.stderr)) ? stdout : { stdout, stderr, ignoreErrors };
+		if (!opts.stdout || typeof opts.stdout.write !== "function") {
+			throw Object.assign(new TypeError('The "options.stdout" property must be of type object. Received ' + typeof opts.stdout),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		const quiet = opts.ignoreErrors !== false;
+		const out = streamSink(opts.stdout, quiet);
+		// stderr defaults to stdout, as Node's does.
+		const err = streamSink(opts.stderr || opts.stdout, quiet);
+		Object.assign(this, makeConsole(out, err, opts.groupIndentation ?? 2));
+		this._stdout = opts.stdout;
+		this._stderr = opts.stderr || opts.stdout;
+	}
+	con.Console = Console;
 	core.console = con;
 
 	// ---------------------------------------------------------------- events
