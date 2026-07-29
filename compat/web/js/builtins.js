@@ -1455,9 +1455,122 @@
 		}
 	}
 
+	// A BYOB reader reads INTO the caller's buffer. This implementation copies
+	// out of the stream's own queue rather than handing the source the caller's
+	// memory to fill (the spec's byobRequest), so a source written against
+	// controller.byobRequest sees none — but every consumer that only calls
+	// read(view) gets the bytes, in the right view type, with the leftovers
+	// kept for the next read.
+	class ReadableStreamBYOBReader {
+		constructor(stream) {
+			if (stream._locked) throw new TypeError("ReadableStream is locked");
+			stream._locked = true;
+			this._stream = stream;
+			stream._reader = this;
+			this.closed = new Promise((resolve, reject) => { this._closedResolve = resolve; this._closedReject = reject; });
+			this.closed.catch(() => {});
+			if (stream._closed) this._closedResolve(undefined);
+			else if (stream._errored) this._closedReject(stream._errorValue);
+		}
+		read(view) {
+			const s = this._stream;
+			if (!s) return Promise.reject(new TypeError("reader has released its lock"));
+			if (!ArrayBuffer.isView(view)) {
+				return Promise.reject(new TypeError("BYOB read expects an ArrayBufferView"));
+			}
+			if (view.byteLength === 0) {
+				return Promise.reject(new TypeError("BYOB read expects a non-empty view"));
+			}
+			const fill = () => {
+				const out = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+				let written = 0;
+				while (written < out.length && (s._byobLeftover || s._queue.length > 0)) {
+					let chunk = s._byobLeftover;
+					if (!chunk) {
+						s._queueTotalSize -= s._queueSizes.shift();
+						chunk = s._queue.shift();
+						chunk = ArrayBuffer.isView(chunk)
+							? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+							: new Uint8Array(chunk);
+					}
+					const take = Math.min(out.length - written, chunk.length);
+					out.set(chunk.subarray(0, take), written);
+					written += take;
+					s._byobLeftover = take < chunk.length ? chunk.subarray(take) : null;
+				}
+				if (written === 0) return null;
+				// The result is a view of the SAME type over the filled prefix,
+				// as the spec requires — a Uint16Array read gives back a
+				// Uint16Array.
+				const Ctor = view.constructor;
+				const elems = Math.floor(written / (view.BYTES_PER_ELEMENT || 1));
+				return { value: new Ctor(view.buffer, view.byteOffset, elems), done: false };
+			};
+			const ready = fill();
+			if (ready) return Promise.resolve(ready);
+			if (s._errored) return Promise.reject(s._errorValue);
+			if (s._closed) {
+				const Ctor = view.constructor;
+				return Promise.resolve({ value: new Ctor(view.buffer, view.byteOffset, 0), done: true });
+			}
+			// Nothing queued yet: pull, then try again once a chunk lands.
+			const waiter = new Promise((resolve, reject) => s._waiters.push({
+				resolve: () => {
+					const r = fill();
+					if (r) resolve(r);
+					else resolve({ value: new view.constructor(view.buffer, view.byteOffset, 0), done: true });
+				},
+				reject,
+			}));
+			s._pull();
+			return waiter;
+		}
+		releaseLock() {
+			if (this._stream) {
+				this._stream._locked = false;
+				this._stream._reader = null;
+				this._closedReject(new TypeError("reader has released its lock"));
+				this._stream = null;
+			}
+		}
+		cancel(reason) {
+			const s = this._stream;
+			if (!s) return Promise.reject(new TypeError("reader has released its lock"));
+			s._locked = false;
+			s._reader = null;
+			this._stream = null;
+			return s.cancel(reason);
+		}
+	}
+	globalThis.ReadableStreamBYOBReader = ReadableStreamBYOBReader;
+
+	// A byte stream's controller is a distinct type in the standard, and the
+	// suite reaches for it by name. The queue-copying BYOB reader above does not
+	// use a byobRequest, so this reports null for one — a source written against
+	// controller.byobRequest sees nothing to fill and falls back to enqueue().
+	class ReadableByteStreamController {
+		constructor(inner) { this._inner = inner; }
+		get byobRequest() { return null; }
+		get desiredSize() { return this._inner.desiredSize; }
+		enqueue(chunk) {
+			if (!ArrayBuffer.isView(chunk)) {
+				throw new TypeError("a byte stream can only enqueue an ArrayBufferView");
+			}
+			return this._inner.enqueue(chunk);
+		}
+		close() { return this._inner.close(); }
+		error(e) { return this._inner.error(e); }
+	}
+	globalThis.ReadableByteStreamController = ReadableByteStreamController;
+
 	class ReadableStream {
 		constructor(underlyingSource = {}, strategy = {}) {
 			this._source = underlyingSource;
+			// A byte stream carries Uint8Array chunks and can be read THROUGH a
+			// caller-supplied buffer (a BYOB read). Without it, every BYOB
+			// consumer — and 49 subtests of the streams suite — hit "Cannot use a
+			// BYOB reader with a non-byte stream" and stopped there.
+			this._isByteStream = underlyingSource && underlyingSource.type === "bytes";
 			this._queue = [];
 			this._queueSizes = []; // parallel to _queue: each chunk's strategy size
 			this._queueTotalSize = 0;
@@ -1528,6 +1641,7 @@
 					if (self._reader) self._reader._closedReject(e);
 				},
 			};
+			if (this._isByteStream) this._controller = new ReadableByteStreamController(this._controller);
 			if (underlyingSource.start) underlyingSource.start(this._controller);
 		}
 		get locked() { return this._locked; }
@@ -1561,10 +1675,16 @@
 			);
 		}
 		getReader(opts) {
-			// This is not a byte stream, so a BYOB reader request must throw (per
-			// spec) rather than silently hand back a default reader that ignores the
-			// caller's buffer — which would corrupt a BYOB consumer's reads.
-			if (opts && opts.mode === "byob") throw new TypeError("Cannot use a BYOB reader with a non-byte stream");
+			if (opts && opts.mode !== undefined && opts.mode !== "byob") {
+				throw new TypeError(`Invalid reader mode ${opts.mode}`);
+			}
+			if (opts && opts.mode === "byob") {
+				// A BYOB reader on a stream that is not a byte stream must throw
+				// rather than silently hand back a default reader that ignores the
+				// caller's buffer — which would corrupt its reads.
+				if (!this._isByteStream) throw new TypeError("Cannot use a BYOB reader with a non-byte stream");
+				return new ReadableStreamBYOBReader(this);
+			}
 			return new ReadableStreamDefaultReader(this);
 		}
 		cancel(reason) {
@@ -1678,8 +1798,28 @@
 			}
 		}
 		pipeThrough(transform, options) {
-			this.pipeTo(transform.writable, options).catch(() => {});
-			return transform.readable;
+			// Every argument is brand-checked BEFORE anything is piped, and a
+			// failure is a synchronous TypeError — pipeThrough returns a stream,
+			// not a promise, so a rejection has nowhere to go. Unchecked, a
+			// malformed pair produced an undefined "readable" and the error
+			// surfaced somewhere unrelated later.
+			if (transform === null || typeof transform !== "object") {
+				throw new TypeError("pipeThrough expects a { readable, writable } pair");
+			}
+			const { readable, writable } = transform;
+			if (!(readable instanceof ReadableStream)) {
+				throw new TypeError("pipeThrough: transform.readable is not a ReadableStream");
+			}
+			if (!(writable instanceof WritableStream)) {
+				throw new TypeError("pipeThrough: transform.writable is not a WritableStream");
+			}
+			if (this.locked) throw new TypeError("pipeThrough: the source stream is locked");
+			if (writable.locked) throw new TypeError("pipeThrough: transform.writable is locked");
+			if (options !== undefined && options !== null && typeof options !== "object") {
+				throw new TypeError("pipeThrough: options must be an object");
+			}
+			this.pipeTo(writable, options).catch(() => {});
+			return readable;
 		}
 		// tee() splits the stream into two branches that each receive every
 		// chunk (React's renderToReadableStream + Next App Router use it). It is
