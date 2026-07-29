@@ -858,13 +858,27 @@
 	let autoSelectFamily = true;
 	let autoSelectFamilyAttemptTimeout = 250;
 
+	// Node's constructors are ES5 functions, so `net.Server(...)` works as well
+	// as `new net.Server(...)`, and its suite uses the bare form. A class throws
+	// "class constructors must be invoked with 'new'". Reflect.construct with
+	// new.target keeps the façade usable as a BASE CLASS too — returning a fresh
+	// object from a constructor would discard the subclass instance super() was
+	// initialising.
+	function callableClass(Cls) {
+		const f = function (...args) { return Reflect.construct(Cls, args, new.target || Cls); };
+		f.prototype = Cls.prototype;
+		Object.setPrototypeOf(f, Cls);
+		Object.defineProperty(f, "name", { value: Cls.name, configurable: true });
+		return f;
+	}
+
 	core.net = {
 		isIPv4,
 		isIPv6,
 		isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),
-		Socket,
-		Stream: Socket,
-		Server: NetServer,
+		Socket: callableClass(Socket),
+		Stream: callableClass(Socket),
+		Server: callableClass(NetServer),
 		createServer: (options, listener) => new NetServer(options, listener),
 		createConnection: (...args) => new Socket().connect(...args),
 		connect: (...args) => new Socket().connect(...args),
@@ -1835,8 +1849,8 @@
 		connect: tlsConnect,
 		createServer: (options, listener) => new TLSServer(options, listener),
 		createSecureContext: (opts) => opts || {},
-		TLSSocket,
-		Server: TLSServer,
+		TLSSocket: callableClass(TLSSocket),
+		Server: callableClass(TLSServer),
 		rootCertificates: [],
 		// getCACertificates reports the trust store this runtime would verify
 		// against. The host's own pool is what tls.Dial uses, and it is not

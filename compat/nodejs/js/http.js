@@ -232,11 +232,17 @@
 	const servers = new Map(); // server id -> Server
 
 	class Server extends EventEmitter {
-		constructor(handler) {
+		constructor(options, handler) {
 			super();
+			if (typeof options === "function") { handler = options; options = undefined; }
 			if (handler) this.on("request", handler);
 			this.listening = false;
 			this.timeout = 0;
+			// Node lets a caller substitute its own request/response classes, and
+			// several tests do exactly that to observe the objects the server
+			// builds. Ignoring the option silently gave them the base classes.
+			this._IncomingMessage = (options && options.IncomingMessage) || IncomingMessage;
+			this._ServerResponse = (options && options.ServerResponse) || ServerResponse;
 		}
 		listen(...args) {
 			let port = 0;
@@ -416,13 +422,15 @@
 			socket.setTimeout(server.timeout);
 			socket.on("timeout", () => server.emit("timeout", socket));
 		}
-		const req = new IncomingMessage({ method, url, rawHeaders, socket });
+		const ReqClass = (server && server._IncomingMessage) || IncomingMessage;
+		const req = new ReqClass({ method, url, rawHeaders, socket });
 		// _read is the backpressure signal: the Readable calls it when it wants
 		// more, which tells the host body pump to send the next chunk.
 		req._read = () => { if (hasBody) ops.http_body_resume(reqId); };
 		// Body chunks arrive via __node_http_body; register for routing.
 		openRequests.set(reqId, req);
-		const res = new ServerResponse({ reqId, socket, req });
+		const ResClass = (server && server._ServerResponse) || ServerResponse;
+		const res = new ResClass({ reqId, socket, req });
 		openResponses.set(reqId, res);
 		// If the handler ends the response without draining the request body, the
 		// host pump stops WITHOUT sending a terminal chunk, so __node_http_body
@@ -701,18 +709,37 @@
 		return req;
 	}
 
+	// Node's constructors are ES5 functions, so `http.Server(opts)` works as
+	// well as `new http.Server(opts)` — and its own suite uses the bare form.
+	// A class throws "class constructors must be invoked with 'new'", which was
+	// the whole of that failure group. callableClass keeps the class (so
+	// `extends` and instanceof still work) behind a callable façade.
+	function callableClass(Cls) {
+		// Reflect.construct with new.target, not `new Cls(...)`: the façade is
+		// also used as a BASE CLASS, and a constructor that returns a fresh
+		// object discards the subclass instance super() was initialising — the
+		// subclass's own methods then vanish.
+		const f = function (...args) {
+			return Reflect.construct(Cls, args, new.target || Cls);
+		};
+		f.prototype = Cls.prototype;
+		Object.setPrototypeOf(f, Cls);
+		Object.defineProperty(f, "name", { value: Cls.name, configurable: true });
+		return f;
+	}
+
 	core.http = {
 		METHODS,
 		STATUS_CODES,
-		Server,
-		IncomingMessage,
-		ServerResponse,
-		OutgoingMessage: ServerResponse,
-		ClientRequest,
-		createServer: (options, handler) => new Server(typeof options === "function" ? options : handler),
+		Server: callableClass(Server),
+		IncomingMessage: callableClass(IncomingMessage),
+		ServerResponse: callableClass(ServerResponse),
+		OutgoingMessage: callableClass(ServerResponse),
+		ClientRequest: callableClass(ClientRequest),
+		createServer: (options, handler) => new Server(options, handler),
 		request: httpRequest,
 		get: httpGet,
-		Agent,
+		Agent: callableClass(Agent),
 		// Node v19+: the default global agent is keep-alive.
 		globalAgent: new Agent({ keepAlive: true }),
 		maxHeaderSize: 16384,
@@ -790,8 +817,8 @@
 			? { ...a, protocol: "https:" }
 			: a;
 	core.https = {
-		Server: HttpsServer,
-		Agent,
+		Server: callableClass(HttpsServer),
+		Agent: callableClass(Agent),
 		globalAgent: new Agent({ keepAlive: true }),
 		createServer: (options, handler) => new HttpsServer(options, handler),
 		request: (...args) => httpRequest(...args.map(httpsify)),
