@@ -53,6 +53,10 @@ var coreModules = map[string]bool{
 	"perf_hooks": true, "process": true, "punycode": true,
 	"querystring": true, "readline": true, "readline/promises": true,
 	"repl": true,
+	// Node's deprecated underscored http modules, which published code still
+	// requires by name.
+	"_http_agent": true, "_http_client": true, "_http_common": true,
+	"_http_incoming": true, "_http_outgoing": true, "_http_server": true,
 	"stream": true, "stream/consumers": true, "stream/promises": true,
 	"stream/web": true, "string_decoder": true, "sys": true,
 	"timers": true, "timers/promises": true, "tls": true, "tty": true,

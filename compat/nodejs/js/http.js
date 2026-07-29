@@ -799,6 +799,40 @@
 		validateHeaderValue: (name, value) => { if (value === undefined) throw new TypeError(`Invalid value for header ${name}`); },
 	};
 
+	// Node's underscored http modules. They are deprecated aliases for pieces of
+	// node:http, but a great deal of published code still requires them by name,
+	// so each maps onto the thing it names here.
+	//
+	// _http_common's HTTPParser is deliberately absent: parsing belongs to Go's
+	// net/http in this runtime, so there is no parser object to hand back, and
+	// inventing one that answers to the shape but not the behaviour would be
+	// worse than saying so.
+	core._http_server = {
+		ServerResponse: core.http.ServerResponse,
+		STATUS_CODES,
+		kConnectionsCheckingInterval: Symbol("http.connectionsCheckingInterval"),
+	};
+	core._http_client = { ClientRequest: core.http.ClientRequest };
+	core._http_incoming = {
+		IncomingMessage: core.http.IncomingMessage,
+		readStart: (socket) => { if (socket && socket.resume) socket.resume(); },
+		readStop: (socket) => { if (socket && socket.pause) socket.pause(); },
+	};
+	core._http_outgoing = {
+		OutgoingMessage: core.http.OutgoingMessage,
+		kHighWaterMark: Symbol("http.highWaterMark"),
+	};
+	core._http_agent = { Agent: core.http.Agent, globalAgent: core.http.globalAgent };
+	core._http_common = {
+		METHODS,
+		methods: METHODS,
+		CRLF: "\r\n",
+		chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
+		continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
+		_checkIsHttpToken: (val) => typeof val === "string" && /^[\^`\-\w!#$%&'*+.|~]+$/.test(val),
+		_checkInvalidHeaderChar: (val) => /[^\t\x20-\x7e\x80-\xff]/.test(String(val)),
+	};
+
 	// HTTPS server: an http Server that binds a TLS listener (https_listen)
 	// instead of the plaintext http_listen. The dispatch machinery is shared.
 	class HttpsServer extends Server {
