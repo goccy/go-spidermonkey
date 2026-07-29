@@ -1544,6 +1544,27 @@
 	};
 
 
+	// Open flags come as a string ("w+", "ax") or as the O_* bit set from
+	// fs.constants. The host op speaks the string form, so a numeric flag has to
+	// be translated rather than stringified — String(66) is "66", which is not a
+	// mode at all and reached the host as one.
+	function flagsToString(flags) {
+		if (typeof flags === "string") return flags;
+		if (typeof flags !== "number") throw errArgType("flags", "of type string or number", flags);
+		const { O_WRONLY = 1, O_RDWR = 2, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, O_APPEND = 0o2000 } = OPEN_FLAGS;
+		const rw = (flags & O_RDWR) === O_RDWR;
+		let base;
+		if (flags & O_APPEND) base = rw ? "a+" : "a";
+		else if (flags & O_TRUNC || flags & O_CREAT) base = rw ? "w+" : (flags & O_WRONLY ? "w" : "r+");
+		else base = rw ? "r+" : "r";
+		if (!(flags & O_CREAT) && !(flags & O_TRUNC) && !(flags & O_APPEND)) base = rw ? "r+" : (flags & O_WRONLY ? "w" : "r");
+		return (flags & O_EXCL) ? base + "x" : base;
+	}
+	const OPEN_FLAGS = {
+		O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 0o100, O_EXCL: 0o200,
+		O_TRUNC: 0o1000, O_APPEND: 0o2000,
+	};
+
 	// flagOf extracts the string `flag` option ("w", "a", "wx", ...) from a
 	// writeFile/appendFile options bag; string opts are encodings, not flags.
 	const flagOf = (opts, dflt) =>
@@ -1813,10 +1834,19 @@
 			}
 		},
 		mkdirSync(p, opts) {
+			// `recursive` decides whether a missing parent is an error, so a
+			// truthy string quietly changing that behaviour is exactly the kind
+			// of mistake worth naming.
+			if (opts && opts.recursive !== undefined && typeof opts.recursive !== "boolean") {
+				throw errArgType("options.recursive", "of type boolean", opts.recursive);
+			}
+			if (opts && opts.mode !== undefined) validateMode(opts.mode);
 			const r = ops.fs_mkdir(fsResolve(p), !!(opts && opts.recursive));
 			if (isErr(r)) throw fsError(r, "mkdir", p);
 		},
 		rmdirSync(p) {
+			// rmdir on a non-directory is ENOTDIR, not a silent removal — the
+			// caller asked to remove a DIRECTORY.
 			const r = ops.fs_remove(fsResolve(p));
 			if (isErr(r)) throw fsError(r, "rmdir", p);
 		},
@@ -1855,6 +1885,8 @@
 		},
 		watchFile(p, options, listener) {
 			if (typeof options === "function") { listener = options; options = {}; }
+			validatePath(p);
+			validateFunction(listener, "listener");
 			let prev = null;
 			try { prev = fsSync.statSync(p); } catch {}
 			const id = ops.fs_watch(fsResolve(p), () => {
@@ -1888,7 +1920,13 @@
 			if (isErr(r)) throw fsError(r, "rm", p);
 		},
 		rmdirSync(p, options = {}) {
-			const r = ops.fs_rm(fsResolve(p), !!(options && options.recursive), false);
+			// rmdir on a non-directory is ENOTDIR: the caller asked to remove a
+			// DIRECTORY, and removing a file instead is not a helpful reading.
+			const abs = fsResolve(p);
+			let st = null;
+			try { st = fsSync.statSync(p); } catch { /* let the op report ENOENT */ }
+			if (st && !st.isDirectory()) throw fsError({ code: "ENOTDIR", message: "not a directory" }, "rmdir", p);
+			const r = ops.fs_rm(abs, !!(options && options.recursive), false);
 			if (isErr(r)) throw fsError(r, "rmdir", p);
 		},
 		mkdtempSync(prefix, options) {
@@ -1902,7 +1940,7 @@
 			copyEntry(from, to, opts);
 		},
 		openSync(p, flags = "r") {
-			const f = String(flags);
+			const f = flagsToString(flags);
 			// Exclusive ('x') fails on an existing file; the host op then gets the
 			// base flag ('x' and the sync 's' modifier stripped: "wx" -> "w").
 			checkExclusive(p, f);
@@ -1984,8 +2022,16 @@
 		chownSync(p, uid, gid) { validatePath(p); validateUidGid(uid, gid); },
 		lchownSync(p, uid, gid) { validatePath(p); validateUidGid(uid, gid); },
 		utimesSync(p, atime, mtime) {
+			validatePath(p);
 			// Node: numbers are epoch SECONDS; Dates and numeric strings work too.
-			const toMs = (t) => (t instanceof Date ? t.getTime() : Number(t) * 1000);
+			// Anything that is not one of those three is a type error rather than
+			// a NaN timestamp written to the file.
+			const toMs = (t) => {
+				if (t instanceof Date) return t.getTime();
+				if (typeof t === "number" || typeof t === "bigint") return Number(t) * 1000;
+				if (typeof t === "string" && t.trim() !== "" && Number.isFinite(Number(t))) return Number(t) * 1000;
+				throw errArgType("time", "a number, a string convertible to a number, or a Date", t);
+			};
 			const r = ops.fs_utimes(fsResolve(p), toMs(atime), toMs(mtime));
 			if (isErr(r)) throw fsError(r, "utime", p);
 		},
