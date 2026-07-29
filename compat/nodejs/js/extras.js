@@ -1470,18 +1470,76 @@
 		);
 		return runner.call(ctx, ctx, ctx, ctx, ctx.exports, ctx.module, String(code));
 	}
+	// vm rejects its arguments before compiling anything, and its own suite
+	// asserts on the codes. A string handed to createContext is a mistake worth
+	// naming, not something to treat as an empty sandbox.
+	const vmArgType = (name, expected, v) => Object.assign(
+		new TypeError(`The "${name}" argument must be ${expected}. Received ${v === null ? "null" : typeof v}`),
+		{ code: "ERR_INVALID_ARG_TYPE" });
+	const vmRange = (name, v) => Object.assign(
+		new RangeError(`The value of "${name}" is out of range. It must be an integer. Received ${v}`),
+		{ code: "ERR_OUT_OF_RANGE" });
+	function vmOffset(opts, name) {
+		const v = opts[name];
+		if (v === undefined) return;
+		if (typeof v !== "number") throw vmArgType(`options.${name}`, "of type number", v);
+		if (!Number.isInteger(v) || v < -(2 ** 31) || v > 2 ** 31 - 1) throw vmRange(`options.${name}`, v);
+	}
+	function validateVMOptions(options, argName = "options") {
+		if (options === undefined || options === null) return {};
+		if (typeof options === "string") return { filename: options };
+		if (typeof options !== "object") throw vmArgType(argName, "of type object", options);
+		if (options.filename !== undefined && typeof options.filename !== "string") {
+			throw vmArgType("options.filename", "of type string", options.filename);
+		}
+		vmOffset(options, "lineOffset");
+		vmOffset(options, "columnOffset");
+		if (options.timeout !== undefined) {
+			if (typeof options.timeout !== "number") throw vmArgType("options.timeout", "of type number", options.timeout);
+			if (!Number.isInteger(options.timeout) || options.timeout <= 0) {
+				throw Object.assign(new RangeError(`The value of "options.timeout" is out of range. It must be a positive integer. Received ${options.timeout}`),
+					{ code: "ERR_OUT_OF_RANGE" });
+			}
+		}
+		return options;
+	}
+	// Which objects have been made into contexts. Node answers isContext() from
+	// the object itself; a flat "false" made every round-trip check fail.
+	const contextified = new WeakSet();
+	const asContext = (o) => {
+		if (o === undefined) o = {};
+		if (o === null || (typeof o !== "object" && typeof o !== "function")) {
+			throw vmArgType("contextObject", "of type object", o);
+		}
+		contextified.add(o);
+		return o;
+	};
 	core.vm = {
-		createContext: (o = {}) => o,
-		isContext: () => false,
-		runInThisContext: (code) => (0, eval)(String(code)),
-		runInNewContext: (code, sandbox) => runInSandbox(code, sandbox),
-		runInContext: (code, contextifiedObject) => runInSandbox(code, contextifiedObject),
-		compileFunction: (code, params = []) => new Function(...params, String(code)),
+		createContext: (o, options) => { validateVMOptions(options); return asContext(o); },
+		isContext: (o) => {
+			if (o === null || (typeof o !== "object" && typeof o !== "function")) {
+				throw vmArgType("object", "of type object", o);
+			}
+			return contextified.has(o);
+		},
+		runInThisContext: (code, options) => { validateVMOptions(options); return (0, eval)(String(code)); },
+		runInNewContext: (code, sandbox, options) => { validateVMOptions(options); return runInSandbox(code, asContext(sandbox)); },
+		runInContext: (code, contextifiedObject, options) => { validateVMOptions(options); return runInSandbox(code, contextifiedObject); },
+		compileFunction: (code, params = [], options) => { validateVMOptions(options); return new Function(...params, String(code)); },
 		Script: class Script {
-			constructor(code) { this._code = String(code); }
-			runInThisContext() { return (0, eval)(this._code); }
-			runInNewContext(sandbox) { return runInSandbox(this._code, sandbox); }
-			runInContext(contextifiedObject) { return runInSandbox(this._code, contextifiedObject); }
+			constructor(code, options) {
+				validateVMOptions(options);
+				this._code = String(code);
+			}
+			runInThisContext(options) { validateVMOptions(options); return (0, eval)(this._code); }
+			runInNewContext(sandbox, options) { validateVMOptions(options); return runInSandbox(this._code, asContext(sandbox)); }
+			runInContext(contextifiedObject, options) { validateVMOptions(options); return runInSandbox(this._code, contextifiedObject); }
+		},
+		constants: {
+			// The DONT_CONTEXTIFY sentinel and the import-module-dynamically modes
+			// callers pass through to the options bag.
+			DONT_CONTEXTIFY: Symbol("vm_dont_contextify"),
+			USE_MAIN_CONTEXT_DEFAULT_LOADER: Symbol("vm_dynamic_import_main_context_default"),
 		},
 	};
 
