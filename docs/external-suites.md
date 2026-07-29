@@ -14,14 +14,14 @@ than tests written here:
 
 `make suites` runs all four.
 
-## Where they stand (measured 2026-07-28, on the pinned revisions)
+## Where they stand (measured on the pinned revisions)
 
 | suite | result |
 |---|---|
 | test262 | 52,266 / 53,329 = **98.0%** |
 | Babel | 4,170 / 4,189 fixtures = **99.55%** (890 skipped) |
-| WPT | 21,595 / 40,888 subtests = **52.8%** |
-| Node.js | see `nodetest/expectations.json` |
+| WPT | 35,694 / 43,142 subtests = **82.7%** |
+| Node.js | ~2,600 tests run, ~640 passing; 235 quarantined as hangs |
 
 The Babel figure comes with a cross-check worth repeating whenever the pin
 moves: every one of the 19 remaining failures ALSO fails under real Node.js
@@ -31,16 +31,37 @@ layout. On that corpus this runtime is behaviourally identical to Node. To
 redo it, run `babeltest/js/fixtures.js` under `node` with `__babeltest_root`
 set to a fixtures directory and diff its failures against `expectations.json`.
 
-WPT's 52.8% is dominated by whole APIs that are not implemented rather than by
-subtle divergences: `WebCryptoAPI` alone is 35.9k of the 40.9k subtests, and
-`urlpattern` (0.6%) has no implementation at all. The directories that ARE
-implemented score far higher — `url` 81%, `performance-timeline` 78%,
-`dom/events` 78%, `FileAPI` 68%, `html/webappapis` 63%.
+WPT by directory, and the one split that the total hides:
 
-It is also worth knowing how fast that number moves for a small fix: giving
-`CryptoKey` its `Symbol.toStringTag` — one property, which the suite checks on
-every key it produces and which everything downstream of a key then trips over
-— took the total from 45.8% to 52.8% on its own.
+| directory | passing |
+|---|---|
+| mimesniff | 98.6% |
+| compression | 95.6% |
+| WebCryptoAPI | 83.8% |
+| url | 81.1% |
+| dom/events | 80% |
+| fetch/data-urls | 78.6% |
+| html/webappapis | 76.9% |
+| FileAPI | 73.3% |
+| user-timing | 70.8% |
+| fetch/api | 65.3% |
+| encoding | 60.2% |
+| streams | 56.1% |
+| urlpattern | 54.9% |
+| webmessaging | 42.9% |
+
+WebCryptoAPI is 35.9k of the 43.1k subtests, so it dominates the total. Split
+by whether the spec is stable, it is **93.8% on the stable Web Crypto spec**
+and 51.4% on the `.tentative.` files — draft algorithms (ML-DSA, AES-OCB,
+KMAC, cSHAKE, X448, Ed448, ChaCha20-Poly1305) that neither Node nor Deno
+implements either.
+
+The Node number is the honest weak axis, and
+[conformance-plan.md](conformance-plan.md) records why with the measured
+failure histogram rather than an estimate: the single largest group is 327
+tests failing on `assert.throws`, because Node reports a bad argument with an
+`ERR_*` code that its own suite matches on and most of this runtime's APIs do
+not yet.
 
 ## The bar: what Bun and Deno measure themselves against
 
