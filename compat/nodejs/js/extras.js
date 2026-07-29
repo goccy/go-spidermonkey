@@ -872,10 +872,182 @@
 		return f;
 	}
 
+	// ------------------------------------------------- SocketAddress/BlockList
+	// A BlockList is an address filter: a set of single addresses, ranges and
+	// subnets that check() answers against. Comparison is done on the numeric
+	// form (a BigInt), because "is 1.1.1.5 between 1.1.1.1 and 1.1.1.10" is a
+	// question about numbers, and string ordering answers it wrong.
+
+	const netArgType = (name, expected, v) => Object.assign(
+		new TypeError(`The "${name}" argument must be ${expected}. Received ${v === null ? "null" : typeof v}`),
+		{ code: "ERR_INVALID_ARG_TYPE" });
+	const netArgValue = (name, v) => Object.assign(
+		new TypeError(`The argument '${name}' must be one of: 'ipv4', 'ipv6'. Received ${JSON.stringify(v)}`),
+		{ code: "ERR_INVALID_ARG_VALUE" });
+
+	// Every address is compared in ONE numeric form: the 128-bit IPv6 value,
+	// with IPv4 mapped into ::ffff:a.b.c.d. That is what makes "1.1.1.2" and
+	// "::ffff:1.1.1.2" compare equal — they name the same host, and a rule added
+	// as either has to match a query in the other.
+	function ipToBigInt(addr, family) {
+		if (family === "ipv4") {
+			const v4 = addr.split(".").reduce((n, o) => (n << 8n) + BigInt(Number(o)), 0n);
+			return (0xffffn << 32n) | v4;
+		}
+		let s = addr;
+		const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(s);
+		if (mapped) s = "::ffff:" + ipv4ToHextets(mapped[1]);
+		const [head, tail = ""] = s.split("::");
+		const headParts = head ? head.split(":") : [];
+		const tailParts = tail ? tail.split(":") : [];
+		const fill = 8 - headParts.length - tailParts.length;
+		const parts = [...headParts, ...Array(Math.max(0, fill)).fill("0"), ...tailParts];
+		return parts.reduce((n, p) => (n << 16n) + BigInt(parseInt(p || "0", 16)), 0n);
+	}
+	const ipv4ToHextets = (v4) => {
+		const o = v4.split(".").map(Number);
+		return ((o[0] << 8) | o[1]).toString(16) + ":" + ((o[2] << 8) | o[3]).toString(16);
+	};
+	const normalizeFamily = (f, argName) => {
+		if (f === undefined) return "ipv4";
+		if (typeof f !== "string") throw netArgType(argName, "of type string", f);
+		const lower = f.toLowerCase();
+		if (lower !== "ipv4" && lower !== "ipv6") throw netArgValue(argName, f);
+		return lower;
+	};
+
+	class SocketAddress {
+		constructor(options = {}) {
+			if (options === null || typeof options !== "object") throw netArgType("options", "of type object", options);
+			this.family = normalizeFamily(options.family, "options.family");
+			this.address = options.address ?? (this.family === "ipv4" ? "127.0.0.1" : "::");
+			if (typeof this.address !== "string") throw netArgType("options.address", "of type string", options.address);
+			this.port = options.port ?? 0;
+			this.flowlabel = options.flowlabel ?? 0;
+		}
+		static parse(input) {
+			const m6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(String(input));
+			if (m6) return new SocketAddress({ address: m6[1], family: "ipv6", port: m6[2] ? Number(m6[2]) : 0 });
+			const [addr, port] = String(input).split(":");
+			return isIPv4(addr) ? new SocketAddress({ address: addr, port: port ? Number(port) : 0 }) : undefined;
+		}
+	}
+
+	// Format the 128-bit value back as an address, compressing the longest run
+	// of zero hextets, so a subnet reads as "8592:757c:efae:4e45::/64" rather
+	// than as a number.
+	function bigIntToIP(n, family) {
+		if (family === "ipv4") {
+			const v = n & 0xffffffffn;
+			return [24n, 16n, 8n, 0n].map((sh) => Number((v >> sh) & 0xffn)).join(".");
+		}
+		const parts = [];
+		for (let i = 7n; i >= 0n; i--) parts.push(Number((n >> (i * 16n)) & 0xffffn).toString(16));
+		let best = { at: -1, len: 0 }, run = { at: -1, len: 0 };
+		parts.forEach((p, i) => {
+			if (p === "0") {
+				if (run.at < 0) run = { at: i, len: 0 };
+				run.len++;
+				if (run.len > best.len) best = { ...run };
+			} else run = { at: -1, len: 0 };
+		});
+		if (best.len < 2) return parts.join(":");
+		return parts.slice(0, best.at).join(":") + "::" + parts.slice(best.at + best.len).join(":");
+	}
+	const familyLabel = (f) => (f === "ipv4" ? "IPv4" : "IPv6");
+
+	class BlockList {
+		constructor() { this._rules = []; }
+		// Node presents the rules as human-readable strings, newest first — it is
+		// a description of the list, not its internal form.
+		get rules() { return this._rules.map((r) => r.text).reverse(); }
+		static isBlockList(v) { return v instanceof BlockList; }
+		// The rule strings ARE the serialized form, so a list round-trips through
+		// JSON without a private format.
+		toJSON() { return this.rules; }
+		fromJSON(json) {
+			let list = json;
+			if (typeof list === "string") {
+				try { list = JSON.parse(list); } catch { list = undefined; }
+			}
+			if (!Array.isArray(list) || list.some((r) => typeof r !== "string")) {
+				throw netArgType("json", "an array of strings or a JSON string", json);
+			}
+			for (const rule of list) this._fromRule(rule);
+			return this;
+		}
+		// A rule that does not parse is ignored rather than fatal: the list is a
+		// filter, and a line nobody can interpret filters nothing.
+		_fromRule(rule) {
+			let m = /^Address: (IPv4|IPv6) (.+)$/.exec(rule);
+			if (m) { try { this.addAddress(m[2], m[1].toLowerCase()); } catch { /* ignored */ } return; }
+			m = /^Range: (IPv4|IPv6) (.+)-(.+)$/.exec(rule);
+			if (m) { try { this.addRange(m[2], m[3], m[1].toLowerCase()); } catch { /* ignored */ } return; }
+			m = /^Subnet: (IPv4|IPv6) (.+)\/(\d+)$/.exec(rule);
+			if (m) { try { this.addSubnet(m[2], Number(m[3]), m[1].toLowerCase()); } catch { /* ignored */ } }
+		}
+		// An address argument is either a SocketAddress or a string plus family.
+		_addr(value, family, argName) {
+			if (value instanceof SocketAddress) return { addr: value.address, family: value.family };
+			if (typeof value !== "string") throw netArgType(argName, "a string or an instance of SocketAddress", value);
+			return { addr: value, family: normalizeFamily(family, "family") };
+		}
+		addAddress(value, family) {
+			const { addr, family: f } = this._addr(value, family, "address");
+			this._rules.push({ kind: "address", family: f, n: ipToBigInt(addr, f), text: `Address: ${familyLabel(f)} ${addr}` });
+			return this;
+		}
+		addRange(start, end, family) {
+			const a = this._addr(start, family, "start");
+			const b = this._addr(end, family, "end");
+			// An inverted range would match nothing, which is never what the
+			// caller meant, so Node names it rather than silently accepting it.
+			if (ipToBigInt(a.addr, a.family) > ipToBigInt(b.addr, b.family)) {
+				throw Object.assign(new TypeError(`The argument 'start' must be less than or equal to 'end'. Received ${JSON.stringify(a.addr)}`),
+					{ code: "ERR_INVALID_ARG_VALUE" });
+			}
+			this._rules.push({ kind: "range", family: a.family, lo: ipToBigInt(a.addr, a.family), hi: ipToBigInt(b.addr, b.family),
+				text: `Range: ${familyLabel(a.family)} ${a.addr}-${b.addr}` });
+			return this;
+		}
+		addSubnet(net, prefix, family) {
+			const a = this._addr(net, family, "net");
+			if (typeof prefix !== "number") throw netArgType("prefix", "of type number", prefix);
+			const width = a.family === "ipv4" ? 32 : 128;
+			if (!Number.isInteger(prefix) || prefix < 0 || prefix > width) {
+				throw Object.assign(new RangeError(`The value of "prefix" is out of range. It must be >= 0 and <= ${width}. Received ${prefix}`),
+					{ code: "ERR_OUT_OF_RANGE" });
+			}
+			// The prefix counts from the address's OWN width, but the comparison
+			// happens in the 128-bit space, so an IPv4 prefix leaves the mapped
+			// ::ffff: header intact.
+			const hostBits = BigInt((a.family === "ipv4" ? 32 : 128) - prefix);
+			const base = ipToBigInt(a.addr, a.family);
+			const span = (1n << hostBits) - 1n;
+			const lo = base & ~span & ((1n << 128n) - 1n);
+			this._rules.push({ kind: "range", family: a.family, lo, hi: lo | span,
+				text: `Subnet: ${familyLabel(a.family)} ${bigIntToIP(lo, a.family)}/${prefix}` });
+			return this;
+		}
+		check(value, family) {
+			// A malformed FAMILY is an argument error; an address that simply does
+			// not parse is just an address the list does not contain.
+			const { addr, family: f } = this._addr(value, family, "address");
+			if ((f === "ipv4" && !isIPv4(addr)) || (f === "ipv6" && !isIPv6(addr))) return false;
+			const n = ipToBigInt(addr, f);
+			for (const r of this._rules) {
+				if (r.kind === "address" ? n === r.n : n >= r.lo && n <= r.hi) return true;
+			}
+			return false;
+		}
+	}
+
 	core.net = {
 		isIPv4,
 		isIPv6,
 		isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),
+		BlockList,
+		SocketAddress,
 		Socket: callableClass(Socket),
 		Stream: callableClass(Socket),
 		Server: callableClass(NetServer),

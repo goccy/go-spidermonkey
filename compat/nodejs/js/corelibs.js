@@ -610,7 +610,14 @@
 		if (seen.has(v)) return "[Circular]";
 		// Node: depth defaults to 2; null means unlimited (undefined means default).
 		const maxDepth = opts.depth === null ? Infinity : (opts.depth === undefined ? 2 : opts.depth);
-		if (depth > maxDepth) return Array.isArray(v) ? "[Array]" : "[Object]";
+		// Past the depth limit the value is named, not shown — and the name is
+		// its CLASS where it has one, since "[BlockList]" tells the reader what
+		// was elided and "[Object]" does not.
+		if (depth > maxDepth) {
+			if (Array.isArray(v)) return "[Array]";
+			const ctor = v.constructor && v.constructor.name;
+			return ctor && ctor !== "Object" ? `[${ctor}]` : "[Object]";
+		}
 		seen.add(v);
 		try {
 			if (Array.isArray(v)) {
@@ -1174,8 +1181,13 @@
 		}
 		// A RegExp matcher runs against the STRING REPRESENTATION of the error
 		// ("TypeError: bad thing"), not its message alone — which is what makes
-		// an anchored /^Error: toString$/ meaningful.
-		if (matcher instanceof RegExp) return matcher.test(String(err));
+		// an anchored /^Error: toString$/ meaningful. A coded error also answers
+		// to the form its stack header takes, "TypeError [ERR_X]: bad thing",
+		// which is how a test matches on the code with a bare /ERR_X/.
+		if (matcher instanceof RegExp) {
+			if (matcher.test(String(err))) return true;
+			return !!(err && err.code) && matcher.test(`${err.name} [${err.code}]: ${err.message}`);
+		}
 		if (matcher && typeof matcher === "object") {
 			return Object.keys(matcher).every((k) => {
 				const want = matcher[k];
