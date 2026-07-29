@@ -39,6 +39,34 @@
 	//   {type:"fixed", value}
 	//   {type:"segment", name, regex, prefix, suffix, modifier}
 	// A modifier is "", "?", "+" or "*".
+	// checkRegexGroup rejects a custom matcher the spec forbids: it must be
+	// plain ASCII and it must actually compile. Accepting either meant a
+	// pattern the platform requires to be a TypeError was quietly built and
+	// then matched nothing.
+	function checkRegexGroup(body) {
+		for (let i = 0; i < body.length; i++) {
+			if (body.charCodeAt(i) > 0x7f) {
+				throw new TypeError("URLPattern: a custom matcher must be ASCII: (" + body + ")");
+			}
+		}
+		try {
+			new RegExp(body, "u");
+		} catch (e) {
+			throw new TypeError("URLPattern: invalid custom matcher (" + body + "): " + e.message);
+		}
+		return body;
+	}
+
+	// A group name is ASCII too, for the same reason.
+	function checkName(name) {
+		for (let i = 0; i < name.length; i++) {
+			if (name.charCodeAt(i) > 0x7f) {
+				throw new TypeError("URLPattern: a group name must be ASCII: :" + name);
+			}
+		}
+		return name;
+	}
+
 	function parsePattern(pattern, opts) {
 		const parts = [];
 		let fixed = "";
@@ -86,12 +114,12 @@
 						body += pattern[k];
 						k++;
 					}
-					regex = body;
+					regex = checkRegexGroup(body);
 					j = k + 1;
 				}
 				const modifier = "?+*".includes(pattern[j]) ? pattern[j++] : "";
 				pushFixed();
-				parts.push({ type: "segment", name, regex, modifier });
+				parts.push({ type: "segment", name: checkName(name), regex, modifier });
 				i = j;
 				continue;
 			}
@@ -107,7 +135,7 @@
 				let j = k + 1;
 				const modifier = "?+*".includes(pattern[j]) ? pattern[j++] : "";
 				pushFixed();
-				parts.push({ type: "segment", name: String(anonymous++), regex: body, modifier });
+				parts.push({ type: "segment", name: String(anonymous++), regex: checkRegexGroup(body), modifier });
 				i = j;
 				continue;
 			}
@@ -279,6 +307,12 @@
 		const qIdx = rest.indexOf("?");
 		if (qIdx >= 0) { out.search = rest.slice(qIdx + 1); rest = rest.slice(0, qIdx); }
 		if (rest !== "") out.pathname = rest;
+		// A string pattern is a URL, so the parts a URL always has are present
+		// even when the text does not spell them out: an authority with no port
+		// means the empty port, not "any port", and an absolute URL has a path.
+		// Left as "*" these matched anything, which is how a pattern for
+		// "https://example.com/" also matched "https://example.com:8080/".
+		if (out.protocol !== undefined && out.port === undefined) out.port = "";
 		if (baseURL !== undefined) {
 			const base = new URL(baseURL);
 			if (out.protocol === undefined) out.protocol = base.protocol.replace(/:$/, "");
@@ -340,7 +374,13 @@
 			}
 			let init;
 			if (typeof input === "string" || input instanceof URL) {
+				// A string pattern is parsed as a URL, so it needs an origin: either
+				// its own protocol or a base URL to take one from. "/foo" alone is a
+				// TypeError, not a pathname-only pattern.
 				init = componentsFromString(String(input), baseURL);
+				if (init.protocol === undefined && baseURL === undefined) {
+					throw new TypeError("URLPattern: a relative pattern needs a base URL: " + String(input));
+				}
 			} else if (input === undefined) {
 				init = {};
 			} else if (input !== null && typeof input === "object") {
@@ -356,6 +396,14 @@
 				}
 			} else {
 				throw new TypeError("URLPattern: invalid input");
+			}
+			// A literal port has to be a port. "100000" is not, and the spec makes
+			// that a TypeError rather than a pattern that can never match.
+			if (init.port !== undefined) {
+				const literal = String(init.port);
+				if (literal !== "" && /^[0-9]+$/.test(literal) && Number(literal) > 65535) {
+					throw new TypeError("URLPattern: port out of range: " + literal);
+				}
 			}
 			this._ignoreCase = !!(options && options.ignoreCase);
 			this._parts = {};
