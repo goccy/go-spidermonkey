@@ -2300,6 +2300,163 @@
 		return allow === origin;
 	}
 
+	// --- CORS preflight ---------------------------------------------------
+	// A cross-origin request that is not "simple" may not be sent until the
+	// server has said it is welcome. Skipping the preflight meant a request the
+	// spec forbids went out anyway, and the suite's preflight fixtures reported
+	// that none had been made.
+	const CORS_SAFELISTED_REQUEST_HEADERS = new Set([
+		"accept", "accept-language", "content-language", "content-type", "range",
+	]);
+	const CORS_SAFELISTED_CONTENT_TYPES = new Set([
+		"application/x-www-form-urlencoded", "multipart/form-data", "text/plain",
+	]);
+	// Response headers a cors response exposes without being asked to.
+	const CORS_SAFELISTED_RESPONSE_HEADERS = new Set([
+		"cache-control", "content-language", "content-length", "content-type",
+		"expires", "last-modified", "pragma",
+	]);
+
+	function isSafelistedRequestHeader(name, value) {
+		const n = String(name).toLowerCase();
+		if (!CORS_SAFELISTED_REQUEST_HEADERS.has(n)) return false;
+		if (n === "content-type") {
+			const mime = String(value).split(";")[0].trim().toLowerCase();
+			return CORS_SAFELISTED_CONTENT_TYPES.has(mime);
+		}
+		return true;
+	}
+
+	// needsPreflight reports whether the request escapes the safelist, and names
+	// the headers that did so (the preflight has to list them).
+	function needsPreflight(method, headers) {
+		const m = String(method || "GET").toUpperCase();
+		const unsafe = [];
+		for (const [k, v] of headers) {
+			const n = String(k).toLowerCase();
+			// The user agent's own headers are never part of the author's request.
+			if (n === "origin" || n === "referer" || n === "user-agent") continue;
+			if (!isSafelistedRequestHeader(n, v)) unsafe.push(n);
+		}
+		const simpleMethod = m === "GET" || m === "HEAD" || m === "POST";
+		if (simpleMethod && unsafe.length === 0) return null;
+		return { method: m, headers: unsafe.sort() };
+	}
+
+	// splitList parses a comma-separated header into a lowercased Set.
+	function splitList(value) {
+		const out = new Set();
+		for (const part of String(value || "").split(",")) {
+			const t = part.trim().toLowerCase();
+			if (t) out.add(t);
+		}
+		return out;
+	}
+
+	async function runPreflight(url, need, origin) {
+		const h = { origin, "access-control-request-method": need.method };
+		if (need.headers.length) h["access-control-request-headers"] = need.headers.join(",");
+		// Browsers send Accept: */* on a preflight, and the suite's fixture
+		// rejects a preflight without it.
+		h.accept = "*/*";
+		// Through the same normalization the real response gets: the raw host
+		// object has no Headers to read the permissions out of.
+		const res = trackBodyUsed(await globalThis.__native_fetch(url, { method: "OPTIONS", headers: h, redirect: "error" }));
+		if (!(res.status >= 200 && res.status < 300)) {
+			throw corsError("preflight responded " + res.status);
+		}
+		const allowOrigin = res.headers.get("access-control-allow-origin");
+		if (allowOrigin !== "*" && allowOrigin !== origin) {
+			throw corsError("preflight did not allow " + origin);
+		}
+		const allowMethods = splitList(res.headers.get("access-control-allow-methods"));
+		if (!allowMethods.has("*") && !allowMethods.has(need.method.toLowerCase()) &&
+			!(need.method === "GET" || need.method === "HEAD" || need.method === "POST")) {
+			throw corsError("preflight did not allow method " + need.method);
+		}
+		const allowHeaders = splitList(res.headers.get("access-control-allow-headers"));
+		if (!allowHeaders.has("*")) {
+			for (const n of need.headers) {
+				if (!allowHeaders.has(n)) throw corsError("preflight did not allow header " + n);
+			}
+		}
+	}
+
+	// filterCORSResponseHeaders removes what a cors response may not expose: a
+	// page sees the safelist plus whatever Access-Control-Expose-Headers names.
+	function filterCORSResponseHeaders(res) {
+		const exposed = splitList(res.headers.get("access-control-expose-headers"));
+		const remove = [];
+		for (const [k] of res.headers) {
+			const n = String(k).toLowerCase();
+			if (CORS_SAFELISTED_RESPONSE_HEADERS.has(n) || exposed.has("*") || exposed.has(n)) continue;
+			remove.push(k);
+		}
+		for (const k of remove) {
+			try { res.headers.delete(k); } catch { /* an immutable guard: leave it */ }
+		}
+		return res;
+	}
+
+	// --- cross-origin redirect chain ---------------------------------------
+	// A CORS request is re-checked at EVERY hop: each response must permit the
+	// current origin, a hop that leaves the origin makes the next request's
+	// origin "null", and a redirect to a URL carrying credentials is a network
+	// error. Letting the host follow the chain hides all of that — only the
+	// final response was ever judged, so ~150 subtests that require a rejection
+	// mid-chain saw a resolved fetch.
+	const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+	async function followCORSRedirects(url, nInit, headers, envURL) {
+		let current = url;
+		let origin = envURL.origin;
+		let hops = 0;
+		for (;;) {
+			// The headers are materialized per hop: nInit.headers is only filled
+			// in by the single-shot dispatch path, and the Origin changes once a
+			// hop has left the origin.
+			const hdrObj = {};
+			for (const [k, v] of headers) hdrObj[k] = v;
+			hdrObj.origin = origin;
+			const step = { ...nInit, redirect: "manual", headers: hdrObj };
+			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
+			const target = new URL(current);
+			const crossHop = target.origin !== envURL.origin;
+			if (crossHop && !corsAllowsResponse(res, origin)) {
+				throw corsError("no Access-Control-Allow-Origin for " + origin + " at " + target.origin);
+			}
+			if (!REDIRECT_STATUSES.has(res.status)) {
+				if (crossHop) filterCORSResponseHeaders(res);
+				try { Object.defineProperty(res, "redirected", { configurable: true, value: hops > 0 }); } catch { /* ignore */ }
+				if (crossHop) {
+					try { Object.defineProperty(res, "type", { configurable: true, value: "cors" }); } catch { /* ignore */ }
+				}
+				return res;
+			}
+			const loc = res.headers.get("location");
+			if (!loc) return res;
+			let next;
+			try { next = new URL(loc, current); } catch { throw corsError("redirect to an unparseable URL"); }
+			// A redirect may not carry credentials in the URL.
+			if (next.username || next.password) throw corsError("redirect to a URL with credentials");
+			if (next.protocol !== "http:" && next.protocol !== "https:") {
+				throw corsError("redirect to a non-HTTP URL");
+			}
+			hops++;
+			if (hops > 20) throw corsError("too many redirects");
+			// Once a hop has left the origin the request is no longer same-origin
+			// to anything: its origin becomes opaque.
+			if (next.origin !== target.origin) origin = "null";
+			// 303, and 301/302 on a non-GET, drop the method and body.
+			if (res.status === 303 || ((res.status === 301 || res.status === 302) &&
+				String(step.method || "GET").toUpperCase() === "POST")) {
+				nInit = { ...nInit, method: "GET" };
+				delete nInit.body;
+			}
+			current = next.href;
+		}
+	}
+
 	globalThis.fetch = function fetch(input, init) {
 		// fetch must ALWAYS return a promise: a normalization failure (a malformed
 		// headers init, an unsupported ReadableStream body) must reject, not throw
@@ -2386,8 +2543,11 @@
 					(res) => {
 						cleanup();
 						const tracked = trackBodyUsed(res);
-						if (crossOrigin && mode === "cors" && !corsAllowsResponse(tracked, envURL.origin)) {
-							throw corsError("no Access-Control-Allow-Origin for " + envURL.origin);
+						if (crossOrigin && mode === "cors") {
+							if (!corsAllowsResponse(tracked, envURL.origin)) {
+								throw corsError("no Access-Control-Allow-Origin for " + envURL.origin);
+							}
+							filterCORSResponseHeaders(tracked);
 						}
 						if (crossOrigin && mode === "no-cors") return opaqueResponse(tracked);
 						if (crossOrigin) {
@@ -2405,12 +2565,35 @@
 					},
 				);
 			};
+			// A cross-origin request outside the safelist is preflighted first, and
+			// only dispatched if the server allows it. The headers must be final
+			// by then — a body contributes a Content-Type, and that is one of the
+			// things the safelist is about.
+			const redirectMode = nInit.redirect || "follow";
+			const chained = crossOrigin && mode === "cors" && redirectMode === "follow";
+			const send = () => {
+				const go = chained
+					? () => {
+						if (signal && onAbort) signal.addEventListener("abort", onAbort);
+						return followCORSRedirects(url, nInit, headers, envURL).then(
+							(res) => { cleanup(); return res; },
+							(err) => {
+								cleanup();
+								if (signal && signal.aborted) throw (signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+								throw err;
+							});
+					}
+					: dispatch;
+				const need = crossOrigin && mode === "cors" ? needsPreflight(method, headers) : null;
+				if (!need) return go();
+				return runPreflight(url, need, envURL.origin).then(go);
+			};
 			// A ReadableStream request body is drained to bytes before dispatch (the
 			// native path sends a buffered body; no chunked uploads yet).
 			if (bodyInit instanceof ReadableStream) {
 				return drainBodyStream(bodyInit).then((bytes) => {
 					if (bytes.length > 0) nInit.body = bytes;
-					return dispatch();
+					return send();
 				});
 			}
 			if (bodyInit !== undefined && bodyInit !== null) {
@@ -2418,7 +2601,7 @@
 				if (bytes !== null) nInit.body = bytes;
 				if (contentType && !headers.has("content-type")) headers.set("content-type", contentType);
 			}
-			return dispatch();
+			return send();
 		} catch (e) {
 			return Promise.reject(e);
 		}

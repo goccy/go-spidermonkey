@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // stash is wptserve's per-server key/value store: a handler puts a value under
@@ -74,6 +76,14 @@ func handlerFor(rel string) wptHandler {
 		return cleanStashHandler
 	case "fetch/api/resources/dump-authorization-header.py":
 		return dumpAuthorizationHandler
+	case "fetch/api/resources/preflight.py":
+		return preflightHandler
+	case "fetch/api/resources/redirect.py":
+		return redirectHandler
+	case "fetch/api/resources/trickle.py":
+		return trickleHandler
+	case "fetch/api/resources/cache.py":
+		return cacheHandler
 	}
 	return nil
 }
@@ -265,5 +275,262 @@ func dumpAuthorizationHandler(st *stash, w http.ResponseWriter, r *http.Request)
 	} else {
 		io.WriteString(w, "none")
 	}
+	return true
+}
+
+// preflightHandler is resources/preflight.py: on OPTIONS it records that a
+// preflight happened (under the query's token, in the stash) and answers with
+// whatever the query says to allow; on the real request it reports what it
+// recorded through x-* headers, since a bodyless response has nowhere else to
+// put it.
+func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	query := r.URL.Query()
+	token := query.Get("token")
+	w.Header().Set("Content-Type", "text/plain")
+	if origins := query.Get("origin"); origins != "" {
+		for _, o := range strings.Split(origins, ", ") {
+			w.Header().Add("Access-Control-Allow-Origin", o)
+		}
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+	if has(r, "clear-stash") {
+		_, ok := st.take(token)
+		w.WriteHeader(http.StatusOK)
+		if ok {
+			io.WriteString(w, "1")
+		} else {
+			io.WriteString(w, "0")
+		}
+		return true
+	}
+	if has(r, "credentials") {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if r.Method == http.MethodOptions {
+		if r.Header.Get("Access-Control-Request-Method") == "" {
+			http.Error(w, "ERROR: No access-control-request-method in preflight!", http.StatusBadRequest)
+			return true
+		}
+		if r.Header.Get("Accept") != "*/*" {
+			http.Error(w, "ERROR: Invalid access in preflight!", http.StatusBadRequest)
+			return true
+		}
+		if v := query.Get("max_age"); v != "" {
+			w.Header().Set("Access-Control-Max-Age", v)
+		}
+		if v := query.Get("allow_headers"); v != "" {
+			w.Header().Set("Access-Control-Allow-Headers", v)
+		}
+		if v := query.Get("allow_methods"); v != "" {
+			w.Header().Set("Access-Control-Allow-Methods", v)
+		}
+		if token != "" {
+			st.put(token, strings.Join([]string{
+				r.Header.Get("Access-Control-Request-Headers"),
+				"1",
+				r.Header.Get("Referer"),
+				r.Header.Get("User-Agent"),
+			}, "\n"))
+		}
+		status := http.StatusOK
+		if v := query.Get("preflight_status"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				status = n
+			}
+		}
+		w.WriteHeader(status)
+		return true
+	}
+
+	// The real request: report what the preflight recorded.
+	controlRequestHeaders, didPreflight, preflightReferrer, preflightUA := "", "0", "", ""
+	if token != "" {
+		if v, ok := st.take(token); ok {
+			parts := strings.SplitN(v, "\n", 4)
+			for len(parts) < 4 {
+				parts = append(parts, "")
+			}
+			controlRequestHeaders, didPreflight, preflightReferrer, preflightUA = parts[0], parts[1], parts[2], parts[3]
+		}
+	}
+	if has(r, "checkUserAgentHeaderInPreflight") && r.Header.Get("User-Agent") != preflightUA {
+		http.Error(w, "ERROR: No user-agent header in preflight", http.StatusBadRequest)
+		return true
+	}
+	w.Header().Set("Access-Control-Expose-Headers",
+		"x-did-preflight, x-control-request-headers, x-referrer, x-preflight-referrer, x-origin")
+	w.Header().Set("x-did-preflight", didPreflight)
+	w.Header().Set("x-control-request-headers", controlRequestHeaders)
+	w.Header().Set("x-preflight-referrer", preflightReferrer)
+	w.Header().Set("x-referrer", r.Header.Get("Referer"))
+	w.Header().Set("x-origin", r.Header.Get("Origin"))
+	if token != "" {
+		st.put(token, strings.Join([]string{controlRequestHeaders, didPreflight, preflightReferrer, preflightUA}, "\n"))
+	}
+	w.WriteHeader(http.StatusOK)
+	return true
+}
+
+// redirectHandler is resources/redirect.py. The redirect family is written
+// against its two behaviours: it counts the hops it has served under a stash
+// token, and it carries the whole query string forward so the next hop behaves
+// the same way.
+func redirectHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	query := r.URL.Query()
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Pragma", "no-cache")
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+
+	token := query.Get("token")
+	count, preflight := 0, "0"
+	if token != "" {
+		if v, ok := st.take(token); ok {
+			parts := strings.SplitN(v, "\n", 2)
+			count, _ = strconv.Atoi(parts[0])
+			if len(parts) > 1 {
+				preflight = parts[1]
+			}
+		}
+	}
+
+	if r.Method == http.MethodOptions {
+		if v := query.Get("allow_headers"); v != "" {
+			w.Header().Set("Access-Control-Allow-Headers", v)
+		}
+		preflight = "1"
+		// A preflight is NOT redirected unless the test asks for it.
+		if !has(r, "redirect_preflight") {
+			if token != "" {
+				st.put(token, fmt.Sprintf("%d\n%s", count, preflight))
+			}
+			w.WriteHeader(http.StatusOK)
+			return true
+		}
+	}
+
+	status := 302
+	if v := query.Get("redirect_status"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			status = n
+		}
+	}
+	count++
+
+	if loc := query.Get("location"); loc != "" {
+		target := loc
+		if !has(r, "simple") {
+			if u, err := url.Parse(loc); err == nil && (u.Scheme == "" || u.Scheme == "http" || u.Scheme == "https") {
+				// Carry the query forward so the next hop behaves the same, and
+				// vary it by count so a redirect LOOP keeps changing URL.
+				sep := "?"
+				if strings.Contains(target, "?") {
+					sep = "&"
+				}
+				forwarded := url.Values{}
+				for k, vs := range query {
+					if len(vs) > 0 {
+						forwarded.Set(k, vs[0])
+					}
+				}
+				forwarded.Set("count", strconv.Itoa(count))
+				target += sep + forwarded.Encode()
+			}
+		}
+		w.Header().Set("Location", target)
+	}
+	if v := query.Get("redirect_referrerpolicy"); v != "" {
+		w.Header().Set("Referrer-Policy", v)
+	}
+	if v := query.Get("delay"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 && ms < 5000 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+	}
+	if token != "" {
+		st.put(token, fmt.Sprintf("%d\n%s", count, preflight))
+		if v := query.Get("max_count"); v != "" {
+			if maxCount, err := strconv.Atoi(v); err == nil && count > maxCount {
+				// Stop redirecting and report the hop count. -1 because the last
+				// one is not a redirection.
+				w.WriteHeader(http.StatusOK)
+				io.WriteString(w, strconv.Itoa(count-1))
+				return true
+			}
+		}
+	}
+	w.WriteHeader(status)
+	return true
+}
+
+// trickleHandler is resources/trickle.py: it dribbles a body out in `count`
+// chunks `ms` apart, which is how the streaming and abort tests get a response
+// that is still arriving when they act on it.
+func trickleHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	ms := 500
+	if v := r.URL.Query().Get("ms"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ms = n
+		}
+	}
+	count := 50
+	if v := r.URL.Query().Get("count"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			count = n
+		}
+	}
+	// Bound what a single fixture can cost: the suite's own values are small,
+	// and a test that asks for minutes of dribbling would stall the run.
+	if ms < 0 {
+		ms = 0
+	}
+	if ms > 1000 {
+		ms = 1000
+	}
+	if count < 0 || count > 200 {
+		count = 50
+	}
+	delay := time.Duration(ms) * time.Millisecond
+	io.Copy(io.Discard, r.Body)
+	time.Sleep(delay)
+	if !has(r, "notype") {
+		w.Header().Set("Content-Type", "text/plain")
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	time.Sleep(delay)
+	for i := 0; i < count; i++ {
+		io.WriteString(w, "TEST_TRICKLE\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(delay)
+	}
+	return true
+}
+
+// cacheHandler is resources/cache.py: a fixed body behind an ETag, so the
+// conditional-request tests have something to revalidate against.
+func cacheHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	const etag = `"123abc"`
+	if r.Header.Get("If-None-Match") == etag {
+		w.Header().Set("X-HTTP-STATUS", "304")
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, "lorem ipsum dolor sit amet")
 	return true
 }
