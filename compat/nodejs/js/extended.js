@@ -549,7 +549,18 @@
 	};
 	process.availableMemory = () => 0;
 	process.constrainedMemory = () => 0;
-	process.getActiveResourcesInfo = () => [];
+	// What the loop is still waiting on. Node names each pending resource by its
+	// kind, and shutdown-ordering and leak checks read this to decide whether the
+	// loop is genuinely idle — a hard-coded empty list told them it always was.
+	process.getActiveResourcesInfo = () => [
+		...(globalThis.__active_timers ? globalThis.__active_timers() : []),
+		...(globalThis.__active_immediates ? globalThis.__active_immediates() : []),
+	];
+	// The two underscored predecessors, still used by published code and by
+	// Node's own suite. Neither distinguishes handles from requests here: the
+	// timers are the resources this runtime tracks.
+	process._getActiveHandles = () => [];
+	process._getActiveRequests = () => [];
 	process.abort = () => { throw new Error("process.abort() called"); };
 	process.setSourceMapsEnabled = () => {};
 

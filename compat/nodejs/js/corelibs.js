@@ -988,12 +988,24 @@
 
 	// ------------------------------------------------------------- timers
 
+	// Outstanding immediates, so process.getActiveResourcesInfo() can name them.
+	// An Immediate stops counting the moment it is about to run, which is what
+	// Node reports from inside the callback.
+	const liveImmediates = new Set();
+	globalThis.__active_immediates = () => [...liveImmediates].map(() => "Immediate");
 	globalThis.setImmediate = (fn, ...args) => {
 		if (typeof fn !== "function") throw new TypeError("callback is not a function");
-		return ops.immediate_set(args.length ? () => fn(...args) : fn);
+		let id;
+		const run = args.length ? () => fn(...args) : fn;
+		id = ops.immediate_set(() => { liveImmediates.delete(id); run(); });
+		liveImmediates.add(id);
+		return id;
 	};
 	globalThis.clearImmediate = (id) => {
-		if (id !== undefined && id !== null) ops.immediate_clear(Number(id) || 0);
+		if (id === undefined || id === null) return;
+		const n = Number(id) || 0;
+		liveImmediates.delete(n);
+		ops.immediate_clear(n);
 	};
 	// The web layer's setTimeout/setInterval already return Timeout-like
 	// handles (ref/unref/refresh/close, coercing to the numeric id), so the

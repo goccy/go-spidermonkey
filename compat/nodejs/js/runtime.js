@@ -65,7 +65,46 @@
 
 	// ------------------------------------------------------------ process
 
-	const env = ops.node_env();
+	// process.env is not a plain object: it is a view of the real environment,
+	// where every name and value is a STRING. `process.env.PORT = 8080` stores
+	// "8080", reading a name that was never set gives undefined rather than
+	// something inherited from Object.prototype, and a symbol is refused
+	// outright because an environment has no symbols in it. Handing out a plain
+	// object meant env.PORT came back as the number 8080, and
+	// `env.hasOwnProperty` resolved to a function.
+	const envStore = ops.node_env();
+	const env = new Proxy(envStore, {
+		get(target, prop) {
+			if (typeof prop === "symbol") return undefined;
+			return Object.prototype.hasOwnProperty.call(target, prop) ? target[prop] : undefined;
+		},
+		set(target, prop, value) {
+			if (typeof prop === "symbol" || typeof value === "symbol") {
+				throw new TypeError("Cannot convert a Symbol value to a string");
+			}
+			target[String(prop)] = String(value);
+			return true;
+		},
+		has(target, prop) {
+			if (typeof prop === "symbol") return false;
+			return Object.prototype.hasOwnProperty.call(target, prop);
+		},
+		deleteProperty(target, prop) {
+			if (typeof prop === "symbol") return true;
+			delete target[prop];
+			return true;
+		},
+		ownKeys(target) { return Object.keys(target); },
+		getOwnPropertyDescriptor(target, prop) {
+			if (typeof prop === "symbol" || !Object.prototype.hasOwnProperty.call(target, prop)) return undefined;
+			return { value: target[prop], writable: true, enumerable: true, configurable: true };
+		},
+		defineProperty(target, prop, desc) {
+			if (typeof prop === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+			target[String(prop)] = String(desc.value);
+			return true;
+		},
+	});
 	const process = {
 		env,
 		argv: ops.node_argv(),

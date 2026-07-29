@@ -2428,21 +2428,38 @@
 	// arm() (re)schedules the underlying host timer and returns its id, so
 	// refresh() can restart it with the same callback/delay (the common idle-
 	// timeout-reset idiom, and Node internals). _id is mutable across refresh.
-	const makeTimer = (arm) => ({
+	// Outstanding timers, by host id. Node reports these through
+	// process.getActiveResourcesInfo(), and answering "nothing is pending" while
+	// timers were in flight made every leak-check and shutdown-ordering test
+	// read the loop as already idle.
+	const liveTimers = new Map();
+	globalThis.__active_timers = () => [...liveTimers.values()];
+	const makeTimer = (arm, kind) => ({
 		_id: arm(),
 		_reffed: true,
+		_kind: kind,
 		unref() { if (this._reffed) { this._reffed = false; ops.timer_ref(this._id, false); } return this; },
 		ref() { if (!this._reffed) { this._reffed = true; ops.timer_ref(this._id, true); } return this; },
 		hasRef() { return this._reffed; },
 		refresh() {
+			liveTimers.delete(this._id);
 			ops.timer_clear(this._id);
 			this._id = arm();
+			liveTimers.set(this._id, this._kind);
 			if (!this._reffed) ops.timer_ref(this._id, false); // preserve unref state
 			return this;
 		},
 		close() { globalThis.clearTimeout(this._id); return this; },
 		[Symbol.toPrimitive]() { return this._id; },
 	});
+	// A one-shot timer stops being active the moment it fires; an interval stays
+	// active until it is cleared.
+	const trackTimer = (arm, kind, repeating) => {
+		const t = makeTimer(arm, kind);
+		liveTimers.set(t._id, kind);
+		if (!repeating) t._oneShot = true;
+		return t;
+	};
 	// runTimerCb isolates a timer callback throw: a throw in one timer must not
 	// tear down the whole event loop. Route it to the platform's uncaught-
 	// exception channel (installed by the Node layer); only if unhandled does it
@@ -2463,18 +2480,28 @@
 	};
 	globalThis.setTimeout = function setTimeout(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
-		const cb = () => runTimerCb(args.length ? () => fn(...args) : fn);
+		let self;
+		// A one-shot timer is still active WHILE its callback runs — Node reports
+		// it from inside — and stops being active once the callback returns.
+		const cb = () => {
+			try { runTimerCb(args.length ? () => fn(...args) : fn); }
+			finally { if (self) liveTimers.delete(self._id); }
+		};
 		const d = Number(delay) || 0;
-		return makeTimer(() => ops.timer_set(cb, d, false));
+		self = trackTimer(() => ops.timer_set(cb, d, false), "Timeout", false);
+		return self;
 	};
 	globalThis.setInterval = function setInterval(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
 		const cb = () => runTimerCb(args.length ? () => fn(...args) : fn);
 		const d = Number(delay) || 0;
-		return makeTimer(() => ops.timer_set(cb, d, true));
+		return trackTimer(() => ops.timer_set(cb, d, true), "Timeout", true);
 	};
 	globalThis.clearTimeout = globalThis.clearInterval = (id) => {
-		if (id !== undefined && id !== null) ops.timer_clear(Number(id) || 0);
+		if (id === undefined || id === null) return;
+		const n = Number(id) || 0;
+		liveTimers.delete(n);
+		ops.timer_clear(n);
 	};
 
 	// fetch: a thin JS wrapper over the native host fetch. WHATWG allows a Headers
