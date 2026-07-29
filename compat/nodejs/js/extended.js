@@ -280,15 +280,69 @@
 		bgCyanBright: [106, 49], bgWhiteBright: [107, 49],
 	};
 	util.styleText = (format, text) => {
+		// The TEXT must be a string — styling a number would produce escape codes
+		// around something the caller never meant to print — and an unknown style
+		// name is a VALUE error, since the argument is the right type and simply
+		// names nothing.
+		if (typeof text !== "string") {
+			throw Object.assign(new TypeError(`The "text" argument must be of type string. Received ${text === null ? "null" : typeof text}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
 		const list = Array.isArray(format) ? format : [format];
 		let open = "", close = "";
 		for (const f of list) {
 			const s = STYLES[f];
-			if (!s) throw new TypeError(`Invalid style: ${f}`);
+			if (!s) {
+				throw Object.assign(new TypeError(`The argument 'format' must be one of the known styles. Received ${JSON.stringify(f)}`),
+					{ code: "ERR_INVALID_ARG_VALUE" });
+			}
 			open += `\x1b[${s[0]}m`;
 			close = `\x1b[${s[1]}m` + close;
 		}
 		return open + text + close;
+	};
+
+	// util.parseEnv reads a .env file's contents into an object. It is a small
+	// well-defined format — KEY=value lines, # comments, optional quoting — and
+	// callers reach for it precisely so they do not have to write it again.
+	util.parseEnv = (content) => {
+		if (typeof content !== "string") {
+			throw Object.assign(new TypeError(`The "content" argument must be of type string. Received ${content === null ? "null" : typeof content}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		const out = {};
+		for (const raw of content.split(/\r?\n/)) {
+			const line = raw.trim();
+			if (!line || line.startsWith("#")) continue;
+			const eq = line.indexOf("=");
+			if (eq <= 0) continue;
+			const key = line.slice(0, eq).trim().replace(/^export\s+/, "");
+			let value = line.slice(eq + 1).trim();
+			// A quoted value keeps its inner whitespace and loses the quotes; an
+			// unquoted one stops at a trailing comment.
+			const q = value[0];
+			if ((q === '"' || q === "'" || q === "`") && value.endsWith(q) && value.length > 1) {
+				value = value.slice(1, -1);
+				if (q === '"') value = value.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+			} else {
+				const hash = value.indexOf(" #");
+				if (hash >= 0) value = value.slice(0, hash).trim();
+			}
+			out[key] = value;
+		}
+		return out;
+	};
+
+	// The internal host/port error helper, which published code still calls.
+	util._exceptionWithHostPort = (err, syscall, address, port, additional) => {
+		let details = address ? ` ${address}:${port}` : "";
+		if (additional) details += ` - Local (${additional})`;
+		const e = new Error(`${syscall}${typeof err === "string" ? " " + err : ""}${details}`);
+		e.code = typeof err === "string" ? err : String(err);
+		e.errno = typeof err === "number" ? err : undefined;
+		e.syscall = syscall;
+		if (address) { e.address = address; if (port) e.port = port; }
+		return e;
 	};
 
 	// util.getCallSites (Node >= 22): the current call stack as structured
