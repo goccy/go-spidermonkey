@@ -705,6 +705,9 @@
 	Socket.prototype.connect = function connect(port, host, connectListener) {
 		if (typeof port === "object") { const o = port; connectListener = host; host = o.host; port = o.port; if (o.allowHalfOpen !== undefined) this.allowHalfOpen = !!o.allowHalfOpen; }
 		if (typeof host === "function") { connectListener = host; host = undefined; }
+		// A string port is a path on a real Node (a unix socket); here only a
+		// numeric port can be dialled, so it is validated as one.
+		if (typeof port !== "string" || !port.startsWith("/")) port = validatePort(port);
 		host = host || "127.0.0.1";
 		this.connecting = true;
 		if (connectListener) this.once("connect", connectListener);
@@ -843,6 +846,7 @@
 	NetServer.prototype.listen = function listen(port, host, cb) {
 		if (typeof port === "object") { const o = port; cb = host; host = o.host; port = o.port; }
 		if (typeof host === "function") { cb = host; host = undefined; }
+		if (typeof port !== "string" || !port.startsWith("/")) port = validatePort(port);
 		host = host || "127.0.0.1";
 		const onConnection = (id, remote) => {
 			const sock = new Socket({ allowHalfOpen: this._allowHalfOpen });
@@ -1116,7 +1120,28 @@
 	// --------------------------------------------------------------- dgram
 	// UDP sockets over the udp_* host ops.
 
+	// A port is a 16-bit number. Accepting anything else and handing it to the
+	// host produced "address 999999: invalid port" from deep inside the dial,
+	// with no indication of which argument the caller got wrong.
+	function validatePort(port, name = "port") {
+		if (port === undefined || port === null) return 0;
+		const n = typeof port === "number" ? port : Number(port);
+		if (typeof port === "boolean" || Number.isNaN(n) || !Number.isInteger(n) || n < 0 || n > 65535) {
+			throw Object.assign(new RangeError(`${name} should be >= 0 and < 65536. Received type ${typeof port} (${port}).`),
+				{ code: "ERR_SOCKET_BAD_PORT" });
+		}
+		return n;
+	}
+
 	function Dgram(type) {
+		// udp4 and udp6 are the only socket types there are; anything else names
+		// a protocol this cannot open, and finding that out at bind time is too
+		// late to be useful.
+		const t = typeof type === "object" && type !== null ? type.type : type;
+		if (t !== undefined && t !== "udp4" && t !== "udp6") {
+			throw Object.assign(new TypeError(`Bad socket type specified. Valid types are: udp4, udp6`),
+				{ code: "ERR_SOCKET_BAD_TYPE" });
+		}
 		core.events.call(this);
 		this._id = null;
 		this._remote = null; // set by connect(): the default send destination
@@ -1135,6 +1160,7 @@
 		if (typeof port === "object" && port !== null) { const o = port; cb = address; address = o.address; port = o.port; }
 		if (typeof address === "function") { cb = address; address = undefined; }
 		if (typeof port === "function") { cb = port; port = undefined; }
+		port = validatePort(port);
 		const onMessage = (data, rinfo) => this.emit("message", Buffer.from(data), rinfo);
 		// The socket TYPE goes to the host: a udp4 socket must resolve and bind in
 		// the IPv4 family. Without it "localhost" resolved to ::1 for a udp4
