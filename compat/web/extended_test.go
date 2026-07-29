@@ -166,3 +166,25 @@ func TestWebStreams(t *testing.T) {
 		}
 	}
 }
+
+// A boxed primitive is a structured-cloneable type, and its value lives in an
+// internal slot rather than an own property — so the plain-object path turned
+// `new Number(5)` into `{}` and `instanceof Number` stopped being true. That
+// was 23 subtests of the structured-clone suite.
+func TestStructuredCloneBoxedPrimitives(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	if got := evalString(t, js, `(() => {
+		const out = [];
+		for (const v of [new Number(5), new String("hi"), new Boolean(true), Object(10n)]) {
+			const c = structuredClone(v);
+			out.push((c instanceof v.constructor) + ":" + String(c) + ":" + (c !== v));
+		}
+		// A Symbol wrapper is not cloneable, and must say so.
+		try { structuredClone(Object(Symbol("s"))); out.push("symbol:NO-THROW"); }
+		catch (e) { out.push("symbol:" + e.name); }
+		return out.join(" | ");
+	})()`); got != "true:5:true | true:hi:true | true:true:true | true:10:true | symbol:DataCloneError" {
+		t.Errorf("boxed clone = %q", got)
+	}
+}

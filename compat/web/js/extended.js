@@ -245,6 +245,27 @@
 		}
 	};
 
+	// ErrorEvent and PromiseRejectionEvent are the two error-reporting events
+	// the platform dispatches. They were missing entirely, so a handler written
+	// against either could not even be constructed.
+	globalThis.ErrorEvent ??= class ErrorEvent extends Event {
+		constructor(type, init = {}) {
+			super(type, init);
+			this.message = init.message ?? "";
+			this.filename = init.filename ?? "";
+			this.lineno = init.lineno ?? 0;
+			this.colno = init.colno ?? 0;
+			this.error = init.error ?? null;
+		}
+	};
+	globalThis.PromiseRejectionEvent ??= class PromiseRejectionEvent extends Event {
+		constructor(type, init = {}) {
+			super(type, init);
+			this.promise = init.promise;
+			this.reason = init.reason;
+		}
+	};
+
 	// --------------------------------------------------- structuredClone (full)
 	// Replaces the JSON-limited version: Map/Set/Date/RegExp/ArrayBuffer/
 	// typed arrays/Blob/File, cycles preserved. Functions/symbols/WeakMap
@@ -275,6 +296,18 @@
 			return out;
 		}
 		if (value instanceof Blob) { const out = value.slice(0, value.size, value.type); seen.set(value, out); return out; }
+		// A boxed primitive clones as a boxed primitive of the same type. The
+		// plain-object path below turned `new Number(5)` into `{}`: the value
+		// lives in an internal slot, not an own property, so nothing was copied
+		// and `instanceof Number` stopped being true.
+		for (const Box of [Number, String, Boolean, BigInt, Symbol]) {
+			if (value instanceof Box) {
+				if (Box === Symbol) throw new DOMException("could not be cloned", "DataCloneError");
+				const out = Object(Box.prototype.valueOf.call(value));
+				seen.set(value, out);
+				return out;
+			}
+		}
 
 		if (value instanceof Map) {
 			const out = new Map();
