@@ -2379,11 +2379,19 @@
 				}
 			}
 		}
+		// withStoreScope(context) is runStores turned inside out: instead of
+		// wrapping a function, it ENTERS the stores and hands back a disposable
+		// that leaves them again — which is what `using scope = ...` needs.
+		withStoreScope(context) {
+			const leave = enterBoundStores(this, context);
+			this.publish(context);
+			return { [Symbol.dispose]: leave };
+		}
 		bindStore(store, transform) { this._stores.set(store, transform || ((v) => v)); }
 		unbindStore(store) { return this._stores.delete(store); }
 		runStores(context, fn, thisArg, ...args) {
-			this.publish(context);
-			let run = () => Reflect.apply(fn, thisArg, args);
+			// publish is INNERMOST, so subscribers see the stores already entered.
+			let run = () => { this.publish(context); return Reflect.apply(fn, thisArg, args); };
 			for (const [store, transform] of this._stores) {
 				const next = run;
 				run = () => store.run(transform(context), next);
@@ -2391,6 +2399,19 @@
 			return run();
 		}
 	}
+	// Enter every store bound to a channel and return the function that leaves
+	// them again. Entering BEFORE publishing is deliberate: a subscriber runs
+	// inside the scope the channel is establishing, and asking it to observe a
+	// store that is not set yet defeats the point of binding one.
+	function enterBoundStores(channel, context) {
+		const restore = [];
+		for (const [store, transform] of channel._stores) {
+			restore.push([store, store.getStore()]);
+			store.enterWith(transform(context));
+		}
+		return () => { for (const [store, prev] of restore) store.enterWith(prev); };
+	}
+
 	function dcChannel(name) {
 		name = String(name);
 		let ch = dcChannels.get(name);
@@ -2436,6 +2457,39 @@
 					channels.end.publish(context);
 				}
 			},
+			// traceCallback wraps a callback-style call: start publishes before,
+			// asyncStart/asyncEnd around the CALLBACK, and the stores stay bound
+			// for its duration — which is the whole reason it is not traceSync.
+			traceCallback(fn, position = -1, context = {}, thisArg, ...args) {
+				channels.start.publish(context);
+				const cb = position >= 0 ? args[position] : args[args.length - 1];
+				const wrapped = function (err, res) {
+					if (err) { context.error = err; channels.error.publish(context); }
+					else { context.result = res; }
+					channels.asyncStart.publish(context);
+					try {
+						return typeof cb === "function" ? Reflect.apply(cb, this, arguments) : undefined;
+					} finally {
+						channels.asyncEnd.publish(context);
+					}
+				};
+				if (position >= 0) args[position] = wrapped;
+				else args[args.length - 1] = wrapped;
+				try {
+					return Reflect.apply(fn, thisArg, args);
+				} catch (error) {
+					context.error = error;
+					channels.error.publish(context);
+					throw error;
+				} finally {
+					channels.end.publish(context);
+				}
+			},
+			// The stores bound to `start`, held for the duration of fn. Node names
+			// it withStoreScope because the SCOPE is what it gives you, not a trace.
+			withStoreScope(context, fn, thisArg, ...args) {
+				return channels.start.runStores(context, fn, thisArg, ...args);
+			},
 			tracePromise(fn, context = {}, thisArg, ...args) {
 				channels.start.publish(context);
 				let promise;
@@ -2455,8 +2509,64 @@
 			},
 		};
 	}
+	// A BoundedChannel is a tracing channel narrowed to the two edges of an
+	// operation — start and end — for callers that only want to bound it, not
+	// to trace what happened inside.
+	function BoundedChannel(nameOrChannels) {
+		if (!new.target) return new BoundedChannel(nameOrChannels);
+		const sub = (suffix) => typeof nameOrChannels === "string"
+			? dcChannel(`tracing:${nameOrChannels}:${suffix}`)
+			: nameOrChannels[suffix];
+		this.start = sub("start");
+		this.end = sub("end");
+	}
+	Object.defineProperty(BoundedChannel.prototype, "hasSubscribers", {
+		get() { return this.start.hasSubscribers || this.end.hasSubscribers; },
+		configurable: true,
+	});
+	Object.assign(BoundedChannel.prototype, {
+		subscribe(handlers) {
+			for (const k of ["start", "end"]) if (handlers[k]) this[k].subscribe(handlers[k]);
+		},
+		unsubscribe(handlers) {
+			// True only if something was actually removed, so a caller can tell a
+			// real unsubscribe from a repeat.
+			let removed = false;
+			for (const k of ["start", "end"]) if (handlers[k] && this[k].unsubscribe(handlers[k])) removed = true;
+			return removed;
+		},
+		// The context comes FIRST here: a bounded channel is about the operation
+		// being bounded, and the function is what happens inside it.
+		run(context, fn, thisArg, ...args) {
+			this.start.publish(context);
+			try {
+				const result = Reflect.apply(fn, thisArg, args);
+				context.result = result;
+				return result;
+			} finally {
+				this.end.publish(context);
+			}
+		},
+		// The disposable form: start now, end when the scope is left. The context
+		// is published by reference, so what the block adds to it is visible to
+		// the end subscriber.
+		withScope(context) {
+			// The stores bound to `start` stay entered for the whole scope, so the
+			// `end` subscriber sees them too — the scope is the operation, not
+			// just its first edge.
+			const leave = enterBoundStores(this.start, context);
+			this.start.publish(context);
+			const end = this.end;
+			return {
+				[Symbol.dispose]() { end.publish(context); leave(); },
+			};
+		},
+	});
+
 	core.diagnostics_channel = {
 		Channel,
+		BoundedChannel,
+		boundedChannel: (nameOrChannels) => new BoundedChannel(nameOrChannels),
 		channel: dcChannel,
 		hasSubscribers: (name) => {
 			const ch = dcChannels.get(String(name));
