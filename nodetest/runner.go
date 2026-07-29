@@ -54,13 +54,19 @@ type Options struct {
 }
 
 const (
-	// DefaultTimeout bounds one test file. It is deliberately small, and the
-	// reason is measured rather than assumed: across the suite the slowest test
-	// that COMPLETES takes about 2 seconds and the median takes 40 milliseconds,
-	// so nothing legitimate comes close to this. Only tests that hang ever pay
-	// the timeout — and they pay it in full, which is why they dominated the wall
-	// clock entirely at 60s (about 7% of the tests were 95% of the runtime).
-	// Raise it with NODETEST_TIMEOUT on a slow machine.
+	// DefaultTimeout bounds one test file. It is deliberately small because a
+	// test that hangs pays it in full, and at 60s those dominated the wall clock
+	// entirely (about 7% of the tests were 95% of the runtime).
+	//
+	// The margin is measured, not assumed, and it has NARROWED as more of the
+	// suite began completing: the median is still ~40ms, but the slowest test
+	// that completes is now about 5 seconds
+	// (test-zlib-unzip-one-byte-chunks.js, which feeds a gzip stream one byte at
+	// a time). That is a 2x margin rather than the 5x this was chosen with, so
+	// under a sharded run's concurrency a test in that band can exceed the cap
+	// and be recorded as a hang — which shows up as a flaky expectation rather
+	// than as the slow test it is. Raise it with NODETEST_TIMEOUT when
+	// reproducing a baseline on a loaded machine.
 	DefaultTimeout = 10 * time.Second
 	// A Node test is small; the cap is deliberately modest because a test that
 	// blocks in a host op is ABANDONED with its interpreter still alive (see
