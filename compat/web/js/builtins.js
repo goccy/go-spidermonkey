@@ -2474,6 +2474,15 @@
 		return new TypeError("Failed to fetch: " + what);
 	}
 
+	// A network failure rejects with a TypeError. The host reports one as a
+	// plain string ("Get \"http://…\": dial tcp …"), and rejecting with that
+	// string meant every test asserting `promise_rejects_js(TypeError)` saw a
+	// string instead — the failure was right, its type was not.
+	function asFetchError(err) {
+		if (err instanceof Error) return err;
+		return new TypeError("Failed to fetch: " + String(err));
+	}
+
 	function corsAllowsResponse(res, origin) {
 		const allow = res.headers && res.headers.get("access-control-allow-origin");
 		if (!allow) return false;
@@ -2776,7 +2785,7 @@
 						// error string; reject with the signal's reason (a proper
 						// DOMException "AbortError") instead of that opaque string.
 						if (signal && signal.aborted) throw (signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
-						throw err;
+						throw asFetchError(err);
 					},
 				);
 			};
@@ -2795,7 +2804,7 @@
 							(err) => {
 								cleanup();
 								if (signal && signal.aborted) throw (signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
-								throw err;
+								throw asFetchError(err);
 							});
 					}
 					: dispatch;
