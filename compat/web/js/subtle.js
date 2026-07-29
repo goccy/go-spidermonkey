@@ -16,9 +16,19 @@
 		return u;
 	};
 
+	// "Get a copy of the buffer source" yields the bytes it HAS. A buffer
+	// detached before the copy — which a caller can arrange from a getter on the
+	// algorithm, since normalization runs first — has none, and the copy is
+	// empty rather than an error: the operation then proceeds on no input, which
+	// is exactly what the spec describes and what callers observe elsewhere.
 	const toU8 = (data) => {
-		if (data instanceof ArrayBuffer) return new Uint8Array(data);
-		if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+		if (data instanceof ArrayBuffer) {
+			try { return new Uint8Array(data); } catch { return new Uint8Array(0); }
+		}
+		if (ArrayBuffer.isView(data)) {
+			try { return new Uint8Array(data.buffer, data.byteOffset, data.byteLength); }
+			catch { return new Uint8Array(0); }
+		}
 		throw new TypeError("expected a BufferSource");
 	};
 	const toBuf = (arr) => Uint8Array.from(arr).buffer;
@@ -354,8 +364,13 @@
 	// when they are not. Unchecked, encrypting with (say) an AES-CBC key under
 	// {name:"AES-GCM"} reached the cipher and failed with whatever the host
 	// happened to say.
-	function checkKeyAlgMatches(alg, key, op) {
-		const want = String(algName(alg)).toUpperCase();
+	// The name is passed IN, already read. An algorithm's `name` is normalized
+	// exactly once per operation, and reading it again is observable: a caller
+	// can make it a getter with side effects, and the WPT suite does precisely
+	// that to detach a buffer mid-call. Reading it twice ran those side effects
+	// twice.
+	function checkKeyAlgMatches(name, key, op) {
+		const want = String(name).toUpperCase();
 		const have = String((key && key.algorithm && key.algorithm.name) || "").toUpperCase();
 		if (have && want && have !== want) {
 			throw new DOMException(
@@ -602,34 +617,34 @@
 
 		async sign(alg, key, data) {
 			need(key, "sign");
-			checkKeyAlgMatches(alg, key, "sign");
 			const name = algName(alg).toUpperCase();
+			checkKeyAlgMatches(name, key, "sign");
 			if (name === "HMAC") return toBuf(ops.subtle_hmac_sign(key.algorithm.hash.name, key._h, toU8(data)));
 			if (name === "ECDSA") return toBuf(ops.subtle_ec_sign(hashName(alg.hash), key._h, toU8(data)));
 			if (name === "ED25519") return toBuf(ops.subtle_ed_sign(key._h, toU8(data)));
 			if (RSA_NAMES.includes(name)) {
 				return toBuf(ops.subtle_rsa_sign(rsaScheme(name), key.algorithm.hash.name, alg.saltLength == null ? -1 : Number(alg.saltLength), key._h, toU8(data)));
 			}
-			unsupported(`algorithm ${algName(alg)}`);
+			unsupported(`algorithm ${name}`);
 		},
 
 		async verify(alg, key, signature, data) {
 			need(key, "verify");
-			checkKeyAlgMatches(alg, key, "verify");
 			const name = algName(alg).toUpperCase();
+			checkKeyAlgMatches(name, key, "verify");
 			if (name === "HMAC") return ops.subtle_hmac_verify(key.algorithm.hash.name, key._h, toU8(signature), toU8(data));
 			if (name === "ECDSA") return ops.subtle_ec_verify(hashName(alg.hash), key._h, toU8(signature), toU8(data));
 			if (name === "ED25519") return ops.subtle_ed_verify(key._h, toU8(signature), toU8(data));
 			if (RSA_NAMES.includes(name)) {
 				return ops.subtle_rsa_verify(rsaScheme(name), key.algorithm.hash.name, alg.saltLength == null ? -1 : Number(alg.saltLength), key._h, toU8(signature), toU8(data));
 			}
-			unsupported(`algorithm ${algName(alg)}`);
+			unsupported(`algorithm ${name}`);
 		},
 
 		async encrypt(alg, key, data) {
 			need(key, "encrypt");
-			checkKeyAlgMatches(alg, key, "encrypt");
 			const name = algName(alg).toUpperCase();
+			checkKeyAlgMatches(name, key, "encrypt");
 			if (AES_NAMES.includes(name)) {
 				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
@@ -640,13 +655,13 @@
 				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
 				return toBuf(subtleFail(ops.subtle_rsa_oaep(true, key._h, key.algorithm.hash.name, toU8(data), label)));
 			}
-			unsupported(`encrypt algorithm ${algName(alg)}`);
+			unsupported(`encrypt algorithm ${name}`);
 		},
 
 		async decrypt(alg, key, data) {
 			need(key, "decrypt");
-			checkKeyAlgMatches(alg, key, "decrypt");
 			const name = algName(alg).toUpperCase();
+			checkKeyAlgMatches(name, key, "decrypt");
 			if (AES_NAMES.includes(name)) {
 				const iv = toU8(name === "AES-CTR" ? alg.counter : alg.iv);
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
@@ -657,7 +672,7 @@
 				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
 				return toBuf(subtleFail(ops.subtle_rsa_oaep(false, key._h, key.algorithm.hash.name, toU8(data), label)));
 			}
-			unsupported(`decrypt algorithm ${algName(alg)}`);
+			unsupported(`decrypt algorithm ${name}`);
 		},
 
 		// wrapKey exports the key material, then encrypts it with the wrapping
@@ -666,7 +681,7 @@
 		// key only carries wrapKey/unwrapKey usages.
 		async wrapKey(format, key, wrappingKey, wrapAlg) {
 			need(wrappingKey, "wrapKey");
-			checkKeyAlgMatches(wrapAlg, wrappingKey, "wrapKey");
+			checkKeyAlgMatches(algName(wrapAlg), wrappingKey, "wrapKey");
 			const exported = await subtle.exportKey(format, key);
 			const bytes = format === "jwk" ? new TextEncoder().encode(JSON.stringify(exported)) : new Uint8Array(exported);
 			return toBuf(rawCrypt(true, wrapAlg, wrappingKey, bytes));
@@ -674,7 +689,7 @@
 
 		async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlg, keyAlg, extractable, usages) {
 			need(unwrappingKey, "unwrapKey");
-			checkKeyAlgMatches(unwrapAlg, unwrappingKey, "unwrapKey");
+			checkKeyAlgMatches(algName(unwrapAlg), unwrappingKey, "unwrapKey");
 			const decrypted = new Uint8Array(rawCrypt(false, unwrapAlg, unwrappingKey, toU8(wrappedKey)));
 			const material = format === "jwk"
 				? JSON.parse(new TextDecoder().decode(decrypted))
@@ -689,14 +704,14 @@
 		// them as a CryptoKey of the caller's chosen algorithm.
 		async encapsulateBits(alg, encapsulationKey) {
 			need(encapsulationKey, "encapsulateBits");
-			checkKeyAlgMatches(alg, encapsulationKey, "encapsulateBits");
+			checkKeyAlgMatches(algName(alg), encapsulationKey, "encapsulateBits");
 			const r = encapsulate(encapsulationKey);
 			return { sharedKey: r.shared.buffer, ciphertext: r.ct.buffer };
 		},
 
 		async encapsulateKey(alg, encapsulationKey, sharedKeyAlg, extractable, usages) {
 			need(encapsulationKey, "encapsulateKey");
-			checkKeyAlgMatches(alg, encapsulationKey, "encapsulateKey");
+			checkKeyAlgMatches(algName(alg), encapsulationKey, "encapsulateKey");
 			const r = encapsulate(encapsulationKey);
 			return {
 				sharedKey: await sharedKeyFrom(r.shared, sharedKeyAlg, extractable, usages),
@@ -706,13 +721,13 @@
 
 		async decapsulateBits(alg, decapsulationKey, ciphertext) {
 			need(decapsulationKey, "decapsulateBits");
-			checkKeyAlgMatches(alg, decapsulationKey, "decapsulateBits");
+			checkKeyAlgMatches(algName(alg), decapsulationKey, "decapsulateBits");
 			return toBuf(subtleFail(ops.subtle_mlkem_decapsulate(decapsulationKey._h, toU8(ciphertext))));
 		},
 
 		async decapsulateKey(alg, decapsulationKey, ciphertext, sharedKeyAlg, extractable, usages) {
 			need(decapsulationKey, "decapsulateKey");
-			checkKeyAlgMatches(alg, decapsulationKey, "decapsulateKey");
+			checkKeyAlgMatches(algName(alg), decapsulationKey, "decapsulateKey");
 			const bits = subtleFail(ops.subtle_mlkem_decapsulate(decapsulationKey._h, toU8(ciphertext)));
 			return sharedKeyFrom(bits, sharedKeyAlg, extractable, usages);
 		},

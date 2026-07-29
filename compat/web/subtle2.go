@@ -82,29 +82,39 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 	}
 	switch mode {
 	case "AES-GCM":
-		// WebCrypto permits any non-empty IV length. Go fixes the nonce size,
-		// and Seal/Open PANIC on a mismatch, so pick the AEAD by the actual IV
-		// length instead of hard-coding 12. Non-default tag sizes only compose
-		// with the standard 96-bit nonce in the stdlib, so require 12 there.
+		// WebCrypto permits ANY non-empty IV length and any of the seven tag
+		// lengths. Go's stdlib offers each independently — NewGCMWithNonceSize
+		// fixes the tag at 128 bits, NewGCMWithTagSize fixes the nonce at 96 —
+		// and there is no constructor for both, which is why every combination
+		// off the default pair used to be refused outright.
+		//
+		// They compose without a bespoke GCM: a short tag IS the full tag
+		// truncated, and the ciphertext does not depend on the tag length at
+		// all. So the AEAD is always built for the caller's nonce length, and
+		// the tag is cut to size on the way out and checked by recomputation on
+		// the way in.
 		if len(iv) == 0 {
 			return subtleErr("OperationError: AES-GCM IV must not be empty"), nil
 		}
-		var gcm cipher.AEAD
-		if tagBytes == 16 {
-			gcm, err = cipher.NewGCMWithNonceSize(block, len(iv))
-		} else if len(iv) == 12 {
-			gcm, err = cipher.NewGCMWithTagSize(block, tagBytes)
-		} else {
-			return subtleErr("OperationError: AES-GCM with a non-default tag length requires a 12-byte IV"), nil
+		switch tagBytes {
+		case 4, 8, 12, 13, 14, 15, 16:
+		default:
+			return subtleErr("OperationError: AES-GCM tagLength must be 32, 64, 96, 104, 112, 120 or 128 bits"), nil
 		}
+		gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 		if err != nil {
 			return subtleErr("OperationError: " + err.Error()), nil
 		}
 		if encrypt {
-			return bytesValue(gcm.Seal(nil, iv, data, aad)), nil
+			sealed := gcm.Seal(nil, iv, data, aad)
+			// sealed is ciphertext||tag16; keep only the requested tag bytes.
+			return bytesValue(sealed[:len(data)+tagBytes]), nil
 		}
-		pt, err := gcm.Open(nil, iv, data, aad)
-		if err != nil {
+		if len(data) < tagBytes {
+			return subtleErr("OperationError: decryption failed"), nil
+		}
+		pt, ok := gcmOpenTruncated(gcm, iv, data, aad, tagBytes)
+		if !ok {
 			return subtleErr("OperationError: decryption failed"), nil
 		}
 		return bytesValue(pt), nil
@@ -493,4 +503,35 @@ func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 		"subtle_pbkdf2":            s.opPBKDF2Derive,
 		"subtle_rsa_oaep":          s.opRSAOAEP,
 	}
+}
+
+// gcmOpenTruncated verifies and decrypts a GCM message whose tag was cut to
+// tagBytes. The tag length changes nothing about the ciphertext, so the work is
+// to recover the plaintext and then recompute what the full tag would have
+// been.
+//
+// The keystream comes out of the AEAD itself: sealing a run of zeros yields the
+// keystream, because 0 XOR ks is ks. XOR it over the ciphertext for the
+// plaintext, seal that for real, and compare — both the ciphertext (which must
+// match, or the message was altered) and the leading tagBytes of the tag.
+func gcmOpenTruncated(gcm cipher.AEAD, iv, data, aad []byte, tagBytes int) ([]byte, bool) {
+	ct := data[:len(data)-tagBytes]
+	given := data[len(data)-tagBytes:]
+	if tagBytes == gcm.Overhead() {
+		pt, err := gcm.Open(nil, iv, data, aad)
+		return pt, err == nil
+	}
+	keystream := gcm.Seal(nil, iv, make([]byte, len(ct)), nil)[:len(ct)]
+	pt := make([]byte, len(ct))
+	for i := range ct {
+		pt[i] = ct[i] ^ keystream[i]
+	}
+	sealed := gcm.Seal(nil, iv, pt, aad)
+	if subtle.ConstantTimeCompare(sealed[:len(ct)], ct) != 1 {
+		return nil, false
+	}
+	if subtle.ConstantTimeCompare(sealed[len(ct):len(ct)+tagBytes], given) != 1 {
+		return nil, false
+	}
+	return pt, true
 }
