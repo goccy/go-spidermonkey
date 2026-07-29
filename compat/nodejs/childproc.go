@@ -46,10 +46,12 @@ type procState struct {
 	// than OS processes; their ids are negative so they can never collide with
 	// a real pid.
 	nextNestedPID int64
+	// ipc holds the fork() channel of each nested child, keyed by its id.
+	ipc map[int64]*ipcChannel
 }
 
 func newProcState() *procState {
-	return &procState{procs: map[int64]*exec.Cmd{}, stdin: map[int64]*connWriter{}}
+	return &procState{procs: map[int64]*exec.Cmd{}, stdin: map[int64]*connWriter{}, ipc: map[int64]*ipcChannel{}}
 }
 
 func (rt *Runtime) childOps() map[string]spidermonkey.Func {
@@ -407,6 +409,13 @@ func (rt *Runtime) spawnNested(cfg spidermonkey.Config, opts *spidermonkey.Objec
 	w.attach(inW)
 	go w.run(func(error) {})
 	st.stdin[id] = w
+	// fork() asks for an IPC channel; spawn() does not. The guest signals it
+	// with stdio containing "ipc", exactly as Node's own option does.
+	var ipc *ipcChannel
+	if wantsIPC(opts) {
+		ipc = newIPCChannel()
+		st.ipc[id] = ipc
+	}
 	st.mu.Unlock()
 
 	rt.loop.AddPending("childproc")
@@ -416,7 +425,10 @@ func (rt *Runtime) spawnNested(cfg spidermonkey.Config, opts *spidermonkey.Objec
 	env := envList(opts, cfg.Env)
 	cwd := optString(opts, "cwd")
 	go func() {
-		res := rt.runNested(cfg, argv, env, cwd, inR, outW, errW, 0)
+		res := rt.runNestedIPC(cfg, argv, env, cwd, inR, outW, errW, 0, ipc)
+		if ipc != nil {
+			ipc.close()
+		}
 		outW.Close()
 		errW.Close()
 		wgOut.Wait()
@@ -596,4 +608,14 @@ func (rt *Runtime) closeChild() {
 			c.Process.Kill()
 		}
 	}
+}
+
+// wantsIPC reports whether the caller asked for a message channel: Node
+// signals it by putting "ipc" in the stdio array, which is what fork() does.
+func wantsIPC(opts *spidermonkey.Object) bool {
+	if opts == nil {
+		return false
+	}
+	v, ok := optScalar(opts, "ipc")
+	return ok && v.Bool()
 }

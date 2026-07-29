@@ -50,6 +50,10 @@ var extendedJS string
 type Options struct {
 	// Argv becomes process.argv. Empty means ["node", "main"].
 	Argv []string
+	// ipc, when set, makes this runtime the CHILD end of a fork() channel:
+	// process.send and process.on('message') talk to the parent through it.
+	// Set only by spawnNested; there is no way to ask for it from outside.
+	ipc *ipcChannel
 }
 
 // Runtime is one Node.js-compatible installation on one interpreter.
@@ -68,7 +72,10 @@ type Runtime struct {
 	net            *netState
 	workers        *workerManager
 	child          *procState
-	io             *ioState
+	// ipcChild is set on a runtime that IS a forked child: it is the one end of
+	// the channel back to its parent.
+	ipcChild *ipcChannel
+	io       *ioState
 
 	mu             sync.Mutex
 	pendingReturns []*spidermonkey.Object // handles returned to the guest, freed on release_pending
@@ -135,6 +142,7 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	}
 	if len(opts) > 0 {
 		rt.opts = opts[0]
+		rt.ipcChild = rt.opts.ipc
 	}
 	if len(rt.opts.Argv) == 0 {
 		rt.opts.Argv = []string{"node", "main"}
@@ -161,6 +169,13 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	defer ops.Free()
 	for name, fn := range rt.ops() {
 		if err := ops.DefineFunc(name, fn); err != nil {
+			return nil, err
+		}
+	}
+	// A forked child is told so before the core libraries run: process.send
+	// exists only on a child, which is how Node itself distinguishes one.
+	if rt.ipcChild != nil {
+		if err := js.Global().Set("__node_has_ipc", spidermonkey.ValueOf(true)); err != nil {
 			return nil, err
 		}
 	}
@@ -490,7 +505,7 @@ func (rt *Runtime) ops() map[string]spidermonkey.Func {
 		"crypto_hmac":     rt.opCryptoHMAC,
 	}
 	for _, group := range []map[string]spidermonkey.Func{
-		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.dnsOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(), rt.ioOps(), rt.sysOps(),
+		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.dnsOps(), rt.ipcOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(), rt.ioOps(), rt.sysOps(),
 	} {
 		for name, fn := range group {
 			table[name] = fn

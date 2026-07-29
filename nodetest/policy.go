@@ -89,12 +89,6 @@ func skipReason(rel, src string) string {
 		strings.Contains(src, "internalBinding(") {
 		return "tests node-private internals"
 	}
-	// child_process.fork needs an IPC channel to the child, which the nested
-	// interpreter does not have yet. Spawning process.execPath itself DOES work
-	// now (see compat/nodejs/nested.go), so those tests are no longer skipped.
-	if strings.Contains(src, ".fork(") || strings.Contains(src, "fork(__filename") {
-		return "child_process.fork needs an IPC channel"
-	}
 	// Native addons cannot exist in a wasm sandbox.
 	if strings.Contains(src, ".node')") || strings.Contains(src, `.node")`) ||
 		strings.Contains(src, "process.dlopen") {

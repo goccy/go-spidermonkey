@@ -435,6 +435,35 @@
 	};
 	globalThis.__node_reset_exit_emitted = () => { __exitEmitted = false; };
 
+	// The CHILD end of a fork() channel. `__node_has_ipc` is set by the host on
+	// a runtime that was forked; without it process.send is absent, which is
+	// exactly how Node tells a forked child from a plain one.
+	if (globalThis.__node_has_ipc) {
+		process.connected = true;
+		process.channel = { ref() {}, unref() {} };
+		process.send = function send(message, sendHandle, options, callback) {
+			if (typeof sendHandle === "function") { callback = sendHandle; sendHandle = undefined; }
+			else if (typeof options === "function") { callback = options; options = undefined; }
+			if (!process.connected) {
+				const e = Object.assign(new Error("channel closed"), { code: "ERR_IPC_CHANNEL_CLOSED" });
+				if (callback) { process.nextTick(() => callback(e)); return false; }
+				throw e;
+			}
+			const ok = ops.ipc_send(0, JSON.stringify(message === undefined ? null : message));
+			if (callback) process.nextTick(() => callback(ok ? null : new Error("channel closed")));
+			return ok;
+		};
+		process.disconnect = function disconnect() {
+			if (!process.connected) return;
+			process.connected = false;
+			ops.ipc_disconnect(0);
+			process.nextTick(() => process.emit("disconnect"));
+		};
+		ops.ipc_start(0,
+			(json) => { try { process.emit("message", JSON.parse(json)); } catch { /* not JSON: drop */ } },
+			() => { if (process.connected) { process.connected = false; process.emit("disconnect"); } });
+	}
+
 	// The uncaughtException channel: an error escaping a process.nextTick
 	// callback (or a stream 'error' with no listener) routes here. If a handler
 	// is registered it runs and the error is considered handled; otherwise the
@@ -1920,11 +1949,54 @@
 		};
 		const onError = (msg) => cp.emit("error", new Error(String(msg)));
 		const r = ops.child_spawn(
-			{ file: String(file), args: (args || []).map(String), cwd: options.cwd, envArray: envToArray(options.env) },
+			{ file: String(file), args: (args || []).map(String), cwd: options.cwd,
+				envArray: envToArray(options.env), ipc: !!options.ipc },
 			onStdout, onStderr, onExit, onError);
 		if (isErr(r)) { process.nextTick(() => cp.emit("error", cpErr(r, file))); return cp; }
 		cp.pid = r.pid;
+		if (options.ipc) attachIPC(cp, r.pid);
 		return cp;
+	}
+
+	// attachIPC wires the parent end of a fork() channel onto a ChildProcess:
+	// send/message/disconnect, and `connected` so a caller can tell whether the
+	// channel is still there. Node serializes IPC messages as JSON, and so does
+	// this — a value that will not survive JSON does not survive fork either.
+	function attachIPC(cp, id) {
+		cp.connected = true;
+		cp.channel = { ref() {}, unref() {} };
+		cp.send = function send(message, sendHandle, options, callback) {
+			if (typeof sendHandle === "function") { callback = sendHandle; sendHandle = undefined; }
+			else if (typeof options === "function") { callback = options; options = undefined; }
+			if (!cp.connected) {
+				const e = Object.assign(new Error("channel closed"), { code: "ERR_IPC_CHANNEL_CLOSED" });
+				if (callback) { process.nextTick(() => callback(e)); return false; }
+				cp.emit("error", e);
+				return false;
+			}
+			const ok = ops.ipc_send(id, JSON.stringify(message === undefined ? null : message));
+			if (callback) process.nextTick(() => callback(ok ? null : new Error("channel closed")));
+			return ok;
+		};
+		cp.disconnect = function disconnect() {
+			if (!cp.connected) return;
+			cp.connected = false;
+			ops.ipc_disconnect(id);
+			process.nextTick(() => cp.emit("disconnect"));
+		};
+		ops.ipc_start(id,
+			(json) => { try { cp.emit("message", JSON.parse(json)); } catch { /* not JSON: drop */ } },
+			() => { if (cp.connected) { cp.connected = false; cp.emit("disconnect"); } });
+	}
+
+	// fork() is spawn() of THIS runtime with a message channel attached. The
+	// "binary" is the runtime itself (see nested.go), so the module path is the
+	// script argument.
+	function fork(modulePath, args, options) {
+		if (!Array.isArray(args)) { options = args; args = []; }
+		options = options || {};
+		const argv = [...(options.execArgv || []), String(modulePath), ...(args || []).map(String)];
+		return spawn(options.execPath || process.execPath, argv, { ...options, ipc: true });
 	}
 
 	function normalizeExec(command, options, callback) {
@@ -2015,7 +2087,7 @@
 		execSync,
 		execFile,
 		execFileSync,
-		fork: () => { throw new Error("child_process.fork is not supported (no node executable to re-spawn)"); },
+		fork,
 		ChildProcess,
 	};
 

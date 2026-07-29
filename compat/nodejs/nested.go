@@ -115,6 +115,14 @@ type nestedResult struct {
 func (rt *Runtime) runNested(cfg spidermonkey.Config, argv []string, env []string, cwd string,
 	stdin io.Reader, stdout, stderr io.Writer, timeout time.Duration,
 ) nestedResult {
+	return rt.runNestedIPC(cfg, argv, env, cwd, stdin, stdout, stderr, timeout, nil)
+}
+
+// runNestedIPC is runNested with an optional message channel back to the
+// parent — what makes a child a fork() child rather than a spawn() child.
+func (rt *Runtime) runNestedIPC(cfg spidermonkey.Config, argv []string, env []string, cwd string,
+	stdin io.Reader, stdout, stderr io.Writer, timeout time.Duration, ipc *ipcChannel,
+) nestedResult {
 	a := parseNestedArgs(argv)
 
 	childCfg := cfg
@@ -140,7 +148,7 @@ func (rt *Runtime) runNested(cfg spidermonkey.Config, argv []string, env []strin
 	if a.script != "" {
 		scriptArgv = append([]string{defaultExecPath, a.script}, a.argv...)
 	}
-	child, err := Install(js, Options{Argv: scriptArgv})
+	child, err := Install(js, Options{Argv: scriptArgv, ipc: ipc})
 	if err != nil {
 		return nestedResult{exitCode: 1, err: err}
 	}
