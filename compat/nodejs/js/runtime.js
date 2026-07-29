@@ -250,9 +250,16 @@
 			new TypeError(`The "${name}" argument must be of type ${expected}. Received ${got}`),
 			{ code: "ERR_INVALID_ARG_TYPE" });
 	}
+	// Past 2**32 Node groups the digits of the offending value ("1_099_511_627_776"),
+	// which is the only readable way to show a number that wide.
+	function numericSeparator(v) {
+		const s = String(v);
+		if (typeof v !== "number" || !Number.isInteger(v) || (v <= 2 ** 32 && v >= -(2 ** 32))) return s;
+		return s.replace(/(\d)(?=(\d\d\d)+(?!\d))/g, "$1_");
+	}
 	function rangeError(name, range, actual) {
 		return Object.assign(
-			new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${actual}`),
+			new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${numericSeparator(actual)}`),
 			{ code: "ERR_OUT_OF_RANGE" });
 	}
 	// requireIndex validates one of Buffer's numeric offset/length arguments.
@@ -265,6 +272,58 @@
 		}
 		return value;
 	}
+
+	// Node's numeric accessors reject a bad argument with a CODE, and the code
+	// says which kind of mistake it was: a non-number offset is an
+	// ERR_INVALID_ARG_TYPE TypeError, while a number that is out of bounds —
+	// or not an integer at all — is an ERR_OUT_OF_RANGE RangeError. The bare
+	// RangeError a DataView raises carries neither, and reading past the end
+	// through the index accessors did not throw at all, so the suite's whole
+	// read*/write* coverage saw the wrong error or none.
+	function ckOff(buf, o, bytes) {
+		if (typeof o !== "number") throw argTypeError("offset", "number", o);
+		// Node tests integer-ness with floor(v) !== v, which lets Infinity through
+		// to the range message and sends only NaN and fractions to this one.
+		if (Math.floor(o) !== o) throw rangeError("offset", "an integer", o);
+		const max = buf.length - bytes;
+		// A buffer too small to hold the value AT ANY offset is a different
+		// failure from an offset that merely sits past the end, and Node gives
+		// it its own code.
+		if (max < 0) {
+			throw Object.assign(new RangeError("Attempt to access memory outside buffer bounds"),
+				{ code: "ERR_BUFFER_OUT_OF_BOUNDS" });
+		}
+		if (o < 0 || o > max) throw rangeError("offset", `>= 0 and <= ${max}`, o);
+		return o;
+	}
+	// The variable-width accessors carry a byteLength of 1..6 as well.
+	function ckLen(len) {
+		if (typeof len !== "number") throw argTypeError("byteLength", "number", len);
+		if (Math.floor(len) !== len) throw rangeError("byteLength", "an integer", len);
+		if (len < 1 || len > 6) throw rangeError("byteLength", ">= 1 and <= 6", len);
+		return len;
+	}
+	// Range-check a value before a write, like Node (which throws ERR_OUT_OF_
+	// RANGE rather than silently truncating a wrapped value into the buffer).
+	// Beyond 4 bytes the bound is not exactly representable as a decimal literal,
+	// so Node states it as a power of two instead of a rounded number.
+	function ckU(v, bytes) {
+		if (typeof v !== "number") throw argTypeError("value", "number", v);
+		const max = Math.pow(2, 8 * bytes) - 1;
+		if (v >= 0 && v <= max) return;
+		throw rangeError("value", bytes > 4 ? `>= 0 and < 2 ** ${8 * bytes}` : `>= 0 and <= ${max}`, v);
+	}
+	function ckI(v, bytes) {
+		if (typeof v !== "number") throw argTypeError("value", "number", v);
+		const lim = Math.pow(2, 8 * bytes - 1);
+		if (v >= -lim && v <= lim - 1) return;
+		throw rangeError("value", bytes > 4 ? `>= -(2 ** ${8 * bytes - 1}) and < 2 ** ${8 * bytes - 1}` : `>= ${-lim} and <= ${lim - 1}`, v);
+	}
+	const dv = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+	// A BigInt accessor takes a BigInt: passing a Number is a type error, not
+	// something to coerce, because BigInt(1.5) would throw the wrong error.
+	function ckBU(v) { if (typeof v !== "bigint") throw argTypeError("value", "bigint", v); if (v < 0n || v > 0xffffffffffffffffn) throw rangeError("value", ">= 0n and <= 18446744073709551615n", v); return v; }
+	function ckBI(v) { if (typeof v !== "bigint") throw argTypeError("value", "bigint", v); if (v < -(2n ** 63n) || v > 2n ** 63n - 1n) throw rangeError("value", ">= -9223372036854775808n and <= 9223372036854775807n", v); return v; }
 
 	class Buffer extends Uint8Array {
 		static from(value, encodingOrOffset, length) {
@@ -388,6 +447,40 @@
 			this.set(bytes.subarray(0, n), offset);
 			return n;
 		}
+		// subarray shares the bytes; Node hands back a Buffer, so the result has
+		// to carry Buffer's prototype rather than the plain Uint8Array one.
+		subarray(start, end) { return wrap(Uint8Array.prototype.subarray.call(this, start, end)); }
+		toLocaleString(encoding, start, end) { return this.toString(encoding, start, end); }
+		// How a Buffer prints. util.inspect() defers to this, and it truncates at
+		// buffer.INSPECT_MAX_BYTES so dumping a large payload cannot flood a log.
+		inspect() {
+			const max = globalThis.__node_inspect_max_bytes ?? 50;
+			const shown = Math.min(this.length, max);
+			let s = "";
+			for (let i = 0; i < shown; i++) s += (i ? " " : "") + this[i].toString(16).padStart(2, "0");
+			const rest = this.length - shown;
+			if (rest > 0) s += `${shown ? " " : ""}... ${rest} more byte${rest > 1 ? "s" : ""}`;
+			return `<Buffer ${s}>`;
+		}
+		[Symbol.for("nodejs.util.inspect.custom")]() { return this.inspect(); }
+		// Per-encoding slice/write pairs. Node exposes one of each on the
+		// prototype as the primitive that toString()/write() dispatch to, and
+		// enough published code reaches for them directly (and its own suite
+		// enumerates them) that leaving them off is a hole in the surface.
+		asciiSlice(start, end) { return this.toString("ascii", start, end); }
+		base64Slice(start, end) { return this.toString("base64", start, end); }
+		base64urlSlice(start, end) { return this.toString("base64url", start, end); }
+		latin1Slice(start, end) { return this.toString("latin1", start, end); }
+		hexSlice(start, end) { return this.toString("hex", start, end); }
+		ucs2Slice(start, end) { return this.toString("ucs2", start, end); }
+		utf8Slice(start, end) { return this.toString("utf8", start, end); }
+		asciiWrite(string, offset, length) { return this.write(string, offset, length, "ascii"); }
+		base64Write(string, offset, length) { return this.write(string, offset, length, "base64"); }
+		base64urlWrite(string, offset, length) { return this.write(string, offset, length, "base64url"); }
+		latin1Write(string, offset, length) { return this.write(string, offset, length, "latin1"); }
+		hexWrite(string, offset, length) { return this.write(string, offset, length, "hex"); }
+		ucs2Write(string, offset, length) { return this.write(string, offset, length, "ucs2"); }
+		utf8Write(string, offset, length) { return this.write(string, offset, length, "utf8"); }
 		indexOf(value, byteOffset, encoding) {
 			if (typeof byteOffset === "string") { encoding = byteOffset; byteOffset = 0; }
 			byteOffset = +byteOffset || 0;
@@ -443,69 +536,69 @@
 			for (let i = offset; i < end; i++) this[i] = src[(i - offset) % src.length];
 			return this;
 		}
-		readUInt8(off = 0) {
-			if (off < 0 || off >= this.length) throw new RangeError(`The value of "offset" is out of range. It must be >= 0 and <= ${this.length - 1}. Received ${off}`);
-			return this[off];
-		}
+		readUInt8(off = 0) { return this[ckOff(this, off, 1)]; }
 		writeUInt8(v, off = 0) {
-			if (off < 0 || off >= this.length) throw new RangeError(`The value of "offset" is out of range. It must be >= 0 and <= ${this.length - 1}. Received ${off}`);
-			this._ckU(v, 1);
-			this[off] = v & 0xff;
+			ckU(v, 1);
+			this[ckOff(this, off, 1)] = v & 0xff;
 			return off + 1;
 		}
-		// Range-check a value before a write, like Node (which throws ERR_OUT_OF_
-		// RANGE rather than silently truncating a wrapped value into the buffer).
-		_ckU(v, bytes) { const max = Math.pow(2, 8 * bytes) - 1; if (v < 0 || v > max) throw new RangeError(`The value of "value" is out of range. It must be >= 0 and <= ${max}. Received ${v}`); }
-		_ckI(v, bytes) { const lim = Math.pow(2, 8 * bytes - 1); if (v < -lim || v > lim - 1) throw new RangeError(`The value of "value" is out of range. It must be >= ${-lim} and <= ${lim - 1}. Received ${v}`); }
-		_dv() { return new DataView(this.buffer, this.byteOffset, this.byteLength); }
-		readUInt16BE(o = 0) { return this._dv().getUint16(o, false); }
-		readUInt16LE(o = 0) { return this._dv().getUint16(o, true); }
-		readUInt32BE(o = 0) { return this._dv().getUint32(o, false); }
-		readUInt32LE(o = 0) { return this._dv().getUint32(o, true); }
-		readInt8(o = 0) { return this._dv().getInt8(o); }
-		readInt16BE(o = 0) { return this._dv().getInt16(o, false); }
-		readInt16LE(o = 0) { return this._dv().getInt16(o, true); }
-		readInt32BE(o = 0) { return this._dv().getInt32(o, false); }
-		readInt32LE(o = 0) { return this._dv().getInt32(o, true); }
-		readFloatBE(o = 0) { return this._dv().getFloat32(o, false); }
-		readFloatLE(o = 0) { return this._dv().getFloat32(o, true); }
-		readDoubleBE(o = 0) { return this._dv().getFloat64(o, false); }
-		readDoubleLE(o = 0) { return this._dv().getFloat64(o, true); }
-		readBigUInt64BE(o = 0) { return this._dv().getBigUint64(o, false); }
-		readBigUInt64LE(o = 0) { return this._dv().getBigUint64(o, true); }
-		readBigInt64BE(o = 0) { return this._dv().getBigInt64(o, false); }
-		readBigInt64LE(o = 0) { return this._dv().getBigInt64(o, true); }
-		writeInt8(v, o = 0) { this._ckI(v, 1); this._dv().setInt8(o, v); return o + 1; }
-		writeUInt16BE(v, o = 0) { this._ckU(v, 2); this._dv().setUint16(o, v, false); return o + 2; }
-		writeUInt16LE(v, o = 0) { this._ckU(v, 2); this._dv().setUint16(o, v, true); return o + 2; }
-		writeUInt32BE(v, o = 0) { this._ckU(v, 4); this._dv().setUint32(o, v, false); return o + 4; }
-		writeUInt32LE(v, o = 0) { this._ckU(v, 4); this._dv().setUint32(o, v, true); return o + 4; }
-		writeInt16BE(v, o = 0) { this._ckI(v, 2); this._dv().setInt16(o, v, false); return o + 2; }
-		writeInt16LE(v, o = 0) { this._ckI(v, 2); this._dv().setInt16(o, v, true); return o + 2; }
-		writeInt32BE(v, o = 0) { this._ckI(v, 4); this._dv().setInt32(o, v, false); return o + 4; }
-		writeInt32LE(v, o = 0) { this._ckI(v, 4); this._dv().setInt32(o, v, true); return o + 4; }
-		writeFloatBE(v, o = 0) { this._dv().setFloat32(o, v, false); return o + 4; }
-		writeFloatLE(v, o = 0) { this._dv().setFloat32(o, v, true); return o + 4; }
-		writeDoubleBE(v, o = 0) { this._dv().setFloat64(o, v, false); return o + 8; }
-		writeDoubleLE(v, o = 0) { this._dv().setFloat64(o, v, true); return o + 8; }
-		_ckBU(v) { const b = BigInt(v); if (b < 0n || b > 0xffffffffffffffffn) throw new RangeError(`The value of "value" is out of range. It must be >= 0n and <= 18446744073709551615n. Received ${b}`); return b; }
-		_ckBI(v) { const b = BigInt(v); if (b < -(2n ** 63n) || b > 2n ** 63n - 1n) throw new RangeError(`The value of "value" is out of range. Received ${b}`); return b; }
-		writeBigUInt64BE(v, o = 0) { this._dv().setBigUint64(o, this._ckBU(v), false); return o + 8; }
-		writeBigUInt64LE(v, o = 0) { this._dv().setBigUint64(o, this._ckBU(v), true); return o + 8; }
-		writeBigInt64BE(v, o = 0) { this._dv().setBigInt64(o, this._ckBI(v), false); return o + 8; }
-		writeBigInt64LE(v, o = 0) { this._dv().setBigInt64(o, this._ckBI(v), true); return o + 8; }
-		// Variable-width LE/BE integer accessors (1..6 bytes).
-		readUIntLE(o = 0, len = 1) { let v = 0, m = 1; for (let i = 0; i < len; i++) { v += this[o + i] * m; m *= 256; } return v; }
-		readUIntBE(o = 0, len = 1) { let v = 0; for (let i = 0; i < len; i++) v = v * 256 + this[o + i]; return v; }
-		readIntLE(o = 0, len = 1) { let v = this.readUIntLE(o, len); const s = Math.pow(2, 8 * len - 1); if (v >= s) v -= s * 2; return v; }
-		readIntBE(o = 0, len = 1) { let v = this.readUIntBE(o, len); const s = Math.pow(2, 8 * len - 1); if (v >= s) v -= s * 2; return v; }
-		writeUIntLE(v, o = 0, len = 1) { this._ckU(v, len); let n = v; for (let i = 0; i < len; i++) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
-		writeUIntBE(v, o = 0, len = 1) { this._ckU(v, len); let n = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
-		writeIntLE(v, o = 0, len = 1) { this._ckI(v, len); return this.writeUIntLE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
-		writeIntBE(v, o = 0, len = 1) { this._ckI(v, len); return this.writeUIntBE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
+		readUInt16BE(o = 0) { return dv(this).getUint16(ckOff(this, o, 2), false); }
+		readUInt16LE(o = 0) { return dv(this).getUint16(ckOff(this, o, 2), true); }
+		readUInt32BE(o = 0) { return dv(this).getUint32(ckOff(this, o, 4), false); }
+		readUInt32LE(o = 0) { return dv(this).getUint32(ckOff(this, o, 4), true); }
+		readInt8(o = 0) { return dv(this).getInt8(ckOff(this, o, 1)); }
+		readInt16BE(o = 0) { return dv(this).getInt16(ckOff(this, o, 2), false); }
+		readInt16LE(o = 0) { return dv(this).getInt16(ckOff(this, o, 2), true); }
+		readInt32BE(o = 0) { return dv(this).getInt32(ckOff(this, o, 4), false); }
+		readInt32LE(o = 0) { return dv(this).getInt32(ckOff(this, o, 4), true); }
+		readFloatBE(o = 0) { return dv(this).getFloat32(ckOff(this, o, 4), false); }
+		readFloatLE(o = 0) { return dv(this).getFloat32(ckOff(this, o, 4), true); }
+		readDoubleBE(o = 0) { return dv(this).getFloat64(ckOff(this, o, 8), false); }
+		readDoubleLE(o = 0) { return dv(this).getFloat64(ckOff(this, o, 8), true); }
+		readBigUInt64BE(o = 0) { return dv(this).getBigUint64(ckOff(this, o, 8), false); }
+		readBigUInt64LE(o = 0) { return dv(this).getBigUint64(ckOff(this, o, 8), true); }
+		readBigInt64BE(o = 0) { return dv(this).getBigInt64(ckOff(this, o, 8), false); }
+		readBigInt64LE(o = 0) { return dv(this).getBigInt64(ckOff(this, o, 8), true); }
+		writeInt8(v, o = 0) { ckI(v, 1); dv(this).setInt8(ckOff(this, o, 1), v); return o + 1; }
+		writeUInt16BE(v, o = 0) { ckU(v, 2); dv(this).setUint16(ckOff(this, o, 2), v, false); return o + 2; }
+		writeUInt16LE(v, o = 0) { ckU(v, 2); dv(this).setUint16(ckOff(this, o, 2), v, true); return o + 2; }
+		writeUInt32BE(v, o = 0) { ckU(v, 4); dv(this).setUint32(ckOff(this, o, 4), v, false); return o + 4; }
+		writeUInt32LE(v, o = 0) { ckU(v, 4); dv(this).setUint32(ckOff(this, o, 4), v, true); return o + 4; }
+		writeInt16BE(v, o = 0) { ckI(v, 2); dv(this).setInt16(ckOff(this, o, 2), v, false); return o + 2; }
+		writeInt16LE(v, o = 0) { ckI(v, 2); dv(this).setInt16(ckOff(this, o, 2), v, true); return o + 2; }
+		writeInt32BE(v, o = 0) { ckI(v, 4); dv(this).setInt32(ckOff(this, o, 4), v, false); return o + 4; }
+		writeInt32LE(v, o = 0) { ckI(v, 4); dv(this).setInt32(ckOff(this, o, 4), v, true); return o + 4; }
+		writeFloatBE(v, o = 0) { dv(this).setFloat32(ckOff(this, o, 4), v, false); return o + 4; }
+		writeFloatLE(v, o = 0) { dv(this).setFloat32(ckOff(this, o, 4), v, true); return o + 4; }
+		writeDoubleBE(v, o = 0) { dv(this).setFloat64(ckOff(this, o, 8), v, false); return o + 8; }
+		writeDoubleLE(v, o = 0) { dv(this).setFloat64(ckOff(this, o, 8), v, true); return o + 8; }
+		writeBigUInt64BE(v, o = 0) { const b = ckBU(v); dv(this).setBigUint64(ckOff(this, o, 8), b, false); return o + 8; }
+		writeBigUInt64LE(v, o = 0) { const b = ckBU(v); dv(this).setBigUint64(ckOff(this, o, 8), b, true); return o + 8; }
+		writeBigInt64BE(v, o = 0) { const b = ckBI(v); dv(this).setBigInt64(ckOff(this, o, 8), b, false); return o + 8; }
+		writeBigInt64LE(v, o = 0) { const b = ckBI(v); dv(this).setBigInt64(ckOff(this, o, 8), b, true); return o + 8; }
+		// Variable-width LE/BE integer accessors. Neither offset nor byteLength
+		// has a default: Node requires both, and defaulting them turned
+		// readIntBE(undefined, 1) into a silent read at zero rather than the
+		// type error it owes.
+		readUIntLE(o, len) { ckLen(len); ckOff(this, o, len); let v = 0, m = 1; for (let i = 0; i < len; i++) { v += this[o + i] * m; m *= 256; } return v; }
+		readUIntBE(o, len) { ckLen(len); ckOff(this, o, len); let v = 0; for (let i = 0; i < len; i++) v = v * 256 + this[o + i]; return v; }
+		readIntLE(o, len) { ckLen(len); let v = this.readUIntLE(o, len); const s = Math.pow(2, 8 * len - 1); if (v >= s) v -= s * 2; return v; }
+		readIntBE(o, len) { ckLen(len); let v = this.readUIntBE(o, len); const s = Math.pow(2, 8 * len - 1); if (v >= s) v -= s * 2; return v; }
+		writeUIntLE(v, o, len) { ckLen(len); ckU(v, len); ckOff(this, o, len); let n = v; for (let i = 0; i < len; i++) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
+		writeUIntBE(v, o, len) { ckLen(len); ckU(v, len); ckOff(this, o, len); let n = v; for (let i = len - 1; i >= 0; i--) { this[o + i] = n & 0xff; n = Math.floor(n / 256); } return o + len; }
+		writeIntLE(v, o, len) { ckLen(len); ckI(v, len); ckOff(this, o, len); return this.writeUIntLE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
+		writeIntBE(v, o, len) { ckLen(len); ckI(v, len); ckOff(this, o, len); return this.writeUIntBE(v < 0 ? v + Math.pow(2, 8 * len) : v, o, len); }
 		swap16() { if (this.length % 2) throw new RangeError("Buffer size must be a multiple of 16-bits"); for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }
 		swap32() { if (this.length % 4) throw new RangeError("Buffer size must be a multiple of 32-bits"); for (let i = 0; i < this.length; i += 4) { let a = this[i], b = this[i + 1]; this[i] = this[i + 3]; this[i + 1] = this[i + 2]; this[i + 2] = b; this[i + 3] = a; } return this; }
 		swap64() { if (this.length % 8) throw new RangeError("Buffer size must be a multiple of 64-bits"); for (let i = 0; i < this.length; i += 8) { for (let j = 0; j < 4; j++) { const t = this[i + j]; this[i + j] = this[i + 7 - j]; this[i + 7 - j] = t; } } return this; }
+	}
+
+	// Node spells the unsigned accessors both ways — readUInt8 and readUint8 —
+	// and the two are the SAME function object, which its suite checks. The
+	// lowercase spelling is the one newer code tends to use.
+	for (const name of Object.getOwnPropertyNames(Buffer.prototype)) {
+		const alias = name.replace(/UInt/, "Uint");
+		if (alias !== name) Buffer.prototype[alias] = Buffer.prototype[name];
 	}
 
 	function wrap(u8) { return Object.setPrototypeOf(u8, Buffer.prototype); }

@@ -558,7 +558,26 @@
 	const Buffer = globalThis.Buffer;
 	Buffer.prototype.toString; // ensure prototype touched
 	const bufferMod = core.buffer;
-	bufferMod.INSPECT_MAX_BYTES = 50;
+	// INSPECT_MAX_BYTES caps how much of a Buffer inspect() prints. It is
+	// writable, and Node validates the assignment — a NaN or a negative number
+	// silently accepted would turn every later inspect into garbage. The value
+	// lives on a global because Buffer.prototype.inspect is defined in the
+	// earlier-evaluated runtime.js and cannot see this closure.
+	globalThis.__node_inspect_max_bytes = 50;
+	Object.defineProperty(bufferMod, "INSPECT_MAX_BYTES", {
+		enumerable: true,
+		configurable: true,
+		get: () => globalThis.__node_inspect_max_bytes,
+		set(v) {
+			if (typeof v !== "number") {
+				throw Object.assign(new TypeError(`The "value" argument must be of type number. Received ${typeof v}`), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (Number.isNaN(v) || v < 0) {
+				throw Object.assign(new RangeError(`The value of "value" is out of range. It must be >= 0. Received ${v}`), { code: "ERR_OUT_OF_RANGE" });
+			}
+			globalThis.__node_inspect_max_bytes = v;
+		},
+	});
 	bufferMod.isAscii = (input) => {
 		const u8 = input instanceof Uint8Array ? input : new Uint8Array(input);
 		for (const b of u8) if (b > 0x7f) return false;

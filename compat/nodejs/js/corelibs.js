@@ -1378,6 +1378,119 @@
 	// points at.
 	function fsResolve(p) { return followLinks(fsResolveNoFollow(p)); }
 
+	// ------------------------------------------------------ argument checks
+	// Node rejects a bad argument before it touches anything, and its own suite
+	// asserts on the { code, name } pair the rejection carries. Two details make
+	// or break those assertions. The callback flavours validate SYNCHRONOUSLY —
+	// fs.readFile(p, "bogus-encoding", cb) throws at the call, it does not report
+	// through cb — so a check cannot live inside the deferred operation. And a
+	// malformed fd or offset is an ERR_OUT_OF_RANGE RangeError, while a wrong
+	// TYPE is an ERR_INVALID_ARG_TYPE TypeError; the two are not interchangeable.
+	function receivedOf(v) {
+		if (v === null || v === undefined) return ` Received ${v}`;
+		if (typeof v === "function") return ` Received function ${v.name}`;
+		if (typeof v === "object") {
+			const n = v.constructor && v.constructor.name;
+			return n ? ` Received an instance of ${n}` : ` Received ${String(v)}`;
+		}
+		let s = typeof v === "string" ? `'${v}'` : String(v);
+		if (s.length > 28) s = s.slice(0, 25) + "...";
+		return ` Received type ${typeof v} (${s})`;
+	}
+	const errArgType = (name, expected, v) => Object.assign(
+		new TypeError(`The "${name}" argument must be ${expected}.${receivedOf(v)}`),
+		{ code: "ERR_INVALID_ARG_TYPE" });
+	const errArgValue = (name, v, reason) => Object.assign(
+		new TypeError(`The argument '${name}' ${reason}. Received ${typeof v === "string" ? `'${v}'` : String(v)}`),
+		{ code: "ERR_INVALID_ARG_VALUE" });
+	const errRange = (name, range, v) => Object.assign(
+		new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${v}`),
+		{ code: "ERR_OUT_OF_RANGE" });
+
+	function validateFunction(v, name) {
+		if (typeof v !== "function") throw errArgType(name, "of type function", v);
+	}
+	function validateInteger(v, name, min, max) {
+		if (typeof v !== "number") throw errArgType(name, "of type number", v);
+		if (!Number.isInteger(v)) throw errRange(name, "an integer", v);
+		if (v < min || v > max) throw errRange(name, `>= ${min} && <= ${max}`, v);
+	}
+	const validateFd = (fd) => validateInteger(fd, "fd", 0, 0x7fffffff);
+	function validateBuffer(v, name) {
+		if (!ArrayBuffer.isView(v)) throw errArgType(name, "an instance of Buffer, TypedArray, or DataView", v);
+	}
+	// Buffer's encoding names. An unknown one is a VALUE error, not a type error,
+	// and undefined means "the default" rather than "invalid".
+	const KNOWN_ENCODINGS = new Set([
+		"utf8", "utf-8", "ascii", "latin1", "binary", "base64", "base64url",
+		"hex", "ucs2", "ucs-2", "utf16le", "utf-16le", "buffer",
+	]);
+	function validateEncoding(enc) {
+		if (enc === undefined || enc === null) return;
+		if (typeof enc !== "string" || !KNOWN_ENCODINGS.has(enc.toLowerCase())) {
+			throw errArgValue("encoding", enc, "is invalid encoding");
+		}
+	}
+	// The trailing options argument of most path APIs: a string encoding, an
+	// object bag, or absent. A function there is the callback, checked elsewhere.
+	function validateEncodingOpt(opts) {
+		if (opts === undefined || opts === null || typeof opts === "function") return;
+		if (typeof opts === "string") return validateEncoding(opts);
+		if (typeof opts !== "object") throw errArgType("options", "of type object", opts);
+		validateEncoding(opts.encoding);
+	}
+	// fsResolveNoFollow already raises the right error for a bad path, so calling
+	// it for the check alone keeps one definition of "what is a path".
+	const validatePath = (p) => { fsResolveNoFollow(p); };
+
+	// Per-API checks, shared by the sync and the callback flavour so both reject
+	// the same inputs at the same moment. Keyed by the callback-flavour name.
+	const fsCheck = {
+		readFile: (p, o) => { validatePath(p); validateEncodingOpt(o); },
+		writeFile: (p, d, o) => { validatePath(p); validateEncodingOpt(o); },
+		appendFile: (p, d, o) => { validatePath(p); validateEncodingOpt(o); },
+		readdir: (p, o) => { validatePath(p); validateEncodingOpt(o); },
+		readlink: (p, o) => { validatePath(p); validateEncodingOpt(o); },
+		realpath: (p, o) => { validatePath(p); validateEncodingOpt(o); },
+		mkdtemp: (p, o) => { validatePath(p); validateEncodingOpt(o); },
+		stat: validatePath, lstat: validatePath, unlink: validatePath,
+		rmdir: validatePath, rm: validatePath, mkdir: validatePath,
+		access: validatePath, truncate: validatePath, open: validatePath,
+		rename: (a, b) => { validatePath(a); validatePath(b); },
+		link: (a, b) => { validatePath(a); validatePath(b); },
+		copyFile: (a, b) => { validatePath(a); validatePath(b); },
+		cp: (a, b) => { validatePath(a); validatePath(b); },
+		symlink: (t, p) => { validatePath(t); validatePath(p); },
+		chmod: (p, m) => { validatePath(p); validateMode(m); },
+		lchmod: (p, m) => { validatePath(p); validateMode(m); },
+		chown: (p, u, g) => { validatePath(p); validateUidGid(u, g); },
+		lchown: (p, u, g) => { validatePath(p); validateUidGid(u, g); },
+		close: validateFd,
+		fstat: validateFd,
+		ftruncate: (fd) => validateFd(fd),
+	};
+	// An octal string ("755") is as good as a number; anything else is not a mode.
+	function validateMode(m) {
+		if (m === undefined || m === null) return;
+		if (typeof m === "string") {
+			if (!/^[0-7]+$/.test(m)) throw errArgValue("mode", m, "must be a 32-bit unsigned integer or an octal string");
+			return;
+		}
+		validateInteger(m, "mode", 0, 0o777);
+	}
+	// -1 is Node's "leave it alone" sentinel, so the range starts below zero.
+	function validateUidGid(uid, gid) {
+		validateInteger(uid, "uid", -1, 0xffffffff);
+		validateInteger(gid, "gid", -1, 0xffffffff);
+	}
+	// The later-evaluated modules (streams.js, extras.js) are separate closures
+	// and need the same checks, so they travel on the shared registry.
+	core.__validate = {
+		errArgType, errArgValue, errRange,
+		validateFunction, validateInteger, validateFd, validateBuffer,
+		validateEncoding, validateEncodingOpt, validatePath,
+	};
+
 
 	// flagOf extracts the string `flag` option ("w", "a", "wx", ...) from a
 	// writeFile/appendFile options bag; string opts are encodings, not flags.
@@ -1398,6 +1511,7 @@
 
 	const fsSync = {
 		readFileSync(p, opts) {
+			validateEncodingOpt(opts);
 			const r = ops.fs_read_file(fsResolve(p));
 			ops.release_pending();
 			if (isErr(r)) throw fsError(r, "open", p);
@@ -1406,6 +1520,7 @@
 			return enc ? buf.toString(enc) : buf;
 		},
 		writeFileSync(p, data, opts) {
+			validateEncodingOpt(opts);
 			// A string is decoded per the encoding option (default utf8), so
 			// writeFileSync(p, "deadbeef", "hex") writes the 4 decoded bytes, not
 			// the ASCII of the string.
@@ -1422,6 +1537,7 @@
 			if (isErr(r)) throw fsError(r, "open", p);
 		},
 		appendFileSync(p, data, opts) {
+			validateEncodingOpt(opts);
 			const payload = typeof data === "string" ? Buffer.from(data, encodingOf(opts) || "utf8") : Buffer.from(data);
 			checkExclusive(p, flagOf(opts, "a"));
 			const r = ops.fs_write_file(fsResolve(p), payload, true);
@@ -1448,7 +1564,8 @@
 			return fsSync.statSync(p, opts);
 		},
 		readdirSync(p, options) {
-			const base = String(p);
+			validateEncodingOpt(options);
+			const base = fsResolve(p);
 			const dirent = (name, parentPath, isDir) => ({
 				name,
 				parentPath,
@@ -1504,14 +1621,16 @@
 			if (isErr(r)) throw fsError(r, "unlink", p);
 		},
 		renameSync(oldP, newP) {
-			const r = ops.fs_rename(fsResolve(oldP), String(newP));
+			const r = ops.fs_rename(fsResolve(oldP), fsResolve(newP));
 			if (isErr(r)) throw fsError(r, "rename", oldP);
 		},
-		realpathSync(p) {
+		realpathSync(p, options) {
 			// No symlinks exist in this FS (memfs/host mounts have none), so the
 			// canonical path is just the resolved one — but Node's realpath still
 			// requires the target to EXIST (ENOENT otherwise; syscall "lstat").
-			const resolved = path.resolve(String(p));
+			validateEncodingOpt(options);
+			// Canonical means normalized too: "/dir/../dir/f" is "/dir/f".
+			const resolved = normalizePath(fsResolve(p));
 			if (!ops.fs_exists(resolved)) {
 				throw fsError({ code: "ENOENT", message: "no such file or directory" }, "lstat", String(p));
 			}
@@ -1554,7 +1673,7 @@
 			}
 		},
 		copyFileSync(src, dest) {
-			const r = ops.fs_copyfile(fsResolve(src), String(dest));
+			const r = ops.fs_copyfile(fsResolve(src), fsResolve(dest));
 			if (isErr(r)) throw fsError(r, "copyfile", src);
 		},
 		rmSync(p, options = {}) {
@@ -1565,7 +1684,8 @@
 			const r = ops.fs_rm(fsResolve(p), !!(options && options.recursive), false);
 			if (isErr(r)) throw fsError(r, "rmdir", p);
 		},
-		mkdtempSync(prefix) {
+		mkdtempSync(prefix, options) {
+			validateEncodingOpt(options);
 			const r = ops.fs_mkdtemp(fsResolve(prefix));
 			if (isErr(r)) throw fsError(r, "mkdtemp", prefix);
 			return r;
@@ -1592,10 +1712,17 @@
 			return r;
 		},
 		closeSync(fd) {
+			validateFd(fd);
 			const r = ops.fs_close_fd(fd);
 			if (isErr(r)) throw fsError(r, "close", fd);
 		},
 		readSync(fd, buffer, offset = 0, length = buffer.length, position = null) {
+			validateFd(fd);
+			validateBuffer(buffer, "buffer");
+			validateInteger(offset, "offset", 0, buffer.byteLength);
+			if (position !== null && position !== undefined && typeof position !== "bigint") {
+				validateInteger(position, "position", 0, Number.MAX_SAFE_INTEGER);
+			}
 			const r = ops.fs_read_fd(fd, length, position);
 			ops.release_pending();
 			if (isErr(r)) throw fsError(r, "read", fd);
@@ -1604,6 +1731,8 @@
 			return r.bytesRead;
 		},
 		writeSync(fd, buffer, offset, length, position) {
+			validateFd(fd);
+			if (typeof buffer !== "string") validateBuffer(buffer, "buffer");
 			let data, pos;
 			if (typeof buffer === "string") {
 				// writeSync(fd, string[, position[, encoding]])
@@ -1619,11 +1748,13 @@
 			return r;
 		},
 		fstatSync(fd, opts) {
+			validateFd(fd);
 			const r = ops.fs_fstat(fd);
 			if (isErr(r)) throw fsError(r, "fstat", fd);
 			return statsOf(r, !!(opts && opts.bigint));
 		},
 		ftruncateSync(fd, len = 0) {
+			validateFd(fd);
 			const r = ops.fs_ftruncate(fd, Number(len) || 0);
 			if (isErr(r)) throw fsError(r, "ftruncate", fd);
 		},
@@ -1632,14 +1763,18 @@
 			try { fsSync.ftruncateSync(fd, len); } finally { fsSync.closeSync(fd); }
 		},
 		chmodSync(p, mode) {
+			validateMode(mode);
 			// Node accepts an octal string ("755") or a number.
 			const m = typeof mode === "string" ? parseInt(mode, 8) : Number(mode);
 			const r = ops.fs_chmod(fsResolve(p), m & 0o7777);
 			if (isErr(r)) throw fsError(r, "chmod", p);
 		},
 		lchmodSync(p, mode) { return fsSync.chmodSync(p, mode); }, // no symlinks
-		chownSync() {},
-		lchownSync() {},
+		// There are no owners in this filesystem, so a chown that VALIDATES is
+		// the whole of it — but it has to validate, because that is the only
+		// observable half.
+		chownSync(p, uid, gid) { validatePath(p); validateUidGid(uid, gid); },
+		lchownSync(p, uid, gid) { validatePath(p); validateUidGid(uid, gid); },
 		utimesSync(p, atime, mtime) {
 			// Node: numbers are epoch SECONDS; Dates and numeric strings work too.
 			const toMs = (t) => (t instanceof Date ? t.getTime() : Number(t) * 1000);
@@ -1652,7 +1787,8 @@
 			if (symlinks.has(abs)) throw fsError({ code: "EEXIST", message: "file already exists" }, "symlink", linkPath);
 			symlinks.set(abs, typeof target === "string" ? target : String(target));
 		},
-		readlinkSync(p) {
+		readlinkSync(p, options) {
+			validateEncodingOpt(options);
 			const abs = fsResolveNoFollow(p);
 			if (!symlinks.has(abs)) throw fsError({ code: "EINVAL", message: "invalid argument" }, "readlink", p);
 			return symlinks.get(abs);
@@ -1666,11 +1802,15 @@
 		unlinkLink(p) { return symlinks.delete(fsResolveNoFollow(p)); },
 	};
 
-	// Callback flavors run the sync op and deliver on the microtask queue.
-	function callbackify1(syncFn) {
+	// Callback flavors validate synchronously, then run the sync op and deliver
+	// on the microtask queue. The split matters: Node THROWS on a bad argument
+	// and REPORTS a failed operation through the callback, and its suite asserts
+	// on both halves.
+	function callbackify1(syncFn, check) {
 		return (...args) => {
 			const cb = args.pop();
-			if (typeof cb !== "function") throw new TypeError("callback required");
+			validateFunction(cb, "cb");
+			if (check) check(...args);
 			queueMicrotask(() => {
 				try { cb(null, syncFn(...args)); } catch (e) { cb(e); }
 			});
@@ -1678,34 +1818,47 @@
 	}
 	const fsMod = {
 		...fsSync,
-		readFile: callbackify1(fsSync.readFileSync),
-		writeFile: callbackify1(fsSync.writeFileSync),
-		appendFile: callbackify1(fsSync.appendFileSync),
-		stat: callbackify1(fsSync.statSync),
-		lstat: callbackify1(fsSync.statSync),
-		readdir: callbackify1(fsSync.readdirSync),
-		mkdir: callbackify1(fsSync.mkdirSync),
-		rmdir: callbackify1(fsSync.rmdirSync),
-		rm: callbackify1(fsSync.rmSync),
-		unlink: callbackify1(fsSync.unlinkSync),
-		rename: callbackify1(fsSync.renameSync),
-		realpath: callbackify1(fsSync.realpathSync),
-		symlink: callbackify1(fsSync.symlinkSync),
-		readlink: callbackify1(fsSync.readlinkSync),
-		link: callbackify1(fsSync.linkSync),
-		copyFile: callbackify1(fsSync.copyFileSync),
-		mkdtemp: callbackify1(fsSync.mkdtempSync),
-		cp: callbackify1(fsSync.cpSync),
-		chmod: callbackify1(fsSync.chmodSync),
-		lchmod: callbackify1(fsSync.chmodSync),
-		utimes: callbackify1(fsSync.utimesSync),
-		lutimes: callbackify1(fsSync.utimesSync),
-		truncate: callbackify1(fsSync.truncateSync),
-		ftruncate: callbackify1(fsSync.ftruncateSync),
-		chown: (p, uid, gid, cb) => queueMicrotask(() => cb(null)),
-		exists: (p, cb) => queueMicrotask(() => cb(fsSync.existsSync(p))),
+		readFile: callbackify1(fsSync.readFileSync, fsCheck.readFile),
+		writeFile: callbackify1(fsSync.writeFileSync, fsCheck.writeFile),
+		appendFile: callbackify1(fsSync.appendFileSync, fsCheck.appendFile),
+		stat: callbackify1(fsSync.statSync, fsCheck.stat),
+		lstat: callbackify1(fsSync.statSync, fsCheck.lstat),
+		readdir: callbackify1(fsSync.readdirSync, fsCheck.readdir),
+		mkdir: callbackify1(fsSync.mkdirSync, fsCheck.mkdir),
+		rmdir: callbackify1(fsSync.rmdirSync, fsCheck.rmdir),
+		rm: callbackify1(fsSync.rmSync, fsCheck.rm),
+		unlink: callbackify1(fsSync.unlinkSync, fsCheck.unlink),
+		rename: callbackify1(fsSync.renameSync, fsCheck.rename),
+		realpath: callbackify1(fsSync.realpathSync, fsCheck.realpath),
+		symlink: callbackify1(fsSync.symlinkSync, fsCheck.symlink),
+		readlink: callbackify1(fsSync.readlinkSync, fsCheck.readlink),
+		link: callbackify1(fsSync.linkSync, fsCheck.link),
+		copyFile: callbackify1(fsSync.copyFileSync, fsCheck.copyFile),
+		mkdtemp: callbackify1(fsSync.mkdtempSync, fsCheck.mkdtemp),
+		cp: callbackify1(fsSync.cpSync, fsCheck.cp),
+		chmod: callbackify1(fsSync.chmodSync, fsCheck.chmod),
+		lchmod: callbackify1(fsSync.chmodSync, fsCheck.lchmod),
+		utimes: callbackify1(fsSync.utimesSync, fsCheck.stat),
+		lutimes: callbackify1(fsSync.utimesSync, fsCheck.stat),
+		truncate: callbackify1(fsSync.truncateSync, fsCheck.truncate),
+		ftruncate: callbackify1(fsSync.ftruncateSync, fsCheck.ftruncate),
+		chown: callbackify1(fsSync.chownSync, fsCheck.chown),
+		lchown: callbackify1(fsSync.lchownSync, fsCheck.lchown),
+		exists: (p, cb) => {
+			// exists() predates Node's error convention: its callback takes the
+			// boolean alone. The callback is still required, and a bad path
+			// answers false rather than throwing.
+			validateFunction(cb, "cb");
+			queueMicrotask(() => {
+				let ok = false;
+				try { ok = fsSync.existsSync(p); } catch { ok = false; }
+				cb(ok);
+			});
+		},
 		access: (p, mode, cb) => {
 			const done = typeof mode === "function" ? mode : cb;
+			validateFunction(done, "cb");
+			validatePath(p);
 			queueMicrotask(() => {
 				try { fsSync.accessSync(p); done(null); } catch (e) { done(e); }
 			});
@@ -1716,19 +1869,38 @@
 		open: (p, flags, mode, cb) => {
 			if (typeof flags === "function") { cb = flags; flags = "r"; }
 			else if (typeof mode === "function") { cb = mode; }
+			validateFunction(cb, "cb");
+			validatePath(p);
 			queueMicrotask(() => { try { cb(null, fsSync.openSync(p, flags)); } catch (e) { cb(e); } });
 		},
-		close: (fd, cb) => queueMicrotask(() => { try { fsSync.closeSync(fd); if (cb) cb(null); } catch (e) { if (cb) cb(e); } }),
+		close: (fd, cb) => {
+			validateFd(fd);
+			if (cb !== undefined) validateFunction(cb, "cb");
+			queueMicrotask(() => { try { fsSync.closeSync(fd); if (cb) cb(null); } catch (e) { if (cb) cb(e); } });
+		},
 		read: (fd, buffer, offset, length, position, cb) => {
+			validateFd(fd);
+			validateBuffer(buffer, "buffer");
+			if (offset !== undefined && offset !== null) validateInteger(offset, "offset", 0, buffer.byteLength);
+			if (length !== undefined && length !== null) validateInteger(length, "length", 0, buffer.byteLength - (offset || 0));
+			validateFunction(cb, "cb");
 			queueMicrotask(() => { try { const n = fsSync.readSync(fd, buffer, offset, length, position); cb(null, n, buffer); } catch (e) { cb(e); } });
 		},
 		write: (fd, buffer, offset, length, position, cb) => {
 			if (typeof offset === "function") { cb = offset; offset = length = position = undefined; }
 			else if (typeof length === "function") { cb = length; length = position = undefined; }
 			else if (typeof position === "function") { cb = position; position = undefined; }
+			validateFd(fd);
+			if (typeof buffer !== "string") validateBuffer(buffer, "buffer");
+			validateFunction(cb, "cb");
 			queueMicrotask(() => { try { const n = fsSync.writeSync(fd, buffer, offset, length, position); cb(null, n, buffer); } catch (e) { cb(e); } });
 		},
-		fstat: (fd, opts, cb) => { if (typeof opts === "function") cb = opts; queueMicrotask(() => { try { cb(null, fsSync.fstatSync(fd)); } catch (e) { cb(e); } }); },
+		fstat: (fd, opts, cb) => {
+			if (typeof opts === "function") cb = opts;
+			validateFd(fd);
+			validateFunction(cb, "cb");
+			queueMicrotask(() => { try { cb(null, fsSync.fstatSync(fd)); } catch (e) { cb(e); } });
+		},
 		constants: {
 			F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1,
 			// File-type bits so `(stats.mode & S_IFMT) === S_IFDIR` works.

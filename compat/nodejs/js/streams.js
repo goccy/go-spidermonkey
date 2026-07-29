@@ -863,8 +863,20 @@
 
 	// -------------------------------------------------- fs stream flavors
 
+	// `start`/`end` are byte offsets, and Node rejects a string there rather than
+	// coercing it — a stream built from { start: "4" } would otherwise read from
+	// a plausible-looking but wrong place.
+	const V = core.__validate;
+	const checkStreamRange = (options) => {
+		if (options.start !== undefined) V.validateInteger(options.start, "start", 0, Number.MAX_SAFE_INTEGER);
+		if (options.end !== undefined && options.end !== Infinity) V.validateInteger(options.end, "end", 0, Number.MAX_SAFE_INTEGER);
+		if (options.fd !== undefined && options.fd !== null && typeof options.fd !== "object") V.validateFd(options.fd);
+	};
+
 	fsMod.createReadStream = (p, options = {}) => {
 		if (typeof options === "string") options = { encoding: options };
+		V.validateEncodingOpt(options);
+		checkStreamRange(options);
 		const hwm = options.highWaterMark || 64 * 1024;
 		let fd = typeof options.fd === "number" ? options.fd : null;
 		const ownFd = typeof options.fd !== "number";
@@ -906,6 +918,9 @@
 	};
 
 	fsMod.createWriteStream = (p, options = {}) => {
+		if (typeof options === "string") options = { encoding: options };
+		V.validateEncodingOpt(options);
+		checkStreamRange(options);
 		const flags = options.flags || "w";
 		// A caller-supplied fd is used directly (and not closed by us); otherwise
 		// open lazily on the first write. A numeric `start` makes every write a
