@@ -522,7 +522,9 @@
 			h.update(data);
 			return outputEncoding === "buffer" ? h.digest() : h.digest(outputEncoding);
 		},
-		Hash, Hmac: Hash,
+		// Node's crypto constructors are callable without `new` — legacy, but
+		// published code and its own suite both do it.
+		Hash: callableClass(Hash), Hmac: callableClass(Hash),
 		KeyObject,
 		createSecretKey, createPublicKey, createPrivateKey,
 		sign: signOneShot,
@@ -531,7 +533,7 @@
 			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(true, key, iv) : new Cipheriv(algo, key, iv),
 		createDecipheriv: (algo, key, iv) =>
 			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(false, key, iv) : new Decipheriv(algo, key, iv),
-		Cipheriv, Decipheriv,
+		Cipheriv: callableClass(Cipheriv), Decipheriv: callableClass(Decipheriv),
 		publicEncrypt, privateDecrypt,
 		publicDecrypt, privateEncrypt,
 		createDiffieHellman: (prime, gen) => new DiffieHellman(prime, gen),
@@ -554,7 +556,7 @@
 		X509Certificate,
 		createSign: (algo) => new Sign(algo),
 		createVerify: (algo) => new Verify(algo),
-		Sign, Verify,
+		Sign: callableClass(Sign), Verify: callableClass(Verify),
 		pbkdf2Sync,
 		pbkdf2: asyncify(pbkdf2Sync),
 		scryptSync,

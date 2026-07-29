@@ -700,9 +700,22 @@
 		throw new TypeError(`Unknown encoding: ${encoding}`);
 	}
 
-	globalThis.Buffer = Buffer;
+	// Buffer is callable without `new`. The form is deprecated and its
+	// allocating overload is the reason why, but a great deal of published code
+	// still writes `Buffer(x)` — and a class simply refuses the call. A Proxy
+	// adds the call trap while leaving construction, statics and instanceof
+	// exactly as they were.
+	const CallableBuffer = new Proxy(Buffer, {
+		apply(_t, _this, args) {
+			// Buffer(number) allocates ZERO-FILLED, as it has since Node 8; the
+			// uninitialized behaviour is what made the legacy form dangerous.
+			return typeof args[0] === "number" ? Buffer.alloc(args[0]) : Buffer.from(...args);
+		},
+	});
+	globalThis.Buffer = CallableBuffer;
 	core.buffer = {
-		Buffer,
+		Buffer: CallableBuffer,
+		SlowBuffer: (size) => Buffer.allocUnsafeSlow(size),
 		kMaxLength: 0x7fffffff,
 		constants: { MAX_LENGTH: 0x7fffffff, MAX_STRING_LENGTH: 0x1fffffe8 },
 		atob: globalThis.atob,
