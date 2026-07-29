@@ -127,6 +127,7 @@ func (rt *Runtime) opChildSpawn(cfg spidermonkey.Config, args []spidermonkey.Val
 	}
 
 	cmd := exec.Command(file, argv...)
+	isolateProcessGroup(cmd)
 	applyCwdEnv(cmd, opts, cfg.Env)
 	stdin, _ := cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
@@ -340,6 +341,7 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 	}
 
 	cmd := exec.Command(file, argv...)
+	isolateProcessGroup(cmd)
 	applyCwdEnv(cmd, opts, cfg.Env)
 	if len(args) > 1 && !args[1].IsUndefined() {
 		if in, ierr := valueBytes(args[1]); ierr == nil && len(in) > 0 {
@@ -605,6 +607,9 @@ func (rt *Runtime) closeChild() {
 	st.mu.Unlock()
 	for _, c := range procs {
 		if c.Process != nil {
+			// The GROUP, not just the child: a grandchild holding the runner's
+			// pipe is what keeps a finished run from returning.
+			killProcessGroup(c.Process.Pid)
 			c.Process.Kill()
 		}
 	}
