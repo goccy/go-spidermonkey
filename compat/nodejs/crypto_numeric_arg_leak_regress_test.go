@@ -15,23 +15,31 @@ import (
 // where a number is expected pins that object — and its backing store — for the
 // interpreter's life on every call. Under a memory cap this exhausts memory.
 //
-// The cases use SUCCESS-path parameters — saltLength (PKCS#1 v1.5 sign ignores
-// it) and hkdf keylen — so passing an object is silently accepted and leaks with
-// no guest-visible error, accumulating across the loop. Each iteration allocates
+// The case uses a SUCCESS-path parameter — saltLength, which PKCS#1 v1.5 sign
+// ignores — so passing an object is silently accepted and leaks with no
+// guest-visible error, accumulating across the loop. Each iteration allocates
 // and drops a fresh large array used as the hostile numeric argument. With the
 // roots freed, the arrays are collectable and every iteration completes; if they
 // leak the guest OOMs long before the loop ends and the Eval errors.
+//
+// hkdfSync's keylen was a second site here and is now unreachable: the wrapper
+// rejects a non-number before the op sees it, which is the stronger fix — the
+// leak cannot be reached through the public API at all. The loop asserts that
+// rejection so the guarantee is not quietly lost if the check is removed.
 func TestCryptoNumericArgObjectDoesNotLeak(t *testing.T) {
 	const script = `
 		const crypto = require("crypto");
 		const N = 200;              // 200 * 2 MiB per site = 400 MiB pinned if leaked
 		const SZ = 2 * 1024 * 1024; // >> the 256 MiB cap when accumulated
 		const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+		let rejected = 0;
 		for (let i = 0; i < N; i++) {
 			const big = new Uint8Array(SZ);       // hostile object numeric arg
 			crypto.createSign("sha256").update("m").sign({ key: privateKey, saltLength: big });
-			crypto.hkdfSync("sha256", "key", "salt", "info", big);
+			try { crypto.hkdfSync("sha256", "key", "salt", "info", big); }
+			catch (e) { if (e.code === "ERR_INVALID_ARG_TYPE") rejected++; }
 		}
+		if (rejected !== N) throw new Error("hkdfSync accepted an object keylen " + (N - rejected) + " times");
 		globalThis.__completed = N;
 	`
 	js, rt := newRuntime(t, spidermonkey.Config{MaxMemoryBytes: 256 << 20})

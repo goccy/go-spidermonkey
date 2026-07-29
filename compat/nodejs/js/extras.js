@@ -59,9 +59,36 @@
 
 	const toBuf = (d, enc) => (typeof d === "string" ? Buffer.from(d, enc || "utf8") : Buffer.from(d.buffer ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : d));
 
+	// The names every crypto entry point uses for a bad argument. Reaching the
+	// host with a non-string algorithm produced whatever the Go side made of
+	// "null" — a message about an unknown digest, not about the argument.
+	const cryptoArgType = (name, expected, v) => Object.assign(
+		new TypeError(`The "${name}" argument must be ${expected}. Received ${v === null ? "null" : typeof v}`),
+		{ code: "ERR_INVALID_ARG_TYPE" });
+	const cryptoRange = (name, range, v) => Object.assign(
+		new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${v}`),
+		{ code: "ERR_OUT_OF_RANGE" });
+	function requireAlgorithm(algorithm, name = "algorithm") {
+		if (typeof algorithm !== "string") throw cryptoArgType(name, "of type string", algorithm);
+		return algorithm.toLowerCase();
+	}
+	// A count that must be a positive integer: iterations, key lengths, sizes.
+	function requireCount(v, name, min = 0, max = Number.MAX_SAFE_INTEGER) {
+		if (typeof v !== "number") throw cryptoArgType(name, "of type number", v);
+		if (!Number.isInteger(v)) throw cryptoRange(name, "an integer", v);
+		if (v < min || v > max) throw cryptoRange(name, `>= ${min} && <= ${max}`, v);
+		return v;
+	}
+	const requireBufferLike = (v, name) => {
+		if (typeof v !== "string" && !ArrayBuffer.isView(v) && !(v instanceof ArrayBuffer)) {
+			throw cryptoArgType(name, "of type string or an instance of Buffer, TypedArray, or DataView", v);
+		}
+		return v;
+	};
+
 	class Hash {
 		constructor(algorithm, key) {
-			this._alg = String(algorithm).toLowerCase();
+			this._alg = requireAlgorithm(algorithm);
 			this._key = key;
 			this._chunks = [];
 		}
@@ -95,7 +122,10 @@
 	// (buf[, offset[, size]]) overload and chunking the getRandomValues call so a
 	// buffer larger than 64 KiB doesn't hit its per-call QuotaExceededError.
 	function randomFillInto(buf, offset, size) {
-		if (!ArrayBuffer.isView(buf)) throw new TypeError('The "buf" argument must be a TypedArray or DataView');
+		if (!ArrayBuffer.isView(buf)) {
+			throw Object.assign(new TypeError('The "buf" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.'),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
 		const total = buf.byteLength;
 		// Node counts offset/size in ELEMENTS for a typed array (bytes for a
 		// DataView, which has no BYTES_PER_ELEMENT). Scale to bytes before bounds
@@ -104,8 +134,8 @@
 		const elem = buf.BYTES_PER_ELEMENT || 1;
 		offset = offset === undefined ? 0 : (offset >>> 0) * elem;
 		size = size === undefined ? total - offset : (size >>> 0) * elem;
-		if (offset > total) throw new RangeError('"offset" is out of range');
-		if (offset + size > total) throw new RangeError('"size" is out of range');
+		if (offset > total) throw Object.assign(new RangeError('The value of "offset" is out of range.'), { code: "ERR_OUT_OF_RANGE" });
+		if (offset + size > total) throw Object.assign(new RangeError('The value of "size" is out of range.'), { code: "ERR_OUT_OF_RANGE" });
 		// View the exact target window as bytes so offset/size are respected.
 		const view = new Uint8Array(buf.buffer, buf.byteOffset + offset, size);
 		for (let off = 0; off < size; off += 65536) {
@@ -312,18 +342,29 @@
 	}
 
 	function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+		requireBufferLike(password, "password");
+		requireBufferLike(salt, "salt");
+		requireCount(iterations, "iterations", 1);
+		requireCount(keylen, "keylen", 0);
+		requireAlgorithm(digest, "digest");
 		const r = ops.crypto_pbkdf2(toBuf(password), toBuf(salt), iterations, keylen, String(digest).toLowerCase());
 		ops.release_pending();
 		if (isErr(r)) cryptoThrow(r);
 		return Buffer.from(r);
 	}
 	function scryptSync(password, salt, keylen, options = {}) {
+		requireBufferLike(password, "password");
+		requireBufferLike(salt, "salt");
+		requireCount(keylen, "keylen", 0);
 		const r = ops.crypto_scrypt(toBuf(password), toBuf(salt), keylen, options);
 		ops.release_pending();
 		if (isErr(r)) cryptoThrow(r);
 		return Buffer.from(r);
 	}
 	function hkdfSync(digest, ikm, salt, info, keylen) {
+		requireAlgorithm(digest, "digest");
+		requireBufferLike(ikm, "ikm");
+		requireCount(keylen, "keylen", 0);
 		const r = ops.crypto_hkdf(String(digest).toLowerCase(), toBuf(ikm), toBuf(salt), toBuf(info), keylen);
 		ops.release_pending();
 		if (isErr(r)) cryptoThrow(r);
@@ -507,7 +548,13 @@
 		},
 		get fips() { return false; },
 		createHash: (algorithm) => new Hash(algorithm),
-		createHmac: (algorithm, key) => new Hash(algorithm, toBuf(keyMaterial(key))),
+		// The ALGORITHM is checked before the key: createHmac(null) is a mistake
+		// about the digest, and reporting it as a bad key sends the caller to
+		// the wrong argument.
+		createHmac: (algorithm, key) => {
+			requireAlgorithm(algorithm);
+			return new Hash(algorithm, toBuf(keyMaterial(key)));
+		},
 		// crypto.hash(alg, data[, encoding]) — the one-shot form, which exists
 		// because hashing a single buffer through a stream object is all
 		// ceremony and no benefit.
@@ -530,9 +577,9 @@
 		sign: signOneShot,
 		verify: verifyOneShot,
 		createCipheriv: (algo, key, iv) =>
-			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(true, key, iv) : new Cipheriv(algo, key, iv),
+			requireAlgorithm(algo) === "chacha20-poly1305" ? new ChaChaCipher(true, key, iv) : new Cipheriv(algo, key, iv),
 		createDecipheriv: (algo, key, iv) =>
-			String(algo).toLowerCase() === "chacha20-poly1305" ? new ChaChaCipher(false, key, iv) : new Decipheriv(algo, key, iv),
+			requireAlgorithm(algo) === "chacha20-poly1305" ? new ChaChaCipher(false, key, iv) : new Decipheriv(algo, key, iv),
 		Cipheriv: callableClass(Cipheriv), Decipheriv: callableClass(Decipheriv),
 		publicEncrypt, privateDecrypt,
 		publicDecrypt, privateEncrypt,
@@ -577,8 +624,13 @@
 			if (max === undefined) { max = min; min = 0; }
 			// Node requires safe integers with max > min; a degenerate range must
 			// throw ERR_OUT_OF_RANGE, not silently return NaN or a wrong number.
+			if (typeof min !== "number" || typeof max !== "number") {
+				throw cryptoArgType(typeof min !== "number" ? "min" : "max", "of type number", typeof min !== "number" ? min : max);
+			}
 			if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || max <= min) {
-				throw new RangeError(`The value of "max" is out of range. It must be greater than the value of "min" (${min}). Received ${max}`);
+				throw Object.assign(
+					new RangeError(`The value of "max" is out of range. It must be greater than the value of "min" (${min}). Received ${max}`),
+					{ code: "ERR_OUT_OF_RANGE" });
 			}
 			const range = max - min;
 			const buf = randomBytes(6);
@@ -600,6 +652,14 @@
 			queueMicrotask(() => cb(err, err ? buf : out));
 		},
 		timingSafeEqual: (a, b) => {
+			// Both sides must be buffers: comparing two STRINGS in constant time
+			// is not what this function does, and silently coercing them would
+			// give a caller a false sense of what it protected.
+			for (const [v, n] of [[a, "a"], [b, "b"]]) {
+				if (!ArrayBuffer.isView(v) && !(v instanceof ArrayBuffer)) {
+					throw cryptoArgType(n, "an instance of Buffer, TypedArray, or DataView", v);
+				}
+			}
 			if (a.byteLength !== b.byteLength) throw new RangeError("Input buffers must have the same byte length");
 			let diff = 0;
 			const ua = toBuf(a), ub = toBuf(b);
