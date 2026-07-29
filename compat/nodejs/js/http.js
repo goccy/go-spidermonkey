@@ -728,11 +728,24 @@
 			return this;
 		}
 		_httpId() {
-			// Reuse the same server-id space the http dispatch keys on.
-			if (this.__id === undefined) this.__id = (globalThis.__node_next_https = (globalThis.__node_next_https || 900000) + 1);
+			// Reuse the same server-id space the http dispatch keys on. The
+			// counter lives in this module, NOT on globalThis: Node's suite checks
+			// for globals a test leaked, and an implementation detail of ours
+			// showing up there failed 24 tests that had nothing to do with https.
+			if (this.__id === undefined) this.__id = ++nextHttpsID;
 			return this.__id;
 		}
 	}
+
+	// nextHttpsID is module state; __node_set_next_https lets a test drive it to
+	// a chosen value without putting the counter itself on globalThis.
+	let nextHttpsID = 900000;
+	// Non-enumerable, because Node's suite lists the enumerable globals a test
+	// leaked and compares them against a fixed set — which is exactly the check
+	// the old counter tripped.
+	Object.defineProperty(globalThis, "__node_set_next_https", {
+		value: (n) => { nextHttpsID = Number(n); }, configurable: true, enumerable: false,
+	});
 
 	// tlsOptionsOf picks the https settings out of a request's options. It
 	// returns undefined when none were given, so an ordinary request keeps

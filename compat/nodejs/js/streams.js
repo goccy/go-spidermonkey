@@ -813,8 +813,32 @@
 	Object.setPrototypeOf(Stream, EventEmitter);
 	Stream.prototype.pipe = Readable.prototype.pipe;
 
+	// duplexPair returns two Duplexes wired back to back: what one writes, the
+	// other reads. It is how the suite tests a Duplex without a socket, and it
+	// is a documented part of node:stream.
+	function duplexPair() {
+		const a = new Duplex({
+			write(chunk, enc, cb) { b.push(chunk); cb(); },
+			final(cb) { b.push(null); cb(); },
+			read() {},
+		});
+		const b = new Duplex({
+			write(chunk, enc, cb) { a.push(chunk); cb(); },
+			final(cb) { a.push(null); cb(); },
+			read() {},
+		});
+		// Destroying one end destroys the other, but does NOT hand it the error:
+		// the peer of a failed connection is torn down, not itself at fault, and
+		// re-emitting the error there would crash code that only listens on the
+		// side it owns.
+		a.once("close", () => { if (!b.destroyed) b.destroy(); });
+		b.once("close", () => { if (!a.destroyed) a.destroy(); });
+		return [a, b];
+	}
+
 	const streamMod = Object.assign(Stream, {
 		Readable, Writable, Duplex, Transform, PassThrough, Stream, finished, pipeline,
+		duplexPair,
 	});
 	core.stream = streamMod;
 

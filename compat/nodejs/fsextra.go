@@ -260,8 +260,12 @@ func (rt *Runtime) opFSOpen(cfg spidermonkey.Config, args []spidermonkey.Value) 
 		}
 		data = b
 	case "a", "a+":
+		// Append CREATES the file if it is not there, as Node does — an opened
+		// log file exists before anything is logged to it.
 		if b, err := readFile(cfg.FS, p); err == nil {
 			data = b
+		} else {
+			dirty = true
 		}
 	case "w", "w+":
 		dirty = true // truncate/create on open
@@ -392,7 +396,37 @@ func (rt *Runtime) opFSWriteFD(cfg spidermonkey.Config, args []spidermonkey.Valu
 		}
 	}
 	f.dirty = true
+	// Write THROUGH, not just into the fd's buffer. Node's write is visible to
+	// the next read of the same path, and holding the bytes until close meant a
+	// program that wrote a file and then read it back — a log writer, a
+	// checkpoint, most of the fs suite — saw nothing there.
+	if err := flushFD(f); err != nil {
+		return fsErrValue(err), nil
+	}
 	return spidermonkey.ValueOf(len(data)), nil
+}
+
+// flushFD writes an open file's buffer out to the filesystem.
+func flushFD(f *openFile) error {
+	wfs, err := writableFS(f.cfg)
+	if err != nil {
+		return err
+	}
+	fh, err := wfs.OpenFile(f.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	w, ok := fh.(io.Writer)
+	if !ok {
+		fh.Close()
+		return fmt.Errorf("file handle is not writable")
+	}
+	if _, err := w.Write(f.data); err != nil {
+		fh.Close()
+		return err
+	}
+	f.dirty = false
+	return fh.Close()
 }
 
 func (rt *Runtime) opFSCloseFD(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {

@@ -473,6 +473,14 @@
 	}
 
 	core.crypto = {
+		// FIPS mode is not a thing here: the primitives are Go's crypto, which
+		// has no FIPS switch to report. Saying so plainly is what the tests that
+		// branch on it need — they only ask whether it is on.
+		getFips: () => 0,
+		setFips: (v) => {
+			if (v) throw Object.assign(new Error("FIPS mode is not available"), { code: "ERR_CRYPTO_FIPS_UNAVAILABLE" });
+		},
+		get fips() { return false; },
 		createHash: (algorithm) => new Hash(algorithm),
 		createHmac: (algorithm, key) => new Hash(algorithm, toBuf(keyMaterial(key))),
 		Hash, Hmac: Hash,
@@ -1825,6 +1833,19 @@
 		TLSSocket,
 		Server: TLSServer,
 		rootCertificates: [],
+		// getCACertificates reports the trust store this runtime would verify
+		// against. The host's own pool is what tls.Dial uses, and it is not
+		// enumerable from Go, so "default" and "system" answer with what we can
+		// state truthfully: an empty list, plus whatever the caller added.
+		getCACertificates(type = "default") {
+			if (!["default", "system", "bundled", "extra"].includes(String(type))) {
+				throw Object.assign(new TypeError(`Invalid CA certificate type: ${type}`), { code: "ERR_INVALID_ARG_VALUE" });
+			}
+			return core.tls.rootCertificates;
+		},
+		setDefaultCACertificates(certs) {
+			core.tls.rootCertificates = Array.from(certs || []).map(String);
+		},
 		// A convenience (not in Node): a self-signed cert for quick servers.
 		generateSelfSigned: (host) => ops.tls_selfsigned(host),
 	};

@@ -421,7 +421,16 @@
 		if (__exitEmitted) return;
 		__exitEmitted = true;
 		if (process.listenerCount && process.listenerCount("exit") > 0) {
-			process.emit("exit", process.exitCode ?? 0);
+			try {
+				process.emit("exit", process.exitCode ?? 0);
+			} catch (e) {
+				// An 'exit' handler calling process.exit() is ordinary — it is how
+				// a failed assertion sets the code from inside the handler — and
+				// its unwind sentinel has nowhere left to go. Record the code and
+				// let the process finish exiting; rethrowing made the sentinel
+				// itself the reported failure, hiding what the test actually said.
+				if (!(e && e.__nodeExit)) throw e;
+			}
 		}
 	};
 	globalThis.__node_reset_exit_emitted = () => { __exitEmitted = false; };
@@ -1597,6 +1606,92 @@
 			O_TRUNC: 0o1000, O_APPEND: 0o2000,
 		},
 	};
+	// Utf8Stream (node:fs) is a write-only stream over a file descriptor built
+	// for logging: append-only, UTF-8, with a synchronous mode. It is a small
+	// surface over the fd primitives already here, and 16 suite files use it.
+	class Utf8Stream extends core.events {
+		constructor(options = {}) {
+			super();
+			const opts = typeof options === "string" ? { dest: options } : (options || {});
+			this.sync = !!opts.sync;
+			this.append = opts.append !== false;
+			this.mode = opts.mode;
+			this.destroyed = false;
+			this.writing = false;
+			this.minLength = opts.minLength || 0;
+			this.maxLength = opts.maxLength || 0;
+			this.maxWrite = opts.maxWrite || 16 * 1024;
+			this._buf = "";
+			this.file = opts.dest ?? opts.file ?? null;
+			if (opts.fd !== undefined && opts.fd !== null) {
+				this.fd = opts.fd;
+			} else if (this.file) {
+				const flags = this.append ? "a" : "w";
+				this.fd = fsMod.openSync(this.file, flags, this.mode);
+			} else {
+				throw Object.assign(new TypeError("Utf8Stream needs a dest or an fd"), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			// Opening for append creates the file; make it exist now rather than
+			// at the first write, which is what a reader checking for the log
+			// expects.
+			try { fsMod.writeSync(this.fd, ""); } catch { /* the fd may be a pipe */ }
+			// Node emits 'ready' once the destination is usable.
+			process.nextTick(() => { if (!this.destroyed) this.emit("ready"); });
+		}
+		write(data) {
+			if (this.destroyed) {
+				throw Object.assign(new Error("the stream has been destroyed"), { code: "ERR_STREAM_DESTROYED" });
+			}
+			if (typeof data !== "string") {
+				throw Object.assign(new TypeError("expected a string"), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			this._buf += data;
+			if (this.maxLength && this._buf.length > this.maxLength) {
+				this._buf = "";
+				this.emit("drop", data);
+				return true;
+			}
+			// minLength decides, not `sync`: a stream told to buffer until 4 KiB
+			// buffers in sync mode too. `sync` says HOW the flush happens, not
+			// when.
+			if (this._buf.length >= this.minLength) this.flushSync();
+			return true;
+		}
+		flushSync() {
+			if (this.destroyed || this._buf === "") return;
+			const chunk = this._buf;
+			this._buf = "";
+			fsMod.writeSync(this.fd, chunk);
+		}
+		flush(cb) {
+			try { this.flushSync(); } catch (e) { if (cb) return cb(e); throw e; }
+			if (cb) process.nextTick(() => cb(null));
+		}
+		reopen(file) {
+			if (this.destroyed) return;
+			this.flushSync();
+			try { fsMod.closeSync(this.fd); } catch { /* already gone */ }
+			this.file = file ?? this.file;
+			this.fd = fsMod.openSync(this.file, this.append ? "a" : "w", this.mode);
+			this.emit("ready");
+		}
+		end() {
+			// A stream that has already been destroyed cannot be ended again.
+			if (this.destroyed) return;
+			try { this.flushSync(); } catch { /* report through 'error' below */ }
+			this.destroy();
+			this.emit("finish");
+		}
+		destroy() {
+			if (this.destroyed) return;
+			try { this.flushSync(); } catch { /* the fd may already be gone */ }
+			this.destroyed = true;
+			try { fsMod.closeSync(this.fd); } catch { /* already closed */ }
+			process.nextTick(() => this.emit("close"));
+		}
+	}
+	fsMod.Utf8Stream = Utf8Stream;
+
 	core.fs = fsMod;
 
 	// A FileHandle for fs.promises.open (read/write/close/stat/readFile/writeFile

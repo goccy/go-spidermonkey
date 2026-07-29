@@ -25,7 +25,7 @@ func TestHTTPSServerIdNoCollision(t *testing.T) {
 			const httpSrv = http.createServer((req, res) => res.end("http"));
 			httpSrv.listen(0, "127.0.0.1", () => {
 				// Force the next https id to collide with the http server's id.
-				globalThis.__node_next_https = httpSrv._id - 1;
+				globalThis.__node_set_next_https(httpSrv._id - 1);
 				const { cert, key } = require("tls").generateSelfSigned("localhost");
 				const httpsSrv = https.createServer({ cert, key }, (req, res) => res.end("https"));
 				httpsSrv.listen(0, "127.0.0.1", () => {
