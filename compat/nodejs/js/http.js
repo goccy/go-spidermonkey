@@ -124,6 +124,24 @@
 		}
 	}
 
+	// A header name has to be an HTTP token and a value has to be something
+	// that can go on the wire. Both are named errors, because a header silently
+	// dropped or written as "undefined" is a bug the caller finds much later,
+	// in a client.
+	const TOKEN_RE = /^[\^`\-\w!#$%&'*+.|~]+$/;
+	function checkHeaderName(name) {
+		if (typeof name !== "string" || name === "" || !TOKEN_RE.test(name)) {
+			throw Object.assign(new TypeError(`Header name must be a valid HTTP token [${JSON.stringify(String(name))}]`),
+				{ code: "ERR_INVALID_HTTP_TOKEN" });
+		}
+	}
+	function checkHeaderValue(name, value) {
+		if (value === undefined) {
+			throw Object.assign(new TypeError(`Invalid value "undefined" for header "${name}"`),
+				{ code: "ERR_HTTP_INVALID_HEADER_VALUE" });
+		}
+	}
+
 	class ServerResponse extends Writable {
 		constructor(init = {}) {
 			super();
@@ -138,6 +156,8 @@
 			this._headers = new Map(); // lowercased -> { name, value }
 		}
 		setHeader(name, value) {
+			checkHeaderName(name);
+			checkHeaderValue(name, value);
 			this._headers.set(String(name).toLowerCase(), { name: String(name), value });
 			return this;
 		}
@@ -166,11 +186,39 @@
 			return this;
 		}
 		writeHead(statusCode, reasonOrHeaders, headers) {
-			this.statusCode = statusCode;
+			// Headers already on the wire cannot be rewritten, and a status code
+			// outside 100..999 is not one — both are named errors, because a
+			// silently-accepted 99 produces a response no client can parse.
+			if (this.headersSent) {
+				throw Object.assign(new Error("Cannot write headers after they are sent to the client"),
+					{ code: "ERR_HTTP_HEADERS_SENT" });
+			}
+			// Node coerces with |0 and range-checks the result, but reports the
+			// ORIGINAL value, so the message names what the caller actually wrote.
+			const code = statusCode | 0;
+			if (code < 100 || code > 999) {
+				const shown = statusCode !== null && typeof statusCode === "object"
+					? (Array.isArray(statusCode) ? "[]" : "{}")
+					: String(statusCode);
+				throw Object.assign(new RangeError(`Invalid status code: ${shown}`),
+					{ code: "ERR_HTTP_INVALID_STATUS_CODE" });
+			}
+			this.statusCode = code;
 			if (typeof reasonOrHeaders === "string") this.statusMessage = reasonOrHeaders;
-			else if (reasonOrHeaders !== undefined) headers = reasonOrHeaders;
+			else {
+				// A status with no standard reason phrase reports "unknown", which
+				// is what Node puts on the wire for it.
+				this.statusMessage = STATUS_CODES[code] || "unknown";
+				if (reasonOrHeaders !== undefined) headers = reasonOrHeaders;
+			}
 			if (headers) {
 				if (Array.isArray(headers)) {
+					// A flat header array must be name/value PAIRS; an odd length
+					// means one of them has no partner and would be dropped.
+					if (headers.length % 2 !== 0) {
+						throw Object.assign(new TypeError(`The argument 'headers' is invalid. Received ${JSON.stringify(headers)}`),
+							{ code: "ERR_INVALID_ARG_VALUE" });
+					}
 					for (let i = 0; i + 1 < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
 				} else {
 					for (const k of Object.keys(headers)) this.setHeader(k, headers[k]);
@@ -189,8 +237,12 @@
 			return this;
 		}
 		_ensureHead() {
-			if (this.headersSent || this._reqId === undefined) return;
+			if (this.headersSent) return;
+			// The headers are COMMITTED here whether or not a request is bound
+			// yet: writeHead's contract is that nothing more may be added, and a
+			// response that reports otherwise lets a caller silently lose them.
 			this.headersSent = true;
+			if (this._reqId === undefined) return;
 			const pairs = [];
 			for (const { name, value } of this._headers.values()) {
 				if (Array.isArray(value)) for (const v of value) pairs.push([name, String(v)]);
