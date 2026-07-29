@@ -1160,7 +1160,10 @@
 			if (matcher.prototype instanceof Error || matcher === Error) return err instanceof matcher;
 			return matcher(err) === true;
 		}
-		if (matcher instanceof RegExp) return matcher.test(err && err.message !== undefined ? String(err.message) : String(err));
+		// A RegExp matcher runs against the STRING REPRESENTATION of the error
+		// ("TypeError: bad thing"), not its message alone — which is what makes
+		// an anchored /^Error: toString$/ meaningful.
+		if (matcher instanceof RegExp) return matcher.test(String(err));
 		if (matcher && typeof matcher === "object") {
 			return Object.keys(matcher).every((k) => {
 				const want = matcher[k];

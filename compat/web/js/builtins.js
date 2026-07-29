@@ -745,6 +745,43 @@
 		return decodeURIComponent(String(s).replace(/\+/g, " "));
 	}
 
+	// Calling a URLSearchParams method on the wrong receiver, or with a required
+	// argument left off, is a named failure rather than a generic TypeError:
+	// callers (and Node's own suite) match on the code. Without the checks
+	// `params.get.call(undefined)` read properties off undefined and
+	// `params.append("a")` silently stored the string "undefined" as a value.
+	const invalidThis = (what) => Object.assign(
+		new TypeError(`Value of "this" must be of type ${what}`), { code: "ERR_INVALID_THIS" });
+	const missingArgs = (...names) => Object.assign(
+		new TypeError(`The ${names.map((n) => `"${n}"`).join(" and ")} argument${names.length > 1 ? "s" : ""} must be specified`),
+		{ code: "ERR_MISSING_ARGS" });
+
+	// The iterator entries()/keys()/values() hand back. It is its own type with
+	// its own brand check, and it reads the pair list LIVE — the spec has
+	// iteration observe changes made while it runs.
+	class URLSearchParamsIterator {
+		constructor(params, kind) { this._params = params; this._kind = kind; this._i = 0; }
+		next() {
+			if (!(this instanceof URLSearchParamsIterator)) throw invalidThis("URLSearchParamsIterator");
+			const pairs = this._params._pairs;
+			if (this._i >= pairs.length) return { value: undefined, done: true };
+			const [k, v] = pairs[this._i++];
+			return { value: this._kind === "key" ? k : this._kind === "value" ? v : [k, v], done: false };
+		}
+		[Symbol.iterator]() { return this; }
+	}
+	Object.defineProperty(URLSearchParamsIterator.prototype, Symbol.toStringTag,
+		{ value: "URLSearchParams Iterator", configurable: true });
+
+	const brand = (v) => { if (!(v instanceof URLSearchParams)) throw invalidThis("URLSearchParams"); };
+	// A name or value is stringified the way the spec's IDL conversion is, which
+	// REFUSES a symbol rather than producing "Symbol()". String() would happily
+	// accept one and store a value no caller ever meant to pass.
+	const str = (v) => {
+		if (typeof v === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+		return String(v);
+	};
+
 	class URLSearchParams {
 		constructor(init = "") {
 			this._pairs = [];
@@ -767,49 +804,80 @@
 				for (const pair of init) {
 					const p = [...pair];
 					if (p.length !== 2) throw new TypeError("URLSearchParams: each init pair needs 2 items");
-					this._pairs.push([String(p[0]), String(p[1])]);
+					this._pairs.push([str(p[0]), str(p[1])]);
 				}
 			} else if (init && typeof init === "object") {
-				for (const k of Object.keys(init)) this._pairs.push([k, String(init[k])]);
+				for (const k of Object.keys(init)) this._pairs.push([k, str(init[k])]);
 			}
 		}
-		get size() { return this._pairs.length; }
-		append(k, v) { this._pairs.push([String(k), String(v)]); this._sync(); }
+		get size() { brand(this); return this._pairs.length; }
+		append(k, v) {
+			brand(this);
+			if (arguments.length < 2) throw missingArgs("name", "value");
+			this._pairs.push([str(k), str(v)]);
+			this._sync();
+		}
 		delete(k, v) {
-			k = String(k);
+			brand(this);
+			if (arguments.length < 1) throw missingArgs("name");
+			k = str(k);
 			// The two-arg form (WHATWG) deletes only tuples matching BOTH name and value.
 			this._pairs = arguments.length > 1
-				? this._pairs.filter((p) => !(p[0] === k && p[1] === String(v)))
+				? this._pairs.filter((p) => !(p[0] === k && p[1] === str(v)))
 				: this._pairs.filter((p) => p[0] !== k);
 			this._sync();
 		}
-		get(k) { k = String(k); const p = this._pairs.find((p) => p[0] === k); return p ? p[1] : null; }
-		getAll(k) { k = String(k); return this._pairs.filter((p) => p[0] === k).map((p) => p[1]); }
+		get(k) {
+			brand(this);
+			if (arguments.length < 1) throw missingArgs("name");
+			k = str(k);
+			const p = this._pairs.find((p) => p[0] === k);
+			return p ? p[1] : null;
+		}
+		getAll(k) {
+			brand(this);
+			if (arguments.length < 1) throw missingArgs("name");
+			k = str(k);
+			return this._pairs.filter((p) => p[0] === k).map((p) => p[1]);
+		}
 		has(k, v) {
-			k = String(k);
+			brand(this);
+			if (arguments.length < 1) throw missingArgs("name");
+			k = str(k);
 			return arguments.length > 1
-				? this._pairs.some((p) => p[0] === k && p[1] === String(v))
+				? this._pairs.some((p) => p[0] === k && p[1] === str(v))
 				: this._pairs.some((p) => p[0] === k);
 		}
 		set(k, v) {
-			k = String(k);
+			brand(this);
+			if (arguments.length < 2) throw missingArgs("name", "value");
+			k = str(k);
 			let found = false;
 			this._pairs = this._pairs.filter((p) => {
 				if (p[0] !== k) return true;
 				if (found) return false;
 				found = true;
-				p[1] = String(v);
+				p[1] = str(v);
 				return true;
 			});
-			if (!found) this._pairs.push([k, String(v)]);
+			if (!found) this._pairs.push([k, str(v)]);
 			this._sync();
 		}
-		sort() { this._pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._sync(); }
-		toString() { return this._pairs.map(([k, v]) => encodeQueryComponent(k) + "=" + encodeQueryComponent(v)).join("&"); }
-		forEach(cb, thisArg) { for (const [k, v] of [...this._pairs]) cb.call(thisArg, v, k, this); }
-		*entries() { for (const p of this._pairs) yield [...p]; }
-		*keys() { for (const [k] of this._pairs) yield k; }
-		*values() { for (const [, v] of this._pairs) yield v; }
+		sort() { brand(this); this._pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._sync(); }
+		toString() { brand(this); return this._pairs.map(([k, v]) => encodeQueryComponent(k) + "=" + encodeQueryComponent(v)).join("&"); }
+		forEach(cb, thisArg) {
+			brand(this);
+			if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+			// Live, like the iterator: the list is re-read each step, so a
+			// callback that appends is observed by the walk that is running.
+			for (let i = 0; i < this._pairs.length; i++) {
+				const [k, v] = this._pairs[i];
+				cb.call(thisArg, v, k, this);
+			}
+		}
+		entries() { brand(this); return new URLSearchParamsIterator(this, "entry"); }
+		keys() { brand(this); return new URLSearchParamsIterator(this, "key"); }
+		values() { brand(this); return new URLSearchParamsIterator(this, "value"); }
 		[Symbol.iterator]() { return this.entries(); }
 		_sync() { if (this._url) this._url._search = this._pairs.length ? "?" + this.toString() : ""; }
 	}
