@@ -118,6 +118,13 @@
 	// AES-KW is a secret AES key too (import/export/generate), but only wraps —
 	// it never appears in encrypt/decrypt, which stay gated on AES_NAMES.
 	const AES_ALL = [...AES_NAMES, "AES-KW"];
+	// ChaCha20-Poly1305 is a secret-key AEAD like the AES modes, but nothing
+	// about it is negotiable: one key size, one nonce size, one tag size. The
+	// canonical spelling is mixed-case, and a key reports the name it was asked
+	// for, so it cannot be carried as the uppercased lookup key.
+	const CHACHA = "CHACHA20-POLY1305";
+	const CANONICAL_NAMES = { [CHACHA]: "ChaCha20-Poly1305" };
+	const canonicalName = (upper) => CANONICAL_NAMES[upper] || upper;
 
 	// The host tags an error with the DOMException name the spec asks for, as a
 	// "DataError: ..." / "InvalidAccessError: ..." prefix. Reporting every one
@@ -156,6 +163,7 @@
 		"AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-KW": ["wrapKey", "unwrapKey"],
+		[CHACHA]: ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		HMAC: ["sign", "verify"],
 		ECDSA: ["sign", "verify"],
 		ED25519: ["sign", "verify"],
@@ -182,6 +190,7 @@
 		"ML-KEM-512", "ML-KEM-768", "ML-KEM-1024",
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
+		"CHACHA20-POLY1305",
 	]);
 
 	const ALL_USAGES = [
@@ -431,6 +440,12 @@
 				keyRaw.set(key, raw);
 				return key;
 			}
+			if (name === CHACHA) {
+				const raw = crypto.getRandomValues(new Uint8Array(32));
+				const key = new CryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
+				keyRaw.set(key, raw);
+				return key;
+			}
 			if (name === "ED25519") {
 				const r = ops.subtle_ed_generate();
 				const algo = { name: "Ed25519" };
@@ -539,6 +554,24 @@
 				keyRaw.set(key, raw);
 				return key;
 			}
+			if (name === CHACHA) {
+				let raw;
+				if (format === "raw" || format === "raw-secret") raw = toU8(keyData);
+				else if (format === "jwk") {
+					if (!keyData || keyData.kty !== "oct" || typeof keyData.k !== "string") {
+						throw new DOMException("importKey: not an oct JWK", "DataError");
+					}
+					raw = b64uDecode(keyData.k);
+				} else unsupported(`ChaCha20-Poly1305 key format ${format}`);
+				// The one legal key size. A short key is a DataError, not
+				// something to pad or stretch.
+				if (raw.length !== 32) {
+					throw new DOMException("importKey: ChaCha20-Poly1305 key must be 256 bits", "DataError");
+				}
+				const key = new CryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
+				keyRaw.set(key, raw);
+				return key;
+			}
 			if (name === "ED25519") {
 				let r;
 				if (format === "jwk") r = ops.subtle_ed_import("jwk", JSON.stringify(keyData));
@@ -612,6 +645,13 @@
 				}
 				unsupported(`AES export format ${format}`);
 			}
+			if (name === CHACHA) {
+				// No `alg` in the JWK: unlike AES there is no registered name for
+				// it, because there is only one variant to name.
+				if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
+				if (format === "jwk") return { kty: "oct", k: b64uEncode(rawOf(key)), ext: true, key_ops: [...key.usages] };
+				unsupported(`ChaCha20-Poly1305 export format ${format}`);
+			}
 			unsupported(`algorithm ${key.algorithm.name}`);
 		},
 
@@ -651,6 +691,10 @@
 				const tagLen = alg.tagLength ?? 128;
 				return toBuf(subtleFail(ops.subtle_aes_encrypt(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128))));
 			}
+			if (name === CHACHA) {
+				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+				return toBuf(subtleFail(ops.subtle_chacha(true, rawOf(key), toU8(alg.nonce ?? alg.iv), toU8(data), aad)));
+			}
 			if (name === "RSA-OAEP") {
 				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
 				return toBuf(subtleFail(ops.subtle_rsa_oaep(true, key._h, key.algorithm.hash.name, toU8(data), label)));
@@ -667,6 +711,10 @@
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
 				const tagLen = alg.tagLength ?? 128;
 				return toBuf(subtleFail(ops.subtle_aes_decrypt(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128))));
+			}
+			if (name === CHACHA) {
+				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+				return toBuf(subtleFail(ops.subtle_chacha(false, rawOf(key), toU8(alg.nonce ?? alg.iv), toU8(data), aad)));
 			}
 			if (name === "RSA-OAEP") {
 				const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
@@ -785,6 +833,10 @@
 			const op = encrypt ? ops.subtle_aes_encrypt : ops.subtle_aes_decrypt;
 			return subtleFail(op(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128)));
 		}
+		if (name === CHACHA) {
+			const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+			return subtleFail(ops.subtle_chacha(encrypt, rawOf(key), toU8(alg.nonce ?? alg.iv), toU8(data), aad));
+		}
 		if (name === "RSA-OAEP") {
 			const label = alg.label ? toU8(alg.label) : new Uint8Array(0);
 			return subtleFail(ops.subtle_rsa_oaep(encrypt, key._h, key.algorithm.hash.name, toU8(data), label));
@@ -805,6 +857,13 @@
 	function sharedKeyFrom(bits, alg, extractable, usages) {
 		const raw = Uint8Array.from(bits);
 		const name = String(algName(alg)).toUpperCase();
+		if (name === CHACHA) {
+			// One key size, so the whole 32-byte secret is the key.
+			if (raw.length < 32) {
+				throw new DOMException("encapsulateKey: shared secret is shorter than the requested key", "OperationError");
+			}
+			return subtle.importKey("raw", raw.slice(0, 32), alg, extractable, usages);
+		}
 		if (AES_ALL.includes(name)) {
 			const len = checkAESLength(alg.length === undefined ? 256 : alg.length, "encapsulateKey") / 8;
 			if (len > raw.length) {

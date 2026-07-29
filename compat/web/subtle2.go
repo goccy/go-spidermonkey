@@ -502,6 +502,7 @@ func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 		"subtle_hkdf":              s.opHKDFDerive,
 		"subtle_pbkdf2":            s.opPBKDF2Derive,
 		"subtle_rsa_oaep":          s.opRSAOAEP,
+		"subtle_chacha":            s.opChaChaSeal,
 	}
 }
 
