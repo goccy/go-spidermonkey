@@ -863,6 +863,34 @@
 
 	// -------------------------------------------------- fs stream flavors
 
+	// Node exposes the two fs stream classes as constructors, and code reaches
+	// for them by name: `new fs.ReadStream(path)`, `x instanceof fs.WriteStream`,
+	// and prototype patching by the graceful-fs generation of packages. They are
+	// real subclasses of Readable/Writable, so an instance answers to both, and
+	// the create* functions below re-parent what they build onto them.
+	// FileReadStream/FileWriteStream are Node's own legacy aliases.
+	function ReadStream(p, options) { return fsMod.createReadStream(p, options); }
+	function WriteStream(p, options) { return fsMod.createWriteStream(p, options); }
+	ReadStream.prototype = Object.create(Readable.prototype, { constructor: { value: ReadStream } });
+	WriteStream.prototype = Object.create(Writable.prototype, { constructor: { value: WriteStream } });
+	fsMod.ReadStream = fsMod.FileReadStream = ReadStream;
+	fsMod.WriteStream = fsMod.FileWriteStream = WriteStream;
+
+	// The default open(): what a patched prototype replaces. It sets this.fd and
+	// announces the stream is ready, which is the contract a replacement has to
+	// honor too.
+	function defaultOpen() {
+		try {
+			this.fd = fsMod.openSync(this.path, this.flags);
+		} catch (e) {
+			this.destroy(e);
+			return;
+		}
+		process.nextTick(() => { this.emit("open", this.fd); this.emit("ready"); });
+	}
+	ReadStream.prototype.open = defaultOpen;
+	WriteStream.prototype.open = defaultOpen;
+
 	// `start`/`end` are byte offsets, and Node rejects a string there rather than
 	// coercing it — a stream built from { start: "4" } would otherwise read from
 	// a plausible-looking but wrong place.
@@ -878,12 +906,11 @@
 		V.validateEncodingOpt(options);
 		checkStreamRange(options);
 		const hwm = options.highWaterMark || 64 * 1024;
-		let fd = typeof options.fd === "number" ? options.fd : null;
 		const ownFd = typeof options.fd !== "number";
 		let pos = options.start ?? 0;
 		const endInclusive = options.end; // fs stream `end` is INCLUSIVE
 		let opened = false, fdClosed = false;
-		const closeFd = () => { if (!fdClosed && ownFd && fd !== null) { try { fsMod.closeSync(fd); } catch { /* ignore */ } fdClosed = true; } };
+		const closeFd = () => { if (!fdClosed && ownFd && rs.fd !== null) { try { fsMod.closeSync(rs.fd); } catch { /* ignore */ } fdClosed = true; } };
 		const rs = new Readable({
 			// Stream the file in highWaterMark-sized chunks (constant memory) rather
 			// than loading the WHOLE file into guest heap — a large file (or a small
@@ -891,10 +918,14 @@
 			read(n) {
 				try {
 					if (!opened) {
-						if (fd === null) fd = fsMod.openSync(p, options.flags || "r");
 						opened = true;
-						process.nextTick(() => rs.emit("open", fd));
+						// Through this.open(), not a direct openSync: the whole point
+						// of exposing fs.ReadStream is that its prototype can be
+						// patched, which graceful-fs and its dependents do.
+						if (rs.fd === null) this.open();
+						if (rs.fd === null) return; // a patched open() defers it
 					}
+					const fd = rs.fd;
 					let want = Math.min(hwm, Math.max(1, n || hwm));
 					if (endInclusive !== undefined) {
 						const remaining = endInclusive - pos + 1;
@@ -910,9 +941,14 @@
 			},
 			destroy(err, cb) { closeFd(); cb(err); },
 		});
+		Object.setPrototypeOf(rs, ReadStream.prototype);
+		rs.fd = typeof options.fd === "number" ? options.fd : null;
+		rs.flags = options.flags || "r";
 		if (options.encoding) rs.setEncoding(options.encoding);
 		rs.on("end", closeFd);
 		rs.path = p;
+		if (ownFd) rs.open();
+		else process.nextTick(() => rs.emit("ready"));
 		rs.close = (cb) => { closeFd(); rs.destroy(); if (cb) process.nextTick(cb); };
 		return rs;
 	};
@@ -921,23 +957,24 @@
 		if (typeof options === "string") options = { encoding: options };
 		V.validateEncodingOpt(options);
 		checkStreamRange(options);
-		const flags = options.flags || "w";
 		// A caller-supplied fd is used directly (and not closed by us); otherwise
-		// open lazily on the first write. A numeric `start` makes every write a
-		// positioned (pwrite) write from that offset, which Node honors.
-		let fd = typeof options.fd === "number" ? options.fd : null;
+		// open lazily on the first write, through this.open() so a patched
+		// prototype (graceful-fs and its dependents) is honored. A numeric
+		// `start` makes every write a positioned (pwrite) write from that
+		// offset, which Node honors.
 		const ownFd = typeof options.fd !== "number";
 		let pos = typeof options.start === "number" ? options.start : null;
 		const ws = new Writable({
 			write(chunk, encoding, callback) {
 				try {
 					const buf = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
-					if (fd === null) fd = fsMod.openSync(p, flags);
+					if (ws.fd === null) this.open();
+					if (ws.fd === null) { callback(); return; }
 					if (pos !== null) {
-						fsMod.writeSync(fd, buf, 0, buf.length, pos);
+						fsMod.writeSync(ws.fd, buf, 0, buf.length, pos);
 						pos += buf.length;
 					} else {
-						fsMod.writeSync(fd, buf, 0, buf.length);
+						fsMod.writeSync(ws.fd, buf, 0, buf.length);
 					}
 					callback();
 				} catch (e) {
@@ -947,8 +984,8 @@
 			final(callback) {
 				try {
 					// An empty stream must still create/truncate the file.
-					if (fd === null) fd = fsMod.openSync(p, flags);
-					if (ownFd && fd !== null) { fsMod.closeSync(fd); fd = null; }
+					if (ws.fd === null) this.open();
+					if (ownFd && ws.fd !== null) { fsMod.closeSync(ws.fd); ws.fd = null; }
 					callback();
 				} catch (e) {
 					callback(e);
@@ -959,14 +996,23 @@
 				// leaks in the host fd table (and buffered bytes are lost, since
 				// closeSync is what flushes them to the FS).
 				try {
-					if (ownFd && fd !== null) { fsMod.closeSync(fd); fd = null; }
+					if (ownFd && ws.fd !== null) { fsMod.closeSync(ws.fd); ws.fd = null; }
 				} catch (_e) { /* best effort on the error/destroy path */ }
 				callback(err);
 			},
 		});
+		Object.setPrototypeOf(ws, WriteStream.prototype);
+		ws.fd = typeof options.fd === "number" ? options.fd : null;
+		ws.flags = options.flags || "w";
 		ws.path = p;
 		ws.close = (cb) => ws.end(cb);
-		process.nextTick(() => ws.emit("open"));
+		// Node opens at CONSTRUCTION, not on the first write: a caller that waits
+		// for 'open' before writing would otherwise wait forever. 'open' belongs
+		// to open() alone — emitting it here as well fired every handler twice.
+		// A stream handed an existing fd opens nothing and is ready at once.
+		if (ownFd) ws.open();
+		else process.nextTick(() => ws.emit("ready"));
 		return ws;
 	};
+
 })();

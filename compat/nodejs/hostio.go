@@ -16,8 +16,11 @@ import (
 )
 
 type ioState struct {
-	mu          sync.Mutex
-	watchers    map[int64]chan struct{}
+	mu       sync.Mutex
+	watchers map[int64]chan struct{}
+	// Watchers whose loop pending has been released by unref(); tracked so a
+	// repeated unref()/ref() cannot double-release or double-take it.
+	unrefed     map[int64]bool
 	nextWatch   int64
 	sigOnce     sync.Once
 	sigCh       chan os.Signal
@@ -27,15 +30,16 @@ type ioState struct {
 }
 
 func newIOState() *ioState {
-	return &ioState{watchers: map[int64]chan struct{}{}}
+	return &ioState{watchers: map[int64]chan struct{}{}, unrefed: map[int64]bool{}}
 }
 
 func (rt *Runtime) ioOps() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
-		"stdin_start":  rt.opStdinStart,
-		"signal_watch": rt.opSignalWatch,
-		"fs_watch":     rt.opFSWatch,
-		"fs_unwatch":   rt.opFSUnwatch,
+		"stdin_start":    rt.opStdinStart,
+		"signal_watch":   rt.opSignalWatch,
+		"fs_watch":       rt.opFSWatch,
+		"fs_unwatch":     rt.opFSUnwatch,
+		"fs_watch_unref": rt.opFSWatchUnref,
 	}
 }
 
@@ -253,10 +257,50 @@ func (rt *Runtime) opFSUnwatch(cfg spidermonkey.Config, args []spidermonkey.Valu
 	id := int64(args[0].Float())
 	rt.io.mu.Lock()
 	stop := rt.io.watchers[id]
+	wasUnrefed := rt.io.unrefed[id]
 	delete(rt.io.watchers, id)
+	delete(rt.io.unrefed, id)
 	rt.io.mu.Unlock()
 	if stop != nil {
+		// The watcher goroutine releases the pending when it stops. An unref'd
+		// watcher already gave it up, so re-take it here for that release to
+		// balance rather than drop the count below zero.
+		if wasUnrefed {
+			rt.loop.AddPending("stdio")
+		}
 		close(stop)
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// opFSWatchUnref(id, unrefed) drops or re-takes the loop pending a watcher
+// holds. An unref'd watcher keeps polling but no longer counts as a reason for
+// the program to stay alive, which is the whole of what unref() promises.
+func (rt *Runtime) opFSWatchUnref(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 2 {
+		return spidermonkey.Undefined(), nil
+	}
+	id := int64(args[0].Float())
+	rt.io.mu.Lock()
+	_, live := rt.io.watchers[id]
+	unrefed := rt.io.unrefed[id]
+	want := args[1].Bool()
+	if live && unrefed != want {
+		if rt.io.unrefed == nil {
+			rt.io.unrefed = map[int64]bool{}
+		}
+		rt.io.unrefed[id] = want
+	} else {
+		live = false
+	}
+	rt.io.mu.Unlock()
+	if !live {
+		return spidermonkey.Undefined(), nil
+	}
+	if want {
+		rt.loop.DonePending("stdio")
+	} else {
+		rt.loop.AddPending("stdio")
 	}
 	return spidermonkey.Undefined(), nil
 }
@@ -264,6 +308,12 @@ func (rt *Runtime) opFSUnwatch(cfg spidermonkey.Config, args []spidermonkey.Valu
 func (rt *Runtime) closeIO() {
 	rt.io.mu.Lock()
 	for id, stop := range rt.io.watchers {
+		// Same balance as opFSUnwatch: an unref'd watcher's goroutine still
+		// releases a pending when it stops, so give it one to release.
+		if rt.io.unrefed[id] {
+			rt.loop.AddPending("stdio")
+			delete(rt.io.unrefed, id)
+		}
 		delete(rt.io.watchers, id)
 		close(stop)
 	}

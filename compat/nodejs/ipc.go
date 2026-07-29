@@ -27,6 +27,10 @@ type ipcChannel struct {
 	childWak chan struct{} // signalled when toChild grows or the channel closes
 	parentW  chan struct{}
 	closed   bool
+	// Whether each END holds a loop pending on the channel. The two runtimes
+	// share this one object, so a single flag had the parent's ref cancel the
+	// child's and left one side's pending never released.
+	refed map[bool]bool // keyed by isChild
 }
 
 func newIPCChannel() *ipcChannel {
@@ -79,6 +83,39 @@ func (c *ipcChannel) take(readChildQueue bool) (msg string, ok bool, open bool) 
 	return "", false, !c.closed
 }
 
+// setRefed records whether this side holds a loop pending, reporting whether
+// the state actually changed so the caller adds or drops it exactly once.
+func (c *ipcChannel) setRefed(isChild, on bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refed == nil {
+		c.refed = map[bool]bool{}
+	}
+	if c.refed[isChild] == on {
+		return false
+	}
+	c.refed[isChild] = on
+	return true
+}
+
+// clearRefed drops the flag and reports whether a pending was still held, so
+// the reader goroutine releases it exactly once however it got here.
+func (c *ipcChannel) clearRefed(isChild bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	was := c.refed[isChild]
+	if c.refed != nil {
+		c.refed[isChild] = false
+	}
+	return was
+}
+
+func (c *ipcChannel) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
 func (c *ipcChannel) close() {
 	c.mu.Lock()
 	if !c.closed {
@@ -102,6 +139,7 @@ func (rt *Runtime) ipcOps() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
 		"ipc_send":       rt.opIPCSend,
 		"ipc_start":      rt.opIPCStart,
+		"ipc_ref":        rt.opIPCRef,
 		"ipc_disconnect": rt.opIPCDisconnect,
 	}
 }
@@ -136,15 +174,27 @@ func (rt *Runtime) opIPCStart(cfg spidermonkey.Config, args []spidermonkey.Value
 		freeObjects(onMessage, onClose)
 		return spidermonkey.Undefined(), nil
 	}
-	// The channel keeps the loop alive exactly as a socket would: a program
-	// waiting for a message from its peer has not finished.
-	rt.loop.AddPending("ipc")
+	// A REF'D channel keeps the loop alive exactly as a socket would: a program
+	// waiting for a message from its peer has not finished. The CHILD end starts
+	// unref'd, because a child that holds the channel open can never finish, and
+	// the parent does not close the channel until the child finishes — the two
+	// ends would wait on each other forever. ipc_ref flips it once the child is
+	// genuinely listening for messages.
 	// A side READS the queue the other side writes: the child writes toward the
 	// parent (toParent) and reads toChild, and vice versa. Inverting this is
 	// silent — each end simply never hears anything.
 	isChild := toParent
+	keepAlive := len(args) < 4 || args[3].Bool()
+	ch.setRefed(isChild, keepAlive)
+	if keepAlive {
+		rt.loop.AddPending("ipc")
+	}
 	go func() {
-		defer rt.loop.DonePending("ipc")
+		defer func() {
+			if ch.clearRefed(isChild) {
+				rt.loop.DonePending("ipc")
+			}
+		}()
 		for {
 			msg, ok, open := ch.take(isChild)
 			if ok {
@@ -170,6 +220,30 @@ func (rt *Runtime) opIPCStart(cfg spidermonkey.Config, args []spidermonkey.Value
 			<-ch.wake(isChild)
 		}
 	}()
+	return spidermonkey.Undefined(), nil
+}
+
+// opIPCRef(id, on) takes or releases the channel's loop pending. The guest
+// calls it when the first 'message' listener is added and when the last one
+// goes away, which is exactly when the channel starts and stops being a reason
+// for the program to keep running.
+func (rt *Runtime) opIPCRef(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 2 {
+		return spidermonkey.Undefined(), nil
+	}
+	ch, toParent := rt.ipcFor(int64(args[0].Float()))
+	// A closed channel will never deliver again, so taking a pending on it
+	// would be a wait with nothing to wait for.
+	if ch == nil || (args[1].Bool() && ch.isClosed()) {
+		return spidermonkey.Undefined(), nil
+	}
+	if ch.setRefed(toParent, args[1].Bool()) {
+		if args[1].Bool() {
+			rt.loop.AddPending("ipc")
+		} else {
+			rt.loop.DonePending("ipc")
+		}
+	}
 	return spidermonkey.Undefined(), nil
 }
 

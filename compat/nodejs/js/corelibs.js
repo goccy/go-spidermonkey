@@ -440,7 +440,28 @@
 	// exactly how Node tells a forked child from a plain one.
 	if (globalThis.__node_has_ipc) {
 		process.connected = true;
-		process.channel = { ref() {}, unref() {} };
+		// The channel starts UNREF'd, as Node's does, and only counts as a
+		// reason to stay alive once the child is actually listening. Holding it
+		// ref'd unconditionally deadlocked every well-behaved fork: the child
+		// waited on a channel the parent would not close until the child
+		// finished, and the parent would not see it finish until it did.
+		let channelRefs = 0;
+		const refChannel = (on) => {
+			// Once disconnected the channel can never deliver again, so listening
+			// on it is not a reason to stay alive.
+			if (on && !process.connected) return;
+			const before = channelRefs;
+			channelRefs = Math.max(0, channelRefs + (on ? 1 : -1));
+			if ((before > 0) !== (channelRefs > 0)) ops.ipc_ref(0, channelRefs > 0);
+		};
+		process.channel = {
+			ref() { refChannel(true); },
+			unref() { refChannel(false); },
+		};
+		// Listening for a message is what makes the channel load-bearing.
+		// Listening for a message is what makes the channel load-bearing.
+		process.on("newListener", (event) => { if (event === "message") refChannel(true); });
+		process.on("removeListener", (event) => { if (event === "message") refChannel(false); });
 		process.send = function send(message, sendHandle, options, callback) {
 			if (typeof sendHandle === "function") { callback = sendHandle; sendHandle = undefined; }
 			else if (typeof options === "function") { callback = options; options = undefined; }
@@ -461,7 +482,8 @@
 		};
 		ops.ipc_start(0,
 			(json) => { try { process.emit("message", JSON.parse(json)); } catch { /* not JSON: drop */ } },
-			() => { if (process.connected) { process.connected = false; process.emit("disconnect"); } });
+			() => { if (process.connected) { process.connected = false; process.emit("disconnect"); } },
+			false); // the child end does not hold the loop open by itself
 	}
 
 	// The uncaughtException channel: an error escaping a process.nextTick
@@ -1575,6 +1597,24 @@
 		fsSync.copyFileSync(from, to);
 	}
 
+	// fs.watch() hands back an FSWatcher, and callers treat it as a handle, not
+	// just an emitter: they close it, they unref() it so a watch alone does not
+	// hold the process open, and they wait on it with once(). A bare
+	// EventEmitter with a close() method answered none of that.
+	class FSWatcher extends EventEmitter {
+		constructor() { super(); this._id = null; this._closed = false; }
+		close() {
+			if (this._closed) return;
+			this._closed = true;
+			if (this._id !== null) ops.fs_unwatch(this._id);
+			this.emit("close");
+		}
+		// The host op holds a loop pending; releasing it is exactly what unref
+		// means here, and re-taking it is ref.
+		unref() { if (!this._closed && this._id !== null && !this._unrefed) { this._unrefed = true; ops.fs_watch_unref(this._id, true); } return this; }
+		ref() { if (this._unrefed) { this._unrefed = false; ops.fs_watch_unref(this._id, false); } return this; }
+	}
+
 	// Active watchFile() host watchers keyed by path, so unwatchFile() can stop
 	// them — each fs_watch holds a host loop-pending, and never calling
 	// fs_unwatch would keep the event loop alive forever.
@@ -1709,12 +1749,15 @@
 		},
 		watch(p, options, listener) {
 			if (typeof options === "function") { listener = options; options = {}; }
-			const watcher = new EventEmitter();
+			validatePath(p);
+			validateEncodingOpt(options);
+			if (listener !== undefined && listener !== null) validateFunction(listener, "listener");
+			const watcher = new FSWatcher();
 			const id = ops.fs_watch(fsResolve(p), (eventType, filename) => {
 				watcher.emit("change", eventType, filename);
-				if (listener) listener(eventType, filename);
 			});
-			watcher.close = () => ops.fs_unwatch(id);
+			watcher._id = id;
+			if (listener) watcher.on("change", listener);
 			return watcher;
 		},
 		watchFile(p, options, listener) {
@@ -1817,6 +1860,15 @@
 			if (isErr(r)) throw fsError(r, "write", fd);
 			return r;
 		},
+		// The fd-addressed twins of the path operations. There is nothing behind
+		// them here — the host filesystem has no owners, and every write is
+		// already durable — but they have to EXIST and validate their fd, since
+		// that is the whole of their observable contract.
+		fsyncSync(fd) { validateFd(fd); },
+		fdatasyncSync(fd) { validateFd(fd); },
+		fchmodSync(fd, mode) { validateFd(fd); validateMode(mode); },
+		fchownSync(fd, uid, gid) { validateFd(fd); validateUidGid(uid, gid); },
+		futimesSync(fd, atime, mtime) { validateFd(fd); },
 		fstatSync(fd, opts) {
 			validateFd(fd);
 			const r = ops.fs_fstat(fd);
@@ -1914,6 +1966,11 @@
 		ftruncate: callbackify1(fsSync.ftruncateSync, fsCheck.ftruncate),
 		chown: callbackify1(fsSync.chownSync, fsCheck.chown),
 		lchown: callbackify1(fsSync.lchownSync, fsCheck.lchown),
+		fsync: callbackify1(fsSync.fsyncSync, fsCheck.close),
+		fdatasync: callbackify1(fsSync.fdatasyncSync, fsCheck.close),
+		fchmod: callbackify1(fsSync.fchmodSync, (fd, m) => { validateFd(fd); validateMode(m); }),
+		fchown: callbackify1(fsSync.fchownSync, (fd, u, g) => { validateFd(fd); validateUidGid(u, g); }),
+		futimes: callbackify1(fsSync.futimesSync, fsCheck.close),
 		exists: (p, cb) => {
 			// exists() predates Node's error convention: its callback takes the
 			// boolean alone. The callback is still required, and a bad path
@@ -2134,6 +2191,38 @@
 		const signal = opts && typeof opts === "object" ? opts.signal : undefined;
 		if (signal && signal.aborted) return Promise.reject(fsAbortErr(signal));
 		try { return Promise.resolve(fsSync.writeFileSync(p, data, opts)); } catch (e) { return Promise.reject(e); }
+	};
+	// fs.promises.watch is an async ITERATOR of {eventType, filename}, not an
+	// emitter: `for await (const e of watch(dir))`. Events that arrive while
+	// nothing is awaiting queue up, so none is lost between turns of the loop.
+	promisified.watch = (p, options) => {
+		const watcher = fsMod.watch(p, options);
+		const queued = [], waiting = [];
+		let done = false;
+		watcher.on("change", (eventType, filename) => {
+			const ev = { eventType, filename };
+			if (waiting.length) waiting.shift()({ value: ev, done: false });
+			else queued.push(ev);
+		});
+		const stop = () => {
+			done = true;
+			watcher.close();
+			while (waiting.length) waiting.shift()({ value: undefined, done: true });
+			return Promise.resolve({ value: undefined, done: true });
+		};
+		if (options && options.signal) {
+			if (options.signal.aborted) stop();
+			else options.signal.addEventListener("abort", stop, { once: true });
+		}
+		return {
+			[Symbol.asyncIterator]() { return this; },
+			next() {
+				if (queued.length) return Promise.resolve({ value: queued.shift(), done: false });
+				if (done) return Promise.resolve({ value: undefined, done: true });
+				return new Promise((resolve) => waiting.push(resolve));
+			},
+			return: stop,
+		};
 	};
 	promisified.access = (p) => (ops.fs_exists(fsResolve(p)) ? Promise.resolve() : Promise.reject(fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p)));
 	promisified.open = (p, flags) => { try { return Promise.resolve(makeFileHandle(fsSync.openSync(p, flags))); } catch (e) { return Promise.reject(e); } };
