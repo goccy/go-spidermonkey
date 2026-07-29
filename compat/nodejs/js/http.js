@@ -433,7 +433,12 @@
 		try {
 			server.emit("request", req, res);
 		} catch (e) {
-			console.error("Unhandled request handler error:", e instanceof Error ? `${e.name}: ${e.message}\n${e.stack || ""}` : String(e));
+			// Answer the client first — a half-written response would leave the
+			// peer waiting — and then let the exception be what it is. A throw in
+			// a request handler is an UNCAUGHT exception in Node: it reaches
+			// 'uncaughtException' and, with no listener, ends the process.
+			// Swallowing it here left the server listening and the program alive
+			// forever, which is how a whole family of http tests never finished.
 			try {
 				if (!res.headersSent) {
 					res.statusCode = 500;
@@ -441,7 +446,9 @@
 				} else {
 					res.end();
 				}
-			} catch {}
+			} catch { /* the socket is already gone */ }
+			if (globalThis.__node_emit_uncaught) globalThis.__node_emit_uncaught(e);
+			else throw e;
 		}
 		// The request body streams in through __node_http_body; the handler
 		// attached its 'data'/'end' listeners synchronously above (the

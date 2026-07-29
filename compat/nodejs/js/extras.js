@@ -908,10 +908,18 @@
 		// send(msg, [offset, length,] [port, address,] [callback])
 		let cb;
 		if (typeof rest[rest.length - 1] === "function") cb = rest.pop();
-		let port, address, offset, length;
-		if (rest.length >= 4) { offset = rest[0]; length = rest[1]; port = rest[2]; address = rest[3]; }
-		else if (rest.length === 3) { offset = rest[0]; length = rest[1]; port = rest[2]; }
-		else { port = rest[0]; address = rest[1]; }
+		// Node decides the overload by TYPE, not by how many arguments are left:
+		// a leading pair of numbers is (offset, length). Counting arguments made
+		// send(buf, 0, 0, cb) on a CONNECTED socket read the offset and length as
+		// the port and address, so the slice was never taken and the callback
+		// never ran — every connected-send test hung on it.
+		let offset, length;
+		if (!Array.isArray(msg) && rest.length >= 2 &&
+			typeof rest[0] === "number" && typeof rest[1] === "number") {
+			offset = rest.shift();
+			length = rest.shift();
+		}
+		let port = rest[0], address = rest[1];
 		// A connected socket sends to its default destination; passing an explicit
 		// address on a connected socket is an error in Node.
 		if (this._remote) {
@@ -943,9 +951,12 @@
 		// ONLY through the callback; a bare 'error' emit (no callback) matches Node
 		// for send failures with no cb, but a successful send emits nothing.
 		const self = this;
+		const sent = buf.length;
 		ops.udp_send(this._id, buf, Number(port), String(address || "127.0.0.1"), (err) => {
 			const e = err ? Object.assign(new Error(err.message), { code: err.code }) : null;
-			if (cb) cb(e);
+			// Node's send callback is (error, bytes); omitting the count made
+			// every test that asserts on it fail on `undefined`.
+			if (cb) cb(e, e ? 0 : sent);
 			else if (e) self.emit("error", e);
 		});
 		return this;

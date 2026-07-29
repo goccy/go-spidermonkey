@@ -93,15 +93,19 @@ func (rt *Runtime) pumpUDP(id int64, conn *net.UDPConn, onMessage *spidermonkey.
 	credit := make(chan struct{}, maxUDPInFlight)
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
-		if n > 0 {
+		// A datagram with no payload is still a datagram — UDP delivers it and
+		// Node emits 'message' with an empty Buffer. Gating delivery on n > 0
+		// dropped it, so the tests that send an empty packet waited forever.
+		delivered := err == nil && addr != nil
+		if delivered {
 			select {
 			case credit <- struct{}{}:
 			default:
 				// Too many undelivered datagrams in flight: drop this one.
-				n = 0
+				delivered = false
 			}
 		}
-		if n > 0 {
+		if delivered {
 			data := append([]byte(nil), buf[:n]...)
 			family := "IPv6"
 			if addr.IP.To4() != nil {

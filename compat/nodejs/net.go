@@ -542,6 +542,16 @@ const maxClientBody = 100 << 20 // 100 MiB
 // resolve-once, dial-the-approved-IP policy as compat/web's fetch, so the
 // node:http/https client cannot be DNS-rebound past Config.Dial and connects
 // only to addresses the policy approved. Redirects reuse the same DialContext.
+// applyNodeClientDefaults strips what Go adds and Node does not. Node's
+// http.request sends no User-Agent of its own — the suite echoes the request
+// headers back and compares them, so Go's "Go-http-client/1.1" is a visible
+// difference, not a cosmetic one.
+func applyNodeClientDefaults(req *http.Request) {
+	if _, explicit := req.Header["User-Agent"]; !explicit {
+		req.Header.Set("User-Agent", "")
+	}
+}
+
 func gatedTransport(cfg spidermonkey.Config) *http.Transport {
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	return &http.Transport{
@@ -1117,6 +1127,7 @@ func (rt *Runtime) opHTTPClientReq(cfg spidermonkey.Config, args []spidermonkey.
 		return spidermonkey.Undefined(), nil
 	}
 	applyClientHeaders(req, args[2].String())
+	applyNodeClientDefaults(req)
 
 	client, clientCleanup := rt.clientForAgent(cfg, agentJSON)
 	id := rt.startClientRoundTrip(cfg, req, onResponse, onError, client, clientCleanup, nil)
@@ -1151,6 +1162,7 @@ func (rt *Runtime) opHTTPClientReqStream(cfg spidermonkey.Config, args []spiderm
 		return spidermonkey.Undefined(), nil
 	}
 	applyClientHeaders(req, args[2].String())
+	applyNodeClientDefaults(req)
 
 	client, clientCleanup := rt.clientForAgent(cfg, agentJSON)
 	id := rt.startClientRoundTrip(cfg, req, onResponse, onError, client, clientCleanup, stream)

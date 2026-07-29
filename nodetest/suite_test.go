@@ -435,9 +435,29 @@ func TestNodeSuite(t *testing.T) {
 	if report := os.Getenv("NODETEST_REPORT"); report != "" {
 		writeJSON(t, report, failures)
 	}
-	if os.Getenv("NODETEST_UPDATE") != "" {
-		writeJSON(t, expectationsFile, failures)
-		t.Logf("wrote %d expected failures to %s", len(failures), expectationsFile)
+	if mode := os.Getenv("NODETEST_UPDATE"); mode != "" {
+		out := failures
+		if mode == "merge" {
+			// A SHARD's results, merged into the existing file. The suite cannot
+			// always be regenerated in one process — a long single-process run
+			// stops making progress (see docs/engine-followups.md), and sharding
+			// is the documented way around it — so a whole-file rewrite from one
+			// shard would delete every other shard's expectations.
+			out = map[string]string{}
+			if b, err := os.ReadFile(expectationsFile); err == nil {
+				if err := json.Unmarshal(b, &out); err != nil {
+					t.Fatalf("parse %s: %v", expectationsFile, err)
+				}
+			}
+			for _, p := range paths {
+				delete(out, filepath.ToSlash(p)) // this shard re-decides its own
+			}
+			for p, detail := range failures {
+				out[p] = detail
+			}
+		}
+		writeJSON(t, expectationsFile, out)
+		t.Logf("wrote %d expected failures to %s", len(out), expectationsFile)
 		return
 	}
 
