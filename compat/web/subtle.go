@@ -17,6 +17,7 @@ import (
 	"crypto/rsa"
 	_ "crypto/sha1" // register hashes for crypto.Hash.New
 	_ "crypto/sha256"
+	_ "crypto/sha3"
 	_ "crypto/sha512"
 	"crypto/x509"
 	"encoding/base64"
@@ -163,6 +164,14 @@ func hashByName(name string) (crypto.Hash, error) {
 		return crypto.SHA384, nil
 	case "SHA-512":
 		return crypto.SHA512, nil
+	// SHA-3 is a different sponge, not a longer SHA-2, and it is registered in
+	// its own right — a caller asking for SHA3-256 does not want SHA-256.
+	case "SHA3-256":
+		return crypto.SHA3_256, nil
+	case "SHA3-384":
+		return crypto.SHA3_384, nil
+	case "SHA3-512":
+		return crypto.SHA3_512, nil
 	}
 	return 0, fmt.Errorf("unsupported hash %q", name)
 }

@@ -33,7 +33,7 @@
 	};
 	const toBuf = (arr) => Uint8Array.from(arr).buffer;
 
-	const HASHES = ["SHA-1", "SHA-256", "SHA-384", "SHA-512"];
+	const HASHES = ["SHA-1", "SHA-256", "SHA-384", "SHA-512", "SHA3-256", "SHA3-384", "SHA3-512"];
 	const hashName = (h) => {
 		const n = String(h !== null && typeof h === "object" ? h.name : h).toUpperCase();
 		if (!HASHES.includes(n)) throw new DOMException(`unsupported hash ${n}`, "NotSupportedError");
@@ -184,6 +184,9 @@
 		[CHACHA]: ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		KMAC128: ["sign", "verify"],
 		KMAC256: ["sign", "verify"],
+		"ML-DSA-44": ["sign", "verify"],
+		"ML-DSA-65": ["sign", "verify"],
+		"ML-DSA-87": ["sign", "verify"],
 		HMAC: ["sign", "verify"],
 		ECDSA: ["sign", "verify"],
 		ED25519: ["sign", "verify"],
@@ -211,6 +214,12 @@
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
 		"CHACHA20-POLY1305", "KMAC128", "KMAC256", "AES-OCB",
+		// Registered but not yet implemented here. Knowing the NAME is what lets
+		// a bad call be judged on its merits: usages and parameters are checked
+		// against the algorithm's own definition, and only a request that is
+		// otherwise valid gets "not supported". Leaving them unknown reported
+		// every mistake as the same one.
+		"ML-DSA-44", "ML-DSA-65", "ML-DSA-87",
 	]);
 
 	const ALL_USAGES = [
@@ -409,7 +418,18 @@
 
 	const subtle = {
 		async digest(alg, data) {
-			return toBuf(ops.subtle_digest(hashName(alg), toU8(data)));
+			// cSHAKE is an extendable-output function: the caller names the digest
+			// length rather than taking one the algorithm fixes.
+			const name = algName(alg).toUpperCase();
+			if (name === "CSHAKE128" || name === "CSHAKE256") {
+				const bits = alg.outputLength === undefined ? (name === "CSHAKE128" ? 256 : 512) : Number(alg.outputLength);
+				const custom = alg.customization === undefined ? new Uint8Array(0) : toU8(alg.customization);
+				return toBuf(subtleFail(ops.subtle_cshake(name === "CSHAKE128" ? 128 : 256, toU8(data), custom, bits)));
+			}
+			// `name` is already in hand: reading alg.name again would run a
+			// caller's getter a second time, and the suite uses one to mutate the
+			// input mid-call.
+			return toBuf(ops.subtle_digest(hashName(name), toU8(data)));
 		},
 
 		async generateKey(alg, extractable, usages) {
@@ -417,7 +437,8 @@
 			const name = String(declared).toUpperCase();
 			// A key pair may leave one half with no usages, so the empty check
 			// applies to the pair as a whole rather than to each side.
-			const isPair = ["ECDSA", "ECDH", "ED25519", "X25519", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP"].includes(name);
+			const isPair = ["ECDSA", "ECDH", "ED25519", "ED448", "X25519", "X448", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP",
+				"ML-DSA-44", "ML-DSA-65", "ML-DSA-87", ...MLKEM_NAMES].includes(name);
 			// The ALGORITHM is validated in full before the usages are looked at:
 			// WebCrypto normalizes (and so rejects) the algorithm first, and the
 			// suite pairs a bad parameter with bad usages precisely to check which

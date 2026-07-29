@@ -119,3 +119,43 @@ func (s *subtleAPI) opKMAC(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	}
 	return bytesValue(out), nil
 }
+
+// opCShake(bits, data, customization, outputBits) -> bytes | error.
+//
+// cSHAKE is SHAKE with a domain-separation string, and with an empty one it IS
+// SHAKE — which is what makes it usable as a plain extendable-output digest.
+func (s *subtleAPI) opCShake(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 4 {
+		return nil, fmt.Errorf("cshake: (bits, data, customization, outputBits) required")
+	}
+	bits := intArg(args[0])
+	data, err := argBytes(args[1])
+	if err != nil {
+		return nil, err
+	}
+	custom, _ := argBytes(args[2])
+	outBits := intArg(args[3])
+	if outBits <= 0 || outBits%8 != 0 {
+		return subtleErr("OperationError: cSHAKE length must be a positive multiple of 8"), nil
+	}
+	if outBits/8 > maxSubtleKDFBytes {
+		return subtleErr("OperationError: cSHAKE length is too large"), nil
+	}
+	var h sha3.ShakeHash
+	switch bits {
+	case 128:
+		h = sha3.NewCShake128(nil, custom)
+	case 256:
+		h = sha3.NewCShake256(nil, custom)
+	default:
+		return subtleErr("OperationError: cSHAKE must be 128 or 256"), nil
+	}
+	if _, err := h.Write(data); err != nil {
+		return subtleErr("OperationError: " + err.Error()), nil
+	}
+	out := make([]byte, outBits/8)
+	if _, err := h.Read(out); err != nil {
+		return subtleErr("OperationError: " + err.Error()), nil
+	}
+	return bytesValue(out), nil
+}
