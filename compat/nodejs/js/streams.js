@@ -147,6 +147,15 @@
 			consumed: false,
 			needReadable: false,
 			pipes: [],
+			// Node's own fields, carried so a caller that branches on them sees a
+			// value rather than undefined.
+			closed: false, errored: null, errorEmitted: false, constructed: true,
+			reading: false, readingMore: false, resumeScheduled: false, sync: true,
+			emittedReadable: false, readableListening: false, awaitDrainWriters: null,
+			defaultEncoding: options.defaultEncoding || "utf8",
+			emitClose: options.emitClose !== false,
+			autoDestroy: options.autoDestroy !== false,
+			encoding: options.encoding || null,
 		};
 		this.readable = true;
 		this.readableEnded = false;
@@ -164,6 +173,11 @@
 	// Getters must be defined with defineProperties, not Object.assign (which
 	// would invoke them during the copy).
 	Object.defineProperties(Readable.prototype, {
+		// Node calls this state object _readableState, and reaches into it from
+		// its own libraries as well as its suite — `stream._readableState.pipes`
+		// is how you ask what a stream is piped to. Keeping it under a private
+		// name of our own made every one of those reads a TypeError.
+		_readableState: { get() { return this._rs; }, configurable: true },
 		readableHighWaterMark: { get() { return this._rs.highWaterMark; }, configurable: true },
 		readableLength: { get() { return this._rs.length; }, configurable: true },
 		readableObjectMode: { get() { return this._rs.objectMode; }, configurable: true },
@@ -508,6 +522,11 @@
 			ending: false, finished: false, finishEmitted: false, pending: 0, destroyed: false,
 			buffered: 0, // bytes/items awaiting their write callback
 			needDrain: false,
+			// Node's own fields, carried so a caller that branches on them sees a
+			// value rather than undefined.
+			closed: false, errored: null, errorEmitted: false, constructed: true,
+			defaultEncoding: options.defaultEncoding || "utf8", emitClose: options.emitClose !== false,
+			autoDestroy: options.autoDestroy !== false, corked: 0, sync: true, writing: false,
 			highWaterMark: options.highWaterMark ?? (options.objectMode || options.writableObjectMode ? 16 : 16384),
 			objectMode: !!(options.objectMode || options.writableObjectMode),
 		};
@@ -520,6 +539,7 @@
 	}
 
 	const writableGetters = {
+		_writableState: { get() { return this._ws; }, configurable: true },
 		writableHighWaterMark: { get() { return this._ws.highWaterMark; }, configurable: true },
 		writableLength: { get() { return this._ws.buffered; }, configurable: true },
 		writableObjectMode: { get() { return this._ws.objectMode; }, configurable: true },
@@ -811,7 +831,56 @@
 	}
 	Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
 	Object.setPrototypeOf(Stream, EventEmitter);
-	Stream.prototype.pipe = Readable.prototype.pipe;
+	// The LEGACY pipe: 'data' in, write() out, with pause/resume for
+	// backpressure. It cannot be Readable's, which reads a _readableState the
+	// base Stream does not have — and a bare Stream is exactly what the
+	// util.inherits generation of code (and Node's own suite) still builds.
+	Stream.prototype.pipe = function pipe(dest, options) {
+		const source = this;
+		function ondata(chunk) {
+			if (dest.writable && dest.write(chunk) === false && source.pause) source.pause();
+		}
+		function ondrain() { if (source.readable && source.resume) source.resume(); }
+		source.on("data", ondata);
+		dest.on("drain", ondrain);
+
+		// Only end the destination we are not sharing: piping several sources
+		// into one stdout must not close it when the first finishes.
+		if (!dest._isStdio && (!options || options.end !== false)) {
+			source.on("end", onend);
+			source.on("close", onclose);
+		}
+		let didOnEnd = false;
+		function onend() { if (didOnEnd) return; didOnEnd = true; dest.end(); }
+		function onclose() { if (didOnEnd) return; didOnEnd = true; if (typeof dest.destroy === "function") dest.destroy(); }
+
+		// An 'error' with no listener is fatal, so both ends get one — and the
+		// pipe is torn down either way, since half a pipe is worse than none.
+		function onerror(er) {
+			cleanup();
+			if (this.listenerCount("error") === 0) throw er;
+		}
+		source.on("error", onerror);
+		dest.on("error", onerror);
+
+		function cleanup() {
+			source.removeListener("data", ondata);
+			dest.removeListener("drain", ondrain);
+			source.removeListener("end", onend);
+			source.removeListener("close", onclose);
+			source.removeListener("error", onerror);
+			dest.removeListener("error", onerror);
+			source.removeListener("end", cleanup);
+			source.removeListener("close", cleanup);
+			dest.removeListener("close", cleanup);
+		}
+		source.on("end", cleanup);
+		source.on("close", cleanup);
+		dest.on("close", cleanup);
+
+		dest.emit("pipe", source);
+		return dest;
+	};
 
 	// duplexPair returns two Duplexes wired back to back: what one writes, the
 	// other reads. It is how the suite tests a Duplex without a socket, and it
@@ -835,6 +904,120 @@
 		b.once("close", () => { if (!a.destroyed) a.destroy(); });
 		return [a, b];
 	}
+
+	// ------------------------------------------- iterator helpers and toWeb
+	// Node 17+ gives a Readable the same operators an array has. They are lazy
+	// and each returns a new Readable, so `readable.filter(f).map(g).take(3)`
+	// reads only as far as it must — which is the point of having them on a
+	// stream rather than collecting to an array first.
+	const helperSource = async function* (rs) {
+		for await (const chunk of rs) yield chunk;
+	};
+	const fromAsyncGen = (gen, options) => Readable.from(gen, { objectMode: true, ...options });
+	Object.assign(Readable.prototype, {
+		map(fn, options) {
+			const self = this;
+			return fromAsyncGen((async function* () {
+				let i = 0;
+				for await (const c of helperSource(self)) yield await fn(c, i++);
+			})(), options);
+		},
+		filter(fn, options) {
+			const self = this;
+			return fromAsyncGen((async function* () {
+				let i = 0;
+				for await (const c of helperSource(self)) if (await fn(c, i++)) yield c;
+			})(), options);
+		},
+		take(n, options) {
+			const self = this;
+			return fromAsyncGen((async function* () {
+				if (n <= 0) return;
+				let left = n;
+				for await (const c of helperSource(self)) { yield c; if (--left <= 0) return; }
+			})(), options);
+		},
+		drop(n, options) {
+			const self = this;
+			return fromAsyncGen((async function* () {
+				let left = n;
+				for await (const c of helperSource(self)) { if (left-- > 0) continue; yield c; }
+			})(), options);
+		},
+		flatMap(fn, options) {
+			const self = this;
+			return fromAsyncGen((async function* () {
+				let i = 0;
+				for await (const c of helperSource(self)) {
+					const out = await fn(c, i++);
+					if (out && (out[Symbol.asyncIterator] || out[Symbol.iterator])) yield* out;
+					else yield out;
+				}
+			})(), options);
+		},
+		async forEach(fn) { let i = 0; for await (const c of helperSource(this)) await fn(c, i++); },
+		async toArray() { const out = []; for await (const c of helperSource(this)) out.push(c); return out; },
+		async some(fn) { let i = 0; for await (const c of helperSource(this)) if (await fn(c, i++)) return true; return false; },
+		async every(fn) { let i = 0; for await (const c of helperSource(this)) if (!(await fn(c, i++))) return false; return true; },
+		async find(fn) { let i = 0; for await (const c of helperSource(this)) if (await fn(c, i++)) return c; return undefined; },
+		async reduce(fn, initial) {
+			let acc = initial, i = 0, seeded = arguments.length > 1;
+			for await (const c of helperSource(this)) {
+				if (!seeded) { acc = c; seeded = true; i++; continue; }
+				acc = await fn(acc, c, i++);
+			}
+			if (!seeded) throw Object.assign(new TypeError("Reduce of an empty stream with no initial value"), { code: "ERR_INVALID_ARG_TYPE" });
+			return acc;
+		},
+	});
+
+	// The two stream worlds. A Node stream and a WHATWG stream are the same
+	// idea with different shapes, and code that mixes them (a fetch body into a
+	// pipeline, a Node stream into a Response) needs the conversion to exist.
+	Readable.toWeb = (rs) => new globalThis.ReadableStream({
+		start(controller) {
+			rs.on("data", (c) => controller.enqueue(c));
+			rs.once("end", () => { try { controller.close(); } catch { /* already closed */ } });
+			rs.once("error", (e) => controller.error(e));
+		},
+		cancel(reason) { rs.destroy(reason); },
+	});
+	Readable.fromWeb = (ws, options) => Readable.from((async function* () {
+		const reader = ws.getReader();
+		for (;;) {
+			const { value, done } = await reader.read();
+			if (done) return;
+			yield value;
+		}
+	})(), options);
+	Writable.toWeb = (ws) => new globalThis.WritableStream({
+		write(chunk) { return new Promise((res, rej) => ws.write(chunk, (e) => (e ? rej(e) : res()))); },
+		close() { return new Promise((res) => ws.end(res)); },
+		abort(reason) { ws.destroy(reason); },
+	});
+	Writable.fromWeb = (web, options) => {
+		const writer = web.getWriter();
+		return new Writable({
+			...options,
+			write(chunk, enc, cb) { writer.write(chunk).then(() => cb(), cb); },
+			final(cb) { writer.close().then(() => cb(), cb); },
+			destroy(err, cb) { writer.abort(err).then(() => cb(err), () => cb(err)); },
+		});
+	};
+	Duplex.toWeb = (d) => ({ readable: Readable.toWeb(d), writable: Writable.toWeb(d) });
+	Duplex.fromWeb = (pair, options) => {
+		const readable = Readable.fromWeb(pair.readable, options);
+		const writable = Writable.fromWeb(pair.writable, options);
+		const d = new Duplex({
+			...options,
+			read() { readable.resume(); },
+			write(chunk, enc, cb) { writable.write(chunk, enc, cb); },
+			final(cb) { writable.end(cb); },
+		});
+		readable.on("data", (c) => d.push(c));
+		readable.once("end", () => d.push(null));
+		return d;
+	};
 
 	const streamMod = Object.assign(Stream, {
 		Readable, Writable, Duplex, Transform, PassThrough, Stream, finished, pipeline,
