@@ -1569,9 +1569,22 @@
 		}
 		return { force: true, ...options };
 	}
+	// The filter may be async, but only for the callback and promise forms —
+	// cpSync has nowhere to await, so a promise there is a return-value error
+	// rather than something to coerce to "truthy, therefore copy everything".
+	function syncFilter(opts, from, to) {
+		if (!opts.filter) return true;
+		const r = opts.filter(from, to);
+		if (r && typeof r.then === "function") {
+			throw Object.assign(new TypeError('Expected a boolean from the "filter" function but got an instance of Promise.'),
+				{ code: "ERR_INVALID_RETURN_VALUE" });
+		}
+		return r;
+	}
+
 	// One source entry to one destination entry, recursing for directories.
 	function copyEntry(from, to, opts) {
-		if (opts.filter && !opts.filter(from, to)) return;
+		if (!syncFilter(opts, from, to)) return;
 		const st = fsSync.lstatSync(from);
 		let destSt = null;
 		try { destSt = fsSync.lstatSync(to); } catch { /* absent is the normal case */ }
@@ -1610,6 +1623,59 @@
 			return;
 		}
 		fsSync.copyFileSync(from, to);
+	}
+
+	// The async walk. It differs from the sync one in exactly one place — it
+	// AWAITS the filter — which is the whole reason cp() cannot just be cpSync()
+	// on a microtask.
+	async function copyEntryAsync(from, to, opts) {
+		if (opts.filter && !(await opts.filter(from, to))) return;
+		const st = fsSync.lstatSync(from);
+		let destSt = null;
+		try { destSt = fsSync.lstatSync(to); } catch { /* absent is the normal case */ }
+		if (st.isDirectory()) {
+			if (!opts.recursive) {
+				throw Object.assign(new Error(`Recursive option not enabled, current size of ${from} exceeds`),
+					{ code: "ERR_FS_EISDIR", name: "SystemError" });
+			}
+			if (destSt && !destSt.isDirectory()) {
+				throw cpError("DIR_TO_NON_DIR", `cannot overwrite non-directory ${to} with directory ${from}`);
+			}
+			fsSync.mkdirSync(to, { recursive: true });
+			for (const name of fsSync.readdirSync(from)) {
+				await copyEntryAsync(path.join(from, name), path.join(to, name), opts);
+			}
+			return;
+		}
+		if (destSt && destSt.isDirectory()) {
+			throw cpError("NON_DIR_TO_DIR", `cannot overwrite directory ${to} with non-directory ${from}`);
+		}
+		if (destSt) {
+			if (opts.errorOnExist && !opts.force) throw cpError("EEXIST", `${to} already exists`);
+			if (!opts.force) return;
+		}
+		if (st.isSymbolicLink() && !opts.dereference) {
+			const target = fsSync.readlinkSync(from);
+			if (!opts.verbatimSymlinks && path.resolve(path.dirname(from), target).startsWith(to)) {
+				throw cpError("SYMLINK_TO_SUBDIRECTORY", `cannot overwrite ${to} with ${from}`);
+			}
+			try { fsSync.unlinkSync(to); } catch { /* nothing to replace */ }
+			fsSync.symlinkSync(target, to);
+			return;
+		}
+		fsSync.copyFileSync(from, to);
+	}
+
+	// The shared front half of every cp form: validate, resolve, and refuse the
+	// two copies that would never terminate.
+	function cpPrepare(src, dest, options) {
+		const opts = validateCpOptions(options);
+		const from = fsResolve(src), to = fsResolve(dest);
+		if (from === to) throw cpError("EINVAL", `src and dest cannot be the same ${from}`);
+		if (to.startsWith(from.endsWith("/") ? from : from + "/")) {
+			throw cpError("EINVAL", `cannot copy ${from} to a subdirectory of self ${to}`);
+		}
+		return { from, to, opts };
 	}
 
 	// fs.watch() hands back an FSWatcher, and callers treat it as a handle, not
@@ -1820,14 +1886,7 @@
 			return r;
 		},
 		cpSync(src, dest, options) {
-			const opts = validateCpOptions(options);
-			const from = fsResolve(src), to = fsResolve(dest);
-			// Copying a tree onto itself, or into its own subtree, would recurse
-			// forever; Node names both cases before starting.
-			if (from === to) throw cpError("EINVAL", `src and dest cannot be the same ${from}`);
-			if (to.startsWith(from.endsWith("/") ? from : from + "/")) {
-				throw cpError("EINVAL", `cannot copy ${from} to a subdirectory of self ${to}`);
-			}
+			const { from, to, opts } = cpPrepare(src, dest, options);
 			copyEntry(from, to, opts);
 		},
 		openSync(p, flags = "r") {
@@ -1972,7 +2031,21 @@
 		link: callbackify1(fsSync.linkSync, fsCheck.link),
 		copyFile: callbackify1(fsSync.copyFileSync, fsCheck.copyFile),
 		mkdtemp: callbackify1(fsSync.mkdtempSync, fsCheck.mkdtemp),
-		cp: callbackify1(fsSync.cpSync, fsCheck.cp),
+		// cp() is not cpSync() on a microtask: its filter may be async, and the
+		// walk has to wait for each answer before deciding what to copy.
+		cp: (src, dest, options, cb) => {
+			if (typeof options === "function") { cb = options; options = undefined; }
+			validateFunction(cb, "cb");
+			validatePath(src);
+			validatePath(dest);
+			// A bad OPTION is an argument error and throws here; a malformed pair
+			// of PATHS is an operation failure and reaches the callback.
+			validateCpOptions(options);
+			let prepared;
+			try { prepared = cpPrepare(src, dest, options); }
+			catch (e) { queueMicrotask(() => cb(e)); return; }
+			copyEntryAsync(prepared.from, prepared.to, prepared.opts).then(() => cb(null), (e) => cb(e));
+		},
 		chmod: callbackify1(fsSync.chmodSync, fsCheck.chmod),
 		lchmod: callbackify1(fsSync.chmodSync, fsCheck.lchmod),
 		utimes: callbackify1(fsSync.utimesSync, fsCheck.stat),
@@ -2177,7 +2250,7 @@
 		["mkdir", "mkdirSync"], ["rmdir", "rmdirSync"], ["rm", "rmSync"],
 		["unlink", "unlinkSync"], ["rename", "renameSync"],
 		["realpath", "realpathSync"], ["copyFile", "copyFileSync"],
-		["mkdtemp", "mkdtempSync"], ["cp", "cpSync"],
+		["mkdtemp", "mkdtempSync"],
 		["chmod", "chmodSync"], ["lchmod", "lchmodSync"],
 		["utimes", "utimesSync"], ["lutimes", "lutimesSync"],
 		["truncate", "truncateSync"],
@@ -2238,6 +2311,13 @@
 			},
 			return: stop,
 		};
+	};
+	// The promise form shares the async walk, so it accepts an async filter too.
+	promisified.cp = (src, dest, options) => {
+		try {
+			const { from, to, opts } = cpPrepare(src, dest, options);
+			return copyEntryAsync(from, to, opts);
+		} catch (e) { return Promise.reject(e); }
 	};
 	promisified.access = (p) => (ops.fs_exists(fsResolve(p)) ? Promise.resolve() : Promise.reject(fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p)));
 	promisified.open = (p, flags) => { try { return Promise.resolve(makeFileHandle(fsSync.openSync(p, flags))); } catch (e) { return Promise.reject(e); } };
