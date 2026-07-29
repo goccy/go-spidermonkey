@@ -127,8 +127,18 @@
 	// canonical spelling is mixed-case, and a key reports the name it was asked
 	// for, so it cannot be carried as the uppercased lookup key.
 	const CHACHA = "CHACHA20-POLY1305";
-	const CANONICAL_NAMES = { [CHACHA]: "ChaCha20-Poly1305" };
-	const canonicalName = (upper) => CANONICAL_NAMES[upper] || upper;
+	// A key reports the algorithm's REGISTERED spelling, not the one the caller
+	// happened to type. Algorithm names are matched case-insensitively, so
+	// generateKey({name: "rsa-oaep"}) is a valid RSA-OAEP request — and the key
+	// it produces must say "RSA-OAEP". Echoing the caller's casing back made
+	// every such call fail its own identity check.
+	const CANONICAL_NAMES = {
+		[CHACHA]: "ChaCha20-Poly1305",
+		"RSASSA-PKCS1-V1_5": "RSASSA-PKCS1-v1_5",
+		"ED25519": "Ed25519",
+		"ED448": "Ed448",
+	};
+	const canonicalName = (upper) => CANONICAL_NAMES[String(upper).toUpperCase()] || String(upper).toUpperCase();
 	// KMAC128/KMAC256 are keyed hashes: secret keys that sign and verify, with
 	// the digest length chosen per call rather than fixed by the algorithm.
 	const KMAC_NAMES = ["KMAC128", "KMAC256"];
@@ -436,7 +446,7 @@
 				const hash = hashName(alg.hash);
 				const bits = Number(alg.modulusLength);
 				const r = subtleFail(ops.subtle_rsa_generate(bits));
-				const algo = { name: algName(alg), hash: { name: hash }, modulusLength: bits, publicExponent: new Uint8Array([1, 0, 1]) };
+				const algo = { name: canonicalName(algName(alg)), hash: { name: hash }, modulusLength: bits, publicExponent: new Uint8Array([1, 0, 1]) };
 				const isOAEP = name === "RSA-OAEP";
 				return {
 					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => isOAEP ? u === "decrypt" || u === "unwrapKey" : u === "sign"), r.priv),
@@ -446,7 +456,7 @@
 			if (AES_ALL.includes(name)) {
 				const length = checkAESLength(alg.length === undefined ? 256 : alg.length, "generateKey");
 				const raw = crypto.getRandomValues(new Uint8Array(length / 8));
-				const key = new CryptoKey("secret", extractable, { name, length }, usages, null);
+				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -458,7 +468,7 @@
 					throw new DOMException(`Failed to execute 'generateKey': ${name} length must be a positive multiple of 8`, "OperationError");
 				}
 				const raw = crypto.getRandomValues(new Uint8Array(bits / 8));
-				const key = new CryptoKey("secret", extractable, { name, length: bits }, usages, null);
+				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length: bits }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -497,7 +507,7 @@
 			if (name === "ECDH") {
 				const crv = String(alg.namedCurve);
 				const r = subtleFail(ops.subtle_ec_generate(crv)); // reuse EC keygen (same curves)
-				const algo = { name: algName(alg), namedCurve: crv };
+				const algo = { name: canonicalName(algName(alg)), namedCurve: crv };
 				return {
 					privateKey: new CryptoKey("private", extractable, algo, usages, r.priv),
 					publicKey: new CryptoKey("public", true, algo, [], r.pub),
@@ -557,12 +567,15 @@
 				if (format === "jwk") r = ops.subtle_rsa_import_jwk(JSON.stringify(keyData));
 				else if (format === "pkcs8" || format === "spki") r = ops.subtle_rsa_import_der(format, toU8(keyData));
 				else unsupported(`RSA key format ${format}`);
-				const algo = { name: algName(alg), hash: { name: hashName(alg.hash) }, modulusLength: r.bits, publicExponent: new Uint8Array([1, 0, 1]) };
+				const algo = { name: canonicalName(algName(alg)), hash: { name: hashName(alg.hash) }, modulusLength: r.bits, publicExponent: new Uint8Array([1, 0, 1]) };
 				return new CryptoKey(r.type, extractable, algo, usages, r.id);
 			}
 			if (AES_ALL.includes(name)) {
 				let raw;
-				if (format === "raw") raw = toU8(keyData);
+				// "raw-secret" is the newer spelling of "raw" for a symmetric key;
+				// the draft algorithms are specified only with it, so both name the
+				// same thing here.
+				if (format === "raw" || format === "raw-secret") raw = toU8(keyData);
 				else if (format === "jwk") {
 					if (!keyData || keyData.kty !== "oct" || typeof keyData.k !== "string") {
 						throw new DOMException("importKey: not an oct JWK", "DataError");
@@ -572,7 +585,7 @@
 				if (raw.length !== 16 && raw.length !== 24 && raw.length !== 32) {
 					throw new DOMException("importKey: invalid AES key length", "DataError");
 				}
-				const key = new CryptoKey("secret", extractable, { name, length: raw.length * 8 }, usages, null);
+				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length: raw.length * 8 }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -588,7 +601,7 @@
 				if (raw.length === 0) {
 					throw new DOMException("importKey: KMAC key must not be empty", "DataError");
 				}
-				const key = new CryptoKey("secret", extractable, { name, length: raw.length * 8 }, usages, null);
+				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length: raw.length * 8 }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -625,7 +638,7 @@
 				else unsupported(`EC key format ${format}`);
 				// A public key carries no usages in WebCrypto, whatever was asked for.
 				const kUsages = r.type === "public" ? usages.filter((u) => name === "ECDSA" && u === "verify") : usages;
-				return new CryptoKey(r.type, extractable, { name: algName(alg), namedCurve: r.crv }, kUsages, r.id);
+				return new CryptoKey(r.type, extractable, { name: canonicalName(algName(alg)), namedCurve: r.crv }, kUsages, r.id);
 			}
 			if (name === "HKDF" || name === "PBKDF2") {
 				if (format !== "raw") unsupported(`${name} key format ${format}`);
@@ -672,7 +685,7 @@
 				unsupported(`Ed25519 export format ${format}`);
 			}
 			if (AES_ALL.includes(name)) {
-				if (format === "raw") return rawOf(key).slice().buffer;
+				if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
 				if (format === "jwk") {
 					// The JWK alg encodes the AES variant AND the key size, e.g.
 					// A128GCM/A192GCM/A256GCM, A256CBC, A256CTR — derive it from the
