@@ -490,7 +490,7 @@ func (rt *Runtime) ops() map[string]spidermonkey.Func {
 		"crypto_hmac":     rt.opCryptoHMAC,
 	}
 	for _, group := range []map[string]spidermonkey.Func{
-		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(), rt.ioOps(), rt.sysOps(),
+		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.dnsOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(), rt.ioOps(), rt.sysOps(),
 	} {
 		for name, fn := range group {
 			table[name] = fn

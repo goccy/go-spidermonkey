@@ -1545,15 +1545,122 @@
 		setEnvironmentData: () => {},
 	};
 
-	const dnsErr = (cb) => queueMicrotask(() => cb(Object.assign(new Error("dns is not supported yet in this runtime"), { code: "ENOTSUP" })));
-	core.dns = {
-		lookup: (host, opts, cb) => dnsErr(typeof opts === "function" ? opts : cb),
-		resolve: (host, type, cb) => dnsErr(typeof type === "function" ? type : cb),
-		promises: {
-			lookup: () => Promise.reject(new Error("dns is not supported yet in this runtime")),
-			resolve: () => Promise.reject(new Error("dns is not supported yet in this runtime")),
-		},
-	};
+	// node:dns over the host resolver. Every lookup goes through the same
+	// Config.Resolve gate the connect paths use, and a refusal or a failure
+	// arrives with Node's error shape (code/syscall/hostname).
+	function dnsError(info) {
+		const e = new Error(info.message || "dns query failed");
+		e.code = info.code;
+		e.errno = info.code;
+		e.syscall = info.syscall;
+		e.hostname = info.hostname;
+		return e;
+	}
+	// query runs one lookup and hands the callback (err, result).
+	function dnsQuery(kind, host, cb) {
+		if (typeof cb !== "function") throw new TypeError("callback is not a function");
+		ops.dns_resolve(String(kind), String(host), (err, result) => {
+			if (err) cb(dnsError(err), undefined);
+			else cb(null, result);
+		});
+	}
+	const RRTYPES = ["A", "AAAA", "CNAME", "MX", "NS", "PTR", "SRV", "TXT"];
+
+	// lookup answers with a single address (Node's shape), unless `all` was
+	// asked for.
+	function dnsLookup(host, options, cb) {
+		if (typeof options === "function") { cb = options; options = {}; }
+		options = options || {};
+		if (typeof options === "number") options = { family: options };
+		const kind = options.family === 4 ? "A" : options.family === 6 ? "AAAA" : "lookup";
+		dnsQuery(kind, host, (err, list) => {
+			if (err) return cb(err);
+			if (!list || list.length === 0) {
+				return cb(dnsError({ code: "ENOTFOUND", syscall: "getaddrinfo", hostname: String(host) }));
+			}
+			if (options.all) return cb(null, list);
+			cb(null, list[0].address, list[0].family);
+		});
+	}
+
+	function makeResolver() {
+		const self = {
+			// The server list is accepted and reported back, but the host uses the
+			// system resolver: Go's net.Resolver has no per-instance server list,
+			// so honouring it would be a lie. Reporting what was set is what lets
+			// a caller round-trip its own configuration.
+			_servers: [],
+			setServers(list) { self._servers = Array.from(list || []).map(String); },
+			getServers() { return [...self._servers]; },
+			cancel() {},
+			setLocalAddress() {},
+			lookup: dnsLookup,
+			resolve(host, type, cb) {
+				if (typeof type === "function") { cb = type; type = "A"; }
+				const t = String(type).toUpperCase();
+				if (!RRTYPES.includes(t)) {
+					throw Object.assign(new TypeError(`Unknown type: ${type}`), { code: "ERR_INVALID_ARG_VALUE" });
+				}
+				if (t === "A" || t === "AAAA") {
+					return dnsQuery(t, host, (err, list) => {
+						if (err) return cb(err);
+						cb(null, list.map((e) => e.address));
+					});
+				}
+				return dnsQuery(t, host, cb);
+			},
+			reverse(addr, cb) { return dnsQuery("PTR", addr, cb); },
+		};
+		for (const t of RRTYPES) {
+			const name = "resolve" + (t === "A" ? "4" : t === "AAAA" ? "6" : t.charAt(0) + t.slice(1).toLowerCase());
+			self[name] = (host, cb) => self.resolve(host, t, cb);
+		}
+		// Node spells these two with their record type in caps.
+		self.resolveMx = (host, cb) => self.resolve(host, "MX", cb);
+		self.resolveNs = (host, cb) => self.resolve(host, "NS", cb);
+		self.resolveTxt = (host, cb) => self.resolve(host, "TXT", cb);
+		self.resolveSrv = (host, cb) => self.resolve(host, "SRV", cb);
+		self.resolveCname = (host, cb) => self.resolve(host, "CNAME", cb);
+		self.resolvePtr = (host, cb) => self.resolve(host, "PTR", cb);
+		return self;
+	}
+
+	function Resolver(options) {
+		if (!(this instanceof Resolver)) return new Resolver(options);
+		Object.assign(this, makeResolver());
+	}
+
+	// The promise form of every callback method, which is all dns/promises is.
+	function promisify(obj) {
+		const out = { Resolver: class extends Resolver { constructor(o) { super(o); Object.assign(this, promisify(makeResolver())); } } };
+		for (const [k, v] of Object.entries(obj)) {
+			if (typeof v !== "function" || k.startsWith("_")) { out[k] = v; continue; }
+			if (k === "setServers" || k === "getServers" || k === "cancel" || k === "setLocalAddress") { out[k] = v; continue; }
+			out[k] = (...args) => new Promise((resolve, reject) => {
+				v(...args, (err, ...rest) => {
+					if (err) return reject(err);
+					// dns.promises.lookup resolves with { address, family }; every
+					// other method's callback carries a single value.
+					if (k === "lookup" && rest.length > 1) return resolve({ address: rest[0], family: rest[1] });
+					resolve(rest[0]);
+				});
+			});
+		}
+		return out;
+	}
+
+	const dnsModule = makeResolver();
+	dnsModule.Resolver = Resolver;
+	dnsModule.promises = promisify(makeResolver());
+	// The record-type constants Node exports.
+	Object.assign(dnsModule, {
+		ADDRCONFIG: 1024, ALL: 256, V4MAPPED: 8,
+		NODATA: "ENODATA", FORMERR: "EFORMERR", SERVFAIL: "ESERVFAIL",
+		NOTFOUND: "ENOTFOUND", NOTIMP: "ENOTIMP", REFUSED: "REFUSED",
+		BADQUERY: "EBADQUERY", BADNAME: "EBADNAME", BADFAMILY: "EBADFAMILY",
+		TIMEOUT: "ETIMEOUT", CANCELLED: "ECANCELLED",
+	});
+	core.dns = dnsModule;
 
 	// node:tls over the tls_* host ops. TLSSocket is a Socket-shaped Duplex
 	// whose reads come from an encrypted connection; the server side accepts
