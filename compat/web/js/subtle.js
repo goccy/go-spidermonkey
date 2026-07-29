@@ -117,7 +117,11 @@
 	const AES_NAMES = ["AES-GCM", "AES-CBC", "AES-CTR"];
 	// AES-KW is a secret AES key too (import/export/generate), but only wraps —
 	// it never appears in encrypt/decrypt, which stay gated on AES_NAMES.
-	const AES_ALL = [...AES_NAMES, "AES-KW"];
+	// AES-OCB is an AES key in every respect that import/export/generate care
+	// about — same lengths, same JWK `alg` shape — so it joins AES_ALL. It stays
+	// out of AES_NAMES because those route to the AES cipher op and OCB has its
+	// own.
+	const AES_ALL = [...AES_NAMES, "AES-KW", "AES-OCB"];
 	// ChaCha20-Poly1305 is a secret-key AEAD like the AES modes, but nothing
 	// about it is negotiable: one key size, one nonce size, one tag size. The
 	// canonical spelling is mixed-case, and a key reports the name it was asked
@@ -166,6 +170,7 @@
 		"AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-KW": ["wrapKey", "unwrapKey"],
+		"AES-OCB": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		[CHACHA]: ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		KMAC128: ["sign", "verify"],
 		KMAC256: ["sign", "verify"],
@@ -195,7 +200,7 @@
 		"ML-KEM-512", "ML-KEM-768", "ML-KEM-1024",
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
-		"CHACHA20-POLY1305", "KMAC128", "KMAC256",
+		"CHACHA20-POLY1305", "KMAC128", "KMAC256", "AES-OCB",
 	]);
 
 	const ALL_USAGES = [
@@ -673,7 +678,7 @@
 					// A128GCM/A192GCM/A256GCM, A256CBC, A256CTR — derive it from the
 					// actual key length, not a hardcoded A256GCM.
 					const bits = (rawOf(key).length * 8);
-					const suffix = name === "AES-GCM" ? "GCM" : name === "AES-CBC" ? "CBC" : name === "AES-CTR" ? "CTR" : "KW";
+					const suffix = name === "AES-GCM" ? "GCM" : name === "AES-CBC" ? "CBC" : name === "AES-CTR" ? "CTR" : name === "AES-OCB" ? "OCB" : "KW";
 					return { kty: "oct", k: b64uEncode(rawOf(key)), alg: `A${bits}${suffix}`, ext: true, key_ops: [...key.usages] };
 				}
 				unsupported(`AES export format ${format}`);
@@ -742,6 +747,10 @@
 				const tagLen = alg.tagLength ?? 128;
 				return toBuf(subtleFail(ops.subtle_aes_encrypt(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128))));
 			}
+			if (name === "AES-OCB") {
+				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+				return toBuf(subtleFail(ops.subtle_aes_ocb(true, rawOf(key), toU8(alg.iv), toU8(data), aad, alg.tagLength ?? 128)));
+			}
 			if (name === CHACHA) {
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
 				return toBuf(subtleFail(ops.subtle_chacha(true, rawOf(key), toU8(alg.nonce ?? alg.iv), toU8(data), aad)));
@@ -762,6 +771,10 @@
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
 				const tagLen = alg.tagLength ?? 128;
 				return toBuf(subtleFail(ops.subtle_aes_decrypt(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128))));
+			}
+			if (name === "AES-OCB") {
+				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+				return toBuf(subtleFail(ops.subtle_aes_ocb(false, rawOf(key), toU8(alg.iv), toU8(data), aad, alg.tagLength ?? 128)));
 			}
 			if (name === CHACHA) {
 				const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
@@ -897,6 +910,10 @@
 			const tagLen = alg.tagLength ?? 128;
 			const op = encrypt ? ops.subtle_aes_encrypt : ops.subtle_aes_decrypt;
 			return subtleFail(op(name, rawOf(key), iv, toU8(data), aad, tagLen, Number(name === "AES-CTR" ? (alg.length ?? 128) : 128)));
+		}
+		if (name === "AES-OCB") {
+			const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
+			return subtleFail(ops.subtle_aes_ocb(encrypt, rawOf(key), toU8(alg.iv), toU8(data), aad, alg.tagLength ?? 128));
 		}
 		if (name === CHACHA) {
 			const aad = alg.additionalData ? toU8(alg.additionalData) : new Uint8Array(0);
