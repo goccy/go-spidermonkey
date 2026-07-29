@@ -2599,11 +2599,20 @@
 	// final response was ever judged, so ~150 subtests that require a rejection
 	// mid-chain saw a resolved fetch.
 	const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+	const KNOWN_REFERRER_POLICIES = new Set([
+		"", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin",
+		"strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin",
+		"unsafe-url",
+	]);
 
 	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer) {
 		let current = url;
 		let origin = envURL.origin;
 		let hops = 0;
+		// A redirect response may declare its own Referrer-Policy, and the next
+		// hop uses THAT. Carrying the caller's policy the whole way down ignored
+		// the server's instruction.
+		let policy = referrerPolicy;
 		for (;;) {
 			// The headers are materialized per hop: nInit.headers is only filled
 			// in by the single-shot dispatch path, and the Origin changes once a
@@ -2616,7 +2625,7 @@
 			// one. Computing it once sent the first hop's referrer all the way
 			// down the chain.
 			if (!explicitReferrer) {
-				const ref = referrerHeaderFor(referrerPolicy, envURL, new URL(current));
+				const ref = referrerHeaderFor(policy, envURL, new URL(current));
 				if (ref) hdrObj.referer = ref;
 				else delete hdrObj.referer;
 			}
@@ -2643,6 +2652,14 @@
 			if (next.username || next.password) throw corsError("redirect to a URL with credentials");
 			if (next.protocol !== "http:" && next.protocol !== "https:") {
 				throw corsError("redirect to a non-HTTP URL");
+			}
+			const declared = res.headers.get("referrer-policy");
+			if (declared) {
+				// A header may list several, most-preferred last; take the last
+				// one this implementation knows.
+				for (const p of String(declared).split(",").map((x) => x.trim().toLowerCase())) {
+					if (KNOWN_REFERRER_POLICIES.has(p)) policy = p;
+				}
 			}
 			hops++;
 			if (hops > 20) throw corsError("too many redirects");
