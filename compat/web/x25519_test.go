@@ -51,6 +51,15 @@ func TestX25519(t *testing.T) {
 			try { await crypto.subtle.generateKey({name:"X25519"}, true, ["sign"]); out.push("usage:NO-THROW"); }
 			catch (e) { out.push("usage:" + e.name); }
 
+			// A KDF derivation of ZERO bits is a legal request for an empty key;
+			// only a null length is an error. Treating zero as an error broke
+			// every "with 0 length" case in the suite.
+			const pw = await crypto.subtle.importKey("raw", new TextEncoder().encode("pw"), {name:"PBKDF2"}, false, ["deriveBits"]);
+			const zero = await crypto.subtle.deriveBits({name:"PBKDF2", salt:new Uint8Array([1]), iterations:10, hash:"SHA-256"}, pw, 0);
+			out.push("kdf0:" + zero.byteLength);
+			try { await crypto.subtle.deriveBits({name:"PBKDF2", salt:new Uint8Array([1]), iterations:10, hash:"SHA-256"}, pw, null); out.push("kdfnull:NO-THROW"); }
+			catch (e) { out.push("kdfnull:" + e.name); }
+
 			globalThis.__r = out.join(" | ");
 		})();
 	`); err != nil {
@@ -63,7 +72,8 @@ func TestX25519(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "gen:X25519/private/public | derive:32:agree | jwk:OKP/X25519:same | raw:32 | usage:SyntaxError"
+	want := "gen:X25519/private/public | derive:32:agree | jwk:OKP/X25519:same | raw:32 | usage:SyntaxError | " +
+		"kdf0:0 | kdfnull:OperationError"
 	if got := v.Value.String(); got != want {
 		t.Errorf("X25519 =\n %s\nwant\n %s", got, want)
 	}

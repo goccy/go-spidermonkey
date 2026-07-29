@@ -85,8 +85,11 @@
 		// A KDF has no natural output size, so it cannot fall back to "all of it"
 		// the way ECDH can: a null or zero length is an OperationError.
 		if (name === "HKDF" || name === "PBKDF2") {
-			if (length === null || length === undefined || Number(length) === 0) {
-				throw new DOMException(`Failed to execute 'deriveBits': ${name} requires a non-zero length`, "OperationError");
+			// A NULL length is the error — the KDF has no natural output size to
+			// fall back on. Zero is a legal request and yields an empty result;
+			// treating it as an error broke every "with 0 length" case.
+			if (length === null || length === undefined) {
+				throw new DOMException(`Failed to execute 'deriveBits': ${name} needs an explicit length`, "OperationError");
 			}
 		}
 		if (name === "HKDF") {
@@ -106,8 +109,16 @@
 	// it never appears in encrypt/decrypt, which stay gated on AES_NAMES.
 	const AES_ALL = [...AES_NAMES, "AES-KW"];
 
+	// The host tags an error with the DOMException name the spec asks for, as a
+	// "DataError: ..." / "InvalidAccessError: ..." prefix. Reporting every one
+	// as an OperationError threw that away: a malformed key must be a
+	// DataError, and the suite checks which name it got.
 	const subtleFail = (r) => {
-		if (r && r.__subtleError) throw new DOMException(r.message, "OperationError");
+		if (r && r.__subtleError) {
+			const m = /^([A-Za-z]+Error): ([\s\S]*)$/.exec(String(r.message));
+			if (m && m[1] !== "Error") throw new DOMException(m[2], m[1]);
+			throw new DOMException(r.message, "OperationError");
+		}
 		return r;
 	};
 

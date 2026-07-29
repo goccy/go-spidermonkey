@@ -298,8 +298,11 @@ func (s *subtleAPI) opHKDFDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	salt, _ := argBytes(args[2])
 	info, _ := argBytes(args[3])
 	length := intArg(args[4]) / 8
-	if length < 1 || length > maxSubtleKDFBytes {
+	if length < 0 || length > maxSubtleKDFBytes {
 		return subtleErr("OperationError: invalid derived-bits length"), nil
+	}
+	if length == 0 {
+		return bytesValue(nil), nil
 	}
 	r := hkdf.New(newHash, ikm, salt, info)
 	out := make([]byte, length)
@@ -327,8 +330,13 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 		return subtleErr("OperationError: PBKDF2 iterations out of range"), nil
 	}
 	length := intArg(args[4]) / 8
-	if length < 1 || length > maxSubtleKDFBytes {
+	if length < 0 || length > maxSubtleKDFBytes {
 		return subtleErr("OperationError: invalid derived-bits length"), nil
+	}
+	// A zero-length derivation is a legal request for an empty key; Go's
+	// pbkdf2 does not accept a zero key length, so answer it directly.
+	if length == 0 {
+		return bytesValue(nil), nil
 	}
 	return bytesValue(pbkdf2.Key(pw, salt, iter, length, newHash)), nil
 }
