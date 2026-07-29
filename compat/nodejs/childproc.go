@@ -270,6 +270,24 @@ func (rt *Runtime) opChildKill(cfg spidermonkey.Config, args []spidermonkey.Valu
 	return spidermonkey.Undefined(), nil
 }
 
+// defaultMaxBuffer is Node's cap on the output a synchronous child may return
+// (1 MiB). Without one, a child that writes more than the guest's whole linear
+// memory crashes the host outright when the bytes are copied in — a real
+// SIGSEGV, not an error. Node reports ENOBUFS and truncates.
+const defaultMaxBuffer = 1024 * 1024
+
+// capOutput truncates a captured stream to the caller's maxBuffer (or Node's
+// default) and reports whether it had to.
+func capOutput(b []byte, max int) ([]byte, bool) {
+	if max <= 0 {
+		max = defaultMaxBuffer
+	}
+	if len(b) <= max {
+		return b, false
+	}
+	return b[:max], true
+}
+
 // opChildSpawnSync(opts, input) -> {status, signal, stdout, stderr, pid, error}.
 func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 1 {
@@ -309,7 +327,14 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 		}
 		res := rt.runNested(cfg, argv, envList(opts, cfg.Env), optString(opts, "cwd"),
 			stdin, &stdout, &stderr, 0)
-		return rt.spawnSyncResult(stdout.Bytes(), stderr.Bytes(), res.exitCode, res.err)
+		maxBuf := optInt(opts, "maxBuffer")
+		out, outCut := capOutput(stdout.Bytes(), maxBuf)
+		errOut, errCut := capOutput(stderr.Bytes(), maxBuf)
+		nestedErr := res.err
+		if (outCut || errCut) && nestedErr == nil {
+			nestedErr = errnoError("ENOBUFS")
+		}
+		return rt.spawnSyncResult(out, errOut, res.exitCode, nestedErr)
 	}
 
 	cmd := exec.Command(file, argv...)
@@ -344,8 +369,17 @@ func (rt *Runtime) opChildSpawnSync(cfg spidermonkey.Config, args []spidermonkey
 	for k, v := range result {
 		outObj.Set(k, spidermonkey.ValueOf(v))
 	}
-	so, _ := rt.js.NewBytes(stdout.Bytes())
-	se, _ := rt.js.NewBytes(stderr.Bytes())
+	// Bound what a child can hand back, as Node's maxBuffer does. Copying an
+	// unbounded capture into the guest's linear memory is a host crash, not an
+	// error the program can see.
+	capped, outCut := capOutput(stdout.Bytes(), optInt(opts, "maxBuffer"))
+	cappedErr, errCut := capOutput(stderr.Bytes(), optInt(opts, "maxBuffer"))
+	if (outCut || errCut) && result["error"] == nil {
+		result["error"] = "ENOBUFS: stdout maxBuffer length exceeded"
+		outObj.Set("error", spidermonkey.ValueOf(result["error"]))
+	}
+	so, _ := rt.js.NewBytes(capped)
+	se, _ := rt.js.NewBytes(cappedErr)
 	defer so.Free()
 	defer se.Free()
 	outObj.Set("stdout", so)
@@ -428,6 +462,14 @@ func envList(opts *spidermonkey.Object, defaultEnv []string) []string {
 		return []string{}
 	}
 	return defaultEnv
+}
+
+// optInt reads a numeric option (0 when absent).
+func optInt(opts *spidermonkey.Object, name string) int {
+	if v, ok := optScalar(opts, name); ok {
+		return v.Int()
+	}
+	return 0
 }
 
 func optString(opts *spidermonkey.Object, name string) string {

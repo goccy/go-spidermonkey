@@ -529,7 +529,17 @@ func (js *JS) Construct(fn uint64, args string) (string, error) {
 // BytesNew creates a fresh guest Uint8Array holding a copy of data and returns
 // its object handle. The bytes cross the bridge RAW — the protobuf channel is
 // length-delimited and 8-bit clean — with no base64/JSON encoding.
+// maxBytesNew bounds a single host->guest byte transfer. The bytes are copied
+// into the interpreter's LINEAR MEMORY, so a buffer larger than that memory
+// can hold does not fail — it faults, taking the host process with it. A
+// subprocess that wrote 384 MB into a 192 MB interpreter did exactly that.
+// Refusing it as an error keeps the failure inside the program.
+const maxBytesNew = 128 << 20
+
 func (js *JS) BytesNew(data []byte) (uint64, error) {
+	if len(data) > maxBytesNew {
+		return 0, fmt.Errorf("byte array of %d bytes exceeds the %d-byte transfer limit", len(data), maxBytesNew)
+	}
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, js.h)
 	buf = pbAppendBytes(buf, 2, data)
