@@ -13,9 +13,16 @@ from the runs in this repository rather than from intuition.
 | suite | measured |
 |---|---|
 | WPT | **35,694 / 43,142 subtests = 82.7%** |
-| Node.js | 2,611 tests run, **766 pass = 29.3%** |
+| Node.js | 2,611 tests run, **766 pass = 29.3%** (see the note below) |
 | Babel | 4,170 / 4,189 fixtures = 99.6% |
 | test262 | 52,266 / 53,329 = 98.0% |
+
+The Node figure is a full sharded sweep, and it is the number to quote. It
+lags HEAD slightly: a sweep takes about half an hour, so anything committed
+after its binary was built is measured per module instead — the callable
+constructors (`Buffer` 22 → 25) and the HTTP response validation (`http`
+83 → 85) are the two currently in that position. Re-run the sweep before
+quoting a new total rather than adding module deltas to an old one.
 
 WPT by directory, largest first:
 
