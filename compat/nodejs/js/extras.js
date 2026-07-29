@@ -388,6 +388,31 @@
 	}
 
 	// Diffie-Hellman (modp) over the crypto_dh_* ops.
+	// The named MODP groups. These primes are fixed by RFC 2409 and RFC 3526, so
+	// asking for a group by name is how a caller skips prime generation
+	// entirely — which is the whole reason the named groups exist.
+	const MODP_PRIMES = {
+		modp1: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF",
+		modp2: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF",
+		modp5: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
+		modp14: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF",
+	};
+	class DiffieHellmanGroup {
+		constructor(name) {
+			const prime = MODP_PRIMES[String(name)];
+			if (!prime) {
+				throw Object.assign(new Error(`Unknown DH group: ${name}`), { code: "ERR_CRYPTO_UNKNOWN_DH_GROUP" });
+			}
+			const dh = new DiffieHellman(prime.toLowerCase(), "02");
+			// A group's prime and generator are fixed, so unlike DiffieHellman it
+			// exposes no setters for them.
+			for (const m of ["generateKeys", "computeSecret", "getPrime", "getGenerator", "getPublicKey", "getPrivateKey"]) {
+				this[m] = (...a) => dh[m](...a);
+			}
+			Object.defineProperty(this, "verifyError", { get: () => dh.verifyError ?? 0 });
+		}
+	}
+
 	class DiffieHellman {
 		constructor(primeHexOrBits, generator) {
 			// Node accepts a Buffer/Uint8Array prime (and generator) — e.g. from a
@@ -483,6 +508,20 @@
 		get fips() { return false; },
 		createHash: (algorithm) => new Hash(algorithm),
 		createHmac: (algorithm, key) => new Hash(algorithm, toBuf(keyMaterial(key))),
+		// crypto.hash(alg, data[, encoding]) — the one-shot form, which exists
+		// because hashing a single buffer through a stream object is all
+		// ceremony and no benefit.
+		hash: (algorithm, data, outputEncoding = "hex") => {
+			if (typeof algorithm !== "string") {
+				throw Object.assign(new TypeError('The "algorithm" argument must be of type string.'), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
+				throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.'), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			const h = new Hash(algorithm);
+			h.update(data);
+			return outputEncoding === "buffer" ? h.digest() : h.digest(outputEncoding);
+		},
 		Hash, Hmac: Hash,
 		KeyObject,
 		createSecretKey, createPublicKey, createPrivateKey,
@@ -497,6 +536,12 @@
 		publicDecrypt, privateEncrypt,
 		createDiffieHellman: (prime, gen) => new DiffieHellman(prime, gen),
 		DiffieHellman,
+		// The named MODP groups of RFC 2409/3526. They are fixed primes, so a
+		// group is just a DiffieHellman over a known one — and callers ask for
+		// them by name precisely to avoid generating a prime.
+		createDiffieHellmanGroup: (name) => new DiffieHellmanGroup(name),
+		getDiffieHellman: (name) => new DiffieHellmanGroup(name),
+		DiffieHellmanGroup,
 		createECDH: (curve) => new ECDH(curve),
 		ECDH,
 		// One-shot X25519/ECDH from two KeyObjects.
