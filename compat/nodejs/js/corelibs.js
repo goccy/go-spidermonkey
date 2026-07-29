@@ -2413,8 +2413,43 @@
 		}
 	}
 
+	// Every spawn form takes the same three arguments, so they get the same
+	// check. Without it `spawn()` reached the host and returned
+	// `exec: "undefined": executable file not found in $PATH` — an error about
+	// the shell, from a mistake the caller made at the call site.
+	function validateSpawnArgs(file, args, options) {
+		if (typeof file !== "string" || file === "") {
+			throw Object.assign(new TypeError(`The "file" argument must be of type string. Received ${file === null ? "null" : typeof file}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		if (args !== undefined && args !== null && !Array.isArray(args) && typeof args !== "object") {
+			throw Object.assign(new TypeError(`The "args" argument must be an instance of Array. Received ${typeof args}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		if (options !== undefined && options !== null && typeof options !== "object") {
+			throw Object.assign(new TypeError(`The "options" argument must be of type object. Received ${typeof options}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		const o = options || {};
+		for (const key of ["timeout", "maxBuffer", "uid", "gid"]) {
+			if (o[key] !== undefined && typeof o[key] !== "number") {
+				throw Object.assign(new TypeError(`The "options.${key}" property must be of type number. Received ${typeof o[key]}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+		}
+		if (o.timeout !== undefined && (!Number.isInteger(o.timeout) || o.timeout < 0)) {
+			throw Object.assign(new RangeError(`The value of "options.timeout" is out of range. It must be a non-negative integer. Received ${o.timeout}`),
+				{ code: "ERR_OUT_OF_RANGE" });
+		}
+		if (o.cwd !== undefined && o.cwd !== null && typeof o.cwd !== "string" && !(o.cwd instanceof URL)) {
+			throw Object.assign(new TypeError(`The "options.cwd" property must be of type string or an instance of URL. Received ${typeof o.cwd}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+	}
+
 	function spawn(file, args, options) {
 		if (!Array.isArray(args)) { options = args; args = []; }
+		validateSpawnArgs(file, args, options);
 		options = options || {};
 		const cp = new ChildProcess();
 		const onStdout = (chunk) => cp.stdout.push(Buffer.from(chunk));
@@ -2478,6 +2513,12 @@
 	// script argument.
 	function fork(modulePath, args, options) {
 		if (!Array.isArray(args)) { options = args; args = []; }
+		// fork names a MODULE, not an executable, so it is checked here rather
+		// than through the executable check spawn applies below.
+		if (typeof modulePath !== "string" && !(modulePath instanceof URL)) {
+			throw Object.assign(new TypeError(`The "modulePath" argument must be of type string or an instance of URL. Received ${modulePath === null ? "null" : typeof modulePath}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
 		options = options || {};
 		const argv = [...(options.execArgv || []), String(modulePath), ...(args || []).map(String)];
 		return spawn(options.execPath || process.execPath, argv, { ...options, ipc: true });
@@ -2485,6 +2526,10 @@
 
 	function normalizeExec(command, options, callback) {
 		if (typeof options === "function") { callback = options; options = {}; }
+		if (typeof command !== "string") {
+			throw Object.assign(new TypeError(`The "command" argument must be of type string. Received ${command === null ? "null" : typeof command}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
 		return { options: options || {}, callback };
 	}
 
@@ -2499,6 +2544,8 @@
 	function execFile(file, args, options, callback) {
 		if (typeof args === "function") { callback = args; args = []; options = {}; }
 		else if (typeof options === "function") { callback = options; options = {}; }
+		if (!Array.isArray(args) && args !== undefined && args !== null) { options = args; args = []; }
+		validateSpawnArgs(file, args, options);
 		const cp = spawn(file, args || [], options || {});
 		collectAndCallback(cp, callback, options || {});
 		return cp;
@@ -2523,6 +2570,7 @@
 
 	function spawnSync(file, args, options) {
 		if (!Array.isArray(args)) { options = args; args = []; }
+		validateSpawnArgs(file, args, options);
 		options = options || {};
 		const input = options.input !== undefined ? Buffer.from(options.input) : undefined;
 		const r = ops.child_spawnsync(
@@ -2544,6 +2592,7 @@
 	}
 
 	function execSync(command, options = {}) {
+		normalizeExec(command, options);
 		const r = spawnSync("/bin/sh", ["-c", String(command)], options);
 		if (r.error) throw r.error;
 		if (r.status !== 0) {
@@ -2558,6 +2607,7 @@
 
 	function execFileSync(file, args, options) {
 		if (!Array.isArray(args)) { options = args; args = []; }
+		validateSpawnArgs(file, args, options);
 		const r = spawnSync(file, args || [], options || {});
 		if (r.error) throw r.error;
 		if (r.status !== 0) { const e = new Error(`Command failed`); e.status = r.status; throw e; }
