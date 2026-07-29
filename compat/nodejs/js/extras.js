@@ -1896,6 +1896,8 @@
 			super();
 			this.input = options.input;
 			this.output = options.output;
+			this.terminal = !!options.terminal;
+			if (options.prompt !== undefined) this._prompt = String(options.prompt);
 			this._buf = "";
 			this._questionCb = null;
 			this._closed = false;
@@ -1932,8 +1934,14 @@
 			if (this.output) this.output.write(query);
 			this._questionCb = cb;
 		}
-		prompt() { if (this.output) this.output.write("> "); }
-		write(data) { if (this.output) this.output.write(data); }
+		prompt() { if (this.output) this.output.write(this._prompt ?? "> "); }
+		setPrompt(p) { this._prompt = String(p); }
+		getPrompt() { return this._prompt ?? "> "; }
+		// write() feeds the INPUT, as if the user had typed it — it does not
+		// write to the output. Having it backwards meant every caller that
+		// drives an Interface programmatically (the REPL above all) echoed its
+		// script instead of running it.
+		write(data) { if (data !== null && data !== undefined) this._onData(String(data)); }
 		close() {
 			if (this._closed) return;
 			this._closed = true;

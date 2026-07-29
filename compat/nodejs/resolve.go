@@ -52,6 +52,7 @@ var coreModules = map[string]bool{
 	"path": true, "path/posix": true, "path/win32": true,
 	"perf_hooks": true, "process": true, "punycode": true,
 	"querystring": true, "readline": true, "readline/promises": true,
+	"repl": true,
 	"stream": true, "stream/consumers": true, "stream/promises": true,
 	"stream/web": true, "string_decoder": true, "sys": true,
 	"timers": true, "timers/promises": true, "tls": true, "tty": true,

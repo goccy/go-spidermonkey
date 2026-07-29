@@ -666,5 +666,289 @@
 		constructor(format) { return makeCompressionStream(unzlibFor, format); }
 	};
 
+	// ------------------------------------------------------------------ repl
+	// node:repl is an evaluator wrapped around a readline Interface: it reads a
+	// line, decides whether the line is a complete expression, evaluates it, and
+	// prints the value. Everything else about it — the dot-commands, the `_` and
+	// `_error` bindings, the recoverable-syntax-error continuation — is built on
+	// those four steps.
+	//
+	// This is the module a REPL-driving test needs, not an interactive terminal:
+	// the tests feed lines in and read the accumulated output back.
+
+	const REPL_MODE_SLOPPY = Symbol("repl-sloppy");
+	const REPL_MODE_STRICT = Symbol("repl-strict");
+
+	// A syntax error is RECOVERABLE when more input could complete it — an open
+	// brace, an unterminated string. That is the whole of multi-line editing:
+	// keep buffering instead of reporting.
+	function isRecoverableError(err, code) {
+		if (!err || err.name !== "SyntaxError") return false;
+		const m = String(err.message);
+		if (/^(Unexpected end of input|unexpected end of script|expected expression, got end of script)/i.test(m)) return true;
+		if (/unterminated (string|template) literal/i.test(m)) return true;
+		// Fall back to counting the delimiters the tokenizer would have balanced.
+		let depth = 0, inStr = null, escaped = false;
+		for (const ch of String(code)) {
+			if (escaped) { escaped = false; continue; }
+			if (inStr) {
+				if (ch === "\\") escaped = true;
+				else if (ch === inStr) inStr = null;
+				continue;
+			}
+			if (ch === "'" || ch === '"' || ch === "`") { inStr = ch; continue; }
+			if (ch === "(" || ch === "[" || ch === "{") depth++;
+			else if (ch === ")" || ch === "]" || ch === "}") depth--;
+		}
+		return depth > 0 || inStr !== null;
+	}
+
+	class REPLServer extends core.readline.Interface {
+		constructor(options = {}) {
+			const opts = typeof options === "string" ? { prompt: options } : options;
+			super({
+				input: opts.input || process.stdin,
+				output: opts.output || process.stdout,
+				terminal: opts.terminal,
+				prompt: opts.prompt !== undefined ? opts.prompt : "> ",
+			});
+			this.useColors = !!opts.useColors;
+			this.useGlobal = opts.useGlobal !== false;
+			this.ignoreUndefined = !!opts.ignoreUndefined;
+			this.replMode = opts.replMode || REPL_MODE_SLOPPY;
+			this.editorMode = false;
+			this.underscoreAssigned = false;
+			this.last = undefined;
+			this.lastError = undefined;
+			this.lines = [];
+			this.commands = Object.create(null);
+			this._buffered = "";
+			// The evaluation context. With useGlobal the REPL shares the real
+			// global, which is what makes `var x = 1` on one line visible on the
+			// next; a private context keeps its own bindings.
+			this.context = this.useGlobal ? globalThis : core.vm.createContext({ ...globalThis });
+			this.eval = opts.eval || defaultEval;
+			this.writer = opts.writer || ((v) => core.util.inspect(v, { colors: this.useColors }));
+			this.completer = opts.completer || ((line, cb) => cb(null, completeLine(this, line)));
+			// `_` is the last value and `_error` the last error, and assigning
+			// either by hand stops the REPL from overwriting it.
+			defineMagic(this, "_", "last", "underscoreAssigned");
+			defineMagic(this, "_error", "lastError", "underscoreErrAssigned");
+			defineDefaultCommands(this);
+			this.on("line", (line) => this._onLine(line));
+			this.on("close", () => this.emit("exit"));
+		}
+		// A dot-command, a continuation, or something to evaluate.
+		_onLine(line) {
+			const trimmed = String(line).trim();
+			if (!this._buffered && trimmed.startsWith(".") && !/^\.\.?[/.]/.test(trimmed)) {
+				const [name, ...rest] = trimmed.slice(1).split(/\s+/);
+				const cmd = this.commands[name];
+				if (cmd) { cmd.action.call(this, rest.join(" ")); return; }
+				this._writeLine(`Invalid REPL keyword`);
+				this.displayPrompt();
+				return;
+			}
+			const code = this._buffered ? this._buffered + "\n" + line : String(line);
+			this.eval(code + "\n", this.context, "repl", (err, result) => {
+				if (err) {
+					if (err.__replRecoverable) { this._buffered = code; this.displayPrompt(true); return; }
+					this._buffered = "";
+					this.lastError = err;
+					this._writeLine(formatUncaught(err));
+					this.displayPrompt();
+					return;
+				}
+				this._buffered = "";
+				this.lines.push(code);
+				if (!this.underscoreAssigned) this.last = result;
+				if (!(result === undefined && this.ignoreUndefined)) {
+					this._writeLine(this.writer(result));
+				}
+				this.displayPrompt();
+			});
+		}
+		_writeLine(s) { if (this.output) this.output.write(String(s) + "\n"); }
+		displayPrompt(preserveCursor) {
+			if (!this.output) return;
+			this.output.write(this._buffered ? "... " : this.getPrompt());
+		}
+		defineCommand(name, cmd) {
+			this.commands[name] = typeof cmd === "function" ? { action: cmd, help: "" } : cmd;
+		}
+		// complete(line, cb) is what a terminal calls on Tab. It answers with
+		// [completions, the substring they complete], which is the shape the
+		// readline layer needs to know how much of the line to replace.
+		complete(line, cb) {
+			if (this.completer.length >= 2) return this.completer.call(this, line, cb);
+			const out = this.completer.call(this, line);
+			process.nextTick(() => cb(null, out));
+		}
+		// History is a file of past lines; with no path there is nothing to load.
+		setupHistory(path, cb) { this.history = this.history || []; if (cb) process.nextTick(() => cb(null, this)); }
+		resetContext() {
+			this.context = this.useGlobal ? globalThis : core.vm.createContext({ ...globalThis });
+			this.underscoreAssigned = false;
+			this.last = undefined;
+			this.emit("reset", this.context);
+		}
+		clearBufferedCommand() { this._buffered = ""; }
+	}
+	// The deprecated aliases for input/output, still read by published tooling.
+	Object.defineProperties(REPLServer.prototype, {
+		inputStream: { get() { return this.input; }, configurable: true },
+		outputStream: { get() { return this.output; }, configurable: true },
+	});
+
+	// `_`/`_error` read the REPL's own record until the user assigns one, after
+	// which the assignment wins and the REPL stops touching it.
+	function defineMagic(repl, name, prop, flag) {
+		const target = repl.context;
+		try {
+			Object.defineProperty(target, name, {
+				configurable: true,
+				enumerable: false,
+				get() { return repl[prop]; },
+				set(v) { repl[flag] = true; Object.defineProperty(target, name, { value: v, writable: true, configurable: true, enumerable: false }); },
+			});
+		} catch { /* a frozen context keeps whatever it has */ }
+	}
+
+	// Thrown values print as "Uncaught <inspected>", which is how a REPL shows
+	// something that is not an Error (a thrown null, a thrown string).
+	function formatUncaught(err) {
+		if (err instanceof Error) {
+			const stackHead = `${err.name}: ${err.message}`;
+			return `Uncaught ${err.code ? `${stackHead}` : stackHead}`;
+		}
+		return `Uncaught ${core.util.inspect(err)}`;
+	}
+
+	function defaultEval(code, context, file, cb) {
+		let src = code;
+		// A bare object literal at the top of a line is an object, not a block:
+		// `{ a: 1 }` should evaluate to the object, so wrap it in parentheses
+		// when that parses and the raw form does not.
+		const wrapped = `(${src})`;
+		let result, err = null;
+		try {
+			result = runREPL(wrapped, context);
+		} catch (e) {
+			try {
+				result = runREPL(src, context);
+			} catch (e2) {
+				err = e2;
+				if (isRecoverableError(e2, src)) err.__replRecoverable = true;
+			}
+		}
+		cb(err, result);
+	}
+	function runREPL(code, context) {
+		return context === globalThis ? (0, eval)(String(code)) : core.vm.runInContext(code, context);
+	}
+
+	// Tab completion. Only the trailing member expression matters: everything
+	// before the last property access is context to evaluate, and what follows
+	// the final dot is the prefix to match. An expression with side effects is
+	// never evaluated — only plain identifier chains are walked.
+	function completeLine(repl, line) {
+		const text = String(line);
+		if (text.trim().startsWith(".") && !text.includes(" ")) {
+			const prefix = text.trim().slice(1);
+			const hits = Object.keys(repl.commands).filter((c) => c.startsWith(prefix)).map((c) => "." + c);
+			return [hits, text.trim()];
+		}
+		const m = /((?:[A-Za-z_$][\w$]*)(?:\??\.[A-Za-z_$][\w$]*)*)(\??\.)([A-Za-z_$][\w$]*)?$/.exec(text);
+		if (!m) {
+			const word = /[A-Za-z_$][\w$]*$/.exec(text);
+			if (!word) return [[], text];
+			const hits = contextKeys(repl).filter((k) => k.startsWith(word[0]));
+			return [hits, word[0]];
+		}
+		const [, base, dot, partial = ""] = m;
+		let target;
+		try {
+			target = base.split(/\??\./).reduce((o, k) => (o == null ? o : o[k]), repl.context);
+		} catch { return [[], text]; }
+		if (target == null) return [[], text];
+		const hits = propertyNames(target).filter((k) => k.startsWith(partial)).map((k) => base + dot + k);
+		return [hits, base + dot + partial];
+	}
+	const contextKeys = (repl) => {
+		try { return Object.getOwnPropertyNames(repl.context).filter((k) => /^[A-Za-z_$][\w$]*$/.test(k)); }
+		catch { return []; }
+	};
+	// Own properties plus everything inherited, which is what a user sees.
+	function propertyNames(target) {
+		const out = new Set();
+		for (let o = target; o != null; o = Object.getPrototypeOf(o)) {
+			for (const k of Object.getOwnPropertyNames(o)) {
+				if (/^[A-Za-z_$][\w$]*$/.test(k)) out.add(k);
+			}
+		}
+		return [...out];
+	}
+
+	function defineDefaultCommands(repl) {
+		repl.defineCommand("break", {
+			help: "Sometimes you get stuck, this gets you out",
+			action() { this.clearBufferedCommand(); this.displayPrompt(); },
+		});
+		repl.defineCommand("clear", {
+			help: "Break, and also clear the local context",
+			action() { this.clearBufferedCommand(); if (!this.useGlobal) this.resetContext(); this.displayPrompt(); },
+		});
+		repl.defineCommand("exit", {
+			help: "Exit the REPL",
+			action() { this.close(); },
+		});
+		repl.defineCommand("help", {
+			help: "Print this help message",
+			action() {
+				for (const name of Object.keys(this.commands).sort()) {
+					this._writeLine(`.${name.padEnd(9)} ${this.commands[name].help || ""}`);
+				}
+				this._writeLine("");
+				this._writeLine("Press Ctrl+C to abort current expression, Ctrl+D to exit the REPL");
+				this.displayPrompt();
+			},
+		});
+		repl.defineCommand("save", {
+			help: "Save all evaluated commands in this REPL session to a file",
+			action(file) {
+				try { core.fs.writeFileSync(file, this.lines.join("\n")); this._writeLine(`Session saved to: ${file}`); }
+				catch { this._writeLine(`Failed to save: ${file}`); }
+				this.displayPrompt();
+			},
+		});
+		repl.defineCommand("load", {
+			help: "Load JS from a file into the REPL session",
+			action(file) {
+				try {
+					const src = core.fs.readFileSync(file, "utf8");
+					for (const line of src.split("\n")) this.write(line + "\n");
+				} catch { this._writeLine(`Failed to load: ${file}`); }
+				this.displayPrompt();
+			},
+		});
+		repl.defineCommand("editor", {
+			help: "Enter editor mode",
+			action() { this.editorMode = true; this._writeLine("// Entering editor mode (Ctrl+D to finish, Ctrl+C to cancel)"); },
+		});
+	}
+
+	core.repl = {
+		start: (options) => new REPLServer(options),
+		REPLServer,
+		REPL_MODE_SLOPPY,
+		REPL_MODE_STRICT,
+		// `repl.repl` names the REPL the `node` binary starts when it has no
+		// script to run; nothing has started one here.
+		repl: undefined,
+		builtinModules: core.module ? core.module.builtinModules : [],
+		_builtinLibs: core.module ? core.module.builtinModules : [],
+		writer: (v) => core.util.inspect(v),
+	};
+
 	delete globalThis.__node_core_registry;
 })();
