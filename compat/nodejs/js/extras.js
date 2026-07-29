@@ -1085,10 +1085,56 @@
 		if (isErr(r)) { const e = new Error(r.message); e.code = r.code; throw e; }
 		return Buffer.from(r);
 	}
-	const zlibSync = (method) => (data) => zlibRun(method, data);
+	// zlib checks its options before it compresses anything, and its own suite
+	// asserts on the codes. Accepting a chunkSize of 0 or a level of 42 and then
+	// ignoring them is not leniency — it silently builds a stream to settings
+	// the caller never asked for.
+	const Z_MIN_CHUNK = 64;
+	const zlibRange = (name, min, max, v) => Object.assign(
+		new RangeError(`The value of "options.${name}" is out of range. It must be >= ${min} and <= ${max}. Received ${v}`),
+		{ code: "ERR_OUT_OF_RANGE" });
+	function checkZlibOption(opts, name, min, max) {
+		const v = opts[name];
+		if (v === undefined || v === null) return;
+		if (typeof v !== "number") {
+			throw Object.assign(new TypeError(`The "options.${name}" property must be of type number. Received ${typeof v}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		if (!Number.isInteger(v) || v < min || v > max) throw zlibRange(name, min, max, v);
+	}
+	function validateZlibOptions(opts) {
+		if (opts === undefined || opts === null) return {};
+		if (typeof opts !== "object") {
+			throw Object.assign(new TypeError(`The "options" argument must be of type object. Received ${typeof opts}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		checkZlibOption(opts, "chunkSize", Z_MIN_CHUNK, 0x7fffffff);
+		checkZlibOption(opts, "level", -1, 9);
+		checkZlibOption(opts, "windowBits", 8, 15);
+		checkZlibOption(opts, "memLevel", 1, 9);
+		checkZlibOption(opts, "strategy", 0, 4);
+		checkZlibOption(opts, "maxOutputLength", 0, Number.MAX_SAFE_INTEGER);
+		return opts;
+	}
+	// A decompression that would exceed maxOutputLength fails rather than
+	// allocating whatever the compressed input claims it expands to.
+	const capZlibOutput = (buf, opts) => {
+		const max = opts && opts.maxOutputLength;
+		if (typeof max === "number" && buf.length > max) {
+			throw Object.assign(new RangeError(`Cannot create a Buffer larger than ${max} bytes`),
+				{ code: "ERR_BUFFER_TOO_LARGE" });
+		}
+		return buf;
+	};
+	const zlibSync = (method) => (data, opts) => capZlibOutput(zlibRun(method, data), validateZlibOptions(opts));
 	const zlibAsync = (method) => (data, opts, cb) => {
-		if (typeof opts === "function") { cb = opts; }
-		queueMicrotask(() => { try { cb(null, zlibRun(method, data)); } catch (e) { cb(e); } });
+		if (typeof opts === "function") { cb = opts; opts = undefined; }
+		if (typeof cb !== "function") {
+			throw Object.assign(new TypeError('The "callback" argument must be of type function.'),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		validateZlibOptions(opts);
+		queueMicrotask(() => { try { cb(null, capZlibOutput(zlibRun(method, data), opts)); } catch (e) { cb(e); } });
 	};
 	function zlibStream(method) {
 		let id = null;
@@ -1159,21 +1205,66 @@
 		unzip: zlibAsync("unzip"),
 		brotliCompress: zlibAsync("brotliCompress"),
 		brotliDecompress: zlibAsync("brotliDecompress"),
-		createGzip: () => zlibStream("gzip"),
-		createGunzip: () => zlibStream("gunzip"),
-		createDeflate: () => zlibStream("deflate"),
-		createInflate: () => zlibStream("inflate"),
-		createDeflateRaw: () => zlibStream("deflateRaw"),
-		createInflateRaw: () => zlibStream("inflateRaw"),
-		createUnzip: () => zlibStream("unzip"),
-		createBrotliCompress: () => zlibStream("brotliCompress"),
-		createBrotliDecompress: () => zlibStream("brotliDecompress"),
+		createGzip: (o) => (validateZlibOptions(o), zlibStream("gzip")),
+		createGunzip: (o) => (validateZlibOptions(o), zlibStream("gunzip")),
+		createDeflate: (o) => (validateZlibOptions(o), zlibStream("deflate")),
+		createInflate: (o) => (validateZlibOptions(o), zlibStream("inflate")),
+		createDeflateRaw: (o) => (validateZlibOptions(o), zlibStream("deflateRaw")),
+		createInflateRaw: (o) => (validateZlibOptions(o), zlibStream("inflateRaw")),
+		createUnzip: (o) => (validateZlibOptions(o), zlibStream("unzip")),
+		createBrotliCompress: (o) => (validateZlibOptions(o), zlibStream("brotliCompress")),
+		createBrotliDecompress: (o) => (validateZlibOptions(o), zlibStream("brotliDecompress")),
+		// crc32 over the standard IEEE polynomial. Node exposes it because the
+		// checksum is part of the gzip container callers assemble by hand.
+		crc32: (data, value = 0) => {
+			if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
+				throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.'),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : data;
+			let crc = (~value) >>> 0;
+			for (let i = 0; i < bytes.length; i++) {
+				crc ^= bytes[i];
+				for (let b = 0; b < 8; b++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+			}
+			return (~crc) >>> 0;
+		},
 		constants: {
-			Z_NO_FLUSH: 0, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3, Z_FINISH: 4,
-			Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9, Z_DEFAULT_COMPRESSION: -1,
-			BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1, BROTLI_OPERATION_FINISH: 2,
+			Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3,
+			Z_FINISH: 4, Z_BLOCK: 5, Z_TREES: 6,
+			Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2,
+			Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6,
+			Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9,
+			Z_DEFAULT_COMPRESSION: -1,
+			Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4, Z_DEFAULT_STRATEGY: 0,
+			Z_BINARY: 0, Z_TEXT: 1, Z_ASCII: 1, Z_UNKNOWN: 2, Z_DEFLATED: 8,
+			Z_MIN_WINDOWBITS: 8, Z_MAX_WINDOWBITS: 15, Z_DEFAULT_WINDOWBITS: 15,
+			Z_MIN_CHUNK: 64, Z_MAX_CHUNK: Infinity, Z_DEFAULT_CHUNK: 16 * 1024,
+			Z_MIN_MEMLEVEL: 1, Z_MAX_MEMLEVEL: 9, Z_DEFAULT_MEMLEVEL: 8,
+			Z_MIN_LEVEL: -1, Z_MAX_LEVEL: 9, Z_DEFAULT_LEVEL: -1,
+			BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1,
+			BROTLI_OPERATION_FINISH: 2, BROTLI_OPERATION_EMIT_METADATA: 3,
+			BROTLI_MODE_GENERIC: 0, BROTLI_MODE_TEXT: 1, BROTLI_MODE_FONT: 2,
+			BROTLI_DEFAULT_MODE: 0, BROTLI_DEFAULT_QUALITY: 11, BROTLI_MAX_QUALITY: 11,
+			BROTLI_MIN_QUALITY: 0, BROTLI_DEFAULT_WINDOW: 22, BROTLI_MAX_WINDOW_BITS: 24,
+			BROTLI_MIN_WINDOW_BITS: 10,
+			BROTLI_PARAM_MODE: 0, BROTLI_PARAM_QUALITY: 1, BROTLI_PARAM_LGWIN: 2,
+			BROTLI_PARAM_LGBLOCK: 3, BROTLI_PARAM_SIZE_HINT: 5,
 		},
 	};
+	// Each transform is a CONSTRUCTOR as well as a factory, and published code
+	// reaches for both — `new zlib.Gzip()` and `instanceof zlib.BrotliDecompress`
+	// alike.
+	for (const [name, method] of [
+		["Gzip", "gzip"], ["Gunzip", "gunzip"], ["Deflate", "deflate"],
+		["Inflate", "inflate"], ["DeflateRaw", "deflateRaw"], ["InflateRaw", "inflateRaw"],
+		["Unzip", "unzip"], ["BrotliCompress", "brotliCompress"],
+		["BrotliDecompress", "brotliDecompress"],
+	]) {
+		const ctor = function (options) { validateZlibOptions(options); return zlibStream(method); };
+		Object.defineProperty(ctor, "name", { value: name });
+		core.zlib[name] = ctor;
+	}
 
 	// --------------------------------------------------------- async_hooks
 	// AsyncLocalStorage without engine async-context tracking: the store is
