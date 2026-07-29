@@ -125,6 +125,9 @@
 	const CHACHA = "CHACHA20-POLY1305";
 	const CANONICAL_NAMES = { [CHACHA]: "ChaCha20-Poly1305" };
 	const canonicalName = (upper) => CANONICAL_NAMES[upper] || upper;
+	// KMAC128/KMAC256 are keyed hashes: secret keys that sign and verify, with
+	// the digest length chosen per call rather than fixed by the algorithm.
+	const KMAC_NAMES = ["KMAC128", "KMAC256"];
 
 	// The host tags an error with the DOMException name the spec asks for, as a
 	// "DataError: ..." / "InvalidAccessError: ..." prefix. Reporting every one
@@ -164,6 +167,8 @@
 		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-KW": ["wrapKey", "unwrapKey"],
 		[CHACHA]: ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+		KMAC128: ["sign", "verify"],
+		KMAC256: ["sign", "verify"],
 		HMAC: ["sign", "verify"],
 		ECDSA: ["sign", "verify"],
 		ED25519: ["sign", "verify"],
@@ -190,7 +195,7 @@
 		"ML-KEM-512", "ML-KEM-768", "ML-KEM-1024",
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
-		"CHACHA20-POLY1305",
+		"CHACHA20-POLY1305", "KMAC128", "KMAC256",
 	]);
 
 	const ALL_USAGES = [
@@ -440,6 +445,18 @@
 				keyRaw.set(key, raw);
 				return key;
 			}
+			if (KMAC_NAMES.includes(name)) {
+				// The default key length is the variant's security strength, which
+				// is what "KMAC128" and "KMAC256" name.
+				const bits = alg.length === undefined ? (name === "KMAC128" ? 128 : 256) : Number(alg.length);
+				if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
+					throw new DOMException(`Failed to execute 'generateKey': ${name} length must be a positive multiple of 8`, "OperationError");
+				}
+				const raw = crypto.getRandomValues(new Uint8Array(bits / 8));
+				const key = new CryptoKey("secret", extractable, { name, length: bits }, usages, null);
+				keyRaw.set(key, raw);
+				return key;
+			}
 			if (name === CHACHA) {
 				const raw = crypto.getRandomValues(new Uint8Array(32));
 				const key = new CryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
@@ -554,6 +571,22 @@
 				keyRaw.set(key, raw);
 				return key;
 			}
+			if (KMAC_NAMES.includes(name)) {
+				let raw;
+				if (format === "raw" || format === "raw-secret") raw = toU8(keyData);
+				else if (format === "jwk") {
+					if (!keyData || keyData.kty !== "oct" || typeof keyData.k !== "string") {
+						throw new DOMException("importKey: not an oct JWK", "DataError");
+					}
+					raw = b64uDecode(keyData.k);
+				} else unsupported(`${name} key format ${format}`);
+				if (raw.length === 0) {
+					throw new DOMException("importKey: KMAC key must not be empty", "DataError");
+				}
+				const key = new CryptoKey("secret", extractable, { name, length: raw.length * 8 }, usages, null);
+				keyRaw.set(key, raw);
+				return key;
+			}
 			if (name === CHACHA) {
 				let raw;
 				if (format === "raw" || format === "raw-secret") raw = toU8(keyData);
@@ -645,6 +678,13 @@
 				}
 				unsupported(`AES export format ${format}`);
 			}
+			if (KMAC_NAMES.includes(name)) {
+				if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
+				if (format === "jwk") {
+					return { kty: "oct", k: b64uEncode(rawOf(key)), alg: `K${name.substring(4)}`, ext: true, key_ops: [...key.usages] };
+				}
+				unsupported(`${name} export format ${format}`);
+			}
 			if (name === CHACHA) {
 				// No `alg` in the JWK: unlike AES there is no registered name for
 				// it, because there is only one variant to name.
@@ -659,6 +699,7 @@
 			need(key, "sign");
 			const name = algName(alg).toUpperCase();
 			checkKeyAlgMatches(name, key, "sign");
+			if (KMAC_NAMES.includes(name)) return toBuf(kmacRun(name, alg, key, data));
 			if (name === "HMAC") return toBuf(ops.subtle_hmac_sign(key.algorithm.hash.name, key._h, toU8(data)));
 			if (name === "ECDSA") return toBuf(ops.subtle_ec_sign(hashName(alg.hash), key._h, toU8(data)));
 			if (name === "ED25519") return toBuf(ops.subtle_ed_sign(key._h, toU8(data)));
@@ -672,6 +713,16 @@
 			need(key, "verify");
 			const name = algName(alg).toUpperCase();
 			checkKeyAlgMatches(name, key, "verify");
+			if (KMAC_NAMES.includes(name)) {
+				// Compare the whole tag in constant time, not just its prefix: a
+				// verify that accepts a truncated match accepts a forgery.
+				const want = Uint8Array.from(kmacRun(name, alg, key, data));
+				const got = toU8(signature);
+				if (got.length !== want.length) return false;
+				let diff = 0;
+				for (let i = 0; i < want.length; i++) diff |= want[i] ^ got[i];
+				return diff === 0;
+			}
 			if (name === "HMAC") return ops.subtle_hmac_verify(key.algorithm.hash.name, key._h, toU8(signature), toU8(data));
 			if (name === "ECDSA") return ops.subtle_ec_verify(hashName(alg.hash), key._h, toU8(signature), toU8(data));
 			if (name === "ED25519") return ops.subtle_ed_verify(key._h, toU8(signature), toU8(data));
@@ -817,6 +868,20 @@
 			unsupported(`deriveKey derived algorithm ${derivedName}`);
 		},
 	};
+
+	// kmacRun applies the per-call parameters: an output length in bits (the
+	// variant's own strength when unstated) and an optional customization string
+	// that separates one application's MACs from another's.
+	function kmacRun(name, alg, key, data) {
+		const bits = alg.outputLength === undefined
+			? (name === "KMAC128" ? 256 : 512)
+			: Number(alg.outputLength);
+		if (!Number.isInteger(bits) || bits <= 0 || bits % 8 !== 0) {
+			throw new DOMException(`${name} outputLength must be a positive multiple of 8`, "OperationError");
+		}
+		const custom = alg.customization === undefined ? new Uint8Array(0) : toU8(alg.customization);
+		return subtleFail(ops.subtle_kmac(name === "KMAC128" ? 128 : 256, rawOf(key), toU8(data), custom, bits));
+	}
 
 	// rawCrypt runs AES/RSA-OAEP encrypt or decrypt WITHOUT the usage gate,
 	// for the internal wrapKey/unwrapKey path. Returns the raw op result
