@@ -81,25 +81,48 @@ Measured by probing the globals after `web.Install`:
 | `alert`, `confirm`, `prompt` | yes | yes | **no** |
 | `ShadowRealm` | yes | no | **no** |
 
+## The standard behind the milestone
+
+ECMA-429 — the WinterTC Minimum Common Web API, WinterCG's successor housed at
+Ecma TC55 — is the standard "WinterTC conformant" refers to when Bun and Deno
+are compared, and the WPT subset WinterTC is assembling as its test suite will
+cover exactly that surface. The suite does not exist yet (checked 2026-07-30:
+the WinterTC55 org has no test-suite repository; the TPAC 2025 session says the
+subset is being identified, first API snapshot December 2025). Until it does,
+the specification's own enumeration is the checklist, and
+`compat/web/ecma429_test.go` executes it: every required interface, global and
+member, with `known429Gaps` as the recorded exceptions. The one entry is
+`WebAssembly`, whose investigation lives in docs/engine-followups.md item 9 —
+it is an engine-architecture gap (no wasm tier can run under JS_CODEGEN_NONE),
+not a build flag and not a js.cc export.
+
 ## The order of work
 
 Ordered by measured test files unlocked per unit of work.
 
-1. **Harness scope.** Add every directory either Bun or Deno covers, and make
-   the harness run what a browser runs (see below). Until this is done no number
-   here is comparable to theirs.
-2. **`WebSocket`** — 79 files.
-3. **`EventSource`** — 34 files.
+1. ~~**Harness scope.**~~ DONE for `.any.js`/`.worker.js`: the Bun∪Deno
+   directory union, scope and variant expansion, TLS listeners, wptserve
+   `pipe=sub` and `{{headers[...]}}`, idlharness scope markers. Still open:
+   `.window.js` and testharness `.html` (see below).
+2. ~~**`WebSocket`**~~ DONE — 1.80% → 71.29% of subtests, 354/428 cases clean.
+   Remaining: WebSocketStream (tentative), cookie-based fixtures.
+3. ~~**`EventSource`**~~ DONE — 100% of subtests, 68/68 cases clean.
 4. **`Worker` / `SharedWorker` / `BroadcastChannel`** — 52 files in `workers`,
-   plus the worker scopes of every `.any.js` that declares one.
-5. **`webstorage`** — `localStorage` / `sessionStorage`.
-6. **`caches`** — the Cache API.
-7. **`web-locks`** — 16 files, via `navigator.locks`.
-8. **`WebAssembly`** — 101 files. Investigate the wasm build first: the engine
-   reports `typeof WebAssembly === "undefined"`, so this may be a build flag in
-   spidermonkey-wasm rather than work here.
+   plus the worker scopes of every `.any.js` that declares one, plus the
+   Worker-dependent subtests in web-locks and others.
+5. **`webstorage`** — `localStorage` / `sessionStorage`. NOTE: zero
+   `.any.js`/`.worker.js` files — this directory only pays after `.window.js`
+   support, so it moves after item 1's remainder.
+6. **`caches`** — the Cache API (service-workers/cache-storage).
+7. ~~**`web-locks`**~~ DONE — 90.76% of subtests, 26/32 cases clean.
+   Remaining: two Worker-dependent subtests, idlharness details,
+   storage-buckets (tentative).
+8. **`WebAssembly`** — 101 files, and REQUIRED by ECMA-429. Investigated: the
+   engine cannot execute wasm under JS_CODEGEN_NONE (see engine-followups
+   item 9); the realistic path is the JS API host-side over a Go wasm
+   interpreter, with an engine primitive for Memory.buffer aliasing.
 9. **The directories already covered where Deno is ahead**: streams, FileAPI,
-   encoding, webmessaging, user-timing, console.
+   encoding, webmessaging, user-timing, console, dom/observable, xhr fixtures.
 
 ## What the harness does not run yet
 
