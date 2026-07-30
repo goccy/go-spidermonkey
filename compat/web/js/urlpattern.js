@@ -169,6 +169,10 @@
 			const proto = compileComponent(protoPattern, "protocol", "", this._ignoreCase, true);
 			const special = SPECIAL_SCHEMES.some((s) => proto.regexp.test(s));
 			this._parts.protocol = proto;
+			// Kept for generate(), which canonicalizes its result the same way the
+			// pattern's own literal text was canonicalized.
+			this._protoPattern = protoPattern;
+			this._special = special;
 			for (const c of COMPONENTS) {
 				if (c === "protocol") continue;
 				// An unspecified component matches anything.
@@ -193,6 +197,26 @@
 			return this.exec(input, baseURL) !== null;
 		}
 
+		// generate fills a component in from group values. Only a pattern that
+		// describes exactly one component can be generated: a wildcard, an inline
+		// regular expression or any modifier describes a SET of them, and there is
+		// no single answer to give.
+		generate(component, groups) {
+			const c = String(component);
+			if (!COMPONENTS.includes(c)) {
+				throw new TypeError(`generate: ${c} is not a URL component`);
+			}
+			const plain = {};
+			if (groups !== undefined && groups !== null) {
+				for (const [k, v] of Object.entries(groups)) plain[k] = String(v);
+			}
+			const enc = (x) => new TextEncoder().encode(String(x));
+			const r = ops.pattern_generate(c, enc(this._parts[c].pattern),
+				String(this._protoPattern), this._special, enc(JSON.stringify(plain)));
+			if (r && r.__patternError) throw new TypeError(`generate: ${r.message}`);
+			return r;
+		}
+
 		exec(input, baseURL) {
 			let values;
 			try {
@@ -213,6 +237,23 @@
 			return result;
 		}
 	}
+
+	// compareComponent is a tentative API with no standard behind it; the ordering
+	// is Chromium's, which is what the tests encode. It exists so a router can sort
+	// patterns from least to most restrictive.
+	URLPattern.compareComponent = function compareComponent(component, left, right) {
+		const c = String(component);
+		if (!COMPONENTS.includes(c)) {
+			throw new TypeError(`compareComponent: ${c} is not a URL component`);
+		}
+		if (!(left instanceof URLPattern) || !(right instanceof URLPattern)) {
+			throw new TypeError("compareComponent: expected two URLPattern objects");
+		}
+		const enc = (x) => new TextEncoder().encode(String(x));
+		const r = ops.pattern_compare(c, enc(left[c]), enc(right[c]));
+		if (r && r.__patternError) throw new TypeError(`compareComponent: ${r.message}`);
+		return r;
+	};
 
 	Object.defineProperty(URLPattern.prototype, Symbol.toStringTag, {
 		value: "URLPattern", configurable: true,

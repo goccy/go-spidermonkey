@@ -82,6 +82,8 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 
 		"pattern_compile":     w.opPatternCompile,
 		"pattern_from_string": w.opPatternFromString,
+		"pattern_compare":     w.opPatternCompare,
+		"pattern_generate":    w.opPatternGenerate,
 
 		"text_encoding_name": w.opTextEncodingName,
 		"text_decode":        w.opTextDecode,

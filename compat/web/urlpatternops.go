@@ -12,6 +12,7 @@ package web
 // is.
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -435,4 +436,185 @@ func (w *Web) opPatternFromString(cfg spidermonkey.Config, args []spidermonkey.V
 		m[k] = v
 	}
 	return spidermonkey.ValueOf(m), nil
+}
+
+// ------------------------------------------------- compare and generate
+
+// Part ordering. The ranks are ascending, so a full wildcard — the least
+// specific thing a pattern can say — sorts first and literal text last.
+func typeRank(k partType) int {
+	switch k {
+	case partFullWildcard:
+		return 0
+	case partSegmentWildcard:
+		return 1
+	case partRegexp:
+		return 2
+	}
+	return 3
+}
+
+func modRank(m modifier) int {
+	switch m {
+	case modZeroOrMore:
+		return 0
+	case modOptional:
+		return 1
+	case modOneOrMore:
+		return 2
+	}
+	return 3
+}
+
+func cmpInt(a, b int) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+func cmpString(a, b string) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+// comparePart orders two parts, most restrictive last. compareComponent is not
+// in the URL Pattern Standard — it is a tentative API whose only definition is
+// Chromium's implementation — so this follows that: the tuple
+// (type, modifier, prefix, value, suffix), compared in exactly that order.
+//
+// Type ascends full-wildcard < segment-wildcard < regexp < fixed-text, because
+// literal text is the most restrictive thing a pattern can say and an inline
+// regular expression is more likely to constrain a match than to duplicate a
+// wildcard. Modifier ascends zero-or-more < optional < one-or-more < none, for
+// the same reason: requiring the group to be there restricts more than making it
+// optional. A part's NAME is not compared — ":a" and ":b" match the same things.
+func comparePart(l, r part) int {
+	if c := cmpInt(typeRank(l.kind), typeRank(r.kind)); c != 0 {
+		return c
+	}
+	if c := cmpInt(modRank(l.mod), modRank(r.mod)); c != 0 {
+		return c
+	}
+	if c := cmpString(l.prefix, r.prefix); c != 0 {
+		return c
+	}
+	if c := cmpString(l.value, r.value); c != 0 {
+		return c
+	}
+	return cmpString(l.suffix, r.suffix)
+}
+
+// comparePatterns orders two component patterns by comparing their part lists
+// pairwise. When one list runs out, its next part is taken to be empty literal
+// text, which is what makes "/foo/" sort after — as more restrictive than —
+// "/foo/*".
+func comparePatterns(component, left, right string) (int, error) {
+	if left == right {
+		return 0, nil
+	}
+	opts := componentOptions(component)
+	lp, err := parsePattern(left, opts, nil)
+	if err != nil {
+		return 0, err
+	}
+	rp, err := parsePattern(right, opts, nil)
+	if err != nil {
+		return 0, err
+	}
+	empty := part{kind: partFixedText}
+	for i := 0; i < len(lp) || i < len(rp); i++ {
+		l, r := empty, empty
+		if i < len(lp) {
+			l = lp[i]
+		}
+		if i < len(rp) {
+			r = rp[i]
+		}
+		if c := comparePart(l, r); c != 0 {
+			return c, nil
+		}
+	}
+	return 0, nil
+}
+
+// opPatternCompare(component, leftPattern, rightPattern) -> -1, 0 or 1.
+func (w *Web) opPatternCompare(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("pattern compare: (component, left, right) required")
+	}
+	c, err := comparePatterns(args[0].String(), strArg(args[1]), strArg(args[2]))
+	if err != nil {
+		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
+	}
+	return spidermonkey.ValueOf(c), nil
+}
+
+// generateComponent fills a pattern in from group values. Only a pattern that
+// says exactly one thing can be generated: a wildcard, an inline regular
+// expression, or any modifier means the pattern describes a SET of components
+// and there is no one answer to give.
+func generateComponent(component, pattern, protocol string, special bool, groups map[string]string) (string, error) {
+	opts := componentOptions(component)
+	// The pattern is already canonical, so its literal text needs no further
+	// encoding here; the whole result is canonicalized once at the end.
+	parts, err := parsePattern(pattern, opts, nil)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if p.mod != modNone {
+			return "", fmt.Errorf("a repeated or optional group cannot be generated")
+		}
+		switch p.kind {
+		case partFixedText:
+			b.WriteString(p.value)
+		case partSegmentWildcard:
+			v, ok := groups[p.name]
+			if !ok {
+				return "", fmt.Errorf("no value given for group %q", p.name)
+			}
+			// The value has to be something the group could have matched: a
+			// segment cannot contain the delimiter that ends it.
+			if opts.delimiter != "" && strings.Contains(v, opts.delimiter) {
+				return "", fmt.Errorf("group %q cannot contain %q", p.name, opts.delimiter)
+			}
+			b.WriteString(p.prefix)
+			b.WriteString(v)
+			b.WriteString(p.suffix)
+		default:
+			return "", fmt.Errorf("a wildcard or regular expression cannot be generated")
+		}
+	}
+	enc := component
+	if component == "hostname" && strings.HasPrefix(pattern, "[") {
+		enc = "ipv6hostname"
+	}
+	return canonicalize(enc, b.String(), protocol, special)
+}
+
+// opPatternGenerate(component, pattern, protocol, special, groupsJSON) -> the
+// generated component, or a failure the guest turns into a TypeError.
+func (w *Web) opPatternGenerate(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 5 {
+		return nil, fmt.Errorf("pattern generate: (component, pattern, protocol, special, groups) required")
+	}
+	groups := map[string]string{}
+	if err := json.Unmarshal([]byte(strArg(args[4])), &groups); err != nil {
+		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
+	}
+	out, err := generateComponent(args[0].String(), strArg(args[1]), args[2].String(), args[3].Bool(), groups)
+	if err != nil {
+		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
+	}
+	return spidermonkey.ValueOf(out), nil
 }

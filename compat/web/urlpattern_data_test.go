@@ -83,3 +83,133 @@ func TestURLPatternStringsAgainstWPTData(t *testing.T) {
 	}
 	t.Logf("urlpattern object patterns: %d/%d cases pass", pass, pass+fail)
 }
+
+// compareComponent and generate are checked against their own data files, which
+// are the only statement of the ordering and of what "cannot be generated"
+// means precise enough to implement against.
+
+type compareCase struct {
+	Component string            `json:"component"`
+	Left      json.RawMessage   `json:"left"`
+	Right     json.RawMessage   `json:"right"`
+	Expected  int               `json:"expected"`
+	Note      map[string]string `json:"-"`
+}
+
+// patternOf compiles one component of a pattern init the way the class does, so
+// the comparison sees the canonical strings and not the raw input.
+func patternOf(t *testing.T, raw json.RawMessage, component string) (string, bool) {
+	t.Helper()
+	var init map[string]string
+	if json.Unmarshal(raw, &init) != nil {
+		// A constructor string; those cases are covered through the suite.
+		return "", false
+	}
+	input := "*"
+	if v, ok := init[component]; ok {
+		input = stripInitDelimiter(component, v)
+	}
+	protocol := init["protocol"]
+	special := protocol == "" || isSpecialScheme(protocol)
+	parts, err := parsePattern(input, componentOptions(component), encoderFor(component, protocol, special))
+	if err != nil {
+		t.Errorf("%s %q: %v", component, input, err)
+		return "", false
+	}
+	return partsToPatternString(parts, componentOptions(component)), true
+}
+
+func TestURLPatternCompareAgainstWPTData(t *testing.T) {
+	var cases []compareCase
+	loadJSON(t, "urlpattern/resources/urlpattern-compare-test-data.json", &cases)
+
+	var pass, fail int
+	for _, c := range cases {
+		left, ok1 := patternOf(t, c.Left, c.Component)
+		right, ok2 := patternOf(t, c.Right, c.Component)
+		if !ok1 || !ok2 {
+			continue
+		}
+		got, err := comparePatterns(c.Component, left, right)
+		if err != nil {
+			t.Errorf("%s %q vs %q: %v", c.Component, left, right, err)
+			fail++
+			continue
+		}
+		rev, _ := comparePatterns(c.Component, right, left)
+		self, _ := comparePatterns(c.Component, left, left)
+		if got != c.Expected || rev != -c.Expected || self != 0 {
+			t.Errorf("%s %q vs %q: got %d (reverse %d, self %d), want %d",
+				c.Component, left, right, got, rev, self, c.Expected)
+			fail++
+			continue
+		}
+		pass++
+	}
+	t.Logf("urlpattern compare: %d/%d cases pass", pass, pass+fail)
+}
+
+type generateCase struct {
+	Pattern   json.RawMessage   `json:"pattern"`
+	Component string            `json:"component"`
+	Groups    map[string]string `json:"groups"`
+	Expected  *string           `json:"expected"`
+}
+
+func TestURLPatternGenerateAgainstWPTData(t *testing.T) {
+	var cases []generateCase
+	loadJSON(t, "urlpattern/resources/urlpattern-generate-test-data.json", &cases)
+
+	var pass, fail int
+	for _, c := range cases {
+		var init map[string]string
+		if json.Unmarshal(c.Pattern, &init) != nil {
+			continue // a constructor string; covered through the suite
+		}
+		known := false
+		for _, comp := range patternComponents {
+			if comp == c.Component {
+				known = true
+			}
+		}
+		if !known {
+			// An unknown component name is a TypeError, which the guest raises
+			// before reaching the host.
+			if c.Expected == nil {
+				pass++
+			} else {
+				t.Errorf("component %q: expected %q", c.Component, *c.Expected)
+				fail++
+			}
+			continue
+		}
+		input := "*"
+		if v, ok := init[c.Component]; ok {
+			input = stripInitDelimiter(c.Component, v)
+		}
+		protocol := init["protocol"]
+		special := protocol == "" || isSpecialScheme(protocol)
+		parts, err := parsePattern(input, componentOptions(c.Component), encoderFor(c.Component, protocol, special))
+		if err != nil {
+			t.Errorf("%s %q: %v", c.Component, input, err)
+			fail++
+			continue
+		}
+		canonical := partsToPatternString(parts, componentOptions(c.Component))
+		got, gerr := generateComponent(c.Component, canonical, protocol, special, c.Groups)
+		switch {
+		case c.Expected == nil && gerr == nil:
+			t.Errorf("%s %q groups %v: generated %q, want a failure", c.Component, canonical, c.Groups, got)
+			fail++
+		case c.Expected != nil && gerr != nil:
+			t.Errorf("%s %q groups %v: %v, want %q", c.Component, canonical, c.Groups, gerr, *c.Expected)
+			fail++
+		case c.Expected != nil && got != *c.Expected:
+			t.Errorf("%s %q groups %v: generated %q, want %q", c.Component, canonical, c.Groups, got, *c.Expected)
+			fail++
+		default:
+			pass++
+		}
+	}
+	t.Logf("urlpattern generate: %d/%d cases pass", pass, pass+fail)
+}
