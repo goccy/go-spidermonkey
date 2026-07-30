@@ -34,10 +34,23 @@
 			if (parts != null && typeof parts[Symbol.iterator] !== "function") {
 				throw new TypeError("Blob parts must be iterable");
 			}
+			// `endings` is an enumeration, so a value outside it is a TypeError —
+			// and it is read (and validated) before anything is copied.
+			if (options !== null && options !== undefined && options.endings !== undefined) {
+				const endings = String(options.endings);
+				if (endings !== "transparent" && endings !== "native") {
+					throw new TypeError(`Blob: ${endings} is not a line-ending conversion`);
+				}
+				this._endings = endings;
+			}
 			this._blobParts = [...(parts || [])];
 			this._bytes = concatBytes(this._blobParts);
-			this.type = options && options.type !== undefined ? mimeType(String(options.type)) : "";
+			// type and size are IDL attributes: prototype accessors over slots, not
+			// own data properties. As own properties they were writable, and every
+			// interface test that reads a descriptor said so.
+			this._type = options && options.type !== undefined ? mimeType(String(options.type)) : "";
 		}
+		get type() { return this._type; }
 		get size() { return this._bytes.length; }
 		async arrayBuffer() { return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.byteLength); }
 		async bytes() { return this._bytes.slice(); }
@@ -68,13 +81,73 @@
 
 	class File extends Blob {
 		constructor(parts, name, options = {}) {
+			if (arguments.length < 2) {
+				throw new TypeError("File: parts and a name are required");
+			}
 			super(parts, options);
-			this.name = String(name);
-			this.lastModified = options.lastModified ?? Date.now();
+			this._name = String(name);
+			this._lastModified = options && options.lastModified !== undefined
+				? Number(options.lastModified) : Date.now();
 		}
+		get name() { return this._name; }
+		get lastModified() { return this._lastModified; }
 		get [Symbol.toStringTag]() { return "File"; }
 	}
 	globalThis.File = File;
+
+	// FileList is an ordered collection of Files with indexed access. Nothing
+	// here produces one — that needs a file picker — but the interface exists,
+	// which is what `self` is asked for and what a caller feature-detects.
+	class FileList {
+		constructor() {
+			if (!new.target) throw new TypeError("Illegal constructor");
+			Object.defineProperty(this, "_items", { value: [] });
+		}
+		get length() { return this._items.length; }
+		item(i) { return this._items[i >>> 0] ?? null; }
+		*[Symbol.iterator]() { yield* this._items; }
+	}
+	globalThis.FileList = FileList;
+
+	// FileReaderSync is the worker-only synchronous reader. It is implementable
+	// here precisely because a Blob's bytes are already in memory: the async
+	// FileReader exists for a browser that must read from disk without blocking
+	// the main thread, and there is no disk in the path.
+	class FileReaderSync {
+		readAsArrayBuffer(blob) {
+			const b = blobBytes(blob, "readAsArrayBuffer");
+			return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+		}
+		readAsBinaryString(blob) {
+			const b = blobBytes(blob, "readAsBinaryString");
+			let s = "";
+			for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+			return s;
+		}
+		readAsText(blob, encoding) {
+			const b = blobBytes(blob, "readAsText");
+			try {
+				return new TextDecoder(encoding === undefined ? "utf-8" : String(encoding)).decode(b);
+			} catch {
+				// An unknown encoding label falls back to UTF-8 here, as the reader
+				// does: the read itself is not the place a bad label is reported.
+				return new TextDecoder().decode(b);
+			}
+		}
+		readAsDataURL(blob) {
+			const b = blobBytes(blob, "readAsDataURL");
+			let bin = "";
+			for (let i = 0; i < b.length; i++) bin += String.fromCharCode(b[i]);
+			return `data:${blob.type || "application/octet-stream"};base64,${btoa(bin)}`;
+		}
+	}
+	function blobBytes(blob, who) {
+		if (!(blob instanceof Blob)) {
+			throw new TypeError(`${who}: argument must be a Blob`);
+		}
+		return blob._bytes;
+	}
+	globalThis.FileReaderSync = FileReaderSync;
 
 	// ----------------------------------------------------------- FileReader
 	// The event-based way to read a Blob. Blob's own promise methods cover the
@@ -105,17 +178,34 @@
 		}
 		get [Symbol.toStringTag]() { return "FileReader"; }
 
-		_fire(type) {
+		_fire(type, loaded = 0, total = 0) {
 			const ev = new Event(type);
 			// The spec's ProgressEvent fields, which handlers read.
 			try {
 				Object.defineProperties(ev, {
-					lengthComputable: { value: false, configurable: true },
-					loaded: { value: 0, configurable: true },
-					total: { value: 0, configurable: true },
+					lengthComputable: { value: total > 0, configurable: true },
+					loaded: { value: loaded, configurable: true },
+					total: { value: total, configurable: true },
 				});
 			} catch { /* a plain Event is close enough */ }
 			this.dispatchEvent(ev);
+		}
+
+		// _steps runs each event in its OWN task, which is what the specification
+		// queues and what the difference is observable through: a test awaiting
+		// loadstart and then load resumes between them, and a reader that fired
+		// the whole sequence in one turn gave it three events at once. Aborting
+		// mid-sequence stops the rest.
+		_steps(fns) {
+			const run = (i) => {
+				if (i >= fns.length) return;
+				setTimeout(() => {
+					if (this._aborted) return;
+					fns[i]();
+					run(i + 1);
+				}, 0);
+			};
+			run(0);
 		}
 
 		// _read runs the common state machine: one read at a time, LOADING while
@@ -131,31 +221,45 @@
 			this.result = null;
 			this.error = null;
 			this._aborted = false;
-			this._fire("loadstart");
 			blob.arrayBuffer().then(
 				(buf) => {
 					if (this._aborted) return;
-					this.readyState = 2; // DONE
-					try {
-						this.result = convert(new Uint8Array(buf), blob);
-					} catch (e) {
-						this.result = null;
-						this.error = e instanceof DOMException ? e : new DOMException(String(e && e.message || e), "EncodingError");
-						this._fire("error");
-						this._fire("loadend");
-						return;
+					const bytes = new Uint8Array(buf);
+					const steps = [() => this._fire("loadstart", 0, bytes.length)];
+					// No progress event for an empty blob: no data is loaded, so there
+					// is no progress to report — the events test checks exactly that.
+					if (bytes.length > 0) {
+						steps.push(() => this._fire("progress", bytes.length, bytes.length));
 					}
-					this._fire("progress");
-					this._fire("load");
-					this._fire("loadend");
+					steps.push(() => {
+						this.readyState = 2; // DONE
+						try {
+							this.result = convert(bytes, blob);
+						} catch (e) {
+							this.result = null;
+							this.error = e instanceof DOMException ? e
+								: new DOMException(String(e && e.message || e), "EncodingError");
+							this._fire("error", bytes.length, bytes.length);
+							return;
+						}
+						this._fire("load", bytes.length, bytes.length);
+					});
+					steps.push(() => this._fire("loadend", bytes.length, bytes.length));
+					this._steps(steps);
 				},
 				(e) => {
 					if (this._aborted) return;
-					this.readyState = 2;
-					this.result = null;
-					this.error = e instanceof DOMException ? e : new DOMException(String(e && e.message || e), "NotReadableError");
-					this._fire("error");
-					this._fire("loadend");
+					this._steps([
+						() => this._fire("loadstart"),
+						() => {
+							this.readyState = 2;
+							this.result = null;
+							this.error = e instanceof DOMException ? e
+								: new DOMException(String(e && e.message || e), "NotReadableError");
+							this._fire("error");
+						},
+						() => this._fire("loadend"),
+					]);
 				},
 			);
 		}

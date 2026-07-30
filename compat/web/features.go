@@ -73,7 +73,7 @@ var featureGlobals = map[Feature][]string{
 	},
 	FeatureCompression: {"CompressionStream", "DecompressionStream"},
 	FeatureFetch:       {"fetch", "Headers", "Request", "Response"},
-	FeatureFileAPI:     {"Blob", "File", "FileReader", "FormData"},
+	FeatureFileAPI:     {"Blob", "File", "FileList", "FileReader", "FileReaderSync", "FormData"},
 	FeatureCrypto:      {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
 	FeaturePerformance: {
 		"performance", "Performance", "PerformanceEntry", "PerformanceMark",
