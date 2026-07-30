@@ -32,6 +32,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	wazapi "github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/internal/eventloop"
@@ -68,7 +69,13 @@ type wasmModule struct {
 func installWasm(js *spidermonkey.JS, loop *eventloop.Loop) (*wasmAPI, error) {
 	a := &wasmAPI{
 		js: js, loop: loop,
-		rt:        wazero.NewRuntimeWithConfig(context.Background(), wazero.NewRuntimeConfigInterpreter()),
+		// Threads are enabled so a shared memory can exist: WebAssembly.Memory
+		// accepts `shared: true`, and the buffer it then reports is a
+		// SharedArrayBuffer — a type the suite derives from exactly that
+		// expression (common/sab.js). Refusing the memory would refuse the type.
+		rt: wazero.NewRuntimeWithConfig(context.Background(),
+			wazero.NewRuntimeConfigInterpreter().WithCoreFeatures(
+				wazapi.CoreFeaturesV2|experimental.CoreFeaturesThreads)),
 		modules:   map[int64]*wasmModule{},
 		instances: map[int64]wazapi.Module{},
 		memories:  map[int64]wazapi.Memory{},

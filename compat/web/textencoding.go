@@ -12,9 +12,12 @@ package web
 
 import (
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
 	"golang.org/x/text/encoding/htmlindex"
 	"golang.org/x/text/transform"
 )
@@ -62,6 +65,19 @@ func (a *Web) opTextDecode(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	}
 	fatal := len(args) > 2 && args[2].Bool()
 
+	// A single-byte encoding is decoded from its own table rather than through
+	// the transform pipeline. Two reasons, and the first is correctness:
+	// golang.org/x/text's ISO-8859 and windows-125x charmaps leave 0x80-0x9F
+	// unassigned, where the Encoding Standard's index tables map every one of
+	// them to the C1 control of the same value — the standard's null entries all
+	// sit at 0xA1 and above. Decoding through the charmap therefore reported 499
+	// perfectly valid bytes as malformed. The second reason is that byte-wise
+	// decoding makes `fatal` exact: an unmapped byte IS the error, with no need
+	// to infer one from a replacement character in the output.
+	if cm, ok := enc.(*charmap.Charmap); ok {
+		return decodeSingleByte(cm, data, fatal), nil
+	}
+
 	dec := enc.NewDecoder()
 	if fatal {
 		// The default decoder substitutes U+FFFD; a fatal TextDecoder must
@@ -73,6 +89,36 @@ func (a *Web) opTextDecode(cfg spidermonkey.Config, args []spidermonkey.Value) (
 		return spidermonkey.ValueOf(map[string]any{"error": "the encoded data was not valid"}), nil
 	}
 	return spidermonkey.ValueOf(string(out)), nil
+}
+
+// decodeSingleByte decodes with the standard's own single-byte rule: an ASCII
+// byte is itself, and any other byte is its index code point — falling back to
+// the C1 control for the 0x80-0x9F range the charmap leaves out.
+func decodeSingleByte(cm *charmap.Charmap, data []byte, fatal bool) spidermonkey.Value {
+	var b strings.Builder
+	b.Grow(len(data))
+	for _, c := range data {
+		if c < 0x80 {
+			b.WriteByte(c)
+			continue
+		}
+		r := cm.DecodeByte(c)
+		if r == utf8.RuneError {
+			if c <= 0x9f {
+				// Not unmapped: the standard's index has the C1 control here, and
+				// only the charmap is missing it.
+				b.WriteRune(rune(c))
+				continue
+			}
+			if fatal {
+				return spidermonkey.ValueOf(map[string]any{"error": "the encoded data was not valid"})
+			}
+			b.WriteRune(utf8.RuneError)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return spidermonkey.ValueOf(b.String())
 }
 
 // strictDecoder turns the replacement character the table decoders emit for

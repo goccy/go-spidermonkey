@@ -135,7 +135,14 @@
 				rethrow(e);
 			}
 			this._shared = shared;
-			this._ab = new ArrayBuffer(initial * 0x10000);
+			// A shared memory's buffer IS a SharedArrayBuffer, and the type is
+			// directly observable — wpt/common/sab.js derives the SharedArrayBuffer
+			// constructor from exactly this expression. What it is not, here, is
+			// shared with another agent: the host owns the memory's bytes and this
+			// buffer is kept in step with them around each crossing. Nothing in this
+			// runtime can hand a wasm memory to a Worker anyway, so the sharing that
+			// is missing is sharing nothing could have used.
+			this._ab = shared ? new SharedArrayBuffer(initial * 0x10000) : new ArrayBuffer(initial * 0x10000);
 		}
 		get buffer() {
 			brand(this, Memory, "buffer");
@@ -169,6 +176,15 @@
 		// allocating a second one and copying into it — for a large memory that
 		// halves the traffic, and the host's array is freshly minted for us.
 		_adopt(bytes) {
+			if (this._shared) {
+				// A SharedArrayBuffer cannot be detached and cannot be adopted from
+				// the host's plain one, so a grown shared memory gets a fresh shared
+				// buffer of the new size with the bytes copied in.
+				const next = new SharedArrayBuffer(bytes.byteLength);
+				new Uint8Array(next).set(bytes);
+				this._ab = next;
+				return;
+			}
 			if (typeof this._ab.transfer === "function" && !this._ab.detached) {
 				this._ab.transfer(); // detach the old buffer, as grow must
 			}

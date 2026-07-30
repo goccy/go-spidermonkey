@@ -285,9 +285,26 @@
 		"latin1": "win1252", "iso-8859-1": "win1252", "windows-1252": "win1252",
 		"utf-16le": "utf16le", "utf-16": "utf16le", "ucs-2": "utf16le", "ucs2": "utf16le",
 	};
+	// The Encoding Standard strips exactly five characters from a label — tab,
+	// LF, FF, CR and space — and nothing else. String.prototype.trim strips every
+	// Unicode whitespace character, so a label wrapped in U+00A0, U+2028, U+2029
+	// or U+000B was being ACCEPTED where the standard requires a RangeError. That
+	// is not a corner: the suite generates it for every label of every encoding,
+	// which is 2,967 subtests.
+	const stripASCIIWhitespace = (s) => s.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "");
+
+	// Every label in the Encoding Standard is drawn from this set, so a stripped
+	// label containing anything else names no encoding. The check has to happen
+	// HERE rather than at the host table: golang.org/x/text/encoding/htmlindex
+	// does its own fuzzy matching and accepts a label wrapped in U+00A0 or
+	// U+2028, which the standard does not. This is not a heuristic — it is the
+	// alphabet of the label list itself.
+	const LABEL_CHARS = /^[a-z0-9_:.()-]*$/;
+
 	globalThis.TextDecoder = class TextDecoder {
 		constructor(label = "utf-8", options = {}) {
-			const normalized = String(label).trim().toLowerCase();
+			if (options === null || options === undefined) options = {};
+			const normalized = stripASCIIWhitespace(String(label)).toLowerCase();
 			const enc = DECODER_LABELS[normalized];
 			if (enc) {
 				this._enc = enc;
@@ -297,16 +314,23 @@
 				// host: Shift_JIS, GBK, Big5, EUC-KR, ISO-2022-JP, the ISO-8859
 				// and windows-125x families, utf-16be. The label is validated
 				// here so an unknown one is still a RangeError.
+				if (!LABEL_CHARS.test(normalized)) {
+					throw new RangeError(`TextDecoder: unsupported encoding ${label}`);
+				}
 				const name = ops.text_encoding_name(normalized);
 				if (!name) throw new RangeError(`TextDecoder: unsupported encoding ${label}`);
 				this._enc = "host";
 				this._name = name;
 				this._label = normalized;
 			}
-			this.fatal = !!options.fatal;
-			this.ignoreBOM = !!options.ignoreBOM;
+			// fatal and ignoreBOM are IDL attributes, so they are prototype
+			// accessors over slots rather than own properties written here.
+			this._fatal = !!options.fatal;
+			this._ignoreBOM = !!options.ignoreBOM;
 		}
 		get encoding() { return this._name; }
+		get fatal() { return this._fatal; }
+		get ignoreBOM() { return this._ignoreBOM; }
 		decode(input, options = {}) {
 			const stream = !!options.stream;
 			let bytes;
@@ -328,7 +352,7 @@
 				// back, so a multi-byte sequence split across chunks decodes as
 				// two malformed pieces. That is the one thing this path does not
 				// do that the built-in ones do.
-				const r = ops.text_decode(this._label, bytes, this.fatal);
+				const r = ops.text_decode(this._label, bytes, this._fatal);
 				if (r && typeof r === "object" && r.error) throw new TypeError(r.error);
 				return String(r);
 			}
@@ -364,7 +388,7 @@
 					bytes = bytes.subarray(0, bytes.length - keep);
 				}
 			}
-			return utf8Decode(bytes, this.fatal);
+			return utf8Decode(bytes, this._fatal);
 		}
 	};
 
