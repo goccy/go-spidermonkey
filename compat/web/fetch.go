@@ -323,7 +323,11 @@ func newHTTPClient(cfg spidermonkey.Config, roots *x509.CertPool) *http.Client {
 	// The cache wraps the transport rather than the client, so it also sees the
 	// hops of a redirect chain — each of which is a request of its own.
 	inner := &permissiveTransport{std: std, dial: dial}
-	return &http.Client{Transport: &cachingTransport{next: inner, cache: newResponseCache()}}
+	// Decoding sits ABOVE the cache, so a cache hit is decoded too and the cache
+	// stores the bytes the origin actually sent. See fetchdecode.go.
+	return &http.Client{Transport: &decodingTransport{
+		next: &cachingTransport{next: inner, cache: newResponseCache()},
+	}}
 }
 
 // permissionDial is the dialer every outbound connection this package makes goes
@@ -389,8 +393,19 @@ func (a *fetchAPI) dropCache() {
 	if a.client == nil {
 		return
 	}
-	if ct, ok := a.client.Transport.(*cachingTransport); ok {
-		ct.cache.reset()
+	// The cache sits under the decoding transport, so the chain is walked rather
+	// than type-asserted at one level — a layer added above it must not silently
+	// stop the cache being cleared between pooled requests.
+	for t := a.client.Transport; t != nil; {
+		switch v := t.(type) {
+		case *decodingTransport:
+			t = v.next
+		case *cachingTransport:
+			v.cache.reset()
+			return
+		default:
+			return
+		}
 	}
 }
 
@@ -435,6 +450,23 @@ func originPort(u *url.URL) string {
 		return "443"
 	}
 	return "80"
+}
+
+// typeError builds a guest TypeError to reject with. A body that failed to read
+// rejects with one — the standard says so, and a caller writing
+// `catch (e) { if (e instanceof TypeError) ... }` cannot do anything with the
+// bare string this used to hand back. A failure to construct the error is
+// reported as the string it would have carried, because there is nothing better
+// left to say.
+func (a *fetchAPI) typeError(message string) spidermonkey.Value {
+	if a.typeErrorCls == nil {
+		return spidermonkey.ValueOf(message)
+	}
+	v, err := a.typeErrorCls.New(spidermonkey.ValueOf(message))
+	if err != nil {
+		return spidermonkey.ValueOf(message)
+	}
+	return v
 }
 
 // promise wraps v via the guest's own Promise[method] (resolve | reject).
@@ -712,11 +744,11 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 						return nil, false
 					}
 					if rerr != nil {
-						return spidermonkey.ValueOf(rerr.Error()), true
+						return a.typeError(rerr.Error()), true
 					}
 					u8, e := js.NewBytes(data)
 					if e != nil {
-						return spidermonkey.ValueOf(e.Error()), true
+						return a.typeError(e.Error()), true
 					}
 					return u8, false
 				}
@@ -731,11 +763,11 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 						return nil, false
 					}
 					if rerr != nil {
-						return spidermonkey.ValueOf(rerr.Error()), true
+						return a.typeError(rerr.Error()), true
 					}
 					u8, e := js.NewBytes(data)
 					if e != nil {
-						return spidermonkey.ValueOf(e.Error()), true
+						return a.typeError(e.Error()), true
 					}
 					defer u8.Free()
 					buf, e := u8.Get("buffer")
@@ -755,7 +787,7 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 						return nil, false
 					}
 					if rerr != nil {
-						return spidermonkey.ValueOf(rerr.Error()), true
+						return a.typeError(rerr.Error()), true
 					}
 					return spidermonkey.ValueOf(string(data)), false
 				}
@@ -770,7 +802,7 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 						return nil, false
 					}
 					if rerr != nil {
-						return spidermonkey.ValueOf(rerr.Error()), true
+						return a.typeError(rerr.Error()), true
 					}
 					parsed, perr := a.jsonObj.CallMethod("parse", spidermonkey.ValueOf(string(data)))
 					if perr != nil {
