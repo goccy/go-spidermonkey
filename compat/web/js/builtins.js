@@ -2647,6 +2647,42 @@
 	// The environment's own URL is `location.href`; an embedding with no
 	// location has no origin to speak for, so both headers are omitted rather
 	// than invented.
+	// parseSingleByteRange applies RFC 9110's byte-range grammar to one range,
+	// resolved against a known length. It returns null for anything the grammar
+	// refuses — no "bytes=" prefix, no hyphen, a non-ASCII-digit anywhere, more
+	// than one range, whitespace inside the range itself, a start past the end —
+	// and null for an unsatisfiable range, which for a blob: URL is the same
+	// outcome. The rules are exact rather than lenient because the whole point of
+	// the tests is the ones a permissive parser would wave through.
+	function parseSingleByteRange(value, size) {
+		const raw = String(value);
+		const prefix = "bytes=";
+		if (!raw.toLowerCase().startsWith(prefix)) return null;
+		const spec = raw.slice(prefix.length);
+		if (spec.includes(",")) return null; // one range only
+		const hyphen = spec.indexOf("-");
+		if (hyphen < 0) return null;
+		const first = spec.slice(0, hyphen);
+		const last = spec.slice(hyphen + 1);
+		const digitsOnly = (s) => s.length > 0 && /^[0-9]+$/.test(s);
+		if (first === "") {
+			// A suffix range: the LAST n bytes. Zero of them satisfies nothing.
+			if (!digitsOnly(last)) return null;
+			const n = Number(last);
+			if (n === 0) return null;
+			const start = Math.max(0, size - n);
+			return { start, end: size - 1 };
+		}
+		if (!digitsOnly(first)) return null;
+		const start = Number(first);
+		if (start >= size) return null; // unsatisfiable
+		if (last === "") return { start, end: size - 1 };
+		if (!digitsOnly(last)) return null;
+		const end = Math.min(Number(last), size - 1);
+		if (end < start) return null;
+		return { start, end };
+	}
+
 	function environmentURL() {
 		try {
 			const href = globalThis.location && globalThis.location.href;
@@ -2984,7 +3020,36 @@
 				if (m !== "GET") {
 					return Promise.reject(new TypeError("Failed to fetch: blob: URLs answer only GET"));
 				}
+				// A Range header on a blob: URL is served from memory, and a header
+				// the grammar does not accept is a NETWORK ERROR rather than a 416:
+				// there is no server to have answered, so there is nothing to answer
+				// with. The grammar is RFC 9110's, restricted to a single byte range
+				// — a blob: URL answers one range or none.
+				const rangeHeader = headers.get("range");
+				let range = null;
+				if (rangeHeader !== null && rangeHeader !== undefined) {
+					range = parseSingleByteRange(rangeHeader, blob.size);
+					if (range === null) {
+						return Promise.reject(new TypeError("Failed to fetch: the Range header is not a valid single byte range"));
+					}
+				}
 				return blob.arrayBuffer().then((buf) => {
+					if (range) {
+						const body = buf.slice(range.start, range.end + 1);
+						const res = new Response(body, {
+							status: 206,
+							statusText: "Partial Content",
+							headers: {
+								"content-type": blob.type || "",
+								"content-length": String(body.byteLength),
+								"content-range": `bytes ${range.start}-${range.end}/${blob.size}`,
+							},
+						});
+						for (const [k, v] of [["type", "basic"], ["url", url]]) {
+							try { Object.defineProperty(res, k, { configurable: true, value: v }); } catch { /* ignore */ }
+						}
+						return res;
+					}
 					const res = new Response(buf, {
 						status: 200,
 						// A synthesized response still has a reason phrase: XHR reports
