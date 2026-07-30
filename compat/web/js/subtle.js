@@ -41,17 +41,38 @@
 	};
 	const algName = (a) => String(a !== null && typeof a === "object" ? a.name : a);
 
+	// A CryptoKey's four members are IDL ATTRIBUTES, so they live on the
+	// prototype and read slots — not own data properties written by the
+	// constructor, which would be writable and would leave the prototype without
+	// them. It is also not constructible from script: keys come from generateKey,
+	// importKey, deriveKey and unwrapKey, and nothing else may claim to be one.
+	const KEY_INTERNAL = Symbol("CryptoKey.internal");
 	class CryptoKey {
-		constructor(type, extractable, algorithm, usages, handle) {
-			this.type = type;
-			this.extractable = extractable;
-			this.algorithm = algorithm;
-			this.usages = [...usages];
-			// Not enumerable: `usages` and friends are the interface, the handle is
-			// not, and WPT's structural checks walk own enumerable properties.
-			Object.defineProperty(this, "_h", { value: handle, writable: true });
+		// Rest parameters, so the interface object's `length` is zero as the IDL
+		// declares, not the arity of the internal call.
+		constructor(...args) {
+			const [internal, type, extractable, algorithm, usages, handle] = args;
+			if (internal !== KEY_INTERNAL) throw new TypeError("Illegal constructor");
+			// The slots are hidden: the interface is what the prototype exposes, and
+			// a structural check that walks own enumerable properties must see the
+			// key as a platform object rather than as a bag of fields.
+			Object.defineProperties(this, {
+				_type: { value: type },
+				_extractable: { value: extractable },
+				_algorithm: { value: algorithm },
+				_usages: { value: [...usages] },
+				_h: { value: handle, writable: true },
+			});
 		}
+		get type() { return this._type; }
+		get extractable() { return this._extractable; }
+		get algorithm() { return this._algorithm; }
+		get usages() { return this._usages; }
 	}
+	// newCryptoKey is how this file makes one; the constructor refuses everyone
+	// else.
+	const newCryptoKey = (type, extractable, algorithm, usages, handle) =>
+		new CryptoKey(KEY_INTERNAL, type, extractable, algorithm, usages, handle);
 	// Every Web IDL interface has one; WPT checks it on every key it produces,
 	// and its absence fails not only that assertion but everything downstream
 	// that reuses the key.
@@ -76,7 +97,7 @@
 	// other.
 	Object.defineProperty(CryptoKey.prototype, Symbol.for("go-spidermonkey.structuredClone"), {
 		value(deep) {
-			const out = new CryptoKey(this.type, this.extractable, deep(this.algorithm), this.usages, this._h);
+			const out = newCryptoKey(this.type, this.extractable, deep(this.algorithm), this.usages, this._h);
 			const raw = keyRaw.get(this);
 			if (raw !== undefined) keyRaw.set(out, raw.slice());
 			return out;
@@ -645,15 +666,15 @@
 				const lenBits = alg.length || (hash === "SHA-384" || hash === "SHA-512" ? 1024 : 512);
 				const raw = crypto.getRandomValues(new Uint8Array(Math.ceil(lenBits / 8)));
 				const h = ops.subtle_hmac_import(raw);
-				return new CryptoKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: lenBits }, usages, h);
+				return newCryptoKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: lenBits }, usages, h);
 			}
 			if (name === "ECDSA") {
 				const crv = String(alg.namedCurve);
 				const r = ops.subtle_ec_generate(crv);
 				const algo = { name: "ECDSA", namedCurve: crv };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
+					publicKey: newCryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
 			if (RSA_ALL.includes(name)) {
@@ -663,14 +684,14 @@
 				const algo = { name: canonicalName(algName(alg)), hash: { name: hash }, modulusLength: bits, publicExponent: new Uint8Array([1, 0, 1]) };
 				const isOAEP = name === "RSA-OAEP";
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => isOAEP ? u === "decrypt" || u === "unwrapKey" : u === "sign"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => isOAEP ? u === "encrypt" || u === "wrapKey" : u === "verify"), r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages.filter((u) => isOAEP ? u === "decrypt" || u === "unwrapKey" : u === "sign"), r.priv),
+					publicKey: newCryptoKey("public", true, algo, usages.filter((u) => isOAEP ? u === "encrypt" || u === "wrapKey" : u === "verify"), r.pub),
 				};
 			}
 			if (AES_ALL.includes(name)) {
 				const length = checkAESLength(alg.length === undefined ? 256 : alg.length, "generateKey");
 				const raw = crypto.getRandomValues(new Uint8Array(length / 8));
-				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length }, usages, null);
+				const key = newCryptoKey("secret", extractable, { name: canonicalName(name), length }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -682,13 +703,13 @@
 					throw new DOMException(`Failed to execute 'generateKey': ${name} length must be a positive multiple of 8`, "OperationError");
 				}
 				const raw = crypto.getRandomValues(new Uint8Array(bits / 8));
-				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length: bits }, usages, null);
+				const key = newCryptoKey("secret", extractable, { name: canonicalName(name), length: bits }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
 			if (name === CHACHA) {
 				const raw = crypto.getRandomValues(new Uint8Array(32));
-				const key = new CryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
+				const key = newCryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -696,33 +717,33 @@
 				const r = subtleFail(ops.subtle_ed448_generate());
 				const algo = { name: "Ed448" };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
+					publicKey: newCryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
 			if (name === "X448") {
 				const r = subtleFail(ops.subtle_x448_generate());
 				const algo = { name: "X448" };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo,
+					privateKey: newCryptoKey("private", extractable, algo,
 						usages.filter((u) => u === "deriveKey" || u === "deriveBits"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, [], r.pub),
+					publicKey: newCryptoKey("public", true, algo, [], r.pub),
 				};
 			}
 			if (name === "ED25519") {
 				const r = ops.subtle_ed_generate();
 				const algo = { name: "Ed25519" };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
+					publicKey: newCryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
 			if (MLDSA_NAMES.includes(name)) {
 				const r = subtleFail(ops.subtle_mldsa_generate(name));
 				const algo = { name: r.name };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
-					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages.filter((u) => u === "sign"), r.priv),
+					publicKey: newCryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
 			if (MLKEM_NAMES.includes(name)) {
@@ -732,9 +753,9 @@
 				const r = subtleFail(ops.subtle_mlkem_generate(name));
 				const algo = { name: r.name };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo,
+					privateKey: newCryptoKey("private", extractable, algo,
 						usages.filter((u) => u === "decapsulateKey" || u === "decapsulateBits"), r.priv),
-					publicKey: new CryptoKey("public", true, algo,
+					publicKey: newCryptoKey("public", true, algo,
 						usages.filter((u) => u === "encapsulateKey" || u === "encapsulateBits"), r.pub),
 				};
 			}
@@ -742,8 +763,8 @@
 				const r = subtleFail(ops.subtle_x25519_generate());
 				const algo = { name: "X25519" };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages, r.priv),
-					publicKey: new CryptoKey("public", true, algo, [], r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages, r.priv),
+					publicKey: newCryptoKey("public", true, algo, [], r.pub),
 				};
 			}
 			if (name === "ECDH") {
@@ -751,8 +772,8 @@
 				const r = subtleFail(ops.subtle_ec_generate(crv)); // reuse EC keygen (same curves)
 				const algo = { name: canonicalName(algName(alg)), namedCurve: crv };
 				return {
-					privateKey: new CryptoKey("private", extractable, algo, usages, r.priv),
-					publicKey: new CryptoKey("public", true, algo, [], r.pub),
+					privateKey: newCryptoKey("private", extractable, algo, usages, r.priv),
+					publicKey: newCryptoKey("public", true, algo, [], r.pub),
 				};
 			}
 			unsupported(`algorithm ${algName(alg)}`);
@@ -788,14 +809,14 @@
 				const isPub = r.type === "public";
 				// extractable is what the CALLER asked for, for either half. Only
 				// generateKey forces a public key to be extractable.
-				return new CryptoKey(r.type, extractable, { name: r.name },
+				return newCryptoKey(r.type, extractable, { name: r.name },
 					usages.filter((u) => (isPub ? u === "verify" : u === "sign")), r.id);
 			}
 			if (MLKEM_NAMES.includes(name)) {
 				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
 				const r = subtleFail(ops.subtle_mlkem_import(name, format, payload));
 				const isPub = r.type === "public";
-				return new CryptoKey(r.type, extractable, { name: r.name },
+				return newCryptoKey(r.type, extractable, { name: r.name },
 					usages.filter((u) => isPub
 						? u === "encapsulateKey" || u === "encapsulateBits"
 						: u === "decapsulateKey" || u === "decapsulateBits"), r.id);
@@ -805,8 +826,8 @@
 				const r = subtleFail(ops.subtle_x25519_import(format, payload));
 				const algo = { name: "X25519" };
 				return r.priv !== undefined
-					? new CryptoKey("private", extractable, algo, usages, r.priv)
-					: new CryptoKey("public", extractable, algo, [], r.pub);
+					? newCryptoKey("private", extractable, algo, usages, r.priv)
+					: newCryptoKey("public", extractable, algo, [], r.pub);
 			}
 			if (name === "HMAC") {
 				let raw;
@@ -822,7 +843,7 @@
 				}
 				const hash = hashName(alg.hash);
 				const h = ops.subtle_hmac_import(raw);
-				return new CryptoKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: raw.length * 8 }, usages, h);
+				return newCryptoKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: raw.length * 8 }, usages, h);
 			}
 			if (RSA_ALL.includes(name)) {
 				let r;
@@ -830,7 +851,7 @@
 				else if (format === "pkcs8" || format === "spki") r = ops.subtle_rsa_import_der(format, toU8(keyData));
 				else unsupported(`RSA key format ${format}`);
 				const algo = { name: canonicalName(algName(alg)), hash: { name: hashName(alg.hash) }, modulusLength: r.bits, publicExponent: new Uint8Array([1, 0, 1]) };
-				return new CryptoKey(r.type, extractable, algo, usages, r.id);
+				return newCryptoKey(r.type, extractable, algo, usages, r.id);
 			}
 			if (AES_ALL.includes(name)) {
 				let raw;
@@ -847,7 +868,7 @@
 				if (raw.length !== 16 && raw.length !== 24 && raw.length !== 32) {
 					throw new DOMException("importKey: invalid AES key length", "DataError");
 				}
-				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length: raw.length * 8 }, usages, null);
+				const key = newCryptoKey("secret", extractable, { name: canonicalName(name), length: raw.length * 8 }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -863,7 +884,7 @@
 				if (raw.length === 0) {
 					throw new DOMException("importKey: KMAC key must not be empty", "DataError");
 				}
-				const key = new CryptoKey("secret", extractable, { name: canonicalName(name), length: raw.length * 8 }, usages, null);
+				const key = newCryptoKey("secret", extractable, { name: canonicalName(name), length: raw.length * 8 }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -881,7 +902,7 @@
 				if (raw.length !== 32) {
 					throw new DOMException("importKey: ChaCha20-Poly1305 key must be 256 bits", "DataError");
 				}
-				const key = new CryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
+				const key = newCryptoKey("secret", extractable, { name: canonicalName(name) }, usages, null);
 				keyRaw.set(key, raw);
 				return key;
 			}
@@ -891,7 +912,7 @@
 					? op("jwk", JSON.stringify(keyData))
 					: op(format, toU8(keyData)));
 				const type = r.priv !== undefined ? "private" : "public";
-				return new CryptoKey(type, extractable,
+				return newCryptoKey(type, extractable,
 					{ name: canonicalName(name) }, usages, r.priv ?? r.pub);
 			}
 			if (name === "ED25519") {
@@ -899,7 +920,7 @@
 				if (format === "jwk") r = subtleFail(ops.subtle_ed_import("jwk", JSON.stringify(keyData)));
 				else if (["raw", "pkcs8", "spki"].includes(format)) r = subtleFail(ops.subtle_ed_import(format, toU8(keyData)));
 				else unsupported(`Ed25519 key format ${format}`);
-				return new CryptoKey(r.type, extractable, { name: "Ed25519" }, usages, r.id);
+				return newCryptoKey(r.type, extractable, { name: "Ed25519" }, usages, r.id);
 			}
 			if (name === "ECDH" || name === "ECDSA") {
 				let r;
@@ -909,7 +930,7 @@
 				else unsupported(`EC key format ${format}`);
 				// A public key carries no usages in WebCrypto, whatever was asked for.
 				const kUsages = r.type === "public" ? usages.filter((u) => name === "ECDSA" && u === "verify") : usages;
-				return new CryptoKey(r.type, extractable, { name: canonicalName(algName(alg)), namedCurve: r.crv }, kUsages, r.id);
+				return newCryptoKey(r.type, extractable, { name: canonicalName(algName(alg)), namedCurve: r.crv }, kUsages, r.id);
 			}
 			if (KDF_NAMES.includes(name)) {
 				// A KDF key is never extractable: it is a password, and the whole
@@ -917,7 +938,7 @@
 				// Argon2 family names its raw format "raw-secret"; the older two
 				// call the same thing "raw".
 				if (format !== "raw" && format !== "raw-secret") unsupported(`${name} key format ${format}`);
-				const key = new CryptoKey("secret", false, { name: canonicalName(name) }, usages, null);
+				const key = newCryptoKey("secret", false, { name: canonicalName(name) }, usages, null);
 				keyRaw.set(key, toU8(keyData));
 				return key;
 			}

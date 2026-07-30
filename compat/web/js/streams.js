@@ -2632,6 +2632,18 @@
 
 	// ------------------------------------------------------------------ exports
 
+	// These interfaces do their own receiver checks, member by member, because
+	// which of them throws and which rejects is part of each member's definition.
+	// The marker tells the interface-attribute sweep to leave them alone.
+	const IDL_CHECKED = Symbol.for("go-spidermonkey.idlChecked");
+	for (const cls of [ReadableStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader,
+		ReadableStreamDefaultController, ReadableByteStreamController, ReadableStreamBYOBRequest,
+		WritableStream, WritableStreamDefaultWriter, WritableStreamDefaultController,
+		TransformStream, TransformStreamDefaultController,
+		CountQueuingStrategy, ByteLengthQueuingStrategy]) {
+		Object.defineProperty(cls.prototype, IDL_CHECKED, { value: true, configurable: true });
+	}
+
 	globalThis.ReadableStream = ReadableStream;
 	globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
 	globalThis.ReadableStreamBYOBReader = ReadableStreamBYOBReader;

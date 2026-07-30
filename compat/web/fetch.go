@@ -287,6 +287,11 @@ func installFetch(js *spidermonkey.JS, loop *eventloop.Loop, roots *x509.CertPoo
 	}
 	// __native_fetch_abort(id): the JS fetch wrapper's AbortSignal listener calls
 	// this to cancel the Go request context of an in-flight fetch.
+	// __native_fetch_sync(url, init): the blocking round-trip synchronous
+	// XMLHttpRequest is defined in terms of. See fetchsync.go for what it costs.
+	if err := js.Global().DefineFunc("__native_fetch_sync", a.fetchSync); err != nil {
+		return nil, err
+	}
 	if err := js.Global().DefineFunc("__native_fetch_abort", a.fetchAbort); err != nil {
 		return nil, err
 	}

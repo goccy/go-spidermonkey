@@ -29,7 +29,10 @@ func TestCryptoKeyHasToStringTag(t *testing.T) {
 			const key = await crypto.subtle.generateKey(
 				{ name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"]);
 			globalThis.__tag = Object.prototype.toString.call(key) + "|" +
-				key[Symbol.toStringTag] + "|" + Object.keys(key).join(",");
+				key[Symbol.toStringTag] + "|" +
+				["type", "extractable", "algorithm", "usages"]
+					.filter((n) => typeof Object.getOwnPropertyDescriptor(CryptoKey.prototype, n)?.get === "function")
+					.join(",") + "|own:" + Object.keys(key).join(",");
 		})()
 	`)
 	if err != nil || got.Error != nil {
@@ -42,7 +45,7 @@ func TestCryptoKeyHasToStringTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "[object CryptoKey]|CryptoKey|type,extractable,algorithm,usages"
+	want := "[object CryptoKey]|CryptoKey|type,extractable,algorithm,usages|own:"
 	if v.Value.String() != want {
 		t.Errorf("CryptoKey shape = %q, want %q", v.Value.String(), want)
 	}

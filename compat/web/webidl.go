@@ -17,6 +17,29 @@ package web
 // It is fixed in one sweep rather than at 200 definition sites: the rule is one
 // rule, and stating it once is the only way it stays true for the next
 // interface someone adds.
+//
+// Two more rules are enforced the same way, for the same reason.
+//
+// An interface whose prototype carries Symbol.for("go-spidermonkey.idlChecked")
+// keeps its own receiver checks and only has its attributes made enumerable.
+// The two forms are not interchangeable: an operation that returns a promise
+// rejects when the receiver is wrong where one that returns a value throws, and
+// only the interface itself knows which of its members are which.
+//
+// An interface's members only work on ITS instances. `Interface.prototype.attr`
+// read off the prototype, or `Interface.prototype.method.call({})`, is a
+// TypeError — the prototype is not an instance of itself, and a bare object
+// never was. Written by hand this is a brand check at the top of every member;
+// written once it is "the receiver must have this prototype in its chain",
+// which is the same statement and cannot be forgotten on the next member.
+//
+// Required-argument counts are NOT enforced here. A JavaScript function's own
+// `length` looks like the count, but it only is one where every optional
+// parameter was written with a default — and these interfaces were not written
+// under that rule, so `AbortSignal.abort(reason)` reads as one required
+// argument when the argument is optional. Deriving the count from a declaration
+// that does not carry it would refuse correct calls. It belongs at the
+// definition sites, where the answer is known.
 
 import (
 	"context"
@@ -53,14 +76,74 @@ func NormalizeIDLMembers(js *spidermonkey.JS, before string) error {
 	src := `
 		(function (beforeList) {
 			const before = new Set(beforeList.split(" "));
+			const IDL_CHECKED = Symbol.for("go-spidermonkey.idlChecked");
+			// %AsyncFunction.prototype%, by identity rather than by name: an
+			// operation written as an async function is one that returns a promise,
+			// and Web IDL says such an operation REPORTS a bad receiver as a
+			// rejection instead of throwing.
+			const AsyncFunctionProto = Object.getPrototypeOf(async function () {});
 			const skipOnInterface = new Set(["prototype", "name", "length", "constructor"]);
-			function normalize(target, skip) {
+
+			// arityGuard wraps a prototype method so calling it on something that is
+			// not an instance is a TypeError. The wrapper reports the same name and
+			// length as what it wraps: a caller inspecting the operation must see the
+			// operation, not the guard.
+			function arityGuard(fn, brandProto) {
+				if (brandProto === null) return fn;
+				const rejects = Object.getPrototypeOf(fn) === AsyncFunctionProto;
+				const guarded = function (...args) {
+					if (!brandProto.isPrototypeOf(this)) {
+						const e = new TypeError("Illegal invocation: the receiver is not of the right type");
+						if (rejects) return Promise.reject(e);
+						throw e;
+					}
+					return Reflect.apply(fn, this, args);
+				};
+				Object.defineProperty(guarded, "name", { value: fn.name, configurable: true });
+				Object.defineProperty(guarded, "length", { value: fn.length, configurable: true });
+				return guarded;
+			}
+
+			// accessorGuard wraps a getter/setter so reading or writing the attribute
+			// on something that is not an instance is a TypeError.
+			function accessorGuard(fn, brandProto, isSetter, key) {
+				if (typeof fn !== "function") return fn;
+				const guarded = isSetter
+					? function (value) {
+						if (!brandProto.isPrototypeOf(this)) {
+							throw new TypeError("Illegal invocation: the receiver is not of the right type");
+						}
+						return Reflect.apply(fn, this, [value]);
+					}
+					: function () {
+						if (!brandProto.isPrototypeOf(this)) {
+							throw new TypeError("Illegal invocation: the receiver is not of the right type");
+						}
+						return Reflect.apply(fn, this, []);
+					};
+				// An attribute's accessors are named "get x" / "set x", which is not
+				// what a shorthand getter in an object literal is called.
+				Object.defineProperty(guarded, "name", { value: (isSetter ? "set " : "get ") + key, configurable: true });
+				return guarded;
+			}
+
+			// brandProto is the prototype a member's receiver must inherit from, or
+			// null on an interface object (a static member has no receiver to check).
+			function normalize(target, skip, brandProto) {
 				for (const key of Object.getOwnPropertyNames(target)) {
 					if (skip.has(key) || key.startsWith("_")) continue;
 					const d = Object.getOwnPropertyDescriptor(target, key);
-					if (!d || !d.configurable || d.enumerable) continue;
-					d.enumerable = true;
-					Object.defineProperty(target, key, d);
+					if (!d || !d.configurable) continue;
+					let changed = false;
+					if (!d.enumerable) { d.enumerable = true; changed = true; }
+					if (typeof d.value === "function") {
+						const guarded = arityGuard(d.value, brandProto);
+						if (guarded !== d.value) { d.value = guarded; changed = true; }
+					} else if (brandProto !== null && (d.get || d.set)) {
+						if (d.get) { d.get = accessorGuard(d.get, brandProto, false, key); changed = true; }
+						if (d.set) { d.set = accessorGuard(d.set, brandProto, true, key); changed = true; }
+					}
+					if (changed) Object.defineProperty(target, key, d);
 				}
 			}
 			for (const name of Object.getOwnPropertyNames(globalThis)) {
@@ -71,9 +154,15 @@ func NormalizeIDLMembers(js *spidermonkey.JS, before string) error {
 				if (!d || typeof d.value !== "function") continue;
 				const proto = d.value.prototype;
 				if (proto && (typeof proto === "object" || typeof proto === "function")) {
-					normalize(proto, new Set(["constructor"]));
+					// An interface that already checks its own receiver keeps its own
+					// answer. The two are not interchangeable: an operation that
+					// returns a promise must REJECT rather than throw when the
+					// receiver is wrong, and a guard that throws would turn every one
+					// of those into a synchronous exception.
+					if (!proto[IDL_CHECKED]) normalize(proto, new Set(["constructor"]), proto);
+					else normalize(proto, new Set(["constructor"]), null);
 				}
-				normalize(d.value, skipOnInterface);
+				normalize(d.value, skipOnInterface, null);
 			}
 		})(` + jsLiteral(before) + `);
 	`

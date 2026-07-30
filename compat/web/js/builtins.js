@@ -970,42 +970,60 @@
 	// operations are installed onto its prototype by subtle.js, which is where
 	// they are implemented; the class is declared here so `crypto.subtle` has
 	// something to be an instance OF before that runs.
-	class SubtleCrypto {}
+	// Neither is constructible from script: `crypto` is the only Crypto there is
+	// and `crypto.subtle` the only SubtleCrypto, so a constructor call is a
+	// TypeError. The internal token is how this file still makes the two it needs.
+	const CRYPTO_INTERNAL = Symbol("Crypto.internal");
+
+	class SubtleCrypto {
+		// Rest parameters, so the interface object's `length` is the zero the IDL
+		// declares rather than the one the internal token would add.
+		constructor(...args) {
+			if (args[0] !== CRYPTO_INTERNAL) throw new TypeError("Illegal constructor");
+		}
+	}
 	Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: "SubtleCrypto", configurable: true });
 	globalThis.SubtleCrypto ??= SubtleCrypto;
 
+	// getRandomValues and randomUUID are OPERATIONS, so they live on the
+	// prototype. As own properties of the one instance they were invisible to
+	// anything that asks the interface what it offers — and unreachable through
+	// Crypto.prototype, which is where a caller looks for them.
 	class Crypto {
-		constructor() { this._subtle = new globalThis.SubtleCrypto(); }
+		constructor(...args) {
+			if (args[0] !== CRYPTO_INTERNAL) throw new TypeError("Illegal constructor");
+			this._subtle = new globalThis.SubtleCrypto(CRYPTO_INTERNAL);
+		}
 		get subtle() { return this._subtle; }
+		getRandomValues(array) {
+			if (!ArrayBuffer.isView(array)) {
+				throw new TypeError("getRandomValues: expected a typed array");
+			}
+			// Float and DataView are not integer typed arrays; the spec throws.
+			if (array instanceof Float32Array || array instanceof Float64Array || array instanceof DataView) {
+				throw new DOMException("getRandomValues: unsupported array type", "TypeMismatchError");
+			}
+			if (array.byteLength > 65536) {
+				throw new DOMException("getRandomValues: request exceeds 65536 bytes", "QuotaExceededError");
+			}
+			// The host returns the random bytes as a plain array (data, not a
+			// handle); copy them into the caller's view byte-wise.
+			const rand = ops.random_bytes(array.byteLength);
+			const view = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+			for (let i = 0; i < rand.length; i++) view[i] = rand[i];
+			return array;
+		}
+		randomUUID() {
+			const b = this.getRandomValues(new Uint8Array(16));
+			b[6] = (b[6] & 0x0f) | 0x40; // version 4
+			b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+			const hex = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+			return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+		}
 	}
 	Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: "Crypto", configurable: true });
 	globalThis.Crypto ??= Crypto;
-	globalThis.crypto ??= new globalThis.Crypto();
-	globalThis.crypto.getRandomValues ??= (array) => {
-		if (!ArrayBuffer.isView(array)) {
-			throw new TypeError("getRandomValues: expected a typed array");
-		}
-		// Float and DataView are not integer typed arrays; the spec throws.
-		if (array instanceof Float32Array || array instanceof Float64Array || array instanceof DataView) {
-			throw new DOMException("getRandomValues: unsupported array type", "TypeMismatchError");
-		}
-		if (array.byteLength > 65536) {
-			throw new DOMException("getRandomValues: request exceeds 65536 bytes", "QuotaExceededError");
-		}
-		// The host returns the random bytes as a plain array (data, not a
-		// handle); copy them into the caller's view byte-wise.
-		const rand = ops.random_bytes(array.byteLength);
-		const view = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
-		for (let i = 0; i < rand.length; i++) view[i] = rand[i];
-		return array;
-	};
-	globalThis.crypto.randomUUID ??= () => {
-		const b = crypto.getRandomValues(new Uint8Array(16));
-		b[6] = (b[6] & 0x0f) | 0x40; // version 4
-		b[8] = (b[8] & 0x3f) | 0x80; // variant 10
-		const hex = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
-		return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-	};
+	globalThis.crypto ??= new globalThis.Crypto(CRYPTO_INTERNAL);
 
 	// ------------------------------------------------ URL / URLSearchParams
 	// WHATWG basic URL parser subset: input tab/newline stripping, backslash
