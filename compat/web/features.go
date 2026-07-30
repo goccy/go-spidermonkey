@@ -47,6 +47,7 @@ const (
 	FeatureEventSource     Feature = "eventsource"
 	FeatureWebLocks        Feature = "web-locks"
 	FeatureWebAssembly     Feature = "webassembly"
+	FeatureWorker          Feature = "worker"
 )
 
 // featureGlobals maps each feature onto the globals it owns. Every global this
@@ -86,6 +87,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureEventSource:     {"EventSource"},
 	FeatureWebLocks:        {"Lock", "LockManager"},
 	FeatureWebAssembly:     {"WebAssembly"},
+	FeatureWorker:          {"Worker"},
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs

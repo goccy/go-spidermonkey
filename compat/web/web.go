@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"fmt"
+	"io"
 	"time"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
@@ -58,6 +59,12 @@ var wasmJS string
 //go:embed js/scope.js
 var scopeJS string
 
+//go:embed js/worker.js
+var workerJS string
+
+//go:embed js/workerglue.js
+var workerGlueJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -66,6 +73,7 @@ type Web struct {
 	ws     *wsAPI
 	es     *esAPI
 	wasm   *wasmAPI
+	worker *workerAPI
 	subtle *subtleAPI
 	start  time.Time
 }
@@ -138,7 +146,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, workerJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -163,6 +171,10 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	w.wasm, err = installWasm(js, w.loop)
 	if err != nil {
 		return nil, fmt.Errorf("web: installing WebAssembly: %w", err)
+	}
+	w.worker, err = installWorker(js, w.loop, w.workerConsole)
+	if err != nil {
+		return nil, fmt.Errorf("web: installing Worker: %w", err)
 	}
 	if err := removeUnselected(js, opts.Features); err != nil {
 		return nil, err
@@ -282,10 +294,25 @@ func (w *Web) Close() error {
 	if w.es != nil {
 		w.es.closeAll()
 	}
+	if w.worker != nil {
+		w.worker.closeAll()
+	}
 	if w.wasm != nil {
 		w.wasm.close()
 	}
 	return nil
+}
+
+// workerConsole writes a worker's forwarded console output to the same streams
+// the parent's console uses.
+func (w *Web) workerConsole(level int, text string, stdout, stderr io.Writer) {
+	out := stdout
+	if level != 0 {
+		out = stderr
+	}
+	if out != nil {
+		fmt.Fprintln(out, text)
+	}
 }
 
 // Loop exposes the installation's event loop so sibling compat packages
@@ -332,6 +359,9 @@ func (w *Web) ResetPerRequest() {
 	}
 	if w.es != nil {
 		w.es.closeAll()
+	}
+	if w.worker != nil {
+		w.worker.closeAll()
 	}
 	// The HTTP cache is dropped between pooled requests. A cache that survived
 	// would let one request observe what another fetched — the response bodies
