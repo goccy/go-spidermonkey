@@ -156,18 +156,26 @@ func TestWorkerTerminateStopsIt(t *testing.T) {
 		// A worker that would keep posting forever if it were not stopped.
 		"/spam.js": `setInterval(() => postMessage("tick"), 2);`,
 	})
+	// What terminate guarantees is that the thread STOPS, not that it stops
+	// between two particular messages: a message already in flight when
+	// terminate is called still arrives. So the test measures quiet AFTER the
+	// call — count at the moment of terminate versus count a while later.
 	got, _ := runWorker(t, srv.URL, `
 		const w = new Worker(BASE + "/spam.js");
-		let seen = 0;
+		let seen = 0, atTerminate = -1;
 		w.onmessage = () => {
-			if (++seen === 1) {
+			seen++;
+			if (atTerminate < 0) {
 				w.terminate();
-				// Anything arriving after terminate would be a message from a thread
-				// that should no longer exist.
-				setTimeout(() => { globalThis.__r = "stopped after " + seen; }, 60);
+				atTerminate = seen;
+				setTimeout(() => {
+					// A few late arrivals are the messages already queued; what must
+					// not happen is the interval continuing to produce them.
+					globalThis.__r = (seen - atTerminate <= 2) ? "quiet" : "still running: " + (seen - atTerminate);
+				}, 150);
 			}
 		};`)
-	if want := "stopped after 1"; got != want {
+	if want := "quiet"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }

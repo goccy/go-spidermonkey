@@ -1139,13 +1139,18 @@
 			// stream's error, rejects TypeError on releaseLock (WHATWG). The stream
 			// keeps a back-pointer so controller.close/error can settle it.
 			stream._reader = this;
-			this.closed = new Promise((resolve, reject) => { this._closedResolve = resolve; this._closedReject = reject; });
+			// `closed` is an IDL ATTRIBUTE, so it lives on the prototype and the
+			// promise lives in a slot. As an own property it was invisible to
+			// anything that inspects the interface — and it is the same promise
+			// every time it is read, which an own property also happened to give.
+			this._closedPromise = new Promise((resolve, reject) => { this._closedResolve = resolve; this._closedReject = reject; });
 			// Internally mark handled: a consumer that never touches reader.closed
 			// must not see an unhandledRejection when the stream errors.
-			this.closed.catch(() => {});
+			this._closedPromise.catch(() => {});
 			if (stream._closed) this._closedResolve(undefined);
 			else if (stream._errored) this._closedReject(stream._errorValue);
 		}
+		get closed() { return this._closedPromise; }
 		read() {
 			const s = this._stream;
 			if (!s) return Promise.reject(new TypeError("reader has released its lock"));
@@ -1201,11 +1206,12 @@
 			stream._locked = true;
 			this._stream = stream;
 			stream._reader = this;
-			this.closed = new Promise((resolve, reject) => { this._closedResolve = resolve; this._closedReject = reject; });
-			this.closed.catch(() => {});
+			this._closedPromise = new Promise((resolve, reject) => { this._closedResolve = resolve; this._closedReject = reject; });
+			this._closedPromise.catch(() => {});
 			if (stream._closed) this._closedResolve(undefined);
 			else if (stream._errored) this._closedReject(stream._errorValue);
 		}
+		get closed() { return this._closedPromise; }
 		// read(view, { min }) fills view and does not resolve until at least `min`
 		// ELEMENTS have arrived — the point of min is to stop a caller having to
 		// reassemble a record that came in pieces. A stream that closes first
@@ -1278,7 +1284,19 @@
 			// does; min exists precisely to not do that.
 			return new Promise((resolve, reject) => {
 				const wait = () => s._waiters.push({
-					resolve: () => {
+					// A waiter is handed the chunk DIRECTLY when one arrives while it is
+					// waiting — the controller's enqueue skips the queue for a waiting
+					// reader, because a plain read() resolves with exactly that value.
+					// A BYOB read consumes bytes from the QUEUE, so the handed-over
+					// chunk has to be put there before draining. Ignoring it meant the
+					// drain found nothing, waited again, and never made progress: a
+					// BYOB read on a byte-stream tee branch hung forever.
+					resolve: (handed) => {
+						if (handed && handed.value !== undefined) {
+							s._queue.push(handed.value);
+							s._queueSizes.push(1);
+							s._queueTotalSize += 1;
+						}
 						drain();
 						if (written >= minBytes) return resolve(result(false));
 						if (s._closed) return resolve(result(true));
@@ -1586,7 +1604,6 @@
 					await raced(writer.write(value));
 				}
 				if (options.preventClose !== true) await writer.close();
-				else writer.releaseLock();
 			} catch (e) {
 				if (options.preventAbort !== true) { try { await writer.abort(e); } catch { /* already errored */ } }
 				// Cancel the SOURCE too (WHATWG: a destination failure cancels the
@@ -1597,11 +1614,13 @@
 				throw e;
 			} finally {
 				if (signal && onAbort) signal.removeEventListener("abort", onAbort);
-				// BOTH locks go, however the pipe ended. Leaving the destination locked
-				// meant a stream could be piped to exactly once, for the lifetime of
-				// the process — the writer here is pipeTo's own, and nobody else can
-				// release it.
+				// BOTH locks go, however the pipe ended. The writer here is pipeTo's
+				// own and nobody else can release it, so leaving it held meant a
+				// destination could be written to exactly once for the life of the
+				// process — and a caller that then took a writer to observe `closed`
+				// got a TypeError instead of the stream's outcome.
 				reader.releaseLock();
+				writer.releaseLock();
 			}
 		}
 		pipeThrough(transform, options) {
@@ -1667,6 +1686,12 @@
 				}).catch((e) => { c1.error(e); c2.error(e); });
 			};
 			const maybeCancel = (reason) => { if (cancelled1 && cancelled2) reader.cancel(reason); };
+			// The branches are NOT byte streams even when the source is, so a BYOB
+			// reader cannot be taken on one. Making them byte streams is correct and
+			// was tried: it needs real pull-into (a byobRequest the source fills),
+			// which this implementation does not have, and without it a BYOB read on
+			// a branch never completes — trading a reported failure for a hang.
+			// readable-byte-streams/tee.any.js is the measure of the gap.
 			const branch1 = new ReadableStream({
 				start(c) { c1 = c; },
 				pull() { pump(); },
@@ -1710,14 +1735,41 @@
 			if (stream._locked) throw new TypeError("WritableStream is locked");
 			stream._locked = true;
 			this._stream = stream;
-			this.ready = Promise.resolve();
-			this.desiredSize = 1;
-			this.closed = new Promise((resolve, reject) => { stream._closedResolve = resolve; stream._closedReject = reject; });
+			// ready, desiredSize and closed are IDL attributes: prototype accessors
+			// over slots, not own properties written in the constructor. desiredSize
+			// is READ from the stream rather than latched, because it changes as the
+			// stream does — and it is null once the stream errored and zero once it
+			// closed, which a latched 1 could never report.
+			this._readyPromise = Promise.resolve();
+			this._closedPromise = new Promise((resolve, reject) => {
+				this._closedResolve = resolve;
+				this._closedReject = reject;
+				// The stream keeps the settlers too, so the sink's close/abort can
+				// settle whichever writer is currently attached.
+				stream._closedResolve = resolve;
+				stream._closedReject = reject;
+			});
 			// Mark `closed` internally handled so a sink/transform error that rejects
 			// it doesn't surface as an unhandledRejection when the caller only
 			// awaited write() (native streams don't leak one here). The caller's own
 			// .then/.catch on `closed` still works.
-			this.closed.catch(() => {});
+			this._closedPromise.catch(() => {});
+			// A writer taken from a stream that has ALREADY finished must observe
+			// that, not wait for it: its closed promise is settled here and now.
+			// Without this a second writer — the one a caller takes after a pipeTo
+			// completed, which is exactly what the piping tests do — held a promise
+			// nothing would ever settle, and awaiting it hung.
+			if (stream._state === "closed") this._closedResolve(undefined);
+			else if (stream._state === "errored") this._closedReject(stream._storedError);
+		}
+		get ready() { return this._readyPromise; }
+		get closed() { return this._closedPromise; }
+		get desiredSize() {
+			const s = this._stream;
+			if (!s) throw new TypeError("desiredSize: the writer has released its lock");
+			if (s._state === "errored") return null;
+			if (s._state === "closed") return 0;
+			return 1;
 		}
 		write(chunk) {
 			const s = this._stream;
@@ -1752,6 +1804,9 @@
 			s._state = "closed";
 			if (s._sink.close) await s._sink.close();
 			s._closedResolve();
+			// The stored error is cleared on a clean close so a later writer does not
+			// inherit a stale one.
+			s._storedError = undefined;
 		}
 		async abort(reason) {
 			const s = this._stream;
@@ -1761,6 +1816,7 @@
 			// in both close and abort isn't double-released.
 			if (s._state !== "writable") return;
 			s._state = "errored";
+			s._storedError = reason;
 			if (s._sink.abort) await s._sink.abort(reason);
 			// Per spec, aborting REJECTS the writer's closed promise with the
 			// reason (it previously resolved it, defeating error handling).
@@ -1769,8 +1825,10 @@
 		releaseLock() {
 			if (this._stream) {
 				// WHATWG: releasing the writer rejects its closed promise with a
-				// TypeError — a no-op if close/abort already settled it.
-				if (this._stream._closedReject) this._stream._closedReject(new TypeError("Writer was released and can no longer be used to monitor the stream's closedness"));
+				// TypeError — a no-op if close/abort already settled it. The reject is
+				// against THIS writer's promise; a later writer gets its own, settled
+				// from the stream's state (see the constructor).
+				this._closedReject(new TypeError("Writer was released and can no longer be used to monitor the stream's closedness"));
 				this._stream._locked = false;
 				this._stream = null;
 			}
