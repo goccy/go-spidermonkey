@@ -252,13 +252,9 @@ globalThis.GLOBAL = {
 		}
 		return `
 (function () {
-  const u = new URL(` + jsString(href) + `);
-  globalThis.location = {
-    href: u.href, origin: u.origin, protocol: u.protocol, host: u.host,
-    hostname: u.hostname, port: u.port, pathname: u.pathname,
-    search: u.search, hash: u.hash, toString: () => u.href,
-  };
-  const base = u.href;
+  // location itself is installed by compat/web (see Options.Location); what is
+  // needed here is only that relative URLs resolve against it.
+  const base = ` + jsString(href) + `;
   const raw = globalThis.fetch;
   globalThis.fetch = function fetch(input, init) {
     if (typeof input === "string") input = new URL(input, base).href;
@@ -282,23 +278,17 @@ func jsString(s string) string {
 	return string(b)
 }
 
-// scopeMarkersFor names the kind of global this case runs in, the way
-// idlharness detects it: `Window` present for a window, a
-// DedicatedWorkerGlobalScope the global is an instance of for a worker. The
-// classes are markers, not implementations — Symbol.hasInstance answers the
-// instanceof without touching the global's prototype chain.
-func scopeMarkersFor(scope string) string {
-	if scope == "window" {
-		return `globalThis.Window ??= class Window {
-  static [Symbol.hasInstance](v) { return v === globalThis; }
-};`
+// scopeFor maps a case's scope name onto the installation's.
+func scopeFor(scope string) web.Scope {
+	switch scope {
+	case "dedicatedworker":
+		return web.ScopeDedicatedWorker
+	case "sharedworker":
+		return web.ScopeSharedWorker
+	case "serviceworker":
+		return web.ScopeServiceWorker
 	}
-	return `globalThis.WorkerGlobalScope ??= class WorkerGlobalScope {
-  static [Symbol.hasInstance](v) { return v === globalThis; }
-};
-globalThis.DedicatedWorkerGlobalScope ??= class DedicatedWorkerGlobalScope {
-  static [Symbol.hasInstance](v) { return v === globalThis; }
-};`
+	return web.ScopeWindow
 }
 
 // collector installs the completion callback that carries the per-subtest
@@ -376,6 +366,11 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	base := opts.BaseURL
+	if opts.HTTPSBaseURL != "" && isHTTPSTest(rel) {
+		base = opts.HTTPSBaseURL
+	}
+
 	out := &lockedBuffer{}
 	js, err := spidermonkey.New(spidermonkey.Config{
 		FS:             os.DirFS(opts.Root),
@@ -393,7 +388,19 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 	}
 	defer js.Close()
 
-	w, err := web.InstallWith(js, web.Options{RootCAs: opts.RootCAs})
+	// The scope and the base URL are environment facts, and compat/web owns the
+	// interfaces they imply: WorkerGlobalScope and its subtype, WorkerNavigator,
+	// WorkerLocation, the worker global's postMessage. The prelude used to hand-
+	// roll a plain `location` object and the harness used to define marker
+	// classes for idlharness; both were the runner standing in for a layer that
+	// should have had them.
+	w, err := web.InstallWith(js, web.Options{
+		RootCAs:  opts.RootCAs,
+		Scope:    scopeFor(c.Scope),
+		Location: base + rel + c.Variant,
+		// One interpreter is one thread here, and a Worker is not hosted yet.
+		HardwareConcurrency: 1,
+	})
 	if err != nil {
 		res.Harness, res.Message = string(StatusError), err.Error()
 		return res
@@ -418,10 +425,6 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 	// prelude, the harness, the completion collector, the META scripts, then
 	// the test itself. They run as separate evaluations so a syntax error in
 	// one is reported against that file.
-	base := opts.BaseURL
-	if opts.HTTPSBaseURL != "" && isHTTPSTest(rel) {
-		base = opts.HTTPSBaseURL
-	}
 	steps := []struct{ name, src string }{{"<prelude>", preludeFor(base, rel+c.Variant, c.Scope)}}
 	harness, err := os.ReadFile(path.Join(opts.Root, "resources/testharness.js"))
 	if err != nil {
@@ -430,14 +433,6 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 	}
 	steps = append(steps,
 		struct{ name, src string }{"resources/testharness.js", string(harness)},
-		// The scope markers go AFTER testharness and BEFORE everything else, on
-		// purpose: testharness picks its environment at LOAD time and must keep
-		// choosing the shell one (whose completion model the runner is built on),
-		// while idlharness classifies the global at RUN time by exactly these
-		// names — without them every [Exposed=Window] or [Exposed=Worker]
-		// interface is judged as if this were a ShadowRealm, and idlharness
-		// demands its ABSENCE.
-		struct{ name, src string }{"<scope-markers>", scopeMarkersFor(c.Scope)},
 		struct{ name, src string }{"<collector>", collector},
 	)
 	scripts := m.scripts
@@ -449,6 +444,14 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 		steps = append(steps, struct{ name, src string }{
 			"<importScripts>", importScriptsShimFor(append(imported, "/resources/testharness.js"))})
 		scripts = append(imported, scripts...)
+	} else if c.Scope != "" && c.Scope != "window" {
+		// A worker-scope .any.js reaches a browser as a generated wrapper that
+		// pulls testharness and the test in with importScripts. The scripts are
+		// already loaded here, but the CALL has to exist: importScripts is part of
+		// the worker surface, and a test that uses it directly (workers/ has
+		// several) must not fail on its absence.
+		steps = append(steps, struct{ name, src string }{
+			"<importScripts>", importScriptsShimFor([]string{"/resources/testharness.js"})})
 	}
 	for _, s := range scripts {
 		p := resolveScript(rel, s)
@@ -460,6 +463,13 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 		steps = append(steps, struct{ name, src string }{p, string(substituteWPT(p, b, opts.SubVars))})
 	}
 	steps = append(steps, struct{ name, src string }{rel, string(src)})
+	if c.Scope != "" && c.Scope != "window" && !strings.HasSuffix(rel, ".worker.js") {
+		// ...and the wrapper ends with done(). In a worker scope testharness
+		// waits for an explicit finish (WorkerTestEnvironment sets
+		// wait_for_finish), so without this every worker-scope file that does not
+		// call done() itself times out instead of reporting.
+		steps = append(steps, struct{ name, src string }{"<done>", "done();"})
+	}
 
 	for _, st := range steps {
 		r, err := js.Eval(ctx, st.src)

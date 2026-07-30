@@ -78,12 +78,42 @@ func TestEveryGlobalIsClassified(t *testing.T) {
 	for _, g := range web.AlwaysInstalledGlobals() {
 		classified[g] = "(always)"
 	}
+	// The global-scope interfaces belong to the Scope, not to any feature, but
+	// they are still enumerated — see ScopeGlobals.
+	for _, g := range web.ScopeGlobals(web.ScopeWindow) {
+		classified[g] = "(scope)"
+	}
 
 	for g := range installedGlobals(t, web.Options{}) {
 		if _, ok := classified[g]; !ok {
 			t.Errorf("the installation defines %q, which no feature claims: add it to "+
 				"featureGlobals, or to alwaysInstalled if every feature needs it", g)
 		}
+	}
+}
+
+// TestScopeGlobalsAreInstalled holds the scope enumeration to the installation,
+// in both directions: everything a Scope claims must appear, and a worker scope
+// must NOT leave the window-only interfaces behind.
+func TestScopeGlobalsAreInstalled(t *testing.T) {
+	for _, scope := range []web.Scope{web.ScopeWindow, web.ScopeDedicatedWorker,
+		web.ScopeSharedWorker, web.ScopeServiceWorker} {
+		t.Run(string(scope), func(t *testing.T) {
+			got := installedGlobals(t, web.Options{Scope: scope})
+			for _, g := range web.ScopeGlobals(scope) {
+				if !got[g] {
+					t.Errorf("scope %s claims %q and the installation does not define it", scope, g)
+				}
+			}
+			if scope == web.ScopeWindow {
+				return
+			}
+			for _, g := range []string{"Window", "Location", "Navigator"} {
+				if got[g] {
+					t.Errorf("scope %s defines %q, which belongs to a window", scope, g)
+				}
+			}
+		})
 	}
 }
 

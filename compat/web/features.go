@@ -98,6 +98,26 @@ var alwaysInstalled = []string{
 	"onerror", "onunhandledrejection", "onrejectionhandled",
 }
 
+// scopeGlobals are the global-scope interfaces installed for each Scope. They
+// belong to no feature — a worker does not have "the worker feature", it has a
+// different global — but they are enumerated here so that every global this
+// package installs is accounted for somewhere. See js/scope.js.
+var scopeGlobals = map[Scope][]string{
+	ScopeWindow:          {"Window", "Location", "Navigator"},
+	ScopeDedicatedWorker: {"WorkerGlobalScope", "DedicatedWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "postMessage", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},
+	ScopeSharedWorker:    {"WorkerGlobalScope", "SharedWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},
+	ScopeServiceWorker:   {"WorkerGlobalScope", "ServiceWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},
+}
+
+// ScopeGlobals reports the global-scope interfaces a Scope installs, so the
+// package's own tests can hold the enumeration to what the installation does.
+func ScopeGlobals(s Scope) []string {
+	if s == "" {
+		s = ScopeWindow
+	}
+	return append([]string(nil), scopeGlobals[s]...)
+}
+
 // AllFeatures is the whole web platform surface this package implements.
 func AllFeatures() []Feature {
 	out := make([]Feature, 0, len(featureGlobals))
@@ -133,7 +153,31 @@ type Options struct {
 	// a test server that mints its own certificate. Nil means the system pool
 	// alone, which is what a guest should normally get.
 	RootCAs *x509.CertPool
+	// Scope says what KIND of global this is, which decides the global-scope
+	// interfaces installed: Window and Location, or WorkerGlobalScope with its
+	// subtype, WorkerNavigator and WorkerLocation. It is not a feature selection
+	// — a worker does not have "fewer features", it has a different global — so
+	// it is a separate field. Empty means ScopeWindow.
+	Scope Scope
+	// Location, when set, is the URL `location` reports. A runtime has one only
+	// because an embedding gave it one: there is no document here to supply it.
+	// Empty leaves `location` undefined, which is what a bare embedding has.
+	Location string
+	// HardwareConcurrency is what navigator.hardwareConcurrency reports. Zero
+	// means 1: one interpreter is one thread, and claiming more parallelism than
+	// the embedding can deliver is worse than under-reporting it.
+	HardwareConcurrency int
 }
+
+// Scope is the kind of global an installation creates.
+type Scope string
+
+const (
+	ScopeWindow          Scope = "window"
+	ScopeDedicatedWorker Scope = "dedicatedworker"
+	ScopeSharedWorker    Scope = "sharedworker"
+	ScopeServiceWorker   Scope = "serviceworker"
+)
 
 // featureSet turns a selection into a lookup, treating nil as everything.
 func featureSet(features []Feature) map[Feature]bool {

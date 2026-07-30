@@ -55,6 +55,9 @@ var weblocksJS string
 //go:embed js/wasm.js
 var wasmJS string
 
+//go:embed js/scope.js
+var scopeJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -164,6 +167,12 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	if err := removeUnselected(js, opts.Features); err != nil {
 		return nil, err
 	}
+	// The global-scope interfaces go last: they decorate what everything above
+	// installed (navigator's prototype, the event target), and which of them
+	// exist depends on what kind of global this is rather than on any feature.
+	if err := installScope(js, opts); err != nil {
+		return nil, err
+	}
 	if err := HideNewGlobals(js, preexisting); err != nil {
 		return nil, err
 	}
@@ -181,6 +190,33 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 // for itself. The guest hook decides POLICY (dispatch an `unhandledrejection`
 // event here; compat/nodejs replaces it with process.emit); this only carries
 // them across.
+// installScope hands js/scope.js the three things only the embedding knows —
+// what kind of global this is, what URL `location` reports, and how much
+// parallelism the host actually has — and evaluates it.
+func installScope(js *spidermonkey.JS, opts Options) error {
+	scope := opts.Scope
+	if scope == "" {
+		scope = ScopeWindow
+	}
+	setup := fmt.Sprintf("globalThis.__web_scope = %s;\n", jsLiteral(string(scope)))
+	if opts.Location != "" {
+		setup += fmt.Sprintf("globalThis.__web_location = %s;\n", jsLiteral(opts.Location))
+	}
+	if opts.HardwareConcurrency > 0 {
+		setup += fmt.Sprintf("globalThis.__web_concurrency = %d;\n", opts.HardwareConcurrency)
+	}
+	for _, src := range []string{setup, scopeJS} {
+		r, err := js.Eval(context.Background(), src)
+		if err != nil {
+			return fmt.Errorf("web: installing the global scope: %w", err)
+		}
+		if r.Error != nil {
+			return fmt.Errorf("web: the global scope threw: %w", r.Error)
+		}
+	}
+	return nil
+}
+
 func (w *Web) reportRejections(ctx context.Context) (bool, error) {
 	rejections, err := w.js.TakeUnhandledRejections()
 	if err != nil || len(rejections) == 0 {
