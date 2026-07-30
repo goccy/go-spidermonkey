@@ -40,6 +40,9 @@ var urlpatternJS string
 //go:embed js/extended.js
 var extendedJS string
 
+//go:embed js/xhr.js
+var xhrJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -117,7 +120,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -249,6 +252,13 @@ func (w *Web) ResetPerRequest() {
 	// (premature idle -> a spurious 500). Loop().Reset() (called by the caller
 	// after us) also clears timers, but only after the drain has already run.
 	w.loop.ClearTimers()
+	// The HTTP cache is dropped between pooled requests. A cache that survived
+	// would let one request observe what another fetched — the response bodies
+	// themselves, and the timing of a hit — which is the same isolation argument
+	// the key table is reset for.
+	if w.fetch != nil {
+		w.fetch.dropCache()
+	}
 	if w.fetch != nil {
 		// Abort any in-flight async fetch so no goroutine's late loop.Post survives
 		// into the next request (corrupting its pending accounting). cancelInflight

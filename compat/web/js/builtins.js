@@ -2580,6 +2580,9 @@
 				if (ref) uaSet("referer", ref);
 			}
 			if (init.redirect !== undefined && init.redirect !== null) nInit.redirect = String(init.redirect);
+			// The cache mode reaches the host, which is where the cache lives.
+			if (init.cache !== undefined && init.cache !== null) nInit.cache = String(init.cache);
+			if (init.cache !== undefined && init.cache !== null) nInit.cache = String(init.cache);
 			const signal = init.signal || (isReq ? input.signal : undefined);
 			// A signal already aborted at call time rejects immediately with its reason
 			// (a DOMException "AbortError" by default) — the host is never called.

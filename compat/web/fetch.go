@@ -64,6 +64,9 @@ type fetchAPI struct {
 var (
 	errFetchRedirect    = errors.New("fetch: redirect mode is \"error\" and the server returned a redirect")
 	errTooManyRedirects = errors.New("fetch: too many redirects")
+	// errOnlyIfCached is what cache mode "only-if-cached" reports when nothing is
+	// stored: the standard makes that a network error, not an empty response.
+	errOnlyIfCached = errors.New("fetch: cache mode is \"only-if-cached\" and there is no stored response")
 )
 
 // asyncCall tracks one in-flight async fetch op so a pooled instance (cfworkers)
@@ -348,7 +351,21 @@ func newHTTPClient(cfg spidermonkey.Config) *http.Client {
 	// refuses to write is still sent — over the same permission-checked dial.
 	// See fetchraw.go.
 	std := &http.Transport{DialContext: dial}
-	return &http.Client{Transport: &permissiveTransport{std: std, dial: dial}}
+	// The cache wraps the transport rather than the client, so it also sees the
+	// hops of a redirect chain — each of which is a request of its own.
+	inner := &permissiveTransport{std: std, dial: dial}
+	return &http.Client{Transport: &cachingTransport{next: inner, cache: newResponseCache()}}
+}
+
+// dropCache empties the HTTP cache. A pooled instance calls it between requests
+// so one request cannot observe what another fetched.
+func (a *fetchAPI) dropCache() {
+	if a.client == nil {
+		return
+	}
+	if ct, ok := a.client.Transport.(*cachingTransport); ok {
+		ct.cache.reset()
+	}
 }
 
 // checkRequestPermission applies Config.Resolve/Dial to a request's target
@@ -410,6 +427,7 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	url := args[0].String()
 	method := "GET"
 	redirectMode := "follow"
+	cacheModeName := "default"
 	abortID := ""
 	var reqBody io.Reader
 	headers := map[string]string{}
@@ -436,6 +454,9 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 		}
 		if v, ok := scalar("redirect"); ok {
 			redirectMode = v.String()
+		}
+		if v, ok := scalar("cache"); ok {
+			cacheModeName = v.String()
 		}
 		// The guest wraps init.signal as a string id (see the JS fetch wrapper) so
 		// its 'abort' listener can reach __native_fetch_abort. Pre-aborted signals
@@ -538,7 +559,7 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	}
 	// ctx/cancel are created here (on the loop) so the AbortSignal id can be
 	// registered before the guest wires its abort listener — no lost-abort race.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(withCacheMode(context.Background(), cacheModeName))
 	if abortID != "" {
 		a.mu.Lock()
 		a.aborts[abortID] = cancel
