@@ -22,62 +22,67 @@ runtime implements the API. A directory where everything fails is the point.
 
 ## Where it stands
 
-Measured with the harness in `wpt/`, which runs each `.any.js` / `.worker.js`
-file once. See "What the harness does not run yet" below: the number is not
-comparable to a browser's until that list is empty.
+Measured with the harness in `wpt/`, which expands each source file into the
+cases a browser runs (scope × variant). Two rates are reported and only one is
+worth quoting: WebCryptoAPI declares over 70% of every subtest in the corpus,
+so the subtest rate barely moves when a whole API lands. CLEAN CASES — cases
+with no failing subtest — is the fair weighting, and it is the metric the other
+runtimes publish.
 
 | suite | measured |
 |---|---|
-| WPT | **42,591 / 43,401 subtests** in the directories run so far |
+| WPT | **1,413 / 4,498 clean cases = 31.4%** (93,246 / 102,383 subtests) |
 | Node.js | 2,611 tests run, **795 pass = 30.4%** |
 | Babel | 4,170 / 4,189 fixtures = 99.6% |
 | test262 | 52,266 / 53,329 = 98.0% |
 
+The corpus includes `html/canvas/offscreen`, 2,040 cases of OffscreenCanvas
+2D rendering that nothing here implements — 45% of the denominator and the
+single largest block of work outstanding. Deno does not track that directory,
+so the two totals are not like for like; the per-directory lines are.
+
 ### Against Deno, like for like
 
 Deno publishes its expectations (`tests/wpt/runner/expectations/`), so its rate
-is computable rather than guessed. Comparing the metric both sides can produce —
-the share of test files with ZERO failing subtests, over the `.any.*` corpus:
+is computable rather than guessed: 1,361 of 2,190 `.any.*` files with zero
+failures = **62.2%**. Bun publishes no WPT results, so Bun can only be compared
+by API surface.
 
-| | files | zero failures | rate |
-|---|---|---|---|
-| Deno | 2,190 | 1,361 | **62.2%** |
-| this runtime | 564 | 336 | **59.6%** |
-
-Per directory, where both cover it:
+Per directory, where both cover it (clean-case rate here):
 
 | directory | Deno | here |
 |---|---|---|
+| url | 75.9% | 96.6% |
+| urlpattern | 28.6% | 85.7% |
+| eventsource | — | 100% |
+| web-locks | — | 81.3% |
+| websockets | — | 82.7% |
+| WebCryptoAPI | 85.8% | 86.5% |
+| compression | 50.0% | 52.6% |
+| fetch | 45.8% | 44.6% |
 | streams | 90.4% | 37.0% |
 | encoding | 92.4% | 64.9% |
 | FileAPI | 88.9% | 52.5% |
 | user-timing | 95.2% | 69.6% |
 | webmessaging | 80.0% | 40.0% |
 | console | 100% | 57.1% |
-| WebCryptoAPI | 85.8% | 82.9% |
-| fetch | 45.8% | 44.9% |
-| compression | 50.0% | 52.6% |
-| urlpattern | 28.6% | 57.1% |
-| url | 75.9% | 95.8% |
 
-Only `url` and `urlpattern` are ahead. Bun publishes no WPT results, so Bun can
-only be compared by API surface, not by rate.
+The bottom six are item 9 of the order of work below.
 
-## The API surface Bun and Deno have and this runtime does not
+## The API surface Bun and Deno have
 
 Measured by probing the globals after `web.Install`:
 
 | API | Bun | Deno | here |
 |---|---|---|---|
-| `WebSocket` | yes | yes | **no** |
+| `WebSocket`, `CloseEvent` | yes | yes | yes |
+| `EventSource` | no | yes | yes |
+| `WebAssembly` | yes | yes | yes (over wazero) |
+| `navigator`, `navigator.locks` | yes | yes | yes |
 | `Worker`, `SharedWorker` | yes | yes | **no** |
 | `BroadcastChannel` | yes | yes | **no** (compat/nodejs only) |
-| `WebAssembly` | yes | yes | **no** |
 | `localStorage`, `sessionStorage`, `Storage` | no | yes | **no** |
 | `caches`, `CacheStorage` | no | yes | **no** |
-| `navigator` (and `navigator.locks`) | yes | yes | **no** |
-| `EventSource` | no | yes | **no** |
-| `CloseEvent` | yes | yes | **no** |
 | `alert`, `confirm`, `prompt` | yes | yes | **no** |
 | `ShadowRealm` | yes | no | **no** |
 
