@@ -777,12 +777,15 @@
 	// the INTERFACE to be exposed, not just the instance: `performance instanceof
 	// Performance` is what a caller checks, and an object literal cannot answer it.
 	// The User Timing members are added to the prototype further down.
-	class Performance {
-		constructor() { this._timeOrigin = Date.now(); }
+	// Performance derives from EventTarget: the timeline dispatches events, and
+	// the inheritance is directly observable through the prototype chain.
+	class Performance extends EventTarget {
+		constructor() { super(); this._timeOrigin = Date.now(); }
 		get timeOrigin() { return this._timeOrigin; }
 		now() { return ops.perf_now(); }
 		toJSON() { return { timeOrigin: this.timeOrigin }; }
 	}
+	Object.defineProperty(Performance.prototype, Symbol.toStringTag, { value: "Performance", configurable: true });
 	globalThis.Performance ??= Performance;
 	globalThis.performance ??= new Performance();
 
@@ -968,12 +971,14 @@
 	// they are implemented; the class is declared here so `crypto.subtle` has
 	// something to be an instance OF before that runs.
 	class SubtleCrypto {}
+	Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: "SubtleCrypto", configurable: true });
 	globalThis.SubtleCrypto ??= SubtleCrypto;
 
 	class Crypto {
 		constructor() { this._subtle = new globalThis.SubtleCrypto(); }
 		get subtle() { return this._subtle; }
 	}
+	Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: "Crypto", configurable: true });
 	globalThis.Crypto ??= Crypto;
 	globalThis.crypto ??= new globalThis.Crypto();
 	globalThis.crypto.getRandomValues ??= (array) => {

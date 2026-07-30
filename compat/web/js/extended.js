@@ -747,14 +747,29 @@
 		return { readable, writable };
 	}
 
-	globalThis.CompressionStream = class CompressionStream {
+	// The instance IS the stream pair. Returning a plain {readable, writable}
+	// from the constructor — which is what these used to do — gave back an object
+	// that was not a CompressionStream at all: instanceof was false, the
+	// prototype was Object's, and the class string said so.
+	class CompressionStream {
 		constructor(format) {
-			return compressionTransform(COMPRESS, format, "CompressionStream");
+			const pair = compressionTransform(COMPRESS, format, "CompressionStream");
+			Object.defineProperty(this, "_pair", { value: pair });
 		}
-	};
-	globalThis.DecompressionStream = class DecompressionStream {
+		get readable() { return this._pair.readable; }
+		get writable() { return this._pair.writable; }
+	}
+	class DecompressionStream {
 		constructor(format) {
-			return compressionTransform(DECOMPRESS, format, "DecompressionStream");
+			const pair = compressionTransform(DECOMPRESS, format, "DecompressionStream");
+			Object.defineProperty(this, "_pair", { value: pair });
 		}
-	};
+		get readable() { return this._pair.readable; }
+		get writable() { return this._pair.writable; }
+	}
+	for (const cls of [CompressionStream, DecompressionStream]) {
+		Object.defineProperty(cls.prototype, Symbol.toStringTag, { value: cls.name, configurable: true });
+	}
+	globalThis.CompressionStream = CompressionStream;
+	globalThis.DecompressionStream = DecompressionStream;
 })();
