@@ -143,7 +143,10 @@ func TestWPTSuite(t *testing.T) {
 	}
 	defer srv.Close()
 
-	opts := wpt.Options{Root: root, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}
+	opts := wpt.Options{
+		Root: root, BaseURL: srv.BaseURL(), HTTPSBaseURL: srv.HTTPSBaseURL(),
+		RootCAs: srv.RootCAs(), SubVars: srv.SubVars(),
+	}
 	stable := stabilizer(srv.SubVars())
 	if s := os.Getenv("WPT_TIMEOUT"); s != "" {
 		d, err := time.ParseDuration(s)
@@ -235,12 +238,13 @@ func TestWPTSuite(t *testing.T) {
 		areas = append(areas, a)
 	}
 	sort.Strings(areas)
-	var totalPass, totalFail int
+	var totalPass, totalFail, totalCases int
 	for _, a := range areas {
 		s := byArea[a]
 		totalPass += s.pass
 		totalFail += s.fail
-		t.Logf("%-24s subtests %6d/%6d  %.2f%%  (files %4d, harness-error %3d, skipped %3d)",
+		totalCases += s.files
+		t.Logf("%-24s subtests %6d/%6d  %.2f%%  (cases %4d, harness-error %3d, skipped %3d)",
 			a, s.pass, s.pass+s.fail, 100*float64(s.pass)/float64(max(s.pass+s.fail, 1)),
 			s.files, s.broken, s.skipped)
 	}
@@ -248,6 +252,14 @@ func TestWPTSuite(t *testing.T) {
 		totalPass, totalPass+totalFail,
 		100*float64(totalPass)/float64(max(totalPass+totalFail, 1)),
 		time.Since(start).Round(time.Second))
+	// The subtest rate is dominated by whichever directory declares the most
+	// assertions — WebCryptoAPI alone is over 70% of them — so it moves barely at
+	// all when a whole API is implemented. The rate below counts CASES that ran
+	// clean, which is both a fair weighting and the number the other runtimes
+	// publish: it is what "Deno passes 62.2% of WPT" means.
+	clean := totalCases - len(failures)
+	t.Logf("TOTAL                    clean cases %5d/%5d  %.2f%%  (a case is a file in one scope with one variant)",
+		clean, totalCases, 100*float64(clean)/float64(max(totalCases, 1)))
 	var reasons []string
 	for r := range harnessReasons {
 		reasons = append(reasons, r)
@@ -349,12 +361,30 @@ func topDir(p string) string {
 // never be clean. The ports are known structurally (this process assigned
 // them), so each goes back to the token it was substituted from.
 func stabilizer(vars map[string]string) *strings.Replacer {
-	// One token per distinct value, not per variable: ports[http][0],
-	// ports[https][0] and ports[ws][0] are all the same listener here.
-	return strings.NewReplacer(
-		":"+vars["ports[http][0]"], ":{{port}}",
-		":"+vars["ports[http][1]"], ":{{altport}}",
-	)
+	// EVERY listener's port, not just the plain-HTTP ones: a subtest name built
+	// from get_host_info().HTTPS_ORIGIN carries the TLS port, and a name built
+	// from a WebSocket URL carries the ws one. One token per distinct value —
+	// ports[http][0] and ports[ws][0] are the same listener here, so they
+	// deliberately collapse to the same token.
+	seen := map[string]string{}
+	var pairs []string
+	for _, name := range []string{
+		"ports[http][0]", "ports[http][1]",
+		"ports[https][0]", "ports[https][1]",
+		"ports[ws][0]", "ports[wss][0]", "ports[h2][0]",
+	} {
+		v := vars[name]
+		if v == "" {
+			continue
+		}
+		if _, dup := seen[v]; dup {
+			continue // already covered by the first variable that named this port
+		}
+		token := ":{{port" + strconv.Itoa(len(seen)) + "}}"
+		seen[v] = token
+		pairs = append(pairs, ":"+v, token)
+	}
+	return strings.NewReplacer(pairs...)
 }
 
 func bucket(s string) string {

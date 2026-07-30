@@ -22,6 +22,8 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,6 +52,10 @@ type fetchAPI struct {
 	deferredFn   *spidermonkey.Object // __web_deferred(): {promise, resolve, reject}
 	typeErrorCls *spidermonkey.Object // TypeError constructor (redirect:"error" rejection)
 
+	// roots, when set, are trusted in ADDITION to the system pool. It is how an
+	// embedding reaches a server whose certificate is not publicly signed — a
+	// private CA, or a test server that mints its own.
+	roots      *x509.CertPool
 	clientOnce sync.Once
 	client     *http.Client
 
@@ -246,8 +252,8 @@ type fetchStream struct {
 	reading   bool // a buffered readAll is in progress (blocks a second one)
 }
 
-func installFetch(js *spidermonkey.JS, loop *eventloop.Loop) (*fetchAPI, error) {
-	a := &fetchAPI{js: js, loop: loop, open: map[*fetchStream]struct{}{}, calls: map[*asyncCall]struct{}{}, aborts: map[string]context.CancelFunc{}}
+func installFetch(js *spidermonkey.JS, loop *eventloop.Loop, roots *x509.CertPool) (*fetchAPI, error) {
+	a := &fetchAPI{js: js, loop: loop, roots: roots, open: map[*fetchStream]struct{}{}, calls: map[*asyncCall]struct{}{}, aborts: map[string]context.CancelFunc{}}
 	// A deferred-promise factory so Go can settle a promise asynchronously.
 	if r, err := js.Eval(context.Background(),
 		`(globalThis.__web_deferred = () => { let resolve, reject; const promise = new Promise((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; }), 0`); err != nil {
@@ -308,9 +314,37 @@ func (a *fetchAPI) fetchAbort(cfg spidermonkey.Config, args []spidermonkey.Value
 // newHTTPClient builds the transport that enforces Config.Resolve (per
 // hostname) and Config.Dial (per resolved address, so a DNS answer cannot
 // smuggle a connection past the allow-list).
-func newHTTPClient(cfg spidermonkey.Config) *http.Client {
+func newHTTPClient(cfg spidermonkey.Config, roots *x509.CertPool) *http.Client {
+	dial := permissionDial(cfg)
+	// The transport is wrapped so that a request whose header values net/http
+	// refuses to write is still sent — over the same permission-checked dial.
+	// See fetchraw.go.
+	std := &http.Transport{DialContext: dial, TLSClientConfig: tlsConfig(roots)}
+	// The cache wraps the transport rather than the client, so it also sees the
+	// hops of a redirect chain — each of which is a request of its own.
+	inner := &permissiveTransport{std: std, dial: dial}
+	return &http.Client{Transport: &cachingTransport{next: inner, cache: newResponseCache()}}
+}
+
+// permissionDial is the dialer every outbound connection this package makes goes
+// through, whatever protocol is layered on it: Config.Resolve decides whether a
+// name may be looked up, and Config.Dial decides whether each RESOLVED address
+// may be connected to — so a DNS answer cannot smuggle a connection past the
+// allow-list.
+// tlsConfig trusts roots IN ADDITION to the system pool, or returns nil to use
+// the system pool alone. A nil *tls.Config is what net/http wants when there is
+// nothing to add — replacing it with an empty one would still be correct, but
+// this way the default path is visibly the default.
+func tlsConfig(roots *x509.CertPool) *tls.Config {
+	if roots == nil {
+		return nil
+	}
+	return &tls.Config{RootCAs: roots}
+}
+
+func permissionDial(cfg spidermonkey.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, portStr, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, err
@@ -347,14 +381,6 @@ func newHTTPClient(cfg spidermonkey.Config) *http.Client {
 		}
 		return nil, lastErr
 	}
-	// The transport is wrapped so that a request whose header values net/http
-	// refuses to write is still sent — over the same permission-checked dial.
-	// See fetchraw.go.
-	std := &http.Transport{DialContext: dial}
-	// The cache wraps the transport rather than the client, so it also sees the
-	// hops of a redirect chain — each of which is a request of its own.
-	inner := &permissiveTransport{std: std, dial: dial}
-	return &http.Client{Transport: &cachingTransport{next: inner, cache: newResponseCache()}}
 }
 
 // dropCache empties the HTTP cache. A pooled instance calls it between requests
@@ -420,7 +446,7 @@ func (a *fetchAPI) promise(method string, v spidermonkey.Value) (spidermonkey.Va
 // transport failure resolves to a REJECTED promise (fetch semantics), not a
 // throw.
 func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
-	a.clientOnce.Do(func() { a.client = newHTTPClient(cfg) })
+	a.clientOnce.Do(func() { a.client = newHTTPClient(cfg, a.roots) })
 	if len(args) < 1 {
 		return nil, fmt.Errorf("fetch: an input URL is required")
 	}

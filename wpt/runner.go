@@ -11,6 +11,7 @@ package wpt
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -19,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
@@ -145,6 +147,15 @@ type Options struct {
 	// against. Empty means the tests run without a server (fetching tests will
 	// report their own failures).
 	BaseURL string
+	// HTTPSBaseURL is the same origin over TLS. A ".https." test is loaded from
+	// here instead: it asserts on location.protocol and builds https:// URLs, so
+	// served over http it fails while constructing a URL rather than for the
+	// reason it exists.
+	HTTPSBaseURL string
+	// RootCAs are the authorities the guest must trust to reach HTTPSBaseURL. The
+	// harness mints its own certificate (see tls.go), so without this every https
+	// fetch fails the handshake.
+	RootCAs *x509.CertPool
 	// SubVars are the suite's server-side `{{name}}` substitutions (see
 	// Server.SubVars). The runner loads a test and its META scripts from disk
 	// rather than through the server, so a ".sub." file arriving that way —
@@ -271,6 +282,11 @@ const collector = `
         message: t.message || "",
       })),
     });
+    // Tell the host the verdicts are in. Waiting for the loop to go IDLE instead
+    // would mean waiting out every handle the test left open — an unclosed
+    // WebSocket keeps the loop alive on purpose, and the file would cost the
+    // whole per-file timeout after it had already finished.
+    __wpt_done();
   });
 })();
 `
@@ -342,18 +358,36 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 	}
 	defer js.Close()
 
-	w, err := web.Install(js)
+	w, err := web.InstallWith(js, web.Options{RootCAs: opts.RootCAs})
 	if err != nil {
 		res.Harness, res.Message = string(StatusError), err.Error()
 		return res
 	}
 	defer w.Close()
 
+	// __wpt_done is what the collector calls once the verdicts are in. The run
+	// stops there rather than at loop idle: a handle the test left open — an
+	// unclosed WebSocket above all — keeps the loop alive by design, and waiting
+	// it out would cost the whole per-file timeout after the file had finished.
+	var reported atomic.Bool
+	if err := js.Global().DefineFunc("__wpt_done",
+		func(spidermonkey.Config, []spidermonkey.Value) (spidermonkey.Value, error) {
+			reported.Store(true)
+			return spidermonkey.Undefined(), nil
+		}); err != nil {
+		res.Harness, res.Message = string(StatusError), err.Error()
+		return res
+	}
+
 	// Everything the file needs, in the order WPT loads it: the shell-scope
 	// prelude, the harness, the completion collector, the META scripts, then
 	// the test itself. They run as separate evaluations so a syntax error in
 	// one is reported against that file.
-	steps := []struct{ name, src string }{{"<prelude>", preludeFor(opts.BaseURL, rel+c.Variant, c.Scope)}}
+	base := opts.BaseURL
+	if opts.HTTPSBaseURL != "" && isHTTPSTest(rel) {
+		base = opts.HTTPSBaseURL
+	}
+	steps := []struct{ name, src string }{{"<prelude>", preludeFor(base, rel+c.Variant, c.Scope)}}
 	harness, err := os.ReadFile(path.Join(opts.Root, "resources/testharness.js"))
 	if err != nil {
 		res.Harness, res.Message = string(StatusError), "testharness.js: "+err.Error()
@@ -400,8 +434,9 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 		}
 	}
 
-	// Drain timers and promise jobs: async_test/promise_test complete here.
-	waitErr := w.Wait(ctx)
+	// Drain timers and promise jobs: async_test/promise_test complete here, and
+	// the run stops as soon as they have — not when the loop runs dry.
+	waitErr := w.Loop().RunUntil(ctx, reported.Load)
 
 	res.Took = time.Since(start)
 	r, err := js.Eval(context.Background(), `globalThis.__wpt_result || ""`)

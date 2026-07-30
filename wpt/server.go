@@ -1,6 +1,7 @@
 package wpt
 
 import (
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,12 +20,18 @@ import (
 // `{{ports[http][1]}}` are meant to be distinct origins on the same host.
 type Server struct {
 	*http.Server
-	ln      net.Listener
-	alt     *http.Server
-	altLn   net.Listener
-	base    string
-	subVars map[string]string
-	stash   *stash
+	ln    net.Listener
+	alt   *http.Server
+	altLn net.Listener
+	// The same two origins again over TLS, for the ".https." tests and the
+	// websockets `?wss` variants. See tls.go.
+	tlsLn    net.Listener
+	altTLSLn net.Listener
+	httpsURL string
+	roots    *x509.CertPool
+	base     string
+	subVars  map[string]string
+	stash    *stash
 }
 
 // StartServer serves root on two loopback ports until Close.
@@ -40,6 +47,12 @@ func StartServer(root string) (*Server, error) {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	altPort := altLn.Addr().(*net.TCPAddr).Port
+	cert, roots, err := selfSigned()
+	if err != nil {
+		ln.Close()
+		altLn.Close()
+		return nil, fmt.Errorf("minting the harness certificate: %w", err)
+	}
 
 	// The base host is "localhost" and the cross-origin host is "127.0.0.1".
 	// They resolve to the same listener and are DIFFERENT origins, which is
@@ -47,38 +60,60 @@ func StartServer(root string) (*Server, error) {
 	// host as "127.0.0.1" when the original host is "localhost". A made-up
 	// name (www1.example) would not resolve and every cross-origin test would
 	// fail as a network error instead of testing what it is about.
-	srv := &Server{
-		ln:    ln,
-		altLn: altLn,
-		base:  fmt.Sprintf("http://localhost:%d/", port),
-		subVars: map[string]string{
-			"host":               "localhost",
-			"ports[http][0]":     fmt.Sprint(port),
-			"ports[http][1]":     fmt.Sprint(altPort),
-			"ports[https][0]":    fmt.Sprint(port),
-			"ports[https][1]":    fmt.Sprint(altPort),
-			"ports[ws][0]":       fmt.Sprint(port),
-			"ports[wss][0]":      fmt.Sprint(altPort),
-			"domains[]":          "localhost",
-			"domains[www]":       "127.0.0.1",
-			"domains[www1]":      "127.0.0.1",
-			"domains[www2]":      "127.0.0.1",
-			"hosts[alt][]":       "127.0.0.1",
-			"hosts[alt][www]":    "127.0.0.1",
-			"hosts[alt][www1]":   "127.0.0.1",
-			"hosts[alt][www2]":   "127.0.0.1",
-			"hosts[][]":          "localhost",
-			"location[host]":     fmt.Sprintf("localhost:%d", port),
-			"location[hostname]": "localhost",
-			"location[port]":     fmt.Sprint(port),
-		},
-	}
+	srv := &Server{ln: ln, altLn: altLn, roots: roots, base: fmt.Sprintf("http://localhost:%d/", port)}
 	srv.stash = newStash()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveWPT(root, srv, w, r)
 	})
 	srv.Server = &http.Server{Handler: handler}
 	srv.alt = &http.Server{Handler: handler}
+
+	// The same two origins again over TLS. Opened before the substitution table
+	// is built, because the table has to name their ports.
+	tlsLn, tlsPort, err := listenTLS(cert, srv.Server)
+	if err != nil {
+		ln.Close()
+		altLn.Close()
+		return nil, err
+	}
+	altTLSLn, altTLSPort, err := listenTLS(cert, srv.alt)
+	if err != nil {
+		ln.Close()
+		altLn.Close()
+		tlsLn.Close()
+		return nil, err
+	}
+	srv.tlsLn, srv.altTLSLn = tlsLn, altTLSLn
+	srv.httpsURL = fmt.Sprintf("https://localhost:%d/", tlsPort)
+	srv.subVars = map[string]string{
+		"host":            "localhost",
+		"ports[http][0]":  fmt.Sprint(port),
+		"ports[http][1]":  fmt.Sprint(altPort),
+		"ports[https][0]": fmt.Sprint(tlsPort),
+		"ports[https][1]": fmt.Sprint(altTLSPort),
+		// ws shares the http listener and wss the https one, as they do in
+		// wptserve: a WebSocket URL and the page that opens it are one origin.
+		"ports[ws][0]":  fmt.Sprint(port),
+		"ports[wss][0]": fmt.Sprint(tlsPort),
+		// There is no HTTP/2 listener. The variable is still defined, because one
+		// left unsubstituted makes a test fail while CONSTRUCTING its URL — a
+		// harness error, which reads as "the runtime is broken" rather than "this
+		// transport is not served here".
+		"ports[h2][0]":       fmt.Sprint(tlsPort),
+		"domains[]":          "localhost",
+		"domains[www]":       "127.0.0.1",
+		"domains[www1]":      "127.0.0.1",
+		"domains[www2]":      "127.0.0.1",
+		"hosts[alt][]":       "127.0.0.1",
+		"hosts[alt][www]":    "127.0.0.1",
+		"hosts[alt][www1]":   "127.0.0.1",
+		"hosts[alt][www2]":   "127.0.0.1",
+		"hosts[][]":          "localhost",
+		"location[host]":     fmt.Sprintf("localhost:%d", port),
+		"location[hostname]": "localhost",
+		"location[port]":     fmt.Sprint(port),
+	}
+
 	// A request whose header values net/http would reject on arrival is answered
 	// by the harness itself, through the same handler. See permissive.go.
 	answer := func(conn net.Conn, req *http.Request, head []byte) bool {
@@ -100,8 +135,13 @@ func (s *Server) BaseURL() string { return s.base }
 // a ".sub." file reaching the guest that way must be substituted too.
 func (s *Server) SubVars() map[string]string { return s.subVars }
 
-// Close stops both listeners.
+// Close stops every listener.
 func (s *Server) Close() error {
+	for _, ln := range []net.Listener{s.tlsLn, s.altTLSLn} {
+		if ln != nil {
+			ln.Close()
+		}
+	}
 	if s.alt != nil {
 		s.alt.Close()
 	}
@@ -133,6 +173,12 @@ func serveWPT(root string, srv *Server, w http.ResponseWriter, r *http.Request) 
 	rel := strings.TrimPrefix(r.URL.Path, "/")
 	if rel == "" || strings.Contains(rel, "..") {
 		http.NotFound(w, r)
+		return
+	}
+	// An upgrade request to one of the suite's WebSocket fixtures is answered on
+	// this same listener: {{ports[ws][0]}} IS the HTTP port here, as it is in
+	// wptserve, so ws:// and http:// share an origin.
+	if serveWebSocket(rel, w, r) {
 		return
 	}
 	// A ported fixture handler answers instead of the file. Anything without

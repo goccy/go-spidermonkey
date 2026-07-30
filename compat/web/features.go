@@ -17,6 +17,7 @@ package web
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"strings"
 
@@ -42,6 +43,7 @@ const (
 	FeatureStructuredClone Feature = "structured-clone"
 	FeatureMessaging       Feature = "messaging"
 	FeatureXMLHttpRequest  Feature = "xmlhttprequest"
+	FeatureWebSocket       Feature = "websocket"
 )
 
 // featureGlobals maps each feature onto the globals it owns. Every global this
@@ -74,6 +76,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureStructuredClone: {"structuredClone"},
 	FeatureMessaging:       {"MessageChannel", "MessagePort"},
 	FeatureXMLHttpRequest:  {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
+	FeatureWebSocket:       {"WebSocket", "CloseEvent"},
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs
@@ -110,6 +113,11 @@ type Options struct {
 	// platform; naming features that depend on one another is the caller's
 	// responsibility (fetch needs streams for a body, for instance).
 	Features []Feature
+	// RootCAs, when set, are certificate authorities the guest's TLS connections
+	// trust IN ADDITION to the system pool — for an origin behind a private CA, or
+	// a test server that mints its own certificate. Nil means the system pool
+	// alone, which is what a guest should normally get.
+	RootCAs *x509.CertPool
 }
 
 // featureSet turns a selection into a lookup, treating nil as everything.

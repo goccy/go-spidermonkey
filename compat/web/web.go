@@ -43,11 +43,15 @@ var extendedJS string
 //go:embed js/xhr.js
 var xhrJS string
 
+//go:embed js/websocket.js
+var websocketJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
 	loop   *eventloop.Loop
 	fetch  *fetchAPI
+	ws     *wsAPI
 	subtle *subtleAPI
 	start  time.Time
 }
@@ -120,7 +124,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -130,9 +134,13 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		}
 	}
 
-	w.fetch, err = installFetch(js, w.loop)
+	w.fetch, err = installFetch(js, w.loop, opts.RootCAs)
 	if err != nil {
 		return nil, fmt.Errorf("web: installing fetch: %w", err)
+	}
+	w.ws, err = installWebSocket(js, w.loop, opts.RootCAs)
+	if err != nil {
+		return nil, fmt.Errorf("web: installing WebSocket: %w", err)
 	}
 	if err := removeUnselected(js, opts.Features); err != nil {
 		return nil, err
@@ -213,6 +221,9 @@ func (w *Web) Wait(ctx context.Context) error {
 // cached engine handles). The interpreter itself stays usable.
 func (w *Web) Close() error {
 	w.fetch.closeAll()
+	if w.ws != nil {
+		w.ws.closeAll()
+	}
 	return nil
 }
 
@@ -252,6 +263,11 @@ func (w *Web) ResetPerRequest() {
 	// (premature idle -> a spurious 500). Loop().Reset() (called by the caller
 	// after us) also clears timers, but only after the drain has already run.
 	w.loop.ClearTimers()
+	// A socket one request left open must not be readable by the next one, and
+	// its reader goroutine must not Post into the next request's loop.
+	if w.ws != nil {
+		w.ws.closeAll()
+	}
 	// The HTTP cache is dropped between pooled requests. A cache that survived
 	// would let one request observe what another fetched — the response bodies
 	// themselves, and the timing of a hit — which is the same isolation argument
