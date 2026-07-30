@@ -1102,7 +1102,12 @@
 			if (stream._closed) this._closedResolve(undefined);
 			else if (stream._errored) this._closedReject(stream._errorValue);
 		}
-		read(view) {
+		// read(view, { min }) fills view and does not resolve until at least `min`
+		// ELEMENTS have arrived — the point of min is to stop a caller having to
+		// reassemble a record that came in pieces. A stream that closes first
+		// resolves with whatever did arrive and done: true; it is not an error to
+		// have asked for more than the stream had.
+		read(view, options = {}) {
 			const s = this._stream;
 			if (!s) return Promise.reject(new TypeError("reader has released its lock"));
 			if (!ArrayBuffer.isView(view)) {
@@ -1111,9 +1116,31 @@
 			if (view.byteLength === 0) {
 				return Promise.reject(new TypeError("BYOB read expects a non-empty view"));
 			}
-			const fill = () => {
-				const out = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-				let written = 0;
+			const bytesPerElement = view.BYTES_PER_ELEMENT || 1;
+			const elements = view.byteLength / bytesPerElement;
+			let min = 1;
+			if (options !== null && options !== undefined && options.min !== undefined) {
+				const raw = Number(options.min);
+				// A negative or fractional min is a malformed argument; zero is a
+				// request to wait for nothing, which the standard singles out.
+				if (!Number.isInteger(raw) || raw < 0) {
+					return Promise.reject(new TypeError("read: min must be a non-negative integer"));
+				}
+				if (raw === 0) {
+					return Promise.reject(new TypeError("read: min must be greater than 0"));
+				}
+				if (raw > elements) {
+					return Promise.reject(new RangeError("read: min is larger than the view"));
+				}
+				min = raw;
+			}
+			const minBytes = min * bytesPerElement;
+			const out = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+			let written = 0;
+
+			// drain moves as much of the queue as will fit into the view, picking up
+			// where the previous wakeup left off.
+			const drain = () => {
 				while (written < out.length && (s._byobLeftover || s._queue.length > 0)) {
 					let chunk = s._byobLeftover;
 					if (!chunk) {
@@ -1128,32 +1155,38 @@
 					written += take;
 					s._byobLeftover = take < chunk.length ? chunk.subarray(take) : null;
 				}
-				if (written === 0) return null;
-				// The result is a view of the SAME type over the filled prefix,
-				// as the spec requires — a Uint16Array read gives back a
-				// Uint16Array.
-				const Ctor = view.constructor;
-				const elems = Math.floor(written / (view.BYTES_PER_ELEMENT || 1));
-				return { value: new Ctor(view.buffer, view.byteOffset, elems), done: false };
 			};
-			const ready = fill();
-			if (ready) return Promise.resolve(ready);
-			if (s._errored) return Promise.reject(s._errorValue);
-			if (s._closed) {
+			// The result is a view of the SAME type over the filled prefix, as the
+			// spec requires — a Uint16Array read gives back a Uint16Array.
+			const result = (done) => {
 				const Ctor = view.constructor;
-				return Promise.resolve({ value: new Ctor(view.buffer, view.byteOffset, 0), done: true });
-			}
-			// Nothing queued yet: pull, then try again once a chunk lands.
-			const waiter = new Promise((resolve, reject) => s._waiters.push({
-				resolve: () => {
-					const r = fill();
-					if (r) resolve(r);
-					else resolve({ value: new view.constructor(view.buffer, view.byteOffset, 0), done: true });
-				},
-				reject,
-			}));
-			s._pull();
-			return waiter;
+				const elems = Math.floor(written / bytesPerElement);
+				return { value: new Ctor(view.buffer, view.byteOffset, elems), done };
+			};
+
+			drain();
+			if (written >= minBytes) return Promise.resolve(result(false));
+			if (s._errored) return Promise.reject(s._errorValue);
+			if (s._closed) return Promise.resolve(result(true));
+
+			// Not enough yet: wait for more, and keep waiting until min is met or
+			// the stream ends. Resolving on the first chunk is what a plain read
+			// does; min exists precisely to not do that.
+			return new Promise((resolve, reject) => {
+				const wait = () => s._waiters.push({
+					resolve: () => {
+						drain();
+						if (written >= minBytes) return resolve(result(false));
+						if (s._closed) return resolve(result(true));
+						if (s._errored) return reject(s._errorValue);
+						wait();
+						s._pull();
+					},
+					reject,
+				});
+				wait();
+				s._pull();
+			});
 		}
 		releaseLock() {
 			if (this._stream) {
@@ -1424,6 +1457,10 @@
 				throw e;
 			} finally {
 				if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+				// BOTH locks go, however the pipe ended. Leaving the destination locked
+				// meant a stream could be piped to exactly once, for the lifetime of
+				// the process — the writer here is pipeTo's own, and nobody else can
+				// release it.
 				reader.releaseLock();
 			}
 		}
@@ -1436,18 +1473,30 @@
 			if (transform === null || typeof transform !== "object") {
 				throw new TypeError("pipeThrough expects a { readable, writable } pair");
 			}
-			const { readable, writable } = transform;
+			// The members are read ONE AT A TIME, in the order the dictionary
+			// declares them, and each is validated before the next is touched. The
+			// order is observable: a pair whose readable is wrong must fail without
+			// ever having asked for its writable, and the suite checks exactly that
+			// with a getter.
+			const readable = transform.readable;
 			if (!(readable instanceof ReadableStream)) {
 				throw new TypeError("pipeThrough: transform.readable is not a ReadableStream");
 			}
+			const writable = transform.writable;
 			if (!(writable instanceof WritableStream)) {
 				throw new TypeError("pipeThrough: transform.writable is not a WritableStream");
 			}
-			if (this.locked) throw new TypeError("pipeThrough: the source stream is locked");
-			if (writable.locked) throw new TypeError("pipeThrough: transform.writable is locked");
 			if (options !== undefined && options !== null && typeof options !== "object") {
 				throw new TypeError("pipeThrough: options must be an object");
 			}
+			// The options are converted before anything is piped, so a bad signal is
+			// a synchronous throw rather than a pipe that fails later.
+			if (options && options.signal !== undefined && options.signal !== null &&
+				!(options.signal instanceof AbortSignal)) {
+				throw new TypeError("pipeThrough: options.signal is not an AbortSignal");
+			}
+			if (this.locked) throw new TypeError("pipeThrough: the source stream is locked");
+			if (writable.locked) throw new TypeError("pipeThrough: transform.writable is locked");
 			this.pipeTo(writable, options).catch(() => {});
 			return readable;
 		}
