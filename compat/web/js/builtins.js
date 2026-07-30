@@ -2343,6 +2343,41 @@
 	Object.defineProperties(Response.prototype, Object.getOwnPropertyDescriptors(bodyMixin));
 	globalThis.Response = Response;
 
+	// nativeResponseProto is what a Go-built response's prototype becomes, so
+	// that `res instanceof Response` holds — ordinary user code asks, and the
+	// WebAssembly streaming entry points are specified to REJECT anything that is
+	// not a Response, so an object that answers every Response question without
+	// being one fails them for the wrong reason.
+	//
+	// It sits BETWEEN the response and Response.prototype rather than being
+	// Response.prototype itself, because the guest class's body mixin reads guest
+	// internals (_body, _bodyStream) a Go-built object does not have. Everything
+	// such a response needs is an own property by the time it is branded (see
+	// trackBodyUsed); this layer supplies the one member that is not, and
+	// deliberately shadows the mixin's internals so none of them can be reached
+	// by accident.
+	const nativeResponseProto = Object.create(Response.prototype, {
+		clone: {
+			value() {
+				// A body already read cannot be cloned, and a clone would have to tee
+				// the host's stream — which this layer cannot do. Reporting that is
+				// better than handing back a response whose body is silently empty.
+				throw new TypeError("clone: a response from fetch cannot be cloned by this runtime");
+			},
+			writable: true, configurable: true,
+		},
+	});
+	// The guest class's body-mixin internals are shadowed as ABSENT rather than
+	// as errors: absent is what they were before this object had a prototype at
+	// all, and sibling layers (compat/cfworkers' passthrough) legitimately test
+	// for them to pick a fast path. Throwing here would turn "this response is
+	// host-backed" into a failure.
+	for (const internal of ["_bodyBytes", "_useBody", "_bodyStream", "_body"]) {
+		Object.defineProperty(nativeResponseProto, internal, {
+			value: undefined, writable: true, configurable: true,
+		});
+	}
+
 	// -------------------------------------------------------------- timers
 
 	// A Timeout-like handle: a lot of ecosystem code does `const t =
@@ -2976,6 +3011,10 @@
 		try {
 			Object.defineProperty(res, "bodyUsed", { configurable: true, get: () => used });
 		} catch { /* leave the native field as-is */ }
+		// Branded LAST: everything a Response answers is an own property by now,
+		// so nothing the guest class's body mixin owns can be reached through the
+		// chain. See nativeResponseProto.
+		try { Object.setPrototypeOf(res, nativeResponseProto); } catch { /* leave unbranded */ }
 		return res;
 	}
 

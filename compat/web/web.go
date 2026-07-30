@@ -52,6 +52,9 @@ var eventsourceJS string
 //go:embed js/weblocks.js
 var weblocksJS string
 
+//go:embed js/wasm.js
+var wasmJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -59,6 +62,7 @@ type Web struct {
 	fetch  *fetchAPI
 	ws     *wsAPI
 	es     *esAPI
+	wasm   *wasmAPI
 	subtle *subtleAPI
 	start  time.Time
 }
@@ -131,7 +135,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -152,6 +156,10 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	w.es, err = installEventSource(js, w.loop, opts.RootCAs)
 	if err != nil {
 		return nil, fmt.Errorf("web: installing EventSource: %w", err)
+	}
+	w.wasm, err = installWasm(js, w.loop)
+	if err != nil {
+		return nil, fmt.Errorf("web: installing WebAssembly: %w", err)
 	}
 	if err := removeUnselected(js, opts.Features); err != nil {
 		return nil, err
@@ -237,6 +245,9 @@ func (w *Web) Close() error {
 	}
 	if w.es != nil {
 		w.es.closeAll()
+	}
+	if w.wasm != nil {
+		w.wasm.close()
 	}
 	return nil
 }

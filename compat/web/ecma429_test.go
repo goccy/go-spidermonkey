@@ -95,15 +95,7 @@ var ecma429EventHandlers = []string{"onerror", "onunhandledrejection", "onreject
 //
 // Anything listed here MUST have a reason. "Not done yet" is a reason; being
 // hard is not an excuse for leaving it undescribed.
-var known429Gaps = map[string]string{
-	// The wasm subsystem IS compiled into the engine archive, but the engine
-	// refuses to expose it: wasm::HasPlatformSupport() requires a JIT backend,
-	// and the build is JS_CODEGEN_NONE — SpiderMonkey can only EXECUTE wasm by
-	// compiling it to native code, which a wasm-hosted engine cannot emit. Not a
-	// build flag and not a js.cc export gap; the investigation, the source
-	// citations and the realistic paths are in docs/engine-followups.md item 9.
-	"WebAssembly": "engine gate: HasPlatformSupport() is false under JS_CODEGEN_NONE; see docs/engine-followups.md",
-}
+var known429Gaps = map[string]string{}
 
 func TestECMA429Surface(t *testing.T) {
 	js, err := spidermonkey.New(spidermonkey.Config{})

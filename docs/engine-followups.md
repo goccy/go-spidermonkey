@@ -356,3 +356,27 @@ The realistic paths, in order of plausibility:
    engine-side primitive this genuinely needs.
 2. **A wasm interpreter tier upstream** (what "PBL for wasm" would be). Does
    not exist; not something this repo can carry as a patch.
+
+## 10. Exhausting `MaxMemoryBytes` is a hard fault, not an error
+
+- **Symptom:** a guest that allocates past `Config.MaxMemoryBytes` kills the
+  PROCESS with `unexpected fault address 0x...ff8` / `fatal error: fault`
+  (SIGSEGV inside `spidermonkeywasm2go/p0.Fn...`), instead of the engine
+  reporting an out-of-memory condition the embedding can turn into a JS error
+  or a failed `Eval`.
+- **How it was found:** implementing the WebAssembly JS API host-side. An early
+  version copied every live `WebAssembly.Memory` across every boundary
+  crossing, and `wasm/jsapi/bad-imports.js` constructs a 16 MiB Memory purely
+  as a wrong-type argument, then instantiates 200 more modules — several
+  gigabytes of guest garbage through a 512 MiB budget. Raising the budget to
+  3 GiB made the same file pass 212 subtests cleanly, which is what identified
+  exhaustion as the cause; the compat-side waste was then fixed properly (only
+  an instance's OWN memories are synced).
+- **Why it matters beyond that bug:** a host cannot defend against this. The
+  budget exists so a runaway guest is contained, and a contained guest must
+  leave the process alive — that is the whole point of the cap. Any embedding
+  running untrusted code has to treat "allocates a lot" as a crash today.
+- **Engine fix needed:** the allocator path that grows linear memory must fail
+  when the growth would exceed the configured maximum, and that failure must
+  reach SpiderMonkey as an allocation failure (the OOM path it already has),
+  rather than being attempted and faulting on the guard page.
