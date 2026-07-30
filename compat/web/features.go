@@ -96,7 +96,7 @@ var featureGlobals = map[Feature][]string{
 // requires them of a runtime, not of a feature selection, so removing a feature
 // must never remove them.
 var alwaysInstalled = []string{
-	"DOMException", "self", "navigator", "isSecureContext",
+	"DOMException", "QuotaExceededError", "self", "navigator", "isSecureContext",
 	"onerror", "onunhandledrejection", "onrejectionhandled",
 }
 

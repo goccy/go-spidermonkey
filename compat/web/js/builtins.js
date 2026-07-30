@@ -24,24 +24,71 @@
 		DataCloneError: 25,
 	};
 
+	// The legacy code constants. Six of them name conditions no modern API
+	// raises — DOMSTRING_SIZE_ERR, NO_DATA_ALLOWED_ERR, NO_MODIFICATION_ALLOWED,
+	// INUSE_ATTRIBUTE_ERR, VALIDATION_ERR, URL_MISMATCH_ERR — so they have no
+	// entry in the name table above and would have been missing entirely, though
+	// the interface still defines them. They are listed here by their numbers,
+	// which is all they have ever been.
+	const DOM_EXCEPTION_LEGACY_CODES = {
+		INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
+		WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+		NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
+		INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+		INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+		VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18,
+		NETWORK_ERR: 19, ABORT_ERR: 20, URL_MISMATCH_ERR: 21,
+		QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+		DATA_CLONE_ERR: 25,
+	};
+
 	class DOMException extends Error {
 		constructor(message = "", name = "Error") {
 			super(message);
-			this.name = name;
+			// name and message are IDL attributes of DOMException, so they are read
+			// from the PROTOTYPE over slots — not own properties, which is where
+			// Error puts them and where the interface does not.
+			Object.defineProperty(this, "_name", { value: String(name), writable: true });
+			Object.defineProperty(this, "_message", { value: String(message), writable: true });
 		}
-		get code() { return DOM_EXCEPTION_CODES[this.name] ?? 0; }
+		get name() { return this._name; }
+		get message() { return this._message; }
+		get code() { return DOM_EXCEPTION_CODES[this._name] ?? 0; }
 	}
 	// The constants live on both the interface and its prototype, as they do for
 	// every Web IDL interface that has them.
-	for (const [name, code] of Object.entries(DOM_EXCEPTION_CODES)) {
-		// INDEX_SIZE_ERR from IndexSizeError: the legacy spelling is the name with
-		// its words separated and "Error" shortened to "ERR".
-		const legacy = name.replace(/Error$/, "").replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase() + "_ERR";
+	for (const [legacy, code] of Object.entries(DOM_EXCEPTION_LEGACY_CODES)) {
 		for (const target of [DOMException, DOMException.prototype]) {
 			Object.defineProperty(target, legacy, { value: code, enumerable: true });
 		}
 	}
 	globalThis.DOMException ??= DOMException;
+
+	// QuotaExceededError became an interface of its own, deriving from
+	// DOMException and carrying the two numbers that make the failure
+	// actionable: how much was asked for, and how much there was. Both are null
+	// when the thrower did not say, which is the common case and the reason they
+	// are nullable at all.
+	class QuotaExceededError extends DOMException {
+		constructor(message = "", options = {}) {
+			super(message, "QuotaExceededError");
+			if (options !== null && options !== undefined && typeof options !== "object") {
+				throw new TypeError("QuotaExceededError: options must be an object");
+			}
+			const o = options || {};
+			const num = (v, what) => {
+				if (v === undefined || v === null) return null;
+				const n = Number(v);
+				if (!Number.isFinite(n)) throw new TypeError(`QuotaExceededError: ${what} must be a finite number`);
+				return n;
+			};
+			Object.defineProperty(this, "_quota", { value: num(o.quota, "quota"), writable: true });
+			Object.defineProperty(this, "_requested", { value: num(o.requested, "requested"), writable: true });
+		}
+		get quota() { return this._quota; }
+		get requested() { return this._requested; }
+	}
+	globalThis.QuotaExceededError ??= QuotaExceededError;
 
 	// --------------------------------------------------------------- console
 
