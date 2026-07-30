@@ -45,6 +45,7 @@ const (
 	FeatureXMLHttpRequest  Feature = "xmlhttprequest"
 	FeatureWebSocket       Feature = "websocket"
 	FeatureEventSource     Feature = "eventsource"
+	FeatureWebLocks        Feature = "web-locks"
 )
 
 // featureGlobals maps each feature onto the globals it owns. Every global this
@@ -82,6 +83,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureXMLHttpRequest:  {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
 	FeatureWebSocket:       {"WebSocket", "CloseEvent"},
 	FeatureEventSource:     {"EventSource"},
+	FeatureWebLocks:        {"Lock", "LockManager"},
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs
@@ -90,7 +92,7 @@ var featureGlobals = map[Feature][]string{
 // requires them of a runtime, not of a feature selection, so removing a feature
 // must never remove them.
 var alwaysInstalled = []string{
-	"DOMException", "self", "navigator",
+	"DOMException", "self", "navigator", "isSecureContext",
 	"onerror", "onunhandledrejection", "onrejectionhandled",
 }
 

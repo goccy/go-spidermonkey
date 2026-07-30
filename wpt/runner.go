@@ -223,7 +223,23 @@ func parseMeta(src string) meta {
 func preludeFor(baseURL, rel, scope string) string {
 	href := baseURL + rel
 	isWindow := scope == "window"
-	return `
+	isSecure := strings.HasPrefix(baseURL, "https:")
+	secureGate := ""
+	if !isSecure {
+		// The web-locks surface is [SecureContext]; a browser would never have
+		// exposed it to this origin, so the harness removes it the way the
+		// exposure gate would have. (localhost is a trustworthy origin in real
+		// browsers, but the suite's non-secure tests are written for a host that
+		// is not — the plain-http origin plays that part here.)
+		secureGate = `
+globalThis.isSecureContext = false;
+delete globalThis.Lock;
+delete globalThis.LockManager;
+delete Object.getPrototypeOf(globalThis.navigator).locks;
+delete globalThis.navigator.locks;
+`
+	}
+	return secureGate + `
 globalThis.self = globalThis;
 globalThis.GLOBAL = {
   isWindow: () => ` + fmt.Sprint(isWindow) + `,
@@ -264,6 +280,25 @@ globalThis.GLOBAL = {
 func jsString(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// scopeMarkersFor names the kind of global this case runs in, the way
+// idlharness detects it: `Window` present for a window, a
+// DedicatedWorkerGlobalScope the global is an instance of for a worker. The
+// classes are markers, not implementations — Symbol.hasInstance answers the
+// instanceof without touching the global's prototype chain.
+func scopeMarkersFor(scope string) string {
+	if scope == "window" {
+		return `globalThis.Window ??= class Window {
+  static [Symbol.hasInstance](v) { return v === globalThis; }
+};`
+	}
+	return `globalThis.WorkerGlobalScope ??= class WorkerGlobalScope {
+  static [Symbol.hasInstance](v) { return v === globalThis; }
+};
+globalThis.DedicatedWorkerGlobalScope ??= class DedicatedWorkerGlobalScope {
+  static [Symbol.hasInstance](v) { return v === globalThis; }
+};`
 }
 
 // collector installs the completion callback that carries the per-subtest
@@ -395,6 +430,14 @@ func Run(ctx context.Context, opts Options, c Case) FileResult {
 	}
 	steps = append(steps,
 		struct{ name, src string }{"resources/testharness.js", string(harness)},
+		// The scope markers go AFTER testharness and BEFORE everything else, on
+		// purpose: testharness picks its environment at LOAD time and must keep
+		// choosing the shell one (whose completion model the runner is built on),
+		// while idlharness classifies the global at RUN time by exactly these
+		// names — without them every [Exposed=Window] or [Exposed=Worker]
+		// interface is judged as if this were a ShadowRealm, and idlharness
+		// demands its ABSENCE.
+		struct{ name, src string }{"<scope-markers>", scopeMarkersFor(c.Scope)},
 		struct{ name, src string }{"<collector>", collector},
 	)
 	scripts := m.scripts

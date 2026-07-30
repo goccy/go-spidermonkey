@@ -539,12 +539,21 @@
 	// the global itself, not a copy.
 	globalThis.self ??= globalThis;
 
+	// A server-side runtime is a secure context: there is no transport between
+	// the code and itself to be insecure. A harness that loads code from an
+	// http origin overrides this to false, and removes the [SecureContext]-only
+	// surface, which is exactly what a browser's exposure gate would have done.
+	globalThis.isSecureContext ??= true;
+
 	// navigator.userAgent is how application code identifies the runtime it is on.
 	// ECMA-429 requires it to be a single opaque product token, with no version
 	// and no comment, so that nothing tries to parse it.
-	globalThis.navigator ??= Object.create(Object.prototype, {
-		userAgent: { value: "go-spidermonkey", enumerable: true, configurable: true },
-	});
+	// navigator's members are IDL attributes, and an IDL attribute lives on the
+	// PROTOTYPE — the object itself has no own properties, which testharness's
+	// assert_idl_attribute checks.
+	globalThis.navigator ??= Object.create(Object.create(Object.prototype, {
+		userAgent: { get: () => "go-spidermonkey", enumerable: true, configurable: true },
+	}));
 
 	globalThis.PromiseRejectionEvent ??= class PromiseRejectionEvent extends Event {
 		constructor(type, init = {}) {
