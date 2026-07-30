@@ -380,3 +380,42 @@ The realistic paths, in order of plausibility:
   when the growth would exceed the configured maximum, and that failure must
   reach SpiderMonkey as an allocation failure (the OOM path it already has),
   rather than being attempted and faulting on the guard page.
+
+## 11. An agent cannot call a host function
+
+- **Symptom:** an agent's realm has exactly one host-provided global,
+  `__agent__`. A `Worker` therefore cannot have any of the APIs this compat
+  layer implements host-side — `URL`, `TextDecoder`, `crypto.subtle`, `fetch`,
+  the whole of `compat/web`'s Go half — because reaching them from inside a
+  worker is not possible at all. compat/nodejs's worker glue reimplements a
+  subset of its environment in pure JavaScript for exactly this reason, and a
+  `compat/web` Worker has to do the same.
+- **What was tried, and why each fails.** The generic host-function table IS
+  reachable from `hostEnv.dispatch`, which agent keys already go through, so the
+  gap looked like a prelude detail. It is not:
+  1. `agentPrelude` deletes `__agent_call__` before the adapter glue runs, so
+     nothing in an agent can reach the channel. Fixable here.
+  2. The channel itself **coerces every argument to a number**. Passing
+     `("echo", "x", 1)` arrives as `[1, 0]` — the strings became zero. So no
+     name, no string argument and no string result can cross. NOT fixable
+     here: the coercion is in the native `__agent_call__`.
+  3. The clone transport cannot substitute. A clone handle is a number, but
+     `JsCloneRead` must run on the READER's thread — the host reads an agent's
+     clone on the main thread, and mints one for an agent on the main thread
+     (see `Agents.Send` / `handlePost`). A synchronous call from an agent
+     goroutine has no main thread to borrow.
+  4. The ordinary `Func` path could not be used even if the arguments arrived
+     intact: it decodes object handles against the MAIN interpreter and takes
+     that interpreter's invoke lock, neither of which an agent shares. An agent
+     registry has to be its own thing, carrying primitives only.
+- **Engine fix needed:** let `__agent_call__` carry string arguments and return
+  a string, for a key namespace reserved for agent host calls. That alone is
+  enough: a composite can travel as JSON and bytes as a latin-1 string, by a
+  convention the compat layer owns, and the handler then runs on the agent's own
+  goroutine touching nothing of the main interpreter.
+- **A second design, if strings are hard.** Share one SharedArrayBuffer with
+  the agent at spawn and have the host capture its backing byte range ONCE on
+  the main thread; afterwards both sides can read and write those bytes from any
+  thread, and the numeric channel only has to carry a length. This needs a way
+  to obtain a SharedArrayBuffer's address and length from Go, which the bytes
+  bridge does not currently expose.
