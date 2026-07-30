@@ -311,8 +311,21 @@ func parseConstructorString(input string) (map[string]string, error) {
 			break
 		}
 	}
+	// A RELATIVE constructor string that names no pathname must leave it unset,
+	// so the base URL's path is inherited. The parser reaches the pathname state
+	// by falling through rather than by seeing a delimiter, so "#baz" produces an
+	// empty pathname the caller never wrote — and an empty one that IS written
+	// gets resolved against the base's directory, which turns "/foo" into "/".
+	// There is no way to write an empty pathname in a relative string, so an
+	// empty one here always means "absent".
+	if _, hasProtocol := p.out["protocol"]; !hasProtocol {
+		if v, ok := p.out["pathname"]; ok && v == "" {
+			delete(p.out, "pathname")
+		}
+	}
 	return p.out, nil
 }
+
 
 // isNonSpecialPatternChar reports whether token i is the given literal
 // character, not escaped and not part of a group or regular expression.
