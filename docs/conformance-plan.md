@@ -92,9 +92,10 @@ subset is being identified, first API snapshot December 2025). Until it does,
 the specification's own enumeration is the checklist, and
 `compat/web/ecma429_test.go` executes it: every required interface, global and
 member, with `known429Gaps` as the recorded exceptions. The one entry is
-`WebAssembly`, whose investigation lives in docs/engine-followups.md item 9 —
-it is an engine-architecture gap (no wasm tier can run under JS_CODEGEN_NONE),
-not a build flag and not a js.cc export.
+nothing: `known429Gaps` is empty. `WebAssembly` was the last entry, and it is
+now provided host-side over wazero rather than by the engine — the engine
+cannot run wasm at all, for reasons recorded in docs/engine-followups.md
+item 9 (an architecture gap, not a build flag and not a js.cc export).
 
 ## The order of work
 
@@ -117,10 +118,12 @@ Ordered by measured test files unlocked per unit of work.
 7. ~~**`web-locks`**~~ DONE — 90.76% of subtests, 26/32 cases clean.
    Remaining: two Worker-dependent subtests, idlharness details,
    storage-buckets (tentative).
-8. **`WebAssembly`** — 101 files, and REQUIRED by ECMA-429. Investigated: the
-   engine cannot execute wasm under JS_CODEGEN_NONE (see engine-followups
-   item 9); the realistic path is the JS API host-side over a Go wasm
-   interpreter, with an engine primitive for Memory.buffer aliasing.
+8. ~~**`WebAssembly`**~~ DONE — 2.55% -> 79.81% of subtests, 88/201 cases
+   clean, via the JS API host-side over wazero's interpreter. No engine
+   primitive was needed after all: mem.buffer is a guest ArrayBuffer synced
+   around each crossing, scoped to the instance's own memories. Remaining:
+   WebAssembly.Function and exception handling (post-MVP proposals), table
+   plumbing (wazero exposes none), tentative ESM integration.
 9. **The directories already covered where Deno is ahead**: streams, FileAPI,
    encoding, webmessaging, user-timing, console, dom/observable, xhr fixtures.
 
