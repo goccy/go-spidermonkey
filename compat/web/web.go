@@ -98,6 +98,13 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	if err != nil {
 		return nil, fmt.Errorf("web: reading globals: %w", err)
 	}
+	// Every own name, not just the enumerable ones: telling this package's
+	// interfaces from the engine's built-ins is what lets their members be given
+	// the attributes Web IDL specifies. See NormalizeIDLMembers.
+	preexistingOwn, err := SnapshotOwnGlobals(js)
+	if err != nil {
+		return nil, fmt.Errorf("web: reading globals: %w", err)
+	}
 
 	ops, err := js.NewObject()
 	if err != nil {
@@ -183,6 +190,11 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	// installed (navigator's prototype, the event target), and which of them
 	// exist depends on what kind of global this is rather than on any feature.
 	if err := installScope(js, opts); err != nil {
+		return nil, err
+	}
+	// After every interface exists and before the globals are hidden: an IDL
+	// member is enumerable where an ES class member is not.
+	if err := NormalizeIDLMembers(js, preexistingOwn); err != nil {
 		return nil, err
 	}
 	if err := HideNewGlobals(js, preexisting); err != nil {
