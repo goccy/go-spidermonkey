@@ -53,31 +53,40 @@
 	// contain the very characters that delimit components, so this is a state
 	// machine that skips over "{...}" groups and "(...)" regular expressions
 	// rather than a search for ":" and "/".
-	function componentsFromString(input, baseURL) {
+	// resolveInit hands a URLPatternInit to the host to resolve against its base
+	// URL. Only the string members travel; a member the caller left out must stay
+	// out, since the cascade turns on which ones exist.
+	function resolveInit(init) {
+		const payload = {};
+		for (const c of [...COMPONENTS, "baseURL"]) {
+			if (init[c] !== undefined && init[c] !== null) payload[c] = String(init[c]);
+		}
+		const r = ops.pattern_process_init(new TextEncoder().encode(JSON.stringify(payload)));
+		if (r && r.__patternError) throw new TypeError(`URLPattern: ${r.message}`);
+		const out = {};
+		for (const c of COMPONENTS) if (r[c] !== undefined) out[c] = r[c];
+		return out;
+	}
+
+	function componentsFromString(input) {
 		const enc = new TextEncoder().encode(String(input));
 		const r = ops.pattern_from_string(enc);
 		if (r && r.__patternError) throw new TypeError(`Invalid pattern: ${r.message}`);
 		const out = {};
 		for (const c of COMPONENTS) if (r[c] !== undefined) out[c] = r[c];
-		if (baseURL !== undefined) {
-			// A relative pattern takes only the components that LOCATE it from the
-			// base URL — protocol, hostname, port — and never the credentials: a
-			// base URL's username is not part of where the pattern points, and
-			// inheriting it turns "any user" into "no user".
-			const base = new URL(String(baseURL));
-			const inherited = {
-				protocol: base.protocol.slice(0, -1),
-				hostname: base.hostname,
-				port: base.port,
-			};
-			const firstNamed = COMPONENTS.findIndex((c) => out[c] !== undefined);
-			COMPONENTS.forEach((c, i) => {
-				if (inherited[c] !== undefined && out[c] === undefined && firstNamed >= 0 && i < firstNamed) {
-					out[c] = inherited[c];
-				}
-			});
-		}
 		return out;
+	}
+
+	// canonicalizeInput puts one component of an object input through the same
+	// canonicalization the pattern's literal text went through. A value the URL
+	// parser cannot make sense of is left alone: exec() answers "no match" for it
+	// rather than throwing.
+	function canonicalizeInput(component, value, protocol) {
+		const proto = protocol === undefined ? "" : String(protocol);
+		const special = proto === "" || SPECIAL_SCHEMES.includes(proto);
+		const enc = new TextEncoder().encode(String(value));
+		const r = ops.pattern_canonicalize(component, enc, proto, special);
+		return r && r.__patternError ? String(value) : r;
 	}
 
 	function inputComponents(input, baseURL) {
@@ -103,7 +112,10 @@
 		}
 		for (const c of COMPONENTS) {
 			if (input[c] !== undefined) {
-				out[c] = String(input[c]);
+				// Canonicalized the same way the pattern's literal text was: a hash of
+				// "café" is "caf%C3%A9" in a pattern, so an input that stays "café"
+				// cannot match it.
+				out[c] = canonicalizeInput(c, input[c], input.protocol);
 			} else if (base) {
 				out[c] = {
 					protocol: base.protocol.replace(/:$/, ""),
@@ -133,20 +145,21 @@
 				// A string pattern is parsed as a URL, so it needs an origin: either
 				// its own protocol or a base URL to take one from. "/foo" alone is a
 				// TypeError, not a pathname-only pattern.
-				init = componentsFromString(String(input), baseURL);
+				init = componentsFromString(String(input));
 				if (init.protocol === undefined && baseURL === undefined) {
 					throw new TypeError("URLPattern: a relative pattern needs a base URL: " + String(input));
 				}
+				// A base URL resolves a constructor string the same way it resolves an
+				// object init: one cascade, host-side, for both forms.
+				if (baseURL !== undefined) init = resolveInit({ ...init, baseURL });
 			} else if (input === undefined) {
 				init = {};
 			} else if (input !== null && typeof input === "object") {
 				init = { ...input };
 				if (init.baseURL !== undefined) {
-					const inherited = componentsFromString("", init.baseURL);
-					for (const c of COMPONENTS) {
-						if (init[c] === undefined && inherited[c] !== undefined) init[c] = inherited[c];
-					}
-					delete init.baseURL;
+					// The cascade — which components a base URL contributes, and how a
+					// relative pathname resolves against it — is host-side.
+					init = resolveInit(init);
 				} else if (baseURL !== undefined) {
 					throw new TypeError("URLPattern: a base URL cannot be given with an object pattern");
 				}

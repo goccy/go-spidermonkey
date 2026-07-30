@@ -80,10 +80,12 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 		"url_domain_to_ascii":   w.opDomainToASCII,
 		"url_domain_to_unicode": w.opDomainToUnicode,
 
-		"pattern_compile":     w.opPatternCompile,
-		"pattern_from_string": w.opPatternFromString,
-		"pattern_compare":     w.opPatternCompare,
-		"pattern_generate":    w.opPatternGenerate,
+		"pattern_compile":      w.opPatternCompile,
+		"pattern_from_string":  w.opPatternFromString,
+		"pattern_compare":      w.opPatternCompare,
+		"pattern_process_init": w.opPatternProcessInit,
+		"pattern_canonicalize": w.opPatternCanonicalize,
+		"pattern_generate":     w.opPatternGenerate,
 
 		"text_encoding_name": w.opTextEncodingName,
 		"text_decode":        w.opTextDecode,

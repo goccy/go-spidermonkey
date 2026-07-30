@@ -251,7 +251,7 @@ func parseConstructorString(input string) (map[string]string, error) {
 				p.rewindAndSet(csUsername)
 				continue
 			}
-			if p.isNonSpecialPatternChar(p.i, "/") || p.isNonSpecialPatternChar(p.i, "?") ||
+			if p.isNonSpecialPatternChar(p.i, "/") || p.isSearchPrefix(p.i) ||
 				p.isNonSpecialPatternChar(p.i, "#") || t.kind == tokEnd {
 				p.rewindAndSet(csHostname)
 				continue
@@ -281,18 +281,18 @@ func parseConstructorString(input string) (map[string]string, error) {
 				p.set("hostname")
 				p.state, p.start = csPort, p.i+1
 			case p.hostIPv6 == 0 && (p.isNonSpecialPatternChar(p.i, "/") ||
-				p.isNonSpecialPatternChar(p.i, "?") || p.isNonSpecialPatternChar(p.i, "#") || t.kind == tokEnd):
+				p.isSearchPrefix(p.i) || p.isNonSpecialPatternChar(p.i, "#") || t.kind == tokEnd):
 				p.set("hostname")
 				p.startComponentAt(p.i)
 			}
 		case csPort:
-			if p.isNonSpecialPatternChar(p.i, "/") || p.isNonSpecialPatternChar(p.i, "?") ||
+			if p.isNonSpecialPatternChar(p.i, "/") || p.isSearchPrefix(p.i) ||
 				p.isNonSpecialPatternChar(p.i, "#") || t.kind == tokEnd {
 				p.set("port")
 				p.startComponentAt(p.i)
 			}
 		case csPathname:
-			if p.isNonSpecialPatternChar(p.i, "?") || p.isNonSpecialPatternChar(p.i, "#") || t.kind == tokEnd {
+			if p.isSearchPrefix(p.i) || p.isNonSpecialPatternChar(p.i, "#") || t.kind == tokEnd {
 				p.set("pathname")
 				p.startComponentAt(p.i)
 			}
@@ -324,6 +324,28 @@ func (p *ctorParser) isNonSpecialPatternChar(i int, want string) bool {
 	// An escaped character is literal text, never a delimiter: "\\:" in a pattern
 	// is a colon to match, not the end of a component.
 	return t.kind == tokChar || t.kind == tokInvalidChar
+}
+
+// isSearchPrefix decides whether the "?" at i starts the query. The tokenizer
+// classes every "?" as a modifier, because that is what it is almost everywhere
+// — so the question is answered by looking BACK: a "?" that follows a name, a
+// regular expression, a closing brace or another modifier belongs to that group,
+// and anything else means the query begins here.
+func (p *ctorParser) isSearchPrefix(i int) bool {
+	if p.tokens[i].value != "?" {
+		return false
+	}
+	if p.tokens[i].kind == tokChar || p.tokens[i].kind == tokInvalidChar {
+		return true
+	}
+	if i == 0 {
+		return true
+	}
+	switch p.tokens[i-1].kind {
+	case tokName, tokRegexp, tokClose, tokOtherModifier, tokAsterisk:
+		return false
+	}
+	return true
 }
 
 func (p *ctorParser) nextIsAuthoritySlashes() bool {
@@ -613,6 +635,141 @@ func (w *Web) opPatternGenerate(cfg spidermonkey.Config, args []spidermonkey.Val
 		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
 	}
 	out, err := generateComponent(args[0].String(), strArg(args[1]), args[2].String(), args[3].Bool(), groups)
+	if err != nil {
+		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
+	}
+	return spidermonkey.ValueOf(out), nil
+}
+
+// --------------------------------------------------- init processing
+
+// patternInit is a URLPatternInit as it arrives from the guest. Each component
+// is a pointer so that "absent" and "present but empty" stay distinct — the
+// whole cascade below turns on which members exist.
+type patternInit struct {
+	Protocol *string `json:"protocol"`
+	Username *string `json:"username"`
+	Password *string `json:"password"`
+	Hostname *string `json:"hostname"`
+	Port     *string `json:"port"`
+	Pathname *string `json:"pathname"`
+	Search   *string `json:"search"`
+	Hash     *string `json:"hash"`
+	BaseURL  *string `json:"baseURL"`
+}
+
+// processInit resolves a URLPatternInit against its base URL. The rule is a
+// cascade: a base URL contributes a component only when the init names nothing
+// more specific than it. Once the init names a hostname, for instance, the base
+// URL's port and path are no longer about the same resource and are not
+// inherited.
+//
+// Inherited text is escaped as a pattern, because it is literal: a base path of
+// "/a:b" must match "/a:b" and not introduce a group named "b".
+func processInit(in patternInit) (map[string]string, error) {
+	out := map[string]string{}
+	set := func(k string, v *string) {
+		if v != nil {
+			out[k] = *v
+		}
+	}
+	for k, v := range map[string]*string{
+		"protocol": in.Protocol, "username": in.Username, "password": in.Password,
+		"hostname": in.Hostname, "port": in.Port, "pathname": in.Pathname,
+		"search": in.Search, "hash": in.Hash,
+	} {
+		set(k, v)
+	}
+	if in.BaseURL == nil {
+		return out, nil
+	}
+	base, err := parseURL(*in.BaseURL, nil, nil, 0, false)
+	if err != nil {
+		return nil, fmt.Errorf("invalid baseURL %q", *in.BaseURL)
+	}
+	// none reports whether the INIT named any of the given components. It has to
+	// be the init and not the accumulating result: each step writes into the
+	// result, so asking the result would mean the first inherited component made
+	// every later step believe the caller had named it.
+	named := map[string]bool{
+		"protocol": in.Protocol != nil, "hostname": in.Hostname != nil,
+		"port": in.Port != nil, "pathname": in.Pathname != nil,
+		"search": in.Search != nil, "hash": in.Hash != nil,
+	}
+	none := func(names ...string) bool {
+		for _, n := range names {
+			if named[n] {
+				return false
+			}
+		}
+		return true
+	}
+	if none("protocol") {
+		out["protocol"] = escapePattern(base.scheme)
+	}
+	if none("protocol", "hostname") {
+		out["hostname"] = escapePattern(base.host)
+	}
+	if none("protocol", "hostname", "port") {
+		out["port"] = escapePattern(base.port)
+	}
+	if none("protocol", "hostname", "port", "pathname") {
+		out["pathname"] = escapePattern(base.serializePath())
+	} else if in.Pathname != nil && !strings.HasPrefix(*in.Pathname, "/") {
+		// A relative pathname is resolved against the base's directory, the way a
+		// relative URL is. Without this, "b" against ".../a" is the pattern "b",
+		// which matches nothing the caller meant.
+		basePath := escapePattern(base.serializePath())
+		if i := strings.LastIndex(basePath, "/"); i >= 0 {
+			out["pathname"] = basePath[:i+1] + *in.Pathname
+		}
+	}
+	if none("protocol", "hostname", "port", "pathname", "search") && base.query != nil {
+		out["search"] = escapePattern(*base.query)
+	}
+	if none("protocol", "hostname", "port", "pathname", "search", "hash") && base.fragment != nil {
+		out["hash"] = escapePattern(*base.fragment)
+	}
+	return out, nil
+}
+
+// opPatternProcessInit(initJSON) -> the resolved components. A component the
+// init does not name and the base URL does not contribute is absent, which the
+// guest reads as "matches anything".
+func (w *Web) opPatternProcessInit(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("pattern process init: (init) required")
+	}
+	var in patternInit
+	if err := json.Unmarshal([]byte(strArg(args[0])), &in); err != nil {
+		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
+	}
+	out, err := processInit(in)
+	if err != nil {
+		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
+	}
+	m := make(map[string]any, len(out))
+	for k, v := range out {
+		m[k] = v
+	}
+	return spidermonkey.ValueOf(m), nil
+}
+
+// opPatternCanonicalize(component, value, protocol, special) -> the component as
+// the URL parser would write it. exec() and test() need this for an object
+// input: a pattern's literal text is canonicalized when the pattern is compiled,
+// so an input that is not canonicalized the same way cannot match it — a hash of
+// "café" has to become "caf%C3%A9" on both sides.
+func (w *Web) opPatternCanonicalize(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 4 {
+		return nil, fmt.Errorf("pattern canonicalize: (component, value, protocol, special) required")
+	}
+	component := args[0].String()
+	value := stripInitDelimiter(component, strArg(args[1]))
+	if component == "hostname" && strings.HasPrefix(value, "[") {
+		component = "ipv6hostname"
+	}
+	out, err := canonicalize(component, value, args[2].String(), args[3].Bool())
 	if err != nil {
 		return spidermonkey.ValueOf(map[string]any{"__patternError": true, "message": err.Error()}), nil
 	}
