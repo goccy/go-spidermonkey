@@ -46,12 +46,16 @@ var xhrJS string
 //go:embed js/websocket.js
 var websocketJS string
 
+//go:embed js/eventsource.js
+var eventsourceJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
 	loop   *eventloop.Loop
 	fetch  *fetchAPI
 	ws     *wsAPI
+	es     *esAPI
 	subtle *subtleAPI
 	start  time.Time
 }
@@ -124,7 +128,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -141,6 +145,10 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	w.ws, err = installWebSocket(js, w.loop, opts.RootCAs)
 	if err != nil {
 		return nil, fmt.Errorf("web: installing WebSocket: %w", err)
+	}
+	w.es, err = installEventSource(js, w.loop, opts.RootCAs)
+	if err != nil {
+		return nil, fmt.Errorf("web: installing EventSource: %w", err)
 	}
 	if err := removeUnselected(js, opts.Features); err != nil {
 		return nil, err
@@ -224,6 +232,9 @@ func (w *Web) Close() error {
 	if w.ws != nil {
 		w.ws.closeAll()
 	}
+	if w.es != nil {
+		w.es.closeAll()
+	}
 	return nil
 }
 
@@ -264,9 +275,13 @@ func (w *Web) ResetPerRequest() {
 	// after us) also clears timers, but only after the drain has already run.
 	w.loop.ClearTimers()
 	// A socket one request left open must not be readable by the next one, and
-	// its reader goroutine must not Post into the next request's loop.
+	// its reader goroutine must not Post into the next request's loop. The same
+	// holds for an event stream.
 	if w.ws != nil {
 		w.ws.closeAll()
+	}
+	if w.es != nil {
+		w.es.closeAll()
 	}
 	// The HTTP cache is dropped between pooled requests. A cache that survived
 	// would let one request observe what another fetched — the response bodies

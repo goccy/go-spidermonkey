@@ -187,8 +187,8 @@
 		_failed() {
 			if (this._state === CLOSED) return;
 			this._state = CLOSED;
-			this.dispatchEvent(new Event("error"));
-			this.dispatchEvent(new globalThis.CloseEvent("close", { code: 1006, reason: "", wasClean: false }));
+			__dispatch_trusted(this, new Event("error"));
+			__dispatch_trusted(this, new globalThis.CloseEvent("close", { code: 1006, reason: "", wasClean: false }));
 		}
 
 		_dispatch(kind, a, b, c) {
@@ -200,7 +200,7 @@
 					this._state = OPEN;
 					this._protocol = a;
 					this._extensions = b;
-					this.dispatchEvent(new Event("open"));
+					__dispatch_trusted(this, new Event("open"));
 					return;
 				case "drain":
 					this._buffered = Math.max(0, this._buffered - a);
@@ -211,7 +211,7 @@
 					if (a) {
 						data = this._binaryType === "blob" ? new Blob([b]) : b.slice().buffer;
 					}
-					this.dispatchEvent(new MessageEvent("message", { data, origin: originOf(this._url) }));
+					__dispatch_trusted(this, new MessageEvent("message", { data, origin: originOf(this._url) }));
 					return;
 				}
 				case "close": {
@@ -222,8 +222,8 @@
 					// An error event precedes the close only when the connection FAILED —
 					// it never opened, or it ended without a close handshake. A close the
 					// guest asked for is not a failure however it ended.
-					if (!c && !opened) this.dispatchEvent(new Event("error"));
-					this.dispatchEvent(new globalThis.CloseEvent("close", { code: a, reason: b, wasClean: !!c }));
+					if (!c && !opened) __dispatch_trusted(this, new Event("error"));
+					__dispatch_trusted(this, new globalThis.CloseEvent("close", { code: a, reason: b, wasClean: !!c }));
 					return;
 				}
 			}

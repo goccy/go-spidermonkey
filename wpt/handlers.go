@@ -97,6 +97,14 @@ func handlerFor(rel string) wptHandler {
 		return httpCacheHandler
 	case "fetch/stale-while-revalidate/resources/stale-script.py":
 		return staleScriptHandler
+	case "eventsource/resources/message.py":
+		return esMessageHandler
+	case "eventsource/resources/message2.py":
+		return esMessage2Handler
+	case "eventsource/resources/last-event-id.py":
+		return esLastEventIDHandler
+	case "eventsource/resources/cors.py":
+		return esCORSHandler
 	}
 	return nil
 }

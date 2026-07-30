@@ -416,11 +416,28 @@
 			this.defaultPrevented = false;
 			this.bubbles = !!init.bubbles;
 			this.cancelable = !!init.cancelable;
+			this._trusted = false;
 		}
+		// isTrusted distinguishes an event the RUNTIME fired (a message arriving,
+		// a timer's timeout) from one script fired through dispatchEvent. Script
+		// can never mint a trusted event: dispatchEvent clears the flag, and only
+		// the internal __dispatch_trusted helper below sets it.
+		get isTrusted() { return this._trusted; }
 		preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
 		stopPropagation() {}
 		stopImmediatePropagation() { this._stopImmediate = true; }
 	};
+
+	// __dispatch_trusted(target, event): dispatch as the user agent, which is the
+	// one caller allowed to leave isTrusted true. Host-driven surfaces
+	// (EventSource, WebSocket, XHR) route their events through this.
+	Object.defineProperty(globalThis, "__dispatch_trusted", {
+		value(target, event) {
+			event._trusted = true;
+			return target.dispatchEvent(event, { __keepTrusted: true });
+		},
+		writable: true, configurable: true, enumerable: false,
+	});
 
 	globalThis.EventTarget ??= class EventTarget {
 		constructor() { this._listeners = new Map(); }
@@ -454,7 +471,10 @@
 				if (entry.signalCleanup) entry.signalCleanup();
 			}
 		}
-		dispatchEvent(event) {
+		dispatchEvent(event, opts) {
+			// A script-dispatched event is never trusted, however it was minted.
+			// The one exception is the internal trusted-dispatch helper.
+			if (!(opts && opts.__keepTrusted)) event._trusted = false;
 			event.target = event.currentTarget = this;
 			const list = this._listeners.get(event.type);
 			if (list) {

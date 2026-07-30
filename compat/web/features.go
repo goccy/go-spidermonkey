@@ -44,6 +44,7 @@ const (
 	FeatureMessaging       Feature = "messaging"
 	FeatureXMLHttpRequest  Feature = "xmlhttprequest"
 	FeatureWebSocket       Feature = "websocket"
+	FeatureEventSource     Feature = "eventsource"
 )
 
 // featureGlobals maps each feature onto the globals it owns. Every global this
@@ -80,6 +81,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureMessaging:       {"MessageChannel", "MessagePort"},
 	FeatureXMLHttpRequest:  {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
 	FeatureWebSocket:       {"WebSocket", "CloseEvent"},
+	FeatureEventSource:     {"EventSource"},
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs

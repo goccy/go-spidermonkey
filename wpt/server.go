@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -157,11 +158,42 @@ func substituteWPT(rel string, data []byte, vars map[string]string) []byte {
 	if !strings.Contains(rel, ".sub.") || !strings.Contains(string(data), "{{") {
 		return data
 	}
+	return substituteVars(data, vars)
+}
+
+func substituteVars(data []byte, vars map[string]string) []byte {
 	out := string(data)
 	for name, value := range vars {
 		out = strings.ReplaceAll(out, "{{"+name+"}}", value)
 	}
 	return []byte(out)
+}
+
+// headersVarRE matches wptserve's `{{headers[name]}}` template variable, whose
+// value is a header of the CURRENT request — it cannot be in the static table.
+// The template syntax is wptserve's own text format; a pattern is how one reads
+// a foreign text format.
+var headersVarRE = regexp.MustCompile(`\{\{headers\[([^\]]+)\]\}\}`)
+
+// substituteRequest expands the per-request template variables.
+func substituteRequest(data []byte, r *http.Request) []byte {
+	return headersVarRE.ReplaceAllFunc(data, func(m []byte) []byte {
+		name := string(headersVarRE.FindSubmatch(m)[1])
+		return []byte(r.Header.Get(name))
+	})
+}
+
+// wantsPipeSub reports whether the request asked for substitution explicitly:
+// wptserve's `?pipe=sub` applies the same templating to a file whose NAME does
+// not carry ".sub.". Pipes compose with "|"; only sub is supported here, and an
+// unsupported pipe leaves the file unprocessed, which the test then reports.
+func wantsPipeSub(r *http.Request) bool {
+	for _, p := range strings.Split(r.URL.Query().Get("pipe"), "|") {
+		if p == "sub" {
+			return true
+		}
+	}
+	return false
 }
 
 // serveWPTFile serves one file, honouring the suite conventions that matter
@@ -194,6 +226,12 @@ func serveWPT(root string, srv *Server, w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	data = substituteWPT(rel, data, vars)
+	if wantsPipeSub(r) {
+		data = substituteVars(data, vars)
+	}
+	if strings.Contains(rel, ".sub.") || wantsPipeSub(r) {
+		data = substituteRequest(data, r)
+	}
 	if hdr, err := os.ReadFile(full + ".headers"); err == nil {
 		for _, line := range strings.Split(string(hdr), "\n") {
 			if k, v, ok := strings.Cut(strings.TrimSpace(line), ":"); ok {
@@ -222,6 +260,10 @@ func contentType(rel string) string {
 		return "text/plain"
 	case strings.HasSuffix(rel, ".css"):
 		return "text/css"
+	case strings.HasSuffix(rel, ".event_stream"):
+		// wptserve's own extension mapping; without it every EventSource fixture
+		// served from a file fails the MIME check the specification requires.
+		return "text/event-stream"
 	}
 	return "application/octet-stream"
 }

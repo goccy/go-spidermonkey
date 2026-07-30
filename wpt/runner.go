@@ -538,7 +538,10 @@ func isLoopback(host string) bool {
 	case "localhost", "127.0.0.1", "::1", "":
 		return true
 	}
-	return false
+	// RFC 6761: any name under .localhost is a loopback name. Tests mint these
+	// on the fly (location.href with "www2." prefixed) to get a second origin
+	// on the same server, exactly as wptserve's subdomain table does.
+	return strings.HasSuffix(host, ".localhost")
 }
 
 func firstLine(s string) string {
