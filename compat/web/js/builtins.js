@@ -1631,9 +1631,101 @@
 	// Hono, ...). Bodies are buffered (string | BufferSource | null);
 	// ReadableStream request/response bodies come later.
 
+	// A header name is an HTTP token; a header value may hold anything but NUL,
+	// LF and CR, and is normalized by stripping HTTP whitespace from both ends.
+	// Note what is NOT forbidden: the other control characters are legal in a
+	// value, and a value made only of whitespace normalizes to the empty string
+	// rather than being rejected.
+	const HEADER_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+	function headerName(name, op) {
+		const n = String(name);
+		if (!HEADER_TOKEN.test(n)) {
+			throw new TypeError(`Headers.${op}: ${JSON.stringify(n)} is not a valid header name`);
+		}
+		return n.toLowerCase();
+	}
+
+	function headerValue(value, op) {
+		const v = String(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+		if (/[\0\n\r]/.test(v)) {
+			throw new TypeError(`Headers.${op}: the header value contains a forbidden character`);
+		}
+		return v;
+	}
+
+	// Forbidden request headers are the ones the user agent alone controls. A
+	// request's Headers silently IGNORES them rather than failing, because the
+	// caller has not made a mistake — the header is simply not theirs to set.
+	const FORBIDDEN_REQUEST_HEADERS = new Set([
+		"accept-charset", "accept-encoding", "access-control-request-headers",
+		"access-control-request-method", "connection", "content-length", "cookie",
+		"cookie2", "date", "dnt", "expect", "host", "keep-alive", "origin",
+		"referer", "set-cookie", "te", "trailer", "transfer-encoding", "upgrade", "via",
+	]);
+
+	function isForbiddenRequestHeader(name, value) {
+		if (FORBIDDEN_REQUEST_HEADERS.has(name) || name.startsWith("proxy-") || name.startsWith("sec-")) {
+			return true;
+		}
+		// A Range header is forbidden except in the one shape a media element
+		// would send.
+		if (name === "range") return !/^bytes=[0-9]+-[0-9]*$/.test(value);
+		return false;
+	}
+
+	// A byte that stops a header from being CORS-safelisted. These are the bytes
+	// that would let a value smuggle structure past a server that trusts it.
+	const CORS_UNSAFE = /[\0-\x08\x0a-\x1f"():<>?@[\\\]{}\x7f]/;
+
+	const SAFELISTED_MIME = new Set([
+		"application/x-www-form-urlencoded", "multipart/form-data", "text/plain",
+	]);
+
+	// The CORS-safelisted request headers are the ones a page could already have
+	// sent with a form, so a no-cors request may carry them and nothing else.
+	function isCORSSafelisted(name, value) {
+		if (value.length > 128) return false;
+		switch (name) {
+			case "accept":
+				return !CORS_UNSAFE.test(value);
+			case "accept-language":
+			case "content-language":
+				return /^[0-9A-Za-z *,\-.;=]*$/.test(value);
+			case "content-type": {
+				if (CORS_UNSAFE.test(value)) return false;
+				const mime = ops.mime_type(value);
+				return !!mime && SAFELISTED_MIME.has(String(mime.essence ?? mime).toLowerCase());
+			}
+			case "range":
+				return /^bytes=[0-9]+-[0-9]*$/.test(value);
+		}
+		return false;
+	}
+
+	// setHeadersGuard is how a Request or a Response says which headers its own
+	// Headers object may hold. It is applied after the init has been copied in,
+	// which is the order the standard uses: the object is filled, then adopted.
+	function setHeadersGuard(headers, guard) {
+		headers._guard = guard;
+		if (guard === "request" || guard === "request-no-cors" || guard === "response") {
+			// Re-run the filter over what is already there, since those entries
+			// arrived while the guard was still "none".
+			for (const k of [...headers._map.keys()]) {
+				const v = headers._map.get(k).join(", ");
+				if (headers._blocked(k, v, "adopt")) headers._map.delete(k);
+			}
+		}
+		return headers;
+	}
+
 	class Headers {
 		constructor(init) {
 			this._map = new Map(); // lowercased name -> array of values
+			// The guard decides which headers this object will hold at all: see
+			// setHeadersGuard. "none" is a free-standing Headers, which filters
+			// nothing.
+			Object.defineProperty(this, "_guard", { value: "none", writable: true });
 			if (init instanceof Headers) {
 				// Copy raw values, preserving each Set-Cookie separately.
 				for (const [k, arr] of init._map) this._map.set(k, [...arr]);
@@ -1646,19 +1738,49 @@
 				for (const k of Object.keys(init)) this.set(k, init[k]);
 			}
 		}
-		append(name, value) {
-			const k = String(name).toLowerCase();
-			const arr = this._map.get(k);
-			if (arr) arr.push(String(value));
-			else this._map.set(k, [String(value)]);
+		// _blocked applies the guard. An immutable Headers throws; every other
+		// guard drops the header quietly, which is what the standard asks for —
+		// the operation "succeeds" and simply has no effect.
+		_blocked(name, value, op) {
+			switch (this._guard) {
+				case "immutable":
+					throw new TypeError(`Headers.${op}: these headers are immutable`);
+				case "request":
+					return isForbiddenRequestHeader(name, value);
+				case "request-no-cors":
+					return !isCORSSafelisted(name, value);
+				case "response":
+					return name === "set-cookie" || name === "set-cookie2";
+			}
+			return false;
 		}
-		set(name, value) { this._map.set(String(name).toLowerCase(), [String(value)]); }
+		append(name, value) {
+			const k = headerName(name, "append");
+			const v = headerValue(value, "append");
+			// A no-cors append is judged on the COMBINED value, since that is what
+			// would go on the wire.
+			const existing = this._map.get(k);
+			const combined = existing ? existing.join(", ") + ", " + v : v;
+			if (this._blocked(k, combined, "append")) return;
+			if (existing) existing.push(v);
+			else this._map.set(k, [v]);
+		}
+		set(name, value) {
+			const k = headerName(name, "set");
+			const v = headerValue(value, "set");
+			if (this._blocked(k, v, "set")) return;
+			this._map.set(k, [v]);
+		}
 		// get combines multiple values with ", " per WHATWG (including Set-Cookie);
 		// getSetCookie is the only way to recover individual Set-Cookie values.
-		get(name) { const a = this._map.get(String(name).toLowerCase()); return a ? a.join(", ") : null; }
+		get(name) { const a = this._map.get(headerName(name, "get")); return a ? a.join(", ") : null; }
 		getSetCookie() { return [...(this._map.get("set-cookie") || [])]; }
-		has(name) { return this._map.has(String(name).toLowerCase()); }
-		delete(name) { this._map.delete(String(name).toLowerCase()); }
+		has(name) { return this._map.has(headerName(name, "has")); }
+		delete(name) {
+			const k = headerName(name, "delete");
+			if (this._blocked(k, this.get(k) ?? "", "delete")) return;
+			this._map.delete(k);
+		}
 		forEach(cb, thisArg) { for (const [k, v] of this.entries()) cb.call(thisArg, v, k, this); }
 		*entries() {
 			for (const k of [...this._map.keys()].sort()) {
@@ -1847,7 +1969,9 @@
 			this[kRequestState] = {
 				url,
 				method: String(init.method ?? (from ? from.method : "GET")).toUpperCase(),
-				headers: new Headers(init.headers ?? (from ? from.headers : undefined)),
+				headers: setHeadersGuard(
+					new Headers(init.headers ?? (from ? from.headers : undefined)),
+					String(init.mode ?? (from ? from.mode : "") ?? "") === "no-cors" ? "request-no-cors" : "request"),
 				signal: init.signal ?? (from ? from.signal : undefined),
 			};
 			// Workers' request.cf survives new Request(req) (workerd behavior).
@@ -1896,7 +2020,7 @@
 				throw new TypeError(`Response constructor: status ${this.status} cannot have a body`);
 			}
 			this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
-			this.headers = new Headers(init.headers);
+			this.headers = setHeadersGuard(new Headers(init.headers), "response");
 			this._bodyStream = null;
 			setBody(this, body);
 			this.ok = this.status >= 200 && this.status <= 299;
