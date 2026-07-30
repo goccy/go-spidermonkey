@@ -311,3 +311,48 @@ it is what makes **dynamic SSR fail on Next.js 15**.
   limitation for an undocumented wrong answer.
 - **Engine fix needed:** expose async-context (host-defined async op) hooks from
   the engine so continuations can be associated with their originating context.
+
+## 9. WebAssembly: the subsystem is compiled in, but no backend can run it
+
+ECMA-429 (the WinterTC Minimum Common Web API) makes the `WebAssembly`
+namespace REQUIRED, so this is a conformance gap, not an optional feature.
+`typeof WebAssembly === "undefined"` in every realm.
+
+The obvious hypothesis — the engine build stripped wasm, or js.cc simply does
+not export it — was checked against the FIREFOX_147_0_4_RELEASE_STARLING
+archive and is wrong on both counts, in an instructive way:
+
+- **The whole wasm subsystem IS in `libspidermonkey.a`**: 4,714 `wasm` symbols,
+  including `js::wasm::Module::instantiate`, `js::wasm::Eval`, the validator,
+  and the baseline/Ion compile drivers. `--disable-jit` does not remove it.
+- **The gate is inside the engine, at runtime.** The `WebAssembly` global is
+  installed only when `wasm::HasSupport(cx)` holds, which requires
+  `wasm::HasPlatformSupport()` (`js/src/wasm/WasmFeatures.cpp:245`), which
+  requires `jit::HasJitBackend()` — and that is hard-coded `return false`
+  under `JS_CODEGEN_NONE` (`js/src/jit/JitOptions.h:182`). Our build defines
+  `JS_CODEGEN_NONE 1` (see `deps/spidermonkey/include/js-confdefs.h`). No
+  pref, context option or js.cc change can flip it.
+- **No real wasm32 backend exists to switch to.** The tree's only wasm32
+  codegen (`JS_CODEGEN_WASM32`, `js/src/jit/wasm32/`) is a 545-line stub with
+  128 `MOZ_CRASH`es — it exists so the engine can be COMPILED for wasm32, not
+  so it can generate code. SpiderMonkey executes wasm only by compiling it to
+  native code; there is no wasm interpreter tier (the portable baseline
+  interpreter is JS-bytecode-only).
+- **The platform seals the deal.** Even a backend that emitted wasm bytes at
+  runtime could not run them: a wasm module cannot make new code executable
+  inside itself. The host would have to instantiate the emitted bytes as a NEW
+  module and bridge every call — and under wasm2go (AOT wasm-to-Go at build
+  time) there is no runtime module loading at all.
+
+So "keep it inside SpiderMonkey" is not a build-flag question; it is "add an
+interpreter tier to SpiderMonkey's wasm engine", an upstream-scale project.
+The realistic paths, in order of plausibility:
+
+1. **Host-side JS API over a Go wasm runtime** (wazero's interpreter — pure
+   Go, no cgo): implement `WebAssembly.{Module,Instance,Memory,Table,Global,
+   Tag,Exception,compile,instantiate,validate,...}` in compat/web as host ops,
+   the way fetch and WebSocket are done. `Memory.buffer` needs the existing
+   bytes bridge plus a way to alias (not copy) guest-visible bytes — the one
+   engine-side primitive this genuinely needs.
+2. **A wasm interpreter tier upstream** (what "PBL for wasm" would be). Does
+   not exist; not something this repo can carry as a patch.

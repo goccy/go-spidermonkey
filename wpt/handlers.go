@@ -93,6 +93,8 @@ func handlerFor(rel string) wptHandler {
 		return infiniteSlowHandler
 	case "fetch/api/request/resources/cache.py":
 		return requestCacheHandler
+	case "fetch/http-cache/resources/http-cache.py":
+		return httpCacheHandler
 	}
 	return nil
 }

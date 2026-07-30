@@ -1211,5 +1211,10 @@
 		return subtle.importKey("raw", raw, alg, extractable, usages);
 	}
 
-	globalThis.crypto.subtle = subtle;
+	// The operations go onto SubtleCrypto.prototype rather than onto the instance:
+	// crypto.subtle is a SubtleCrypto (declared in builtins.js, which ECMA-429
+	// requires to be exposed), and an interface's operations belong to its
+	// prototype. Assigning to crypto.subtle instead would leave the interface
+	// empty and the operations unreachable through it.
+	Object.assign(globalThis.SubtleCrypto.prototype, subtle);
 })();

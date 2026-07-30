@@ -61,16 +61,19 @@ var featureGlobals = map[Feature][]string{
 	},
 	FeatureStreams: {
 		"ReadableStream", "WritableStream", "TransformStream",
-		"ReadableStreamBYOBReader", "ReadableByteStreamController",
+		"ReadableStreamBYOBReader", "ReadableStreamBYOBRequest",
+		"ReadableByteStreamController", "ReadableStreamDefaultController",
+		"ReadableStreamDefaultReader", "TransformStreamDefaultController",
+		"WritableStreamDefaultController", "WritableStreamDefaultWriter",
 		"ByteLengthQueuingStrategy", "CountQueuingStrategy",
 	},
 	FeatureCompression: {"CompressionStream", "DecompressionStream"},
 	FeatureFetch:       {"fetch", "Headers", "Request", "Response"},
 	FeatureFileAPI:     {"Blob", "File", "FileReader", "FormData"},
-	FeatureCrypto:      {"crypto", "CryptoKey"},
+	FeatureCrypto:      {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
 	FeaturePerformance: {
-		"performance", "PerformanceEntry", "PerformanceMark", "PerformanceMeasure",
-		"PerformanceObserver", "PerformanceObserverEntryList",
+		"performance", "Performance", "PerformanceEntry", "PerformanceMark",
+		"PerformanceMeasure", "PerformanceObserver", "PerformanceObserverEntryList",
 	},
 	FeatureTimers:          {"setTimeout", "clearTimeout", "setInterval", "clearInterval", "queueMicrotask"},
 	FeatureStructuredClone: {"structuredClone"},
@@ -80,8 +83,14 @@ var featureGlobals = map[Feature][]string{
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs
-// them. DOMException is how every other feature reports a failure.
-var alwaysInstalled = []string{"DOMException"}
+// them: DOMException is how every other feature reports a failure, and the rest
+// are properties of the global SCOPE rather than of any one API — ECMA-429
+// requires them of a runtime, not of a feature selection, so removing a feature
+// must never remove them.
+var alwaysInstalled = []string{
+	"DOMException", "self", "navigator",
+	"onerror", "onunhandledrejection", "onrejectionhandled",
+}
 
 // AllFeatures is the whole web platform surface this package implements.
 func AllFeatures() []Feature {

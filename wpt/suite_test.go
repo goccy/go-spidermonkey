@@ -9,13 +9,19 @@
 // WPT_FILTER (substring), WPT_WORKERS, WPT_TIMEOUT (per file), WPT_UPDATE=1
 // (regenerate expectations.json), WPT_REPORT=path.
 //
-// Only the .any.js / .worker.js forms are runnable without a browser, and only
-// the directories whose APIs this embedding actually provides are in the
-// default set — a DOM-dependent directory would produce nothing but noise. The
-// suite's own testharness.js drives each file in its shell environment (no DOM
-// is faked), a loopback HTTP server serves the fixtures the tests fetch, and
-// results are judged PER SUBTEST so one unimplemented corner cannot hide the
-// rest of a file.
+// Only the .any.js / .worker.js forms are runnable without a browser. Which
+// DIRECTORIES are in the default set is a separate question, and the answer is
+// not "the ones whose APIs exist here" — see DefaultDirs. The suite's own
+// testharness.js drives each file in its shell environment (no DOM is faked), a
+// loopback server serves the fixtures the tests fetch over both http and https,
+// and results are judged PER SUBTEST so one unimplemented corner cannot hide
+// the rest of a file.
+//
+// Two rates are reported. The subtest rate is not worth quoting on its own:
+// WebCryptoAPI declares over 70% of every subtest in the corpus, so a whole new
+// API moves it by a tenth of a point. The CLEAN CASE rate — cases that ran with
+// no failing subtest — is the fair weighting, and it is also what the other
+// runtimes publish, so it is the only one of the two that can be compared.
 //
 // expectations.json records one line per FILE — the number of failing subtests
 // and a digest of which ones — and the run FAILS on any change to it: a new
@@ -33,6 +39,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,7 +154,10 @@ func TestWPTSuite(t *testing.T) {
 		Root: root, BaseURL: srv.BaseURL(), HTTPSBaseURL: srv.HTTPSBaseURL(),
 		RootCAs: srv.RootCAs(), SubVars: srv.SubVars(),
 	}
-	stable := stabilizer(srv.SubVars())
+	replacer := stabilizer(srv.SubVars())
+	// Volatile ports AND the coordinates of our own evaluated source, both of
+	// which change for reasons unrelated to any outcome.
+	stable := func(s string) string { return evalFrame.ReplaceAllString(replacer.Replace(s), "<eval>") }
 	if s := os.Getenv("WPT_TIMEOUT"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
@@ -183,7 +193,7 @@ func TestWPTSuite(t *testing.T) {
 		close(results)
 	}()
 
-	type stat struct{ pass, fail, files, broken, skipped int }
+	type stat struct{ pass, fail, files, clean, broken, skipped int }
 	byArea := map[string]*stat{}
 	// One line per FILE, not per subtest. Per-subtest keys are the precise form,
 	// but this suite has ~22,000 known failures — mostly whole APIs that are not
@@ -192,6 +202,11 @@ func TestWPTSuite(t *testing.T) {
 	// failed, so a swap (one fixed, one broken, same count) still shows up; the
 	// run itself prints the individual failures, and WPT_REPORT dumps them all.
 	failures := map[string]string{}
+	// The full status+name+message lines behind each digest, kept only in memory
+	// and printed only for a failure the expectations did not predict. A flake
+	// that strikes once per full run is undebuggable from a digest; this is what
+	// turns its next occurrence into a cause.
+	failureDetail := map[string][]string{}
 	harnessReasons := map[string]int{}
 	done, start := 0, time.Now()
 	for r := range results {
@@ -212,8 +227,8 @@ func TestWPTSuite(t *testing.T) {
 			harnessReasons["skip: "+r.Message]++
 		default:
 			s.broken++
-			harnessReasons[r.Harness+": "+bucket(stable.Replace(r.Message))]++
-			failures[r.Path] = r.Harness + ": " + bucket(stable.Replace(r.Message))
+			harnessReasons[r.Harness+": "+bucket(stable(r.Message))]++
+			failures[r.Path] = r.Harness + ": " + bucket(stable(r.Message))
 			continue
 		}
 		var failed []string
@@ -223,9 +238,13 @@ func TestWPTSuite(t *testing.T) {
 				continue
 			}
 			s.fail++
-			failed = append(failed, string(sub.Status)+" "+stable.Replace(sub.Name))
+			failed = append(failed, string(sub.Status)+" "+stable(sub.Name))
+			failureDetail[r.Path] = append(failureDetail[r.Path],
+				string(sub.Status)+" "+stable(sub.Name)+": "+bucket(stable(sub.Message)))
 		}
-		if len(failed) > 0 {
+		if len(failed) == 0 {
+			s.clean++
+		} else {
 			sort.Strings(failed)
 			sum := sha256.Sum256([]byte(strings.Join(failed, "\n")))
 			failures[r.Path] = fmt.Sprintf("%d/%d subtests fail (%x)",
@@ -244,9 +263,10 @@ func TestWPTSuite(t *testing.T) {
 		totalPass += s.pass
 		totalFail += s.fail
 		totalCases += s.files
-		t.Logf("%-24s subtests %6d/%6d  %.2f%%  (cases %4d, harness-error %3d, skipped %3d)",
+		t.Logf("%-34s subtests %6d/%6d %6.2f%%   clean cases %4d/%4d %6.2f%%  (harness-error %3d, skipped %3d)",
 			a, s.pass, s.pass+s.fail, 100*float64(s.pass)/float64(max(s.pass+s.fail, 1)),
-			s.files, s.broken, s.skipped)
+			s.clean, s.files, 100*float64(s.clean)/float64(max(s.files, 1)),
+			s.broken, s.skipped)
 	}
 	t.Logf("TOTAL                    subtests %6d/%6d  %.2f%%  in %v",
 		totalPass, totalPass+totalFail,
@@ -333,6 +353,10 @@ func TestWPTSuite(t *testing.T) {
 			break
 		}
 		t.Errorf("unexpected failure: %s", r)
+		key, _, _ := strings.Cut(r, ": ")
+		for _, line := range failureDetail[key] {
+			t.Errorf("    %s", line)
+		}
 	}
 	for i, k := range stale {
 		if i == 50 {
@@ -360,6 +384,13 @@ func topDir(p string) string {
 // reason that had nothing to do with the outcome, and expectations.json could
 // never be clean. The ports are known structurally (this process assigned
 // them), so each goes back to the token it was substituted from.
+// evalFrame matches a stack frame inside code this harness evaluated. The line
+// and column are positions in compat/web's own JavaScript, so every edit there
+// changes them — which made unrelated files report a "changed outcome" and made
+// expectations.json impossible to keep clean. The FRAME is the information; its
+// coordinates inside our own source are not.
+var evalFrame = regexp.MustCompile(`<eval>:\d+:\d+`)
+
 func stabilizer(vars map[string]string) *strings.Replacer {
 	// EVERY listener's port, not just the plain-HTTP ones: a subtest name built
 	// from get_host_info().HTTPS_ORIGIN carries the TLS port, and a name built

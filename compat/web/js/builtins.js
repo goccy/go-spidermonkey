@@ -477,6 +477,55 @@
 	globalThis.removeEventListener ??= (...a) => globalTarget.removeEventListener(...a);
 	globalThis.dispatchEvent ??= (e) => globalTarget.dispatchEvent(e);
 
+	// The global event handler attributes. ECMA-429 requires all three to exist,
+	// and they must behave as event handler attributes rather than as plain
+	// properties the dispatcher happens to look at: reading gives the current
+	// handler or null, assigning a non-callable clears it, and the handler runs as
+	// a listener so ordering with addEventListener is the one the web defines.
+	//
+	// `onerror` is the exception in two ways, both of them in HTML's event handler
+	// processing algorithm and neither guessable. On a global scope it is invoked
+	// with (message, filename, lineno, colno, error) rather than with the event —
+	// but only when the event IS an ErrorEvent — and its return value is inverted:
+	// returning TRUE cancels, where every other handler cancels by returning false.
+	const globalHandlers = {}; // type -> the handler the attribute reports
+	const globalWrappers = {}; // type -> the listener actually registered
+	for (const type of ["error", "unhandledrejection", "rejectionhandled"]) {
+		Object.defineProperty(globalThis, "on" + type, {
+			get() { return globalHandlers[type] ?? null; },
+			set(fn) {
+				if (globalWrappers[type]) globalTarget.removeEventListener(type, globalWrappers[type]);
+				globalHandlers[type] = typeof fn === "function" ? fn : null;
+				globalWrappers[type] = null;
+				if (!globalHandlers[type]) return;
+				const handler = globalHandlers[type];
+				globalWrappers[type] = type !== "error" ? handler : (event) => {
+					let result;
+					if (event instanceof globalThis.ErrorEvent) {
+						result = handler.call(globalThis, event.message, event.filename,
+							event.lineno, event.colno, event.error);
+					} else {
+						result = handler.call(globalThis, event);
+					}
+					if (result === true) event.preventDefault();
+				};
+				globalTarget.addEventListener(type, globalWrappers[type]);
+			},
+			configurable: true, enumerable: true,
+		});
+	}
+
+	// `self` is how a worker — and every .any.js test — spells the global. It is
+	// the global itself, not a copy.
+	globalThis.self ??= globalThis;
+
+	// navigator.userAgent is how application code identifies the runtime it is on.
+	// ECMA-429 requires it to be a single opaque product token, with no version
+	// and no comment, so that nothing tries to parse it.
+	globalThis.navigator ??= Object.create(Object.prototype, {
+		userAgent: { value: "go-spidermonkey", enumerable: true, configurable: true },
+	});
+
 	globalThis.PromiseRejectionEvent ??= class PromiseRejectionEvent extends Event {
 		constructor(type, init = {}) {
 			super(type, init);
@@ -498,10 +547,10 @@
 		const ev = new globalThis.PromiseRejectionEvent("unhandledrejection", {
 			cancelable: true, promise, reason,
 		});
+		// onunhandledrejection is registered AS a listener (see the handler
+		// attributes above), so dispatching once reaches both it and anything
+		// added with addEventListener — calling it separately would run it twice.
 		globalTarget.dispatchEvent(ev);
-		if (typeof globalThis.onunhandledrejection === "function") {
-			globalThis.onunhandledrejection(ev);
-		}
 		if (!ev.defaultPrevented) {
 			console.error("Uncaught (in promise)", reason);
 		}
@@ -573,10 +622,18 @@
 	// structuredClone is installed by extended.js (full Map/Set/Date/typed-array/
 	// cycle-preserving clone); no JSON-limited fallback is needed here.
 
-	globalThis.performance ??= {
-		timeOrigin: Date.now(),
-		now: () => ops.perf_now(),
-	};
+	// Performance is a class rather than a bare object because ECMA-429 requires
+	// the INTERFACE to be exposed, not just the instance: `performance instanceof
+	// Performance` is what a caller checks, and an object literal cannot answer it.
+	// The User Timing members are added to the prototype further down.
+	class Performance {
+		constructor() { this._timeOrigin = Date.now(); }
+		get timeOrigin() { return this._timeOrigin; }
+		now() { return ops.perf_now(); }
+		toJSON() { return { timeOrigin: this.timeOrigin }; }
+	}
+	globalThis.Performance ??= Performance;
+	globalThis.performance ??= new Performance();
 
 	// User Timing API (mark/measure + getEntries*) and PerformanceObserver.
 	// Implemented here in the web layer so both compat/web and compat/nodejs
@@ -685,7 +742,12 @@
 			static get supportedEntryTypes() { return supportedEntryTypes; }
 		}
 
-		Object.assign(perf, {
+		// The User Timing members go on the PROTOTYPE when performance is a
+		// Performance instance, because that is where an interface's operations
+		// live; a plain object (a host that installed its own performance) still
+		// gets them as own properties, which is all it can have.
+		const perfTarget = Object.getPrototypeOf(perf) === Object.prototype ? perf : Object.getPrototypeOf(perf);
+		Object.assign(perfTarget, {
 			mark(name, options) { return record(new PerformanceMark(name, options)); },
 			measure(name, startOrOptions, endMark) {
 				let start, end, detail;
@@ -726,7 +788,20 @@
 		globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
 	})();
 
-	globalThis.crypto ??= {};
+	// Crypto and SubtleCrypto are interfaces ECMA-429 requires on the global, so
+	// `crypto` is an instance rather than an object literal. SubtleCrypto's
+	// operations are installed onto its prototype by subtle.js, which is where
+	// they are implemented; the class is declared here so `crypto.subtle` has
+	// something to be an instance OF before that runs.
+	class SubtleCrypto {}
+	globalThis.SubtleCrypto ??= SubtleCrypto;
+
+	class Crypto {
+		constructor() { this._subtle = new globalThis.SubtleCrypto(); }
+		get subtle() { return this._subtle; }
+	}
+	globalThis.Crypto ??= Crypto;
+	globalThis.crypto ??= new globalThis.Crypto();
 	globalThis.crypto.getRandomValues ??= (array) => {
 		if (!ArrayBuffer.isView(array)) {
 			throw new TypeError("getRandomValues: expected a typed array");
@@ -1211,6 +1286,26 @@
 	// suite reaches for it by name. The queue-copying BYOB reader above does not
 	// use a byobRequest, so this reports null for one — a source written against
 	// controller.byobRequest sees nothing to fill and falls back to enqueue().
+	// ReadableStreamBYOBRequest is the object a byte source is handed when a BYOB
+	// reader has offered it a buffer to fill. This stream implementation copies
+	// into the reader's view rather than handing the source the buffer, so
+	// byobRequest is always null and no instance is ever produced — which is the
+	// same thing a byte stream with no pending pull-into reports. The interface is
+	// still defined, because ECMA-429 requires it and because it is not
+	// constructible from script either way: the members below are what a caller
+	// would reach through a request, and there is no request to reach them
+	// through.
+	class ReadableStreamBYOBRequest {
+		get view() { return null; }
+		respond(bytesWritten) {
+			throw new TypeError("respond called on a ReadableStreamBYOBRequest with no pending pull-into");
+		}
+		respondWithNewView(view) {
+			throw new TypeError("respondWithNewView called on a ReadableStreamBYOBRequest with no pending pull-into");
+		}
+	}
+	globalThis.ReadableStreamBYOBRequest = ReadableStreamBYOBRequest;
+
 	class ReadableByteStreamController {
 		constructor(inner) { this._inner = inner; }
 		get byobRequest() { return null; }
@@ -1225,6 +1320,70 @@
 		error(e) { return this._inner.error(e); }
 	}
 	globalThis.ReadableByteStreamController = ReadableByteStreamController;
+
+	// ReadableStreamDefaultController is a real class, not the object literal it
+	// used to be, for two reasons: ECMA-429 requires the interface to be exposed,
+	// and the streams suite checks that a controller's operations live on the
+	// PROTOTYPE — an own-property method passes `typeof c.enqueue === "function"`
+	// and fails the interface. It holds the stream and nothing else.
+	class ReadableStreamDefaultController {
+		constructor(stream) { this._s = stream; }
+		// desiredSize = highWaterMark - total queued size; 0 once close has been
+		// requested; null once errored. This is what makes the canonical
+		// `pull(c) { if (c.desiredSize > 0) c.enqueue(x); }` work.
+		get desiredSize() {
+			const s = this._s;
+			if (s._errored) return null;
+			if (s._closed) return 0;
+			return s._highWaterMark - s._queueTotalSize;
+		}
+		enqueue(chunk) {
+			const s = this._s;
+			// Enqueue after close/error throws TypeError (it used to be a silent
+			// no-op here, which hid source bugs).
+			if (s._closed || s._errored) throw new TypeError("Cannot enqueue a chunk into a readable stream that is closed or errored");
+			// The size function runs for EVERY chunk — even one handed straight to a
+			// pending read — and an invalid result errors the stream: a throwing
+			// size(), or a non-finite or negative size, is a RangeError.
+			let size = 1;
+			if (s._sizeFn) {
+				try { size = Number(s._sizeFn(chunk)); }
+				catch (e) { this.error(e); throw e; }
+				if (Number.isNaN(size) || size < 0 || !Number.isFinite(size)) {
+					const e = new RangeError("The return value of a queuing strategy's size function must be a finite, non-negative number");
+					this.error(e);
+					throw e;
+				}
+			}
+			s._progress++;
+			const w = s._waiters.shift();
+			if (w) { w.resolve({ value: chunk, done: false }); return; }
+			s._queue.push(chunk);
+			s._queueSizes.push(size);
+			s._queueTotalSize += size;
+		}
+		close() {
+			const s = this._s;
+			if (s._closed || s._errored) return;
+			s._closed = true;
+			s._progress++;
+			for (const w of s._waiters.splice(0)) w.resolve({ value: undefined, done: true });
+			if (s._reader) s._reader._closedResolve(undefined);
+		}
+		error(e) {
+			const s = this._s;
+			if (s._closed || s._errored) return;
+			s._errored = true;
+			s._errorValue = e;
+			s._progress++;
+			s._queue = []; // drop buffered chunks; the stream is errored
+			s._queueSizes = [];
+			s._queueTotalSize = 0;
+			for (const w of s._waiters.splice(0)) w.reject(e);
+			if (s._reader) s._reader._closedReject(e);
+		}
+	}
+	globalThis.ReadableStreamDefaultController = ReadableStreamDefaultController;
 
 	class ReadableStream {
 		constructor(underlyingSource = {}, strategy = {}) {
@@ -1251,59 +1410,7 @@
 			if (Number.isNaN(hwm) || hwm < 0) throw new RangeError("Invalid highWaterMark");
 			this._highWaterMark = hwm;
 			this._sizeFn = strategy && typeof strategy.size === "function" ? strategy.size : null;
-			const self = this;
-			this._controller = {
-				// desiredSize = highWaterMark - total queued size; 0 once close has
-				// been requested; null once errored (WHATWG). This is what makes the
-				// canonical `pull(c) { if (c.desiredSize > 0) c.enqueue(x); }` work.
-				get desiredSize() {
-					if (self._errored) return null;
-					if (self._closed) return 0;
-					return self._highWaterMark - self._queueTotalSize;
-				},
-				enqueue(chunk) {
-					// WHATWG: enqueue after close/error throws TypeError (it used to be
-					// a silent no-op here, hiding source bugs).
-					if (self._closed || self._errored) throw new TypeError("Cannot enqueue a chunk into a readable stream that is closed or errored");
-					// The size function runs for EVERY chunk (even one handed straight
-					// to a pending read) and an invalid result errors the stream (spec:
-					// throwing size() or a non-finite/negative size → RangeError).
-					let size = 1;
-					if (self._sizeFn) {
-						try { size = Number(self._sizeFn(chunk)); }
-						catch (e) { this.error(e); throw e; }
-						if (Number.isNaN(size) || size < 0 || !Number.isFinite(size)) {
-							const e = new RangeError("The return value of a queuing strategy's size function must be a finite, non-negative number");
-							this.error(e);
-							throw e;
-						}
-					}
-					self._progress++;
-					const w = self._waiters.shift();
-					if (w) { w.resolve({ value: chunk, done: false }); return; }
-					self._queue.push(chunk);
-					self._queueSizes.push(size);
-					self._queueTotalSize += size;
-				},
-				close() {
-					if (self._closed || self._errored) return;
-					self._closed = true;
-					self._progress++;
-					for (const w of self._waiters.splice(0)) w.resolve({ value: undefined, done: true });
-					if (self._reader) self._reader._closedResolve(undefined);
-				},
-				error(e) {
-					if (self._closed || self._errored) return;
-					self._errored = true;
-					self._errorValue = e;
-					self._progress++;
-					self._queue = []; // drop buffered chunks; the stream is errored
-					self._queueSizes = [];
-					self._queueTotalSize = 0;
-					for (const w of self._waiters.splice(0)) w.reject(e);
-					if (self._reader) self._reader._closedReject(e);
-				},
-			};
+			this._controller = new ReadableStreamDefaultController(this);
 			if (this._isByteStream) this._controller = new ReadableByteStreamController(this._controller);
 			if (underlyingSource.start) underlyingSource.start(this._controller);
 		}
@@ -1545,6 +1652,9 @@
 		}
 	}
 	globalThis.ReadableStream = ReadableStream;
+	// The reader classes are the brand a caller checks getReader()'s result
+	// against, and ECMA-429 requires both to be exposed.
+	globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
 
 	// The two standard queuing strategies (WHATWG Streams §9): plain
 	// {highWaterMark, size} carriers the ReadableStream constructor consumes.
@@ -1638,12 +1748,29 @@
 		}
 	}
 
+	// WritableStreamDefaultController: the object a sink's start/write/close are
+	// handed. `signal` is an AbortSignal the sink can watch to learn that the
+	// stream was aborted, which is the only way a long write can find out.
+	class WritableStreamDefaultController {
+		constructor(stream) {
+			this._s = stream;
+			this._abort = new AbortController();
+		}
+		get signal() { return this._abort.signal; }
+		error(e) {
+			if (this._s._state === "errored") return;
+			this._s._state = "errored";
+			this._s._storedError = e;
+		}
+	}
+	globalThis.WritableStreamDefaultController = WritableStreamDefaultController;
+
 	class WritableStream {
 		constructor(underlyingSink = {}) {
 			this._sink = underlyingSink;
 			this._locked = false;
 			this._state = "writable";
-			this._controller = { error: () => { this._state = "errored"; } };
+			this._controller = new WritableStreamDefaultController(this);
 			if (underlyingSink.start) underlyingSink.start(this._controller);
 		}
 		get locked() { return this._locked; }
@@ -1660,6 +1787,20 @@
 		}
 	}
 	globalThis.WritableStream = WritableStream;
+	globalThis.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
+
+	// TransformStreamDefaultController forwards to the readable side's own
+	// controller. It takes a THUNK rather than the controller itself because the
+	// readable's start() runs during its construction, so the controller does not
+	// exist yet when this one has to be built.
+	class TransformStreamDefaultController {
+		constructor(readableController) { this._rc = readableController; }
+		get desiredSize() { return this._rc().desiredSize; }
+		enqueue(chunk) { return this._rc().enqueue(chunk); }
+		terminate() { return this._rc().close(); }
+		error(e) { return this._rc().error(e); }
+	}
+	globalThis.TransformStreamDefaultController = TransformStreamDefaultController;
 
 	class TransformStream {
 		constructor(transformer = {}) {
@@ -1674,12 +1815,7 @@
 				// forever into a dropped readable.
 				cancel(reason) { cancelled = true; cancelReason = reason; },
 			});
-			const controller = {
-				enqueue: (chunk) => rc.enqueue(chunk),
-				terminate: () => rc.close(),
-				error: (e) => rc.error(e),
-				get desiredSize() { return rc.desiredSize; },
-			};
+			const controller = new TransformStreamDefaultController(() => rc);
 			this.writable = new WritableStream({
 				// A throw/rejection in transform or flush must error the READABLE
 				// side too, not just reject the write — otherwise a consumer

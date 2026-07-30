@@ -19,6 +19,7 @@ import (
 //
 //	WPT=1 WPT_BUCKETS=WebCryptoAPI go test ./wpt -run FailureBuckets -v
 //
+// WPT_FILTER narrows to paths containing a substring,
 // WPT_BUCKETS_GREP narrows to messages containing a substring,
 // WPT_BUCKETS_TOP sets how many buckets are printed (default 15), and
 // WPT_BUCKETS_NAMES=1 keys on the subtest name as well as the message, to
@@ -36,6 +37,15 @@ func TestWPTFailureBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if filter := os.Getenv("WPT_FILTER"); filter != "" {
+		var keep []wpt.Case
+		for _, c := range cases {
+			if strings.Contains(c.Path, filter) {
+				keep = append(keep, c)
+			}
+		}
+		cases = keep
+	}
 	srv, err := wpt.StartServer(suiteDir)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +59,10 @@ func TestWPTFailureBuckets(t *testing.T) {
 	counts := map[string]int{}
 	failing := 0
 	for _, c := range cases {
-		r := wpt.Run(context.Background(), wpt.Options{Root: suiteDir, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}, c)
+		r := wpt.Run(context.Background(), wpt.Options{
+			Root: suiteDir, BaseURL: srv.BaseURL(), HTTPSBaseURL: srv.HTTPSBaseURL(),
+			RootCAs: srv.RootCAs(), SubVars: srv.SubVars(),
+		}, c)
 		for _, s := range r.Subtests {
 			if s.Status == wpt.StatusPass || !strings.Contains(s.Message, grep) {
 				continue
