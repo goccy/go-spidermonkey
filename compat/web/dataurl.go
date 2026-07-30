@@ -41,8 +41,13 @@ func parseDataURL(raw string) (mime string, body []byte, err error) {
 		isBase64 = true
 		head = head[:i]
 	}
-	if strings.HasPrefix(head, ";") || head == "" {
-		head = defaultDataMIME + head
+	// A type that begins with ";" is a parameter list with no type, and gets
+	// "text/plain" — and ONLY that. The charset is not a default: it belongs to
+	// the fallback below, for a type that does not parse at all. Prepending the
+	// whole default here gave "text/plain;charset=US-ASCII;charset=x" for
+	// ";charset=x", where the caller's charset is the one that counts.
+	if strings.HasPrefix(head, ";") {
+		head = "text/plain" + head
 	}
 	// The Content-Type is the PARSED type serialized back, not the raw text:
 	// that is what lowercases it, normalizes the whitespace around parameters

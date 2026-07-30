@@ -552,7 +552,12 @@
 			unsupported(`RSA export format ${format}`);
 		}
 		if (name === "ED25519") {
-			if (format === "jwk") return JSON.parse(ops.subtle_ed_export("jwk", key._h));
+			if (format === "jwk") {
+				// key_ops and ext come from the KEY, not from the host: the host knows
+				// the material, the CryptoKey knows what it may be used for.
+				const j = JSON.parse(ops.subtle_ed_export("jwk", key._h));
+				return { ...j, ext: key.extractable, key_ops: [...key.usages] };
+			}
 			if (format === "raw" || format === "raw-public") return Uint8Array.from(ops.subtle_ed_export("raw", key._h)).buffer;
 			if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_ed_export(format, key._h));
 			unsupported(`Ed25519 export format ${format}`);
