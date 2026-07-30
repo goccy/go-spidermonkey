@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,14 +78,18 @@ type cacheEntry struct {
 	stored  time.Time
 }
 
+// responseCache stores, per primary key, one entry PER VARIANT: a response
+// with Vary: Foo selects on the request's Foo value, and storing a second
+// variant must not evict the first — a cache holds the variants side by side,
+// or Vary would make it useless for exactly the resources that use it.
 type responseCache struct {
 	mu      sync.Mutex
-	entries map[string]*cacheEntry
+	entries map[string][]*cacheEntry
 	bytes   int
 }
 
 func newResponseCache() *responseCache {
-	return &responseCache{entries: map[string]*cacheEntry{}}
+	return &responseCache{entries: map[string][]*cacheEntry{}}
 }
 
 // key is the primary cache key: the method and the full URL. Vary is handled
@@ -112,15 +117,15 @@ func varyKeyFor(vary string, h http.Header) (string, bool) {
 func (c *responseCache) get(req *http.Request) *cacheEntry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e := c.entries[cacheKey(req)]
-	if e == nil {
-		return nil
+	for _, e := range c.entries[cacheKey(req)] {
+		// Each variant's OWN Vary decides what it selects on; the header can
+		// differ between variants when the origin changed its mind.
+		want, ok := varyKeyFor(e.header.Get("Vary"), req.Header)
+		if ok && want == e.varyKey {
+			return e
+		}
 	}
-	want, ok := varyKeyFor(e.header.Get("Vary"), req.Header)
-	if !ok || want != e.varyKey {
-		return nil
-	}
-	return e
+	return nil
 }
 
 func (c *responseCache) put(req *http.Request, e *cacheEntry) {
@@ -132,28 +137,53 @@ func (c *responseCache) put(req *http.Request, e *cacheEntry) {
 	e.stored = time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if old := c.entries[cacheKey(req)]; old != nil {
-		c.bytes -= len(old.body)
+	pk := cacheKey(req)
+	variants := c.entries[pk]
+	replaced := false
+	for i, old := range variants {
+		if old.varyKey == e.varyKey {
+			c.bytes -= len(old.body)
+			variants[i] = e
+			replaced = true
+			break
+		}
 	}
-	c.entries[cacheKey(req)] = e
+	if !replaced {
+		variants = append(variants, e)
+	}
+	c.entries[pk] = variants
 	c.bytes += len(e.body)
 	// Evict oldest-first until under the ceiling.
-	for c.bytes > maxCacheBytes && len(c.entries) > 1 {
-		var oldestKey string
+	for c.bytes > maxCacheBytes {
+		oldestKey, oldestIdx := "", -1
 		oldest := time.Now().Add(time.Hour)
-		for k, v := range c.entries {
-			if v.stored.Before(oldest) {
-				oldestKey, oldest = k, v.stored
+		for k, list := range c.entries {
+			for i, v := range list {
+				if v == e {
+					continue // never evict what was just stored
+				}
+				if v.stored.Before(oldest) {
+					oldestKey, oldestIdx, oldest = k, i, v.stored
+				}
 			}
 		}
-		c.bytes -= len(c.entries[oldestKey].body)
-		delete(c.entries, oldestKey)
+		if oldestIdx < 0 {
+			return
+		}
+		list := c.entries[oldestKey]
+		c.bytes -= len(list[oldestIdx].body)
+		list = append(list[:oldestIdx], list[oldestIdx+1:]...)
+		if len(list) == 0 {
+			delete(c.entries, oldestKey)
+		} else {
+			c.entries[oldestKey] = list
+		}
 	}
 }
 
 func (c *responseCache) reset() {
 	c.mu.Lock()
-	c.entries = map[string]*cacheEntry{}
+	c.entries = map[string][]*cacheEntry{}
 	c.bytes = 0
 	c.mu.Unlock()
 }
@@ -177,10 +207,30 @@ func directives(h http.Header) map[string]string {
 	return out
 }
 
-// freshnessLifetime is how long the response may be reused without asking,
-// from max-age if given and from Expires otherwise. There is no heuristic
-// fallback: a response that says nothing about its lifetime is treated as
-// already stale, so it is revalidated rather than guessed about.
+// heuristicStatus lists the codes RFC 9111 calls heuristically cacheable: a
+// response with one of these and no explicit lifetime may still be assigned
+// one. Any other status gets a heuristic only when the response opts in with
+// Cache-Control: public.
+var heuristicStatus = map[int]bool{
+	200: true, 203: true, 204: true, 300: true, 301: true, 308: true,
+	404: true, 405: true, 410: true, 414: true, 501: true,
+}
+
+// hasExplicitLifetime reports whether the response states its own freshness.
+// s-maxage deliberately does not count: it addresses shared caches, and this
+// cache is a private one — it is fetch's own, serving a single user agent.
+func hasExplicitLifetime(h http.Header) bool {
+	if _, ok := directives(h)["max-age"]; ok {
+		return true
+	}
+	return h.Get("Expires") != ""
+}
+
+// freshnessLifetime is how long the response may be reused without asking:
+// max-age, then Expires, then — with nothing explicit — the heuristic the
+// standard suggests, one tenth of the time since Last-Modified. The heuristic
+// applies only where the standard allows one: a heuristically-cacheable status,
+// or an explicit Cache-Control: public.
 func (e *cacheEntry) freshnessLifetime() time.Duration {
 	cc := directives(e.header)
 	if v, ok := cc["max-age"]; ok {
@@ -188,25 +238,48 @@ func (e *cacheEntry) freshnessLifetime() time.Duration {
 			return time.Duration(n) * time.Second
 		}
 	}
-	exp := e.header.Get("Expires")
-	if exp == "" {
-		return 0
-	}
-	t, err := http.ParseTime(exp)
-	if err != nil {
-		// An unparseable Expires means already expired, per the standard.
-		return 0
-	}
 	base := e.received
 	if d := e.header.Get("Date"); d != "" {
 		if dt, derr := http.ParseTime(d); derr == nil {
 			base = dt
 		}
 	}
-	if t.Before(base) {
+	if exp := e.header.Get("Expires"); exp != "" {
+		t, err := http.ParseTime(exp)
+		if err != nil || t.Before(base) {
+			// An unparseable or past Expires means already expired.
+			return 0
+		}
+		return t.Sub(base)
+	}
+	_, public := cc["public"]
+	if !heuristicStatus[e.status] && !public {
 		return 0
 	}
-	return t.Sub(base)
+	if lm := e.header.Get("Last-Modified"); lm != "" {
+		if t, err := http.ParseTime(lm); err == nil && base.After(t) {
+			return base.Sub(t) / 10
+		}
+	}
+	return 0
+}
+
+// freshened is this entry with the 304's headers layered over its own and its
+// clock restarted — a new value, because the stored one may be being served
+// concurrently and is treated as immutable once in the cache.
+func (e *cacheEntry) freshened(h http.Header, requested time.Time) *cacheEntry {
+	out := &cacheEntry{
+		status:    e.status,
+		header:    e.header.Clone(),
+		body:      e.body,
+		requested: requested,
+		received:  time.Now(),
+		varyKey:   e.varyKey,
+	}
+	for k, v := range h {
+		out.header[k] = append([]string(nil), v...)
+	}
+	return out
 }
 
 // age is how old the stored response is now, including any Age the server
@@ -221,18 +294,11 @@ func (e *cacheEntry) age(now time.Time) time.Duration {
 	return reported + now.Sub(e.received)
 }
 
-func (e *cacheEntry) fresh(now time.Time) bool {
-	cc := directives(e.header)
-	if _, ok := cc["no-cache"]; ok {
-		return false
-	}
-	if _, ok := cc["must-revalidate"]; ok && e.age(now) >= e.freshnessLifetime() {
-		return false
-	}
-	return e.age(now) < e.freshnessLifetime()
-}
-
-// storable reports whether a response may be kept at all.
+// storable reports whether a response may be kept at all. The status matters
+// only when the response says nothing about its own lifetime: an explicit
+// max-age or Expires makes any final status storable — the origin has said how
+// long it is good for — while without one only the heuristically-cacheable
+// statuses may be kept.
 func storable(req *http.Request, resp *http.Response) bool {
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return false
@@ -241,18 +307,22 @@ func storable(req *http.Request, resp *http.Response) bool {
 	if resp.StatusCode == http.StatusPartialContent || req.Header.Get("Range") != "" {
 		return false
 	}
-	switch resp.StatusCode {
-	case 200, 203, 204, 300, 301, 304, 404, 405, 410, 414, 501:
-	default:
+	if resp.StatusCode < 200 {
 		return false
 	}
-	cc := directives(resp.Header)
-	if _, ok := cc["no-store"]; ok {
+	if !hasExplicitLifetime(resp.Header) && !heuristicStatus[resp.StatusCode] {
+		// One more way in: a heuristic is allowed for any status that opts in
+		// with Cache-Control: public (see freshnessLifetime).
+		if _, public := directives(resp.Header)["public"]; !public {
+			return false
+		}
+	}
+	if _, ok := directives(resp.Header)["no-store"]; ok {
 		return false
 	}
-	if _, ok := cc["private"]; ok {
-		return false
-	}
+	// Cache-Control: private is NOT a reason to refuse. It forbids SHARED
+	// caches; this cache is a private one — it belongs to the single user agent
+	// doing the fetching, which is exactly who private admits.
 	return true
 }
 
@@ -261,6 +331,82 @@ func storable(req *http.Request, resp *http.Response) bool {
 type cachingTransport struct {
 	next  http.RoundTripper
 	cache *responseCache
+
+	// revalidating holds the cache keys with a background revalidation already
+	// in flight, so a burst of requests inside the stale-while-revalidate window
+	// costs one origin request rather than one each.
+	revalidatingMu sync.Mutex
+	revalidating   map[string]bool
+}
+
+// staleWhileRevalidate reads the response's RFC 5861 window, if it granted one.
+func staleWhileRevalidate(h http.Header) (time.Duration, bool) {
+	v, ok := directives(h)["stale-while-revalidate"]
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
+}
+
+// revalidateInBackground refreshes a stale entry without making the caller
+// wait. The request is rebuilt free of the caller's context — the caller may
+// be gone before the origin answers, and this revalidation is the cache's
+// business, not the caller's — but bounded, so an origin that never answers
+// cannot accumulate goroutines.
+func (t *cachingTransport) revalidateInBackground(req *http.Request, entry *cacheEntry) {
+	key := cacheKey(req)
+	t.revalidatingMu.Lock()
+	if t.revalidating == nil {
+		t.revalidating = map[string]bool{}
+	}
+	if t.revalidating[key] {
+		t.revalidatingMu.Unlock()
+		return
+	}
+	t.revalidating[key] = true
+	t.revalidatingMu.Unlock()
+
+	out := req.Clone(context.Background())
+	out.Body = nil
+	if etag := entry.header.Get("ETag"); etag != "" {
+		out.Header.Set("If-None-Match", etag)
+	} else if lm := entry.header.Get("Last-Modified"); lm != "" {
+		out.Header.Set("If-Modified-Since", lm)
+	}
+	go func() {
+		defer func() {
+			t.revalidatingMu.Lock()
+			delete(t.revalidating, key)
+			t.revalidatingMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		requested := time.Now()
+		resp, err := t.next.RoundTrip(out.WithContext(ctx))
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotModified {
+			t.cache.put(req, entry.freshened(resp.Header, requested))
+			return
+		}
+		if !storable(req, resp) {
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxEntryBytes))
+		if err != nil {
+			return
+		}
+		t.cache.put(req, &cacheEntry{
+			status: resp.StatusCode, header: resp.Header.Clone(), body: body,
+			requested: requested, received: time.Now(),
+		})
+	}()
 }
 
 // serve turns a stored entry back into a response. The body is a fresh reader
@@ -319,10 +465,120 @@ func isConditional(h http.Header) bool {
 	return false
 }
 
+// reqDirectives is the caller's own Cache-Control (RFC 9111 §5.2.1) — the
+// header a page author writes on a fetch, distinct from fetch's cache MODE.
+// Both express constraints on the cache; the header is the finer instrument.
+type reqDirectives struct {
+	noCache, noStore, onlyIfCached bool
+	maxAge                         time.Duration
+	hasMaxAge                      bool
+	maxStale                       time.Duration
+	hasMaxStale, maxStaleAny       bool
+	minFresh                       time.Duration
+	hasMinFresh                    bool
+}
+
+func parseReqDirectives(h http.Header) reqDirectives {
+	var rd reqDirectives
+	cc := directives(h)
+	_, rd.noCache = cc["no-cache"]
+	_, rd.noStore = cc["no-store"]
+	_, rd.onlyIfCached = cc["only-if-cached"]
+	if v, ok := cc["max-age"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			rd.maxAge, rd.hasMaxAge = time.Duration(n)*time.Second, true
+		}
+	}
+	if v, ok := cc["max-stale"]; ok {
+		rd.hasMaxStale = true
+		if v == "" {
+			// max-stale with no value accepts any staleness at all.
+			rd.maxStaleAny = true
+		} else if n, err := strconv.Atoi(v); err == nil {
+			rd.maxStale = time.Duration(n) * time.Second
+		}
+	}
+	if v, ok := cc["min-fresh"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			rd.minFresh, rd.hasMinFresh = time.Duration(n)*time.Second, true
+		}
+	}
+	return rd
+}
+
+// usableWithoutValidation decides whether a stored entry may answer this
+// request directly. The response's own constraints come first (its no-cache,
+// its lifetime), then the request's: each directive can only make the cache
+// LESS willing, except max-stale, which widens the window for an entry that is
+// merely stale — never for one whose origin said must-revalidate.
+func usableWithoutValidation(e *cacheEntry, rd reqDirectives, now time.Time) bool {
+	cc := directives(e.header)
+	if _, ok := cc["no-cache"]; ok {
+		return false
+	}
+	age, lifetime := e.age(now), e.freshnessLifetime()
+	usable := age < lifetime
+	if rd.hasMaxAge && age > rd.maxAge {
+		usable = false
+	}
+	if rd.hasMinFresh && lifetime-age < rd.minFresh {
+		usable = false
+	}
+	if !usable && rd.hasMaxStale {
+		if _, must := cc["must-revalidate"]; !must && (rd.maxStaleAny || age-lifetime <= rd.maxStale) {
+			usable = true
+		}
+	}
+	return usable
+}
+
+// gatewayTimeout is the answer RFC 9111 gives an only-if-cached request that
+// nothing stored can satisfy: a synthesized 504, not a network attempt.
+func gatewayTimeout(req *http.Request) *http.Response {
+	return &http.Response{
+		Status:        "504 Gateway Timeout",
+		StatusCode:    http.StatusGatewayTimeout,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{},
+		Body:          io.NopCloser(bytes.NewReader(nil)),
+		ContentLength: 0,
+		Request:       req,
+	}
+}
+
+// invalidate drops the entries a successful unsafe request makes stale: the
+// request's own URL, and any same-origin Location / Content-Location target the
+// response names — those are the resources the origin just said it changed.
+func (c *responseCache) invalidate(req *http.Request, resp *http.Response) {
+	drop := func(u *url.URL) {
+		if u == nil || u.Hostname() != req.URL.Hostname() {
+			return
+		}
+		key := http.MethodGet + " " + u.String()
+		c.mu.Lock()
+		for _, old := range c.entries[key] {
+			c.bytes -= len(old.body)
+		}
+		delete(c.entries, key)
+		c.mu.Unlock()
+	}
+	drop(req.URL)
+	for _, name := range []string{"Location", "Content-Location"} {
+		if v := resp.Header.Get(name); v != "" {
+			if u, err := req.URL.Parse(v); err == nil {
+				drop(u)
+			}
+		}
+	}
+}
+
 func (t *cachingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	mode := cacheModeOf(req)
-	consult := mode != cacheNoStore && mode != cacheReload
-	store := mode != cacheNoStore
+	rd := parseReqDirectives(req.Header)
+	consult := mode != cacheNoStore && mode != cacheReload && !rd.noStore
+	store := mode != cacheNoStore && !rd.noStore
 	if isConditional(req.Header) {
 		// The caller wrote its own validator: it wants the origin's answer, and a
 		// stored response is not that answer.
@@ -340,8 +596,27 @@ func (t *cachingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			// what happens when there is none.
 			return entry.serve(req), nil
 		case cacheDefault:
-			if entry.fresh(time.Now()) {
+			// The request's own only-if-cached directive takes whatever is stored;
+			// its no-cache forbids answering without revalidating, whatever the
+			// entry's freshness.
+			if rd.onlyIfCached {
 				return entry.serve(req), nil
+			}
+			now := time.Now()
+			if !rd.noCache && usableWithoutValidation(entry, rd, now) {
+				return entry.serve(req), nil
+			}
+			// stale-while-revalidate (RFC 5861): within the window the response
+			// granted, a stale entry is served IMMEDIATELY and the revalidation
+			// happens behind the caller's back — that trade of staleness for
+			// latency is the whole point of the directive. Only when the request
+			// itself imposes no freshness demands of its own.
+			if !rd.noCache && !rd.hasMaxAge && !rd.hasMinFresh {
+				if swr, ok := staleWhileRevalidate(entry.header); ok &&
+					entry.age(now)-entry.freshnessLifetime() <= swr {
+					t.revalidateInBackground(req, entry)
+					return entry.serve(req), nil
+				}
 			}
 		}
 	}
@@ -349,6 +624,11 @@ func (t *cachingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		// The standard makes this a network error rather than an empty response:
 		// the caller asked for the cache and there is nothing there.
 		return nil, errOnlyIfCached
+	}
+	if entry == nil && rd.onlyIfCached && mode != cacheNoStore && mode != cacheReload {
+		// As a HEADER, only-if-cached answers differently than the fetch MODE
+		// does: HTTP's own rule is a synthesized 504, not an error.
+		return gatewayTimeout(req), nil
 	}
 
 	out := req.Clone(req.Context())
@@ -369,18 +649,26 @@ func (t *cachingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
+	// A successful unsafe request invalidates what it changed: its own URL, and
+	// the Location / Content-Location resources the response names.
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+	default:
+		if resp.StatusCode < 400 {
+			t.cache.invalidate(req, resp)
+		}
+	}
 	if resp.StatusCode == http.StatusNotModified && entry != nil {
 		// Freshen the stored headers and serve the stored body. The response's
 		// own headers win where it sends them, since they are the newer word.
+		// The freshening builds a NEW entry rather than mutating the stored one:
+		// another request may be serving that entry's headers right now.
 		resp.Body.Close()
-		for k, v := range resp.Header {
-			entry.header[k] = append([]string(nil), v...)
-		}
-		entry.requested, entry.received = requested, time.Now()
+		fresh := entry.freshened(resp.Header, requested)
 		if store {
-			t.cache.put(req, entry)
+			t.cache.put(req, fresh)
 		}
-		return entry.serve(req), nil
+		return fresh.serve(req), nil
 	}
 	if !store || !storable(req, resp) {
 		return resp, nil

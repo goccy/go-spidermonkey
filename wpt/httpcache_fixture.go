@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -255,4 +256,43 @@ func requestURL(r *http.Request) string {
 // from the time's own location; the format is defined to say GMT.
 func httpDate(t time.Time) string {
 	return t.UTC().Format("Mon, 02 Jan 2006 15:04:05") + " GMT"
+}
+
+// staleScriptHandler ports fetch/stale-while-revalidate/resources/stale-script.py.
+//
+// The resource answers with `Cache-Control: private, max-age=0,
+// stale-while-revalidate=60` and a fresh Unique-Id every time, and counts how
+// often it was ACTUALLY requested per token; the `?query` form reports that
+// count. The test then proves stale-while-revalidate end to end: the second
+// fetch must return the FIRST response's Unique-Id (served stale from the
+// cache) while the count still reaches 2 (the revalidation happened, in the
+// background).
+func staleScriptHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	token := r.URL.Query().Get("token")
+	_, isQuery := r.URL.Query()["query"]
+	count := 0
+	if raw, ok := st.take("stale-script/" + token); ok {
+		count, _ = strconv.Atoi(raw)
+	}
+	if isQuery {
+		// The original puts the value back only while count < 2: reading a
+		// completed count consumes it. Copied as-is — the fixture's contract is
+		// the original's behaviour, oddities included.
+		if count < 2 {
+			st.put("stale-script/"+token, strconv.Itoa(count))
+		}
+		w.Header().Set("Count", strconv.Itoa(count))
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	count++
+	st.put("stale-script/"+token, strconv.Itoa(count))
+	// The id must differ between responses — it is how the test detects which
+	// response a fetch got — and carries no other meaning.
+	id := fmt.Sprintf("%020d", time.Now().UnixNano())
+	w.Header().Set("Content-Type", "text/javascript")
+	w.Header().Set("Cache-Control", "private, max-age=0, stale-while-revalidate=60")
+	w.Header().Set("Unique-Id", id)
+	_, _ = w.Write([]byte("report('" + id + "')"))
+	return true
 }

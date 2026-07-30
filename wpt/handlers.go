@@ -95,6 +95,8 @@ func handlerFor(rel string) wptHandler {
 		return requestCacheHandler
 	case "fetch/http-cache/resources/http-cache.py":
 		return httpCacheHandler
+	case "fetch/stale-while-revalidate/resources/stale-script.py":
+		return staleScriptHandler
 	}
 	return nil
 }

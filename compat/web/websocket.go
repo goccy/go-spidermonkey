@@ -73,6 +73,18 @@ type wsConn struct {
 	conn     *websocket.Conn
 	sentDone bool // the guest has been told this socket is closed
 	outDone  bool // out has been closed; no further sends may be queued
+	// closing means the guest asked for the closing handshake. From then on the
+	// authoritative outcome is writeLoop's Close() call, and readLoop must not
+	// report the connection-teardown error it is about to see as an abnormal
+	// closure: Close() tearing the connection down under a blocked Read is what
+	// a SUCCESSFUL handshake looks like from the read side.
+	closing bool
+}
+
+func (c *wsConn) isClosing() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closing
 }
 
 func installWebSocket(js *spidermonkey.JS, loop *eventloop.Loop, roots *x509.CertPool) (*wsAPI, error) {
@@ -229,10 +241,30 @@ func (c *wsConn) writeLoop() {
 				// this code rather than refusing it.
 				code = websocket.StatusNoStatusRcvd
 			}
-			// Close performs the handshake and then closes the connection, which
-			// unblocks readLoop; readLoop reports the outcome, so the error here is
-			// not the one the guest sees.
-			_ = conn.Close(code, out.reason)
+			// Close performs the whole closing handshake, and ITS outcome is the
+			// authoritative one. It races readLoop for the peer's close frame —
+			// whichever reads it first wins, and when Close wins, readLoop's Read
+			// fails with a connection error that LOOKS like an abnormal closure.
+			// Reporting from both sides (finish is once-only) is what makes the
+			// race harmless; deciding from readLoop alone misreported a completed
+			// handshake as 1006/unclean whenever Close got there first.
+			err := conn.Close(code, out.reason)
+			var ce websocket.CloseError
+			switch {
+			case err == nil:
+				// The peer answered with the code we sent. An empty frame is
+				// reported as 1005 with no reason, per the protocol.
+				reported, reason := out.code, out.reason
+				if out.code == 0 {
+					reported, reason = 1005, ""
+				}
+				c.finish(reported, reason, true)
+			case errors.As(err, &ce):
+				// The handshake completed, with a different answer than we sent.
+				c.finish(int(ce.Code), ce.Reason, true)
+			default:
+				c.finish(1006, "", false)
+			}
 			return
 		}
 		typ := websocket.MessageText
@@ -253,6 +285,13 @@ func (c *wsConn) readLoop() {
 		typ, data, err := conn.Read(c.ctx)
 		if err != nil {
 			code, reason, clean := closeOutcome(err)
+			if !clean && c.isClosing() {
+				// The guest asked to close, so this error is (usually) just
+				// Close() tearing the connection down mid-Read; writeLoop reports
+				// the handshake's real outcome. finish is once-only, so if Close()
+				// genuinely failed, its 1006 still gets through.
+				return
+			}
 			c.finish(code, reason, clean)
 			return
 		}
@@ -405,6 +444,9 @@ func (a *wsAPI) opClose(cfg spidermonkey.Config, args []spidermonkey.Value) (spi
 		c.cancel()
 		return spidermonkey.Undefined(), nil
 	}
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
 	c.queue(wsOut{close: true, code: code, reason: reason})
 	return spidermonkey.Undefined(), nil
 }
