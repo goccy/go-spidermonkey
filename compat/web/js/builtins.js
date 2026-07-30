@@ -2587,16 +2587,30 @@
 					return Promise.reject(new TypeError("Failed to fetch: no object URL " + url));
 				}
 				const m = String(method || "GET").toUpperCase();
+				// A blob: URL answers only GET. Anything else is a network error, not
+				// a 405: there is no server to have refused the method.
 				if (m !== "GET") {
-					return Promise.resolve(new Response(null, { status: 405, statusText: "Method Not Allowed" }));
+					return Promise.reject(new TypeError("Failed to fetch: blob: URLs answer only GET"));
 				}
-				return blob.arrayBuffer().then((buf) => new Response(buf, {
-					status: 200,
-					headers: {
-						"content-type": blob.type || "",
-						"content-length": String(blob.size),
-					},
-				}));
+				return blob.arrayBuffer().then((buf) => {
+					const res = new Response(buf, {
+						status: 200,
+						// A synthesized response still has a reason phrase: XHR reports
+						// statusText, and "" is not what a 200 says.
+						statusText: "OK",
+						headers: {
+							"content-type": blob.type || "",
+							"content-length": String(blob.size),
+						},
+					});
+					// A blob: response is same-origin, so its type is "basic" and its url
+					// is the one that was asked for — a Response built by hand reports
+					// neither, because it did not come from a fetch.
+					for (const [k, v] of [["type", "basic"], ["url", url]]) {
+						try { Object.defineProperty(res, k, { configurable: true, value: v }); } catch { /* ignore */ }
+					}
+					return res;
+				});
 			}
 			// Only a network scheme can be cross-origin. data:, blob: and file:
 			// are fetched by their own scheme handler, not through CORS — judging
