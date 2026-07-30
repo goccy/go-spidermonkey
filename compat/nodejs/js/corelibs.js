@@ -973,24 +973,21 @@
 			}
 			return decodeURIComponent(pathname); // decode exactly once
 		},
+		// UTS-46 ToASCII / ToUnicode, host-side. Node reports an invalid domain as
+		// "", and so does the op; the length and empty-label rules are Node's own
+		// (they come from DNS, not from IDNA) and stay here.
 		domainToASCII: (d) => {
-			// IDNA-lite ToASCII (lowercase + NFC + RFC 3492 punycode), shared
-			// with the WHATWG URL host parser. "" signals an invalid domain.
 			const ascii = globalThis.__url_domain_to_ascii(String(d));
-			if (ascii === null || ascii === "") return "";
-			if (/[\x00-\x20#%/:<>?@[\\\]^|\x7f]/.test(ascii)) return "";
+			if (!ascii) return "";
 			const labels = ascii.split(".");
 			for (let i = 0; i < labels.length; i++) {
 				if (labels[i].length > 63) return "";
-				// Only a single trailing empty label (root dot) is acceptable.
+				// Only a single trailing empty label (the root dot) is acceptable.
 				if (labels[i] === "" && i !== labels.length - 1) return "";
 			}
 			return ascii;
 		},
-		domainToUnicode: (d) => String(d).toLowerCase().split(".").map((label) => {
-			if (!label.startsWith("xn--")) return label;
-			try { return globalThis.__url_punycode_decode(label.slice(4)); } catch { return label; }
-		}).join("."),
+		domainToUnicode: (d) => globalThis.__url_domain_to_unicode(String(d)),
 	};
 
 	// ------------------------------------------------------------- timers

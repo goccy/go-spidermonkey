@@ -883,553 +883,89 @@
 	}
 	globalThis.URLSearchParams = URLSearchParams;
 
-	const DEFAULT_PORTS = { "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21" };
-	const SPECIAL = new Set([...Object.keys(DEFAULT_PORTS), "file:"]);
-	const SCHEME_RE = /^([a-zA-Z][a-zA-Z0-9+.\-]*):([\s\S]*)$/;
+	// url.domainToASCII / domainToUnicode of the Node compat layer. The IDNA is
+	// host-side (x/net/idna): this file used to carry an RFC 3492 punycode codec
+	// and an "IDNA-lite" ToASCII beside it, which is a UTS-46 implementation
+	// without UTS-46's mapping tables.
+	globalThis.__url_domain_to_ascii = (d) => ops.url_domain_to_ascii(urlBytes(d));
+	globalThis.__url_domain_to_unicode = (d) => ops.url_domain_to_unicode(urlBytes(d));
 
-	// Percent-encode sets per the URL Standard. Every set implicitly includes
-	// C0 controls and non-ASCII (>= U+007F); the strings list the extra ASCII
-	// members. "%" is never in a set, so valid %XX escapes pass through
-	// untouched (no double-encoding).
-	const FRAGMENT_SET = " \"<>`";
-	const QUERY_SET = " \"#<>";
-	const SPECIAL_QUERY_SET = QUERY_SET + "'";
-	const PATH_SET = QUERY_SET + "?^`{}";
-	const USERINFO_SET = PATH_SET + "/:;=@[\\]|";
 
-	function encodeComponent(str, set) {
-		let out = "";
-		for (const ch of String(str)) {
-			const cp = ch.codePointAt(0);
-			if (cp > 0x1f && cp < 0x7f && !set.includes(ch)) { out += ch; continue; }
-			for (const b of utf8Encode(ch)) out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
-		}
-		return out;
-	}
-
-	function percentDecode(str) {
-		const bytes = [];
-		const s = String(str);
-		for (let i = 0; i < s.length;) {
-			if (s[i] === "%" && /^[0-9a-fA-F]{2}$/.test(s.slice(i + 1, i + 3))) {
-				bytes.push(parseInt(s.slice(i + 1, i + 3), 16));
-				i += 3;
-			} else {
-				const ch = String.fromCodePoint(s.codePointAt(i));
-				for (const b of utf8Encode(ch)) bytes.push(b);
-				i += ch.length;
-			}
-		}
-		return utf8Decode(new Uint8Array(bytes), false);
-	}
-
-	// ------------------------------ punycode (RFC 3492) for IDNA hostnames
-
-	const PUNY_BASE = 36, PUNY_TMIN = 1, PUNY_TMAX = 26, PUNY_SKEW = 38, PUNY_DAMP = 700;
-	const PUNY_INITIAL_BIAS = 72, PUNY_INITIAL_N = 128, PUNY_MAX = 0x7fffffff;
-
-	function punyAdapt(delta, numPoints, firstTime) {
-		delta = firstTime ? Math.floor(delta / PUNY_DAMP) : delta >> 1;
-		delta += Math.floor(delta / numPoints);
-		let k = 0;
-		while (delta > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) >> 1) {
-			delta = Math.floor(delta / (PUNY_BASE - PUNY_TMIN));
-			k += PUNY_BASE;
-		}
-		return k + Math.floor(((PUNY_BASE - PUNY_TMIN + 1) * delta) / (delta + PUNY_SKEW));
-	}
-
-	// 0..25 -> a..z, 26..35 -> 0..9
-	const punyDigit = (d) => String.fromCharCode(d + 22 + 75 * (d < 26));
-
-	function punyEncode(input) { // input: array of code points; returns ASCII (no "xn--")
-		let n = PUNY_INITIAL_N, delta = 0, bias = PUNY_INITIAL_BIAS;
-		let output = "";
-		for (const cp of input) if (cp < 0x80) output += String.fromCharCode(cp);
-		const basicLength = output.length;
-		let handled = basicLength;
-		if (basicLength) output += "-";
-		while (handled < input.length) {
-			let m = PUNY_MAX;
-			for (const cp of input) if (cp >= n && cp < m) m = cp;
-			if (m - n > Math.floor((PUNY_MAX - delta) / (handled + 1))) throw new RangeError("punycode: overflow");
-			delta += (m - n) * (handled + 1);
-			n = m;
-			for (const cp of input) {
-				if (cp < n && ++delta > PUNY_MAX) throw new RangeError("punycode: overflow");
-				if (cp === n) {
-					let q = delta;
-					for (let k = PUNY_BASE; ; k += PUNY_BASE) {
-						const t = k <= bias ? PUNY_TMIN : k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias;
-						if (q < t) break;
-						output += punyDigit(t + ((q - t) % (PUNY_BASE - t)));
-						q = Math.floor((q - t) / (PUNY_BASE - t));
-					}
-					output += punyDigit(q);
-					bias = punyAdapt(delta, handled + 1, handled === basicLength);
-					delta = 0;
-					handled++;
-				}
-			}
-			delta++;
-			n++;
-		}
-		return output;
-	}
-
-	function punyDecode(input) { // input: ASCII (no "xn--"); returns Unicode label
-		const output = [];
-		let n = PUNY_INITIAL_N, i = 0, bias = PUNY_INITIAL_BIAS;
-		let basic = input.lastIndexOf("-");
-		if (basic < 0) basic = 0;
-		for (let j = 0; j < basic; j++) {
-			if (input.charCodeAt(j) >= 0x80) throw new RangeError("punycode: invalid input");
-			output.push(input.charCodeAt(j));
-		}
-		for (let index = basic > 0 ? basic + 1 : 0; index < input.length;) {
-			const oldi = i;
-			for (let w = 1, k = PUNY_BASE; ; k += PUNY_BASE) {
-				if (index >= input.length) throw new RangeError("punycode: invalid input");
-				const c = input.charCodeAt(index++);
-				const digit = c >= 0x30 && c <= 0x39 ? c - 22
-					: c >= 0x41 && c <= 0x5a ? c - 0x41
-					: c >= 0x61 && c <= 0x7a ? c - 0x61 : PUNY_BASE;
-				if (digit >= PUNY_BASE || digit > Math.floor((PUNY_MAX - i) / w)) throw new RangeError("punycode: invalid input");
-				i += digit * w;
-				const t = k <= bias ? PUNY_TMIN : k >= bias + PUNY_TMAX ? PUNY_TMAX : k - bias;
-				if (digit < t) break;
-				if (w > Math.floor(PUNY_MAX / (PUNY_BASE - t))) throw new RangeError("punycode: invalid input");
-				w *= PUNY_BASE - t;
-			}
-			const out = output.length + 1;
-			bias = punyAdapt(i - oldi, out, oldi === 0);
-			if (Math.floor(i / out) > PUNY_MAX - n) throw new RangeError("punycode: invalid input");
-			n += Math.floor(i / out);
-			i %= out;
-			output.splice(i++, 0, n);
-		}
-		return String.fromCodePoint(...output);
-	}
-
-	// domainToASCII: IDNA-lite (lowercase + NFC + punycode per label).
-	// Returns null on failure (punycode overflow / unencodable input).
-	function domainToASCII(domain) {
-		let s = String(domain);
-		try { s = s.normalize("NFC"); } catch { /* keep unnormalized */ }
-		s = s.toLowerCase();
-		const out = [];
-		for (const label of s.split(".")) {
-			if (/^[\x00-\x7f]*$/.test(label)) { out.push(label); continue; }
-			try { out.push("xn--" + punyEncode([...label].map((c) => c.codePointAt(0)))); }
-			catch { return null; }
-		}
-		return out.join(".");
-	}
-	// Shared with the Node compat layer (url.domainToASCII / domainToUnicode).
-	globalThis.__url_domain_to_ascii = (d) => domainToASCII(d);
-	globalThis.__url_punycode_decode = (s) => punyDecode(s);
-
-	// ---------------------------------------------- host / IPv4 parsing
-
-	// Forbidden domain code points (URL Standard): controls, space, %, DEL,
-	// and URL delimiters that can never appear in a registered domain.
-	const FORBIDDEN_DOMAIN = /[\x00-\x20#%/:<>?@[\\\]^|\x7f]/;
-	// Opaque (non-special) hosts additionally allow "%" but keep the rest.
-	const FORBIDDEN_HOST = /[\x00\x09\x0a\x0d #/:<>?@[\\\]^|]/;
-
-	function endsInNumber(host) {
-		const labels = host.split(".");
-		if (labels.length > 1 && labels[labels.length - 1] === "") labels.pop();
-		const last = labels[labels.length - 1];
-		if (last === "") return false;
-		return /^[0-9]+$/.test(last) || /^0[xX][0-9a-fA-F]*$/.test(last);
-	}
-
-	// parseIPv4 returns the canonical dotted-decimal string, or null when the
-	// input is out of range / malformed (a failure, since the caller has
-	// already determined the host "ends in a number").
-	function parseIPv4(host) {
-		const parts = host.split(".");
-		if (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
-		if (parts.length > 4) return null;
-		const nums = [];
-		for (const part of parts) {
-			if (part === "") return null;
-			let s = part, radix = 10;
-			if (/^0[xX]/.test(s)) {
-				s = s.slice(2);
-				radix = 16;
-				if (s === "") { nums.push(0); continue; }
-				if (!/^[0-9a-fA-F]+$/.test(s)) return null;
-			} else if (s.length > 1 && s[0] === "0") {
-				s = s.slice(1);
-				radix = 8;
-				if (!/^[0-7]+$/.test(s)) return null;
-			} else if (!/^[0-9]+$/.test(s)) {
-				return null;
-			}
-			nums.push(parseInt(s, radix));
-		}
-		const last = nums.pop();
-		for (const n of nums) if (n > 255) return null;
-		if (last >= 256 ** (4 - nums.length)) return null;
-		let ipv4 = last;
-		for (let i = 0; i < nums.length; i++) ipv4 += nums[i] * 256 ** (3 - i);
-		return [ipv4 >>> 24, (ipv4 >>> 16) & 255, (ipv4 >>> 8) & 255, ipv4 & 255].join(".");
-	}
-
-	function parseHostname(input, special) {
-		if (input === "") return "";
-		if (input.startsWith("[")) { // IPv6 literal (kept lax: no full validation)
-			if (!input.endsWith("]")) throw new TypeError("Invalid URL: bad IPv6 host");
-			return input.toLowerCase();
-		}
-		if (!special) {
-			if (FORBIDDEN_HOST.test(input)) throw new TypeError("Invalid URL: forbidden host code point");
-			return input.toLowerCase();
-		}
-		const domain = percentDecode(input);
-		if (FORBIDDEN_DOMAIN.test(domain)) throw new TypeError("Invalid URL: forbidden domain code point");
-		const ascii = domainToASCII(domain);
-		if (ascii === null || FORBIDDEN_DOMAIN.test(ascii)) throw new TypeError("Invalid URL: invalid domain");
-		if (endsInNumber(ascii)) {
-			const ip = parseIPv4(ascii);
-			if (ip === null) throw new TypeError("Invalid URL: invalid IPv4 address");
-			return ip;
-		}
-		return ascii;
-	}
-
-	function parseAuthority(auth, protocol) {
-		const special = SPECIAL.has(protocol);
-		let username = "", password = "", host = auth;
-		const at = auth.lastIndexOf("@");
-		if (at >= 0) {
-			const ui = auth.slice(0, at);
-			host = auth.slice(at + 1);
-			const c = ui.indexOf(":");
-			if (c < 0) username = ui;
-			else { username = ui.slice(0, c); password = ui.slice(c + 1); }
-		}
-		username = encodeComponent(username, USERINFO_SET);
-		password = encodeComponent(password, USERINFO_SET);
-		let hostname = host, port = "";
-		if (host.startsWith("[")) { // IPv6 literal
-			const end = host.indexOf("]");
-			if (end < 0) throw new TypeError("Invalid URL: bad IPv6 host");
-			hostname = host.slice(0, end + 1);
-			const rest = host.slice(end + 1);
-			if (rest.startsWith(":")) port = rest.slice(1);
-		} else {
-			const c = host.lastIndexOf(":");
-			if (c >= 0) { hostname = host.slice(0, c); port = host.slice(c + 1); }
-		}
-		if (port && (!/^[0-9]+$/.test(port) || Number(port) > 65535)) throw new TypeError("Invalid URL: bad port");
-		if (port) port = String(Number(port)); // canonicalize leading zeros
-		if (special && protocol !== "file:" && hostname === "") throw new TypeError("Invalid URL: missing host");
-		hostname = parseHostname(hostname, special);
-		if (protocol === "file:" && hostname === "localhost") hostname = ""; // WHATWG file host rule
-		return { username, password, hostname, port };
-	}
-
-	// normalizePath resolves "." and ".." segments (including their %2e
-	// escapes) while PRESERVING empty segments, per the URL Standard.
-	function normalizePath(path) {
-		if (!path.startsWith("/")) return path;
-		const segs = path.split("/").slice(1);
-		const out = [];
-		for (let i = 0; i < segs.length; i++) {
-			const dots = segs[i].replace(/%2e/gi, ".");
-			if (dots === ".") { if (i === segs.length - 1) out.push(""); continue; }
-			if (dots === "..") { out.pop(); if (i === segs.length - 1) out.push(""); continue; }
-			out.push(segs[i]);
-		}
-		return "/" + out.join("/");
-	}
-
-	// mapSlashes: for special schemes "\" is an alias for "/" everywhere
-	// before the query/fragment (authority separator and path separator).
-	function mapSlashes(s) {
-		const q = s.search(/[?#]/);
-		if (q < 0) return s.replace(/\\/g, "/");
-		return s.slice(0, q).replace(/\\/g, "/") + s.slice(q);
-	}
-
-	// splitURLBody splits "path?query#fragment" (no authority in the input).
-	function splitURLBody(s) {
-		const m = /^([^?#]*)(\?[^#]*)?(#[\s\S]*)?$/.exec(s);
-		return { path: m[1] || "", search: m[2] || "", hash: m[3] || "" };
-	}
-
-	function encodeSearch(s, special) {
-		if (s === "") return "";
-		return "?" + encodeComponent(s.slice(1), special ? SPECIAL_QUERY_SET : QUERY_SET);
-	}
-	function encodeHash(s) {
-		if (s === "") return "";
-		return "#" + encodeComponent(s.slice(1), FRAGMENT_SET);
-	}
+	// The URL interface. Every algorithm behind it — parsing, host parsing,
+	// percent-encoding, the setters' state overrides — is host-side in Go, where
+	// it is the state machine the URL Standard defines and is checked directly
+	// against the standard's own test data. What is left here is the shape of the
+	// interface: brand checks, coercion, the live searchParams object, and
+	// keeping the component cache in step.
+	const urlOK = (r) => {
+		if (r && r.__urlError) throw new TypeError(r.message);
+		return r;
+	};
+	// URL text crosses to the host as UTF-8 bytes, not as a string: the string
+	// bridge stops at the first NUL, and a NUL in a URL is something the standard
+	// has rules for ("\u0000http://h/" trims it, "http://a\u0000b/" fails) — none
+	// of which can run on an input that was already cut short.
+	const urlBytes = (s) => new TextEncoder().encode(String(s));
 
 	class URL {
 		constructor(url, base) {
-			// WHATWG preprocessing: trim C0-control/space from both ends, then
-			// strip every ASCII tab / CR / LF from the remainder.
-			url = String(url).replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "").replace(/[\t\n\r]/g, "");
-			let b = null;
-			if (base !== undefined) b = base instanceof URL ? base : new URL(String(base));
-			const sm = SCHEME_RE.exec(url);
-			if (!sm && !b) throw new TypeError(`Invalid URL: ${url}`);
-			if (sm) {
-				const protocol = sm[1].toLowerCase() + ":";
-				const special = SPECIAL.has(protocol);
-				let rest = special ? mapSlashes(sm[2]) : sm[2];
-				if (special && protocol !== "file:" && b && b._protocol === protocol && !rest.startsWith("//")) {
-					// "http:foo" with an http base is a relative reference (WHATWG
-					// special relative or authority state).
-					this._parseRelative(rest, b);
-				} else if (special && protocol !== "file:") {
-					// Special authority: any run of slashes (already \-mapped)
-					// precedes the authority, even zero ("http:example.com").
-					rest = rest.replace(/^\/+/, "");
-					const cut = rest.search(/[/?#]/);
-					this._protocol = protocol;
-					this._setAuthority(cut < 0 ? rest : rest.slice(0, cut), protocol);
-					const body = splitURLBody(cut < 0 ? "" : rest.slice(cut));
-					this._pathname = normalizePath(encodeComponent(body.path || "/", PATH_SET));
-					this._search = encodeSearch(body.search, true);
-					this._hash = encodeHash(body.hash);
-				} else if (protocol === "file:" && rest.startsWith("//")) {
-					// file host: exactly two slashes precede it — "file:///p" has an
-					// EMPTY host and path "/p" (unlike http's ignore-slashes rule).
-					this._protocol = protocol;
-					const rest2 = rest.slice(2);
-					const cut = rest2.search(/[/?#]/);
-					this._setAuthority(cut < 0 ? rest2 : rest2.slice(0, cut), protocol);
-					const body = splitURLBody(cut < 0 ? "" : rest2.slice(cut));
-					this._pathname = normalizePath(encodeComponent(body.path || "/", PATH_SET));
-					this._search = encodeSearch(body.search, true);
-					this._hash = encodeHash(body.hash);
-				} else if (protocol === "file:") {
-					// file: without authority. With a file: base this is a relative
-					// reference (WHATWG file / file-slash states): inherit the base
-					// host, and resolve a relative path against the base directory.
-					this._protocol = protocol;
-					this._username = ""; this._password = ""; this._port = "";
-					const baseFile = b && b._protocol === "file:";
-					this._hostname = baseFile ? b._hostname : "";
-					const body = splitURLBody(rest);
-					if (body.path.startsWith("/")) {
-						this._pathname = normalizePath(encodeComponent(body.path, PATH_SET));
-						this._search = encodeSearch(body.search, true);
-					} else if (baseFile && body.path === "") {
-						// "file:" / "file:?q" — keep the base path; keep the base
-						// query too unless the reference supplies its own.
-						this._pathname = b._pathname;
-						this._search = body.search !== "" ? encodeSearch(body.search, true) : b._search;
-					} else if (baseFile) {
-						// "file:x" against "file:///dir/y" -> /dir/x (base path is
-						// already encoded — only the new segment gets encoded).
-						const dir = b._pathname.slice(0, b._pathname.lastIndexOf("/") + 1);
-						this._pathname = normalizePath(dir + encodeComponent(body.path, PATH_SET));
-						this._search = encodeSearch(body.search, true);
-					} else {
-						this._pathname = normalizePath(encodeComponent("/" + body.path, PATH_SET));
-						this._search = encodeSearch(body.search, true);
-					}
-					this._hash = encodeHash(body.hash);
-				} else if (rest.startsWith("//")) {
-					// Non-special scheme with an authority.
-					rest = rest.slice(2);
-					const cut = rest.search(/[/?#]/);
-					this._protocol = protocol;
-					this._setAuthority(cut < 0 ? rest : rest.slice(0, cut), protocol);
-					const body = splitURLBody(cut < 0 ? "" : rest.slice(cut));
-					this._pathname = body.path === "" ? "" : normalizePath(encodeComponent(body.path, PATH_SET));
-					this._search = encodeSearch(body.search, false);
-					this._hash = encodeHash(body.hash);
-				} else {
-					// Non-special scheme, opaque or rooted path ("mailto:x", "a:/p").
-					this._protocol = protocol;
-					this._username = ""; this._password = ""; this._hostname = ""; this._port = "";
-					const body = splitURLBody(rest);
-					this._pathname = body.path.startsWith("/")
-						? normalizePath(encodeComponent(body.path, PATH_SET))
-						: body.path; // opaque path: kept as-is
-					this._search = encodeSearch(body.search, false);
-					this._hash = encodeHash(body.hash);
-				}
-			} else {
-				this._parseRelative(SPECIAL.has(b._protocol) ? mapSlashes(url) : url, b);
-			}
-			if (SPECIAL.has(this._protocol) && this._pathname === "") this._pathname = "/";
-			this._searchParams = null;
+			// A URL argument is stringified via its href, so passing a URL as a
+			// base does not depend on toString being the original one.
+			const b = base === undefined ? "" : (base instanceof URL ? base.href : String(base));
+			this._c = urlOK(ops.url_parse(urlBytes(url), urlBytes(b)));
+			this._sp = null;
 		}
-		// _parseRelative resolves a (scheme-less, already \-mapped) reference
-		// against base b, storing canonicalized components.
-		_parseRelative(url, b) {
-			const special = SPECIAL.has(b._protocol);
-			this._protocol = b._protocol;
-			this._username = b._username;
-			this._password = b._password;
-			this._hostname = b._hostname;
-			this._port = b._port;
-			this._hash = "";
-			if (url.startsWith("//")) {
-				// http-family authorities may be preceded by any run of slashes;
-				// file (and non-special) authorities by exactly two.
-				const rest = special && b._protocol !== "file:" ? url.replace(/^\/+/, "") : url.slice(2);
-				const cut = rest.search(/[/?#]/);
-				this._setAuthority(cut < 0 ? rest : rest.slice(0, cut), this._protocol);
-				const body = splitURLBody(cut < 0 ? "" : rest.slice(cut));
-				this._pathname = normalizePath(encodeComponent(body.path || "/", PATH_SET));
-				this._search = encodeSearch(body.search, special);
-				this._hash = encodeHash(body.hash);
-			} else if (url.startsWith("#")) {
-				this._pathname = b._pathname;
-				this._search = b._search;
-				this._hash = encodeHash(url);
-			} else if (url.startsWith("?")) {
-				this._pathname = b._pathname;
-				const sub = /^(\?[^#]*)?(#[\s\S]*)?$/.exec(url);
-				this._search = encodeSearch(sub[1] || "", special);
-				this._hash = encodeHash(sub[2] || "");
-			} else {
-				const body = splitURLBody(url);
-				let path = body.path;
-				if (path.startsWith("/")) {
-					path = normalizePath(encodeComponent(path, PATH_SET));
-					this._search = encodeSearch(body.search, special);
-				} else if (path === "") {
-					// RFC 3986 §5.3: an empty reference path inherits the base path
-					// AND the base query, unless the reference supplies its own query.
-					path = b._pathname;
-					this._search = body.search !== "" ? encodeSearch(body.search, special) : b._search;
-				} else {
-					const dir = b._pathname.slice(0, b._pathname.lastIndexOf("/") + 1);
-					path = normalizePath(dir + encodeComponent(path, PATH_SET));
-					this._search = encodeSearch(body.search, special);
-				}
-				this._pathname = path;
-				this._hash = encodeHash(body.hash);
-			}
+		// _apply runs one setter host-side. A setter the standard says to ignore
+		// comes back with the URL unchanged, so there is nothing to check here.
+		_apply(attr, value) {
+			this._c = urlOK(ops.url_set(urlBytes(this._c.href), attr, urlBytes(value)));
+			// The query may have changed under a live searchParams; re-read it
+			// rather than leaving the two disagreeing.
+			if (this._sp) this._sp._pairs = new URLSearchParams(this._c.search)._pairs;
 		}
-		_setAuthority(auth, protocol) {
-			const a = parseAuthority(auth, protocol);
-			this._username = a.username;
-			this._password = a.password;
-			this._hostname = a.hostname;
-			this._port = a.port === DEFAULT_PORTS[protocol] ? "" : a.port;
-		}
-		get protocol() { return this._protocol; }
-		set protocol(v) {
-			v = String(v).replace(/[\t\n\r]/g, "");
-			const m = /^([a-zA-Z][a-zA-Z0-9+.\-]*):?/.exec(v);
-			if (!m) return;
-			const p = m[1].toLowerCase() + ":";
-			// WHATWG forbids switching between special and non-special schemes.
-			if (SPECIAL.has(p) !== SPECIAL.has(this._protocol)) return;
-			// WHATWG scheme-state overrides: a file: URL with an empty host
-			// cannot change scheme (http requires a host we don't have), and a
-			// URL with credentials or a port cannot become file:.
-			if (this._protocol === "file:" && this._hostname === "" && p !== "file:") return;
-			if (p === "file:" && (this._username !== "" || this._password !== "" || this._port !== "")) return;
-			this._protocol = p;
-			if (this._port === DEFAULT_PORTS[p]) this._port = "";
-		}
-		get username() { return this._username; }
-		set username(v) { this._username = encodeComponent(String(v), USERINFO_SET); }
-		get password() { return this._password; }
-		set password(v) { this._password = encodeComponent(String(v), USERINFO_SET); }
-		get hostname() { return this._hostname; }
-		set hostname(v) {
-			v = String(v).replace(/[\t\n\r]/g, "");
-			// WHATWG setters ignore invalid input (keep the previous value).
-			try {
-				if (v === "" && SPECIAL.has(this._protocol) && this._protocol !== "file:") return;
-				this._hostname = parseHostname(v, SPECIAL.has(this._protocol));
-			} catch { /* ignored */ }
-		}
-		get port() { return this._port; }
-		set port(v) {
-			// WHATWG port parsing: take the leading digit run; ignore the assignment
-			// if there are none (unless clearing) or the value exceeds 65535; blank it
-			// when it equals the scheme's default port.
-			v = String(v);
-			if (v === "") { this._port = ""; return; }
-			const digits = /^\d*/.exec(v)[0];
-			if (digits === "") return; // e.g. "abc" — ignored, like a browser
-			const n = Number(digits);
-			if (n > 65535) return;
-			this._port = String(n) === DEFAULT_PORTS[this._protocol] ? "" : String(n);
-		}
-		get host() { return this._hostname + (this._port ? ":" + this._port : ""); }
-		set host(v) {
-			v = String(v).replace(/[\t\n\r]/g, "");
-			try {
-				const a = parseAuthority(v, this._protocol);
-				this._hostname = a.hostname;
-				if (a.port) this.port = a.port;
-			} catch { /* WHATWG setters ignore invalid input */ }
-		}
-		get pathname() { return this._pathname; }
-		set pathname(v) {
-			v = String(v).replace(/[\t\n\r]/g, "");
-			if (SPECIAL.has(this._protocol)) v = v.replace(/\\/g, "/");
-			// State-override parsing: "?" and "#" do not terminate the path here;
-			// they are percent-encoded along with the rest of the path set.
-			v = encodeComponent(v, PATH_SET);
-			this._pathname = normalizePath(v.startsWith("/") ? v : "/" + v);
-		}
-		get search() { return this._search; }
-		set search(v) {
-			v = String(v).replace(/[\t\n\r]/g, "");
-			if (v.startsWith("?")) v = v.slice(1);
-			this._search = v === "" ? "" : "?" + encodeComponent(v, SPECIAL.has(this._protocol) ? SPECIAL_QUERY_SET : QUERY_SET);
-			if (this._searchParams) this._searchParams._pairs = new URLSearchParams(this._search)._pairs;
-		}
-		get hash() { return this._hash; }
-		set hash(v) {
-			v = String(v).replace(/[\t\n\r]/g, "");
-			if (v.startsWith("#")) v = v.slice(1);
-			this._hash = v === "" ? "" : "#" + encodeComponent(v, FRAGMENT_SET);
-		}
-		get origin() {
-			if (SPECIAL.has(this._protocol)) return `${this._protocol}//${this.host}`;
-			return "null";
-		}
+		get href() { return this._c.href; }
+		set href(v) { this._c = urlOK(ops.url_parse(urlBytes(v), urlBytes(""))); this._sp = null; }
+		get protocol() { return this._c.protocol; }
+		set protocol(v) { this._apply("protocol", v); }
+		get username() { return this._c.username; }
+		set username(v) { this._apply("username", v); }
+		get password() { return this._c.password; }
+		set password(v) { this._apply("password", v); }
+		get host() { return this._c.host; }
+		set host(v) { this._apply("host", v); }
+		get hostname() { return this._c.hostname; }
+		set hostname(v) { this._apply("hostname", v); }
+		get port() { return this._c.port; }
+		set port(v) { this._apply("port", v); }
+		get pathname() { return this._c.pathname; }
+		set pathname(v) { this._apply("pathname", v); }
+		get search() { return this._c.search; }
+		set search(v) { this._apply("search", v); }
+		get hash() { return this._c.hash; }
+		set hash(v) { this._apply("hash", v); }
+		get origin() { return this._c.origin; }
 		get searchParams() {
-			if (!this._searchParams) {
-				this._searchParams = new URLSearchParams(this._search);
-				this._searchParams._url = this;
+			if (!this._sp) {
+				this._sp = new URLSearchParams(this._c.search);
+				this._sp._url = this;
 			}
-			return this._searchParams;
-		}
-		get href() {
-			let s = this._protocol;
-			if (this._hostname !== "" || SPECIAL.has(this._protocol)) {
-				s += "//";
-				if (this._username || this._password) {
-					s += this._username;
-					if (this._password) s += ":" + this._password;
-					s += "@";
-				}
-				s += this.host;
-			}
-			return s + this._pathname + this._search + this._hash;
-		}
-		set href(v) {
-			const u = new URL(String(v));
-			for (const k of ["_protocol", "_username", "_password", "_hostname", "_port", "_pathname", "_search", "_hash"]) {
-				this[k] = u[k];
-			}
-			this._searchParams = null;
+			return this._sp;
 		}
 		toString() { return this.href; }
 		toJSON() { return this.href; }
+		static parse(url, base) {
+			try { return new URL(url, base); } catch { return null; }
+		}
 		static canParse(url, base) {
 			try { new URL(url, base); return true; } catch { return false; }
 		}
 	}
+	// URLSearchParams writes back through the search setter, so a change to the
+	// parameters is a change to the URL and goes through the same host path.
+	Object.defineProperty(URL.prototype, "_search", {
+		set(v) { this._c = urlOK(ops.url_set(urlBytes(this._c.href), "search", urlBytes(v))); },
+		configurable: true,
+	});
 	// createObjectURL hands out a blob: URL that names an in-memory Blob. It is
 	// how FileAPI expects a Blob to be read by anything that takes a URL —
 	// fetch, above all — and without it the whole FileAPI/url group could not
