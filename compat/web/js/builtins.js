@@ -2779,10 +2779,14 @@
 			throw corsError("preflight did not allow method " + need.method);
 		}
 		const allowHeaders = splitList(res.headers.get("access-control-allow-headers"));
-		if (!allowHeaders.has("*")) {
-			for (const n of need.headers) {
-				if (!allowHeaders.has(n)) throw corsError("preflight did not allow header " + n);
-			}
+		const wildcard = allowHeaders.has("*");
+		for (const n of need.headers) {
+			if (allowHeaders.has(n)) continue;
+			// The wildcard covers every header EXCEPT Authorization, which must be
+			// named. It is the one header a server can be talked into accepting by
+			// accident, so the standard makes accepting it deliberate.
+			if (wildcard && n !== "authorization") continue;
+			throw corsError("preflight did not allow header " + n);
 		}
 	}
 

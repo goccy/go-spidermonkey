@@ -105,6 +105,10 @@ func handlerFor(rel string) wptHandler {
 		return esLastEventIDHandler
 	case "eventsource/resources/cors.py":
 		return esCORSHandler
+	case "fetch/cross-origin-resource-policy/resources/hello.py":
+		return corpHelloHandler
+	case "fetch/metadata/resources/echo-as-json.py":
+		return secFetchEchoHandler
 	case "xhr/resources/delay.py":
 		return xhrDelayHandler
 	case "xhr/resources/content.py":
@@ -375,8 +379,17 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 			w.Header().Set("Access-Control-Allow-Methods", v)
 		}
 		if token != "" {
+			// ABSENT is not the same as empty: the original stores None when the
+			// preflight carried no Access-Control-Request-Headers, and then omits
+			// the reporting header entirely — which is what the test reads as null.
+			// Storing "" for both made every no-unsafe-header preflight report an
+			// empty string instead.
+			control := "\x00absent"
+			if v, ok := r.Header["Access-Control-Request-Headers"]; ok && len(v) > 0 {
+				control = v[0]
+			}
 			st.put(token, strings.Join([]string{
-				r.Header.Get("Access-Control-Request-Headers"),
+				control,
 				"1",
 				r.Header.Get("Referer"),
 				r.Header.Get("User-Agent"),
@@ -393,7 +406,7 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	// The real request: report what the preflight recorded.
-	controlRequestHeaders, didPreflight, preflightReferrer, preflightUA := "", "0", "", ""
+	controlRequestHeaders, didPreflight, preflightReferrer, preflightUA := "\x00absent", "0", "", ""
 	if token != "" {
 		if v, ok := st.take(token); ok {
 			parts := strings.SplitN(v, "\n", 4)
@@ -410,7 +423,9 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Access-Control-Expose-Headers",
 		"x-did-preflight, x-control-request-headers, x-referrer, x-preflight-referrer, x-origin")
 	w.Header().Set("x-did-preflight", didPreflight)
-	w.Header().Set("x-control-request-headers", controlRequestHeaders)
+	if controlRequestHeaders != "\x00absent" {
+		w.Header().Set("x-control-request-headers", controlRequestHeaders)
+	}
 	w.Header().Set("x-preflight-referrer", preflightReferrer)
 	w.Header().Set("x-referrer", r.Header.Get("Referer"))
 	w.Header().Set("x-origin", r.Header.Get("Origin"))

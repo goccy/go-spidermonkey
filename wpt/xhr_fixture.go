@@ -199,3 +199,41 @@ func xhrHeadersHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	_, _ = io.WriteString(w, strings.Join(out, "\n"))
 	return true
 }
+
+// corpHelloHandler ports fetch/cross-origin-resource-policy/resources/hello.py:
+// a body with the Cross-Origin-Resource-Policy header the query names, which is
+// how every CORP test states the policy it wants tested.
+func corpHelloHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	w.Header().Set("Cross-Origin-Resource-Policy", r.URL.Query().Get("corp"))
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+	_, _ = io.WriteString(w, "hello")
+	return true
+}
+
+// secFetchEchoHandler ports fetch/metadata/resources/echo-as-json.py: it
+// reports the four Sec-Fetch-* headers as JSON, and refuses a preflight whose
+// Sec-Fetch-Mode is not "cors". This runtime sends none of those headers — they
+// describe a browsing context there is none of here — so the tests record that
+// gap rather than a missing fixture.
+func secFetchEchoHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+	if r.Method == http.MethodOptions {
+		if r.Header.Get("Sec-Fetch-Mode") != "cors" {
+			w.WriteHeader(http.StatusForbidden)
+			return true
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		return true
+	}
+	_, _ = fmt.Fprintf(w, `{"dest":%q,"mode":%q,"site":%q,"user":%q}`,
+		r.Header.Get("Sec-Fetch-Dest"), r.Header.Get("Sec-Fetch-Mode"),
+		r.Header.Get("Sec-Fetch-Site"), r.Header.Get("Sec-Fetch-User"))
+	return true
+}
