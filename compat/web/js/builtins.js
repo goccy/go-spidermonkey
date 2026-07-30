@@ -152,14 +152,65 @@
 	const consoleWrite = (level, args) => {
 		ops.console_write(level, formatConsole(args));
 	};
-	globalThis.console = {
-		log: (...a) => consoleWrite(0, a),
-		info: (...a) => consoleWrite(0, a),
-		debug: (...a) => consoleWrite(0, a),
-		warn: (...a) => consoleWrite(1, a),
-		error: (...a) => consoleWrite(1, a),
-		assert: (cond, ...a) => { if (!cond) consoleWrite(1, ["Assertion failed:", ...a]); },
+	// The console namespace, with every operation the standard lists. The
+	// grouping, counting and timing ones keep real state — a count that always
+	// said 1, or a timer that reported nothing, would be a worse answer than the
+	// absence they replace — and the indent that group() establishes is applied
+	// to what is actually written.
+	const groupIndent = { depth: 0 };
+	const counters = new Map();
+	const timers = new Map();
+	const write = (level, args) => {
+		if (groupIndent.depth > 0) consoleWrite(level, ["  ".repeat(groupIndent.depth) + fmtFirst(args), ...args.slice(1)]);
+		else consoleWrite(level, args);
 	};
+	// The indent is prepended to the first argument so a format string keeps its
+	// position relative to the arguments that fill it.
+	const fmtFirst = (args) => (args.length === 0 ? "" : args[0]);
+
+	globalThis.console = {
+		log: (...a) => write(0, a),
+		info: (...a) => write(0, a),
+		debug: (...a) => write(0, a),
+		warn: (...a) => write(1, a),
+		error: (...a) => write(1, a),
+		trace: (...a) => write(1, ["Trace:", ...a]),
+		dir: (...a) => write(0, a),
+		dirxml: (...a) => write(0, a),
+		table: (...a) => write(0, a),
+		assert: (cond, ...a) => { if (!cond) write(1, ["Assertion failed:", ...a]); },
+		clear: () => { groupIndent.depth = 0; },
+		group: (...a) => { if (a.length) write(0, a); groupIndent.depth++; },
+		groupCollapsed: (...a) => { if (a.length) write(0, a); groupIndent.depth++; },
+		groupEnd: () => { if (groupIndent.depth > 0) groupIndent.depth--; },
+		count: (label = "default") => {
+			const key = String(label);
+			const n = (counters.get(key) ?? 0) + 1;
+			counters.set(key, n);
+			write(0, [`${key}: ${n}`]);
+		},
+		countReset: (label = "default") => { counters.set(String(label), 0); },
+		time: (label = "default") => {
+			const key = String(label);
+			if (timers.has(key)) {
+				write(1, [`Timer "${key}" already exists`]);
+				return;
+			}
+			timers.set(key, performance.now());
+		},
+		timeLog: (label = "default", ...a) => {
+			const key = String(label);
+			if (!timers.has(key)) { write(1, [`Timer "${key}" does not exist`]); return; }
+			write(0, [`${key}: ${(performance.now() - timers.get(key)).toFixed(3)}ms`, ...a]);
+		},
+		timeEnd: (label = "default") => {
+			const key = String(label);
+			if (!timers.has(key)) { write(1, [`Timer "${key}" does not exist`]); return; }
+			write(0, [`${key}: ${(performance.now() - timers.get(key)).toFixed(3)}ms`]);
+			timers.delete(key);
+		},
+	};
+	Object.defineProperty(globalThis.console, Symbol.toStringTag, { value: "console", configurable: true });
 
 	// -------------------------------------------------- TextEncoder / TextDecoder
 
@@ -700,14 +751,22 @@
 		const entries = []; // buffered PerformanceEntry objects, in creation order
 		const observers = new Set();
 
+		// Every member here is an IDL attribute, so each lives on the prototype
+		// over a slot. `detail` in particular: it belongs to PerformanceMark and
+		// PerformanceMeasure and must be found in the PROTOTYPE chain, which an
+		// own property set in a constructor never is — and it is null, not absent,
+		// when nothing was supplied.
 		class PerformanceEntry {
-			constructor(name, entryType, startTime, duration, detail) {
-				this.name = name;
-				this.entryType = entryType;
-				this.startTime = startTime;
-				this.duration = duration;
-				if (detail !== undefined) this.detail = detail;
+			constructor(name, entryType, startTime, duration) {
+				this._name = name;
+				this._entryType = entryType;
+				this._startTime = startTime;
+				this._duration = duration;
 			}
+			get name() { return this._name; }
+			get entryType() { return this._entryType; }
+			get startTime() { return this._startTime; }
+			get duration() { return this._duration; }
 			toJSON() {
 				const o = { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
 				if ("detail" in this) o.detail = this.detail;
@@ -716,14 +775,29 @@
 		}
 		class PerformanceMark extends PerformanceEntry {
 			constructor(name, options) {
+				if (options !== null && options !== undefined && typeof options !== "object") {
+					throw new TypeError("PerformanceMark: options must be an object");
+				}
 				const o = options || {};
-				super(String(name), "mark", o.startTime != null ? o.startTime : perfNow(), 0, o.detail);
+				if (o.startTime !== undefined) {
+					const t = Number(o.startTime);
+					if (Number.isNaN(t)) throw new TypeError("PerformanceMark: startTime must be a number");
+					if (t < 0) throw new TypeError("PerformanceMark: startTime must not be negative");
+				}
+				super(String(name), "mark", o.startTime != null ? Number(o.startTime) : perfNow(), 0);
+				// detail is structured-CLONED at construction, so a later mutation of
+				// what was passed is not observable, and a value that cannot be cloned
+				// is reported here rather than at some later read.
+				this._detail = o.detail === undefined ? null : structuredClone(o.detail);
 			}
+			get detail() { return this._detail; }
 		}
 		class PerformanceMeasure extends PerformanceEntry {
 			constructor(name, startTime, duration, detail) {
-				super(String(name), "measure", startTime, duration, detail);
+				super(String(name), "measure", startTime, duration);
+				this._detail = detail === undefined ? null : structuredClone(detail);
 			}
+			get detail() { return this._detail; }
 		}
 		class PerformanceObserverEntryList {
 			constructor(list) { this._list = list; }

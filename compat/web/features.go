@@ -81,7 +81,7 @@ var featureGlobals = map[Feature][]string{
 	},
 	FeatureTimers:          {"setTimeout", "clearTimeout", "setInterval", "clearInterval", "queueMicrotask"},
 	FeatureStructuredClone: {"structuredClone"},
-	FeatureMessaging:       {"MessageChannel", "MessagePort"},
+	FeatureMessaging:       {"MessageChannel", "MessagePort", "BroadcastChannel"},
 	FeatureXMLHttpRequest:  {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
 	FeatureWebSocket:       {"WebSocket", "CloseEvent"},
 	FeatureEventSource:     {"EventSource"},
