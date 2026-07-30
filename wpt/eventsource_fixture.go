@@ -108,3 +108,26 @@ func esCORSHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	w.WriteHeader(http.StatusNotFound)
 	return true
 }
+
+// xhrDelayHandler ports xhr/resources/delay.py: it answers after the requested
+// number of milliseconds. Several XHR tests use it to make a request that is
+// still outstanding when a timeout or an abort fires; without it the request
+// 404s at once and the test races its own timer. The wait is abandoned as soon
+// as the client goes away, so a test that asks for twenty seconds and aborts
+// after five milliseconds costs five milliseconds.
+func xhrDelayHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	ms, err := strconv.ParseFloat(r.URL.Query().Get("ms"), 64)
+	if err != nil {
+		ms = 500
+	}
+	select {
+	case <-time.After(time.Duration(ms) * time.Millisecond):
+	case <-r.Context().Done():
+		return true
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "YO")
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = w.Write([]byte("TEST_DELAY"))
+	return true
+}

@@ -105,6 +105,33 @@ func handlerFor(rel string) wptHandler {
 		return esLastEventIDHandler
 	case "eventsource/resources/cors.py":
 		return esCORSHandler
+	case "xhr/resources/delay.py":
+		return xhrDelayHandler
+	case "xhr/resources/content.py":
+		return xhrContentHandler
+	case "xhr/resources/access-control-basic-allow.py":
+		return xhrAllowOriginHandler
+	case "xhr/resources/access-control-basic-allow-star.py":
+		return xhrAllowStarHandler
+	case "xhr/resources/corsenabled.py":
+		return xhrCORSEnabledHandler
+	case "xhr/resources/redirect-cors.py":
+		return xhrRedirectCORSHandler
+	case "xhr/resources/reset-token.py":
+		return xhrResetTokenHandler
+	case "xhr/resources/echo-content-cors.py":
+		return xhrEchoContentCORSHandler
+	case "xhr/resources/bad-chunk-encoding.py":
+		return xhrBadChunkEncodingHandler
+	// These are the same fixtures fetch/api uses, under xhr's own resources.
+	case "xhr/resources/status.py":
+		return statusHandler
+	case "xhr/resources/redirect.py":
+		return redirectHandler
+	case "xhr/resources/trickle.py":
+		return trickleHandler
+	case "xhr/resources/dump-authorization-header.py":
+		return dumpAuthorizationHandler
 	}
 	return nil
 }
