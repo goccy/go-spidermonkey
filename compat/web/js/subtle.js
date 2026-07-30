@@ -196,6 +196,8 @@
 		"ED448": ["sign", "verify"],
 		"X448": ["deriveKey", "deriveBits"],
 		"SHA-1": [], "SHA-256": [], "SHA-384": [], "SHA-512": [],
+		"TURBOSHAKE128": [], "TURBOSHAKE256": [], KT128: [], KT256: [],
+		"SHA3-256": [], "SHA3-384": [], "SHA3-512": [], CSHAKE128: [], CSHAKE256: [],
 		"AES-CBC": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
@@ -234,6 +236,10 @@
 		"HMAC", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
 		"HKDF", "PBKDF2",
 		"CHACHA20-POLY1305", "KMAC128", "KMAC256", "AES-OCB",
+		"TURBOSHAKE128", "TURBOSHAKE256", "KT128", "KT256",
+		// The digest-only algorithms. They are names an operation can be asked for,
+		// so they belong here even though no key is ever made for them.
+		"SHA3-256", "SHA3-384", "SHA3-512", "CSHAKE128", "CSHAKE256",
 		"ML-DSA-44", "ML-DSA-65", "ML-DSA-87",
 	]);
 
@@ -565,9 +571,27 @@
 
 	const subtle = {
 		async digest(alg, data) {
-			// cSHAKE is an extendable-output function: the caller names the digest
-			// length rather than taking one the algorithm fixes.
-			const name = algName(alg).toUpperCase();
+			// The name is read ONCE: the suite makes it a getter that detaches the
+			// data buffer, so a second read runs that side effect a second time.
+			const declared = algName(alg);
+			// A missing name is a TypeError — the request is malformed — and not the
+			// NotSupportedError that an algorithm this runtime lacks would get.
+			if (declared === undefined || declared === null || declared === "") {
+				throw new TypeError("Failed to execute 'digest': the algorithm has no name");
+			}
+			const name = String(declared).toUpperCase();
+			if (name === "TURBOSHAKE128" || name === "TURBOSHAKE256") {
+				// The domain separation byte is the caller's; 0x1F is the default the
+				// RFC assigns when nothing else claims one.
+				const d = alg.domainSeparation === undefined ? 0x1f : Number(alg.domainSeparation);
+				return toBuf(subtleFail(ops.subtle_turboshake(
+					name === "TURBOSHAKE128" ? 128 : 256, d, toU8(data), Number(alg.outputLength))));
+			}
+			if (name === "KT128" || name === "KT256") {
+				const custom = alg.customization === undefined ? new Uint8Array(0) : toU8(alg.customization);
+				return toBuf(subtleFail(ops.subtle_kangarootwelve(
+					name === "KT128" ? 128 : 256, toU8(data), custom, Number(alg.outputLength))));
+			}
 			if (name === "CSHAKE128" || name === "CSHAKE256") {
 				const bits = alg.outputLength === undefined ? (name === "CSHAKE128" ? 256 : 512) : Number(alg.outputLength);
 				const custom = alg.customization === undefined ? new Uint8Array(0) : toU8(alg.customization);

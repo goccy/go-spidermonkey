@@ -107,8 +107,10 @@ func (s *subtleAPI) opKMAC(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	}
 	custom, _ := argBytes(args[3])
 	outBits := intArg(args[4])
-	if outBits <= 0 || outBits%8 != 0 {
-		return subtleErr(errOperation, "KMAC length must be a positive multiple of 8"), nil
+	// Zero is a legal length: a zero-byte digest is what an extendable-output
+	// function returns when asked for no output.
+	if outBits < 0 || outBits%8 != 0 {
+		return subtleErr(errOperation, "KMAC length must be a non-negative multiple of 8"), nil
 	}
 	if outBits/8 > maxSubtleKDFBytes {
 		return subtleErr(errOperation, "KMAC length is too large"), nil
@@ -135,8 +137,10 @@ func (s *subtleAPI) opCShake(cfg spidermonkey.Config, args []spidermonkey.Value)
 	}
 	custom, _ := argBytes(args[2])
 	outBits := intArg(args[3])
-	if outBits <= 0 || outBits%8 != 0 {
-		return subtleErr(errOperation, "cSHAKE length must be a positive multiple of 8"), nil
+	// Zero is a legal length: a zero-byte digest is what an extendable-output
+	// function returns when asked for no output.
+	if outBits < 0 || outBits%8 != 0 {
+		return subtleErr(errOperation, "cSHAKE length must be a non-negative multiple of 8"), nil
 	}
 	if outBits/8 > maxSubtleKDFBytes {
 		return subtleErr(errOperation, "cSHAKE length is too large"), nil

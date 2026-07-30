@@ -527,6 +527,8 @@ func (s *subtleAPI) ops2() map[string]spidermonkey.Func {
 		"subtle_chacha":            s.opChaChaSeal,
 		"subtle_kmac":              s.opKMAC,
 		"subtle_aes_ocb":           s.opAESOCB,
+		"subtle_turboshake":        s.opTurboSHAKE,
+		"subtle_kangarootwelve":    s.opKangarooTwelve,
 		"subtle_cshake":            s.opCShake,
 		"subtle_ed448_generate":    s.opEd448Generate,
 		"subtle_ed448_import":      s.opEd448Import,
