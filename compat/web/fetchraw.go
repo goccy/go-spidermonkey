@@ -26,8 +26,12 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"strconv"
+	"strings"
 )
 
 // isCTLNotLWS mirrors the rule httpguts.ValidHeaderFieldValue applies: a
@@ -123,11 +127,87 @@ func (t *permissiveTransport) roundTripRaw(req *http.Request) (*http.Response, e
 		return nil, fmt.Errorf("write request: %w", err)
 	}
 	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, req)
+	resp, err := readResponsePermissive(br, req)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 	resp.Body = &closingBody{Reader: bufio.NewReader(resp.Body), conn: conn, body: resp.Body}
 	return resp, nil
+}
+
+// readResponsePermissive parses a response the way http.ReadResponse would,
+// except that it does not validate header values. ReadResponse goes through
+// net/textproto, whose ReadMIMEHeader rejects a control character in a value —
+// so a server that echoes back the header this path exists to SEND could not be
+// read. The framing is still the standard library's: a chunked body is decoded by
+// httputil, and a counted one by io.LimitReader.
+func readResponsePermissive(br *bufio.Reader, req *http.Request) (*http.Response, error) {
+	statusLine, err := readCRLFLine(br)
+	if err != nil {
+		return nil, err
+	}
+	proto, rest, ok := strings.Cut(statusLine, " ")
+	if !ok {
+		return nil, fmt.Errorf("bad status line %q", statusLine)
+	}
+	codeText, reason, _ := strings.Cut(rest, " ")
+	code, err := strconv.Atoi(codeText)
+	if err != nil {
+		return nil, fmt.Errorf("bad status code %q", codeText)
+	}
+	header := http.Header{}
+	for {
+		line, err := readCRLFLine(br)
+		if err != nil {
+			return nil, err
+		}
+		if line == "" {
+			break
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, fmt.Errorf("bad header line %q", line)
+		}
+		// Only the optional whitespace around the value is removed. Whatever else
+		// the value holds is the value — that is the whole point of this path.
+		header.Add(strings.TrimSpace(name), strings.Trim(value, " \t"))
+	}
+	resp := &http.Response{
+		Status:     codeText + " " + reason,
+		StatusCode: code,
+		Proto:      proto,
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+		Request:    req,
+	}
+	switch {
+	case strings.EqualFold(header.Get("Transfer-Encoding"), "chunked"):
+		resp.ContentLength = -1
+		resp.TransferEncoding = []string{"chunked"}
+		resp.Body = io.NopCloser(httputil.NewChunkedReader(br))
+	case header.Get("Content-Length") != "":
+		n, cerr := strconv.ParseInt(header.Get("Content-Length"), 10, 64)
+		if cerr != nil {
+			return nil, fmt.Errorf("bad Content-Length %q", header.Get("Content-Length"))
+		}
+		resp.ContentLength = n
+		resp.Body = io.NopCloser(io.LimitReader(br, n))
+	default:
+		// No framing: the body runs to end of connection, which is why this path
+		// does not reuse the connection.
+		resp.ContentLength = -1
+		resp.Body = io.NopCloser(br)
+	}
+	return resp, nil
+}
+
+// readCRLFLine reads one header line and returns it without its terminator.
+func readCRLFLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }

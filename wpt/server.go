@@ -79,8 +79,16 @@ func StartServer(root string) (*Server, error) {
 	})
 	srv.Server = &http.Server{Handler: handler}
 	srv.alt = &http.Server{Handler: handler}
-	go srv.Serve(ln)
-	go srv.alt.Serve(altLn)
+	// A request whose header values net/http would reject on arrival is answered
+	// by the harness itself, through the same handler. See permissive.go.
+	answer := func(conn net.Conn, req *http.Request, head []byte) bool {
+		w := &permissiveWriter{header: http.Header{}}
+		handler.ServeHTTP(w, req)
+		defer conn.Close()
+		return w.writeTo(conn) == nil
+	}
+	go srv.Serve(&permissiveListener{Listener: ln, serve: answer})
+	go srv.alt.Serve(&permissiveListener{Listener: altLn, serve: answer})
 	return srv, nil
 }
 
