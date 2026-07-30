@@ -720,8 +720,23 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 	if err := source.DefineFunc("cancel", st.cancel); err != nil {
 		return nil, err
 	}
-	bodyV, err := a.streamCls.New(source)
+	// highWaterMark 0: nothing is read from the connection until a consumer
+	// asks. At the default of 1 the stream pulls as soon as it is constructed —
+	// which claims the body for the STREAM before the response has even been
+	// handed to the caller, so a later res.text() found it already consumed.
+	strategy, err := js.NewObject()
+	if err != nil {
+		source.Free()
+		return nil, err
+	}
+	if err := strategy.Set("highWaterMark", spidermonkey.ValueOf(0)); err != nil {
+		source.Free()
+		strategy.Free()
+		return nil, err
+	}
+	bodyV, err := a.streamCls.New(source, strategy)
 	source.Free()
+	strategy.Free()
 	if err != nil {
 		return nil, err
 	}

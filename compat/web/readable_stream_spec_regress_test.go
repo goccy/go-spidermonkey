@@ -252,8 +252,13 @@ func TestPipeToAbortMidPipe(t *testing.T) {
 			const written = [];
 			let ctrl;
 			// The source enqueues one chunk and then stays pending forever — only
-			// the signal can end the pipe.
-			const rs = new ReadableStream({ start(c) { ctrl = c; c.enqueue("first"); } });
+			// the signal can end the pipe. Its cancel is declared UP FRONT: the
+			// standard reads an underlying source's members once, when the stream is
+			// constructed, so assigning one afterwards is not observable.
+			const rs = new ReadableStream({
+				start(c) { ctrl = c; c.enqueue("first"); },
+				cancel() { sourceCancelled = true; },
+			});
 			const ac = new AbortController();
 			const ws = new WritableStream({
 				write(chunk) {
@@ -262,8 +267,6 @@ func TestPipeToAbortMidPipe(t *testing.T) {
 				},
 				abort() { destAborted = true; },
 			});
-			// Wrap the source cancel via a stream the pipe actually owns.
-			rs._source.cancel = () => { sourceCancelled = true; };
 			try { await rs.pipeTo(ws, { signal: ac.signal }); __c.result = "resolved"; }
 			catch (e) { __c.result = (e && e.name) || e.constructor.name; }
 			__c.written = written.join(",");
@@ -491,21 +494,29 @@ func TestQueuingStrategySizeValidation(t *testing.T) {
 			__r.invalid = "no-throw";
 		} catch (e) { __r.invalid = e.name; }
 
-		// size() must run on the waiter fast path too: a throwing size() errors
-		// the stream even when a read is already pending.
+		// A chunk handed straight to a WAITING read is not measured: the standard
+		// fulfils the read request and never reaches the size algorithm, so a
+		// throwing size() is not called and the read succeeds. Only a chunk that
+		// actually goes on the queue is sized.
 		const rs2 = new ReadableStream(
 			{ start(c) { globalThis.__c2 = c; } },
 			{ highWaterMark: 4, size() { throw new Error("size-boom"); } });
 		const rd = rs2.getReader();
-		const p = rd.read().catch((e) => { __r.fastPathErr = e.message; });
+		const p = rd.read().then((r) => { __r.fastPathValue = r.value; }, (e) => { __r.fastPathErr = e.message; });
 		try { __c2.enqueue("x"); __r.fastPath = "no-throw"; } catch (e) { __r.fastPath = e.message; }
+		// The NEXT chunk has no read waiting for it, so it is queued and measured —
+		// and the throwing size() errors the stream then.
+		try { __c2.enqueue("y"); __r.queued = "no-throw"; } catch (e) { __r.queued = e.message; }
 	`)
 	drainWeb(t, w)
 	if got := evalString(t, js, `__r.invalid`); got != "RangeError" {
 		t.Errorf("invalid byteLength size = %q, want RangeError", got)
 	}
-	if got := evalString(t, js, `__r.fastPath + "|" + __r.fastPathErr`); got != "size-boom|size-boom" {
-		t.Errorf("throwing size() on fast path = %q, want size-boom|size-boom", got)
+	if got := evalString(t, js, `__r.fastPath + "|" + __r.fastPathValue`); got != "no-throw|x" {
+		t.Errorf("chunk handed to a waiting read = %q, want no-throw|x (size is not called)", got)
+	}
+	if got := evalString(t, js, `__r.queued`); got != "size-boom" {
+		t.Errorf("throwing size() on a queued chunk = %q, want size-boom", got)
 	}
 }
 

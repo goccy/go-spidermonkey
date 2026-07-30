@@ -29,6 +29,9 @@ import (
 	"github.com/goccy/go-spidermonkey/compat/internal/eventloop"
 )
 
+//go:embed js/streams.js
+var streamsJS string
+
 //go:embed js/builtins.js
 var builtinsJS string
 
@@ -162,7 +165,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
