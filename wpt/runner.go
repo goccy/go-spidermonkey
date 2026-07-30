@@ -55,6 +55,84 @@ type FileResult struct {
 	Took     time.Duration `json:"-"`
 }
 
+// Case is one runnable test: WPT expands a single source file into one test per
+// target scope and per declared variant, and each of those is a separate result.
+// Running the file once — which is what this harness used to do — measures a
+// fraction of what a browser measures and cannot be compared with it.
+type Case struct {
+	Path    string // suite-relative source file
+	Scope   string // "window", "dedicatedworker", "sharedworker", "serviceworker"
+	Variant string // the "?..." a META: variant= line declares, or ""
+}
+
+// Key is how a case is named in a report and in the expectations file. It is the
+// URL a browser would load, which is what makes it recognisable.
+func (c Case) Key() string {
+	k := c.Path + c.Variant
+	if c.Scope != "" && c.Scope != "window" {
+		k += " [" + c.Scope + "]"
+	}
+	return k
+}
+
+// scopesFor returns the scopes a file declares that this runtime can host. The
+// default, when no META: global line is given, is window plus dedicatedworker.
+func scopesFor(m meta) []string {
+	declared := m.globals
+	if len(declared) == 0 {
+		declared = []string{"window", "dedicatedworker"}
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, g := range declared {
+		switch g {
+		case "window":
+			add("window")
+		case "worker":
+			// "worker" is shorthand for all three worker scopes. Only the
+			// dedicated one is hosted here; the others need a real Worker.
+			add("dedicatedworker")
+		case "dedicatedworker":
+			add("dedicatedworker")
+		case "default", "!default":
+			add("window")
+			add("dedicatedworker")
+		case "sharedworker", "serviceworker", "shadowrealm", "jsshell":
+			// Not hostable here yet. Left out rather than counted as a pass.
+		}
+	}
+	return out
+}
+
+// Expand turns source files into the cases a browser would run: the cross
+// product of the scopes and the variants each file declares.
+func Expand(root string, paths []string) ([]Case, error) {
+	var out []Case
+	for _, p := range paths {
+		b, err := os.ReadFile(path.Join(root, p))
+		if err != nil {
+			return nil, err
+		}
+		m := parseMeta(string(b))
+		variants := m.variant
+		if len(variants) == 0 {
+			variants = []string{""}
+		}
+		for _, scope := range scopesFor(m) {
+			for _, v := range variants {
+				out = append(out, Case{Path: p, Scope: scope, Variant: v})
+			}
+		}
+	}
+	return out, nil
+}
+
 // Options configures a run.
 type Options struct {
 	// Root is the WPT checkout root (the directory containing ./resources).
@@ -124,24 +202,6 @@ func parseMeta(src string) meta {
 	return m
 }
 
-// scopeSupported reports whether this embedding can host the file's target
-// scopes. A file limited to window/shadowrealm scopes has no runnable form
-// here; the default (no META: global) is window+dedicatedworker, and the
-// worker half is exactly what compat/web implements.
-func scopeSupported(m meta) bool {
-	if len(m.globals) == 0 {
-		return true // default window,dedicatedworker — the worker half applies
-	}
-	for _, g := range m.globals {
-		switch g {
-		case "worker", "dedicatedworker", "sharedworker", "serviceworker", "default", "!default":
-			return true
-		}
-	}
-	// window-only or shadowrealm-only.
-	return false
-}
-
 // preludeFor establishes the scope the suite is written against, without
 // faking a DOM: testharness.js detects the absence of Window and uses its
 // ShellTestEnvironment, `self` is the spelling .any.js files use for the
@@ -149,13 +209,14 @@ func scopeSupported(m meta) bool {
 // a fixture resolves against. Supplying a base URL is an environment
 // property, not an API the compat layer is missing — a worker has one too —
 // so fetch is wrapped here rather than changed there.
-func preludeFor(baseURL, rel string) string {
+func preludeFor(baseURL, rel, scope string) string {
 	href := baseURL + rel
+	isWindow := scope == "window"
 	return `
 globalThis.self = globalThis;
 globalThis.GLOBAL = {
-  isWindow: () => false,
-  isWorker: () => true,
+  isWindow: () => ` + fmt.Sprint(isWindow) + `,
+  isWorker: () => ` + fmt.Sprint(!isWindow) + `,
   isShadowRealm: () => false,
 };
 ` + func() string {
@@ -237,9 +298,10 @@ func importScriptsShimFor(loaded []string) string {
 }
 
 // Run executes one .any.js test file and returns its per-subtest verdicts.
-func Run(ctx context.Context, opts Options, rel string) FileResult {
+func Run(ctx context.Context, opts Options, c Case) FileResult {
+	rel := c.Path
 	start := time.Now()
-	res := FileResult{Path: rel}
+	res := FileResult{Path: c.Key()}
 	timeout := opts.Timeout
 	if timeout == 0 {
 		timeout = DefaultTimeout
@@ -256,11 +318,6 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 	}
 	src := substituteWPT(rel, srcBytes, opts.SubVars)
 	m := parseMeta(string(src))
-	if !scopeSupported(m) {
-		res.Harness = "SKIP"
-		res.Message = "scopes " + strings.Join(m.globals, ",") + " need a DOM window"
-		return res
-	}
 	if m.long {
 		timeout *= 2
 	}
@@ -296,7 +353,7 @@ func Run(ctx context.Context, opts Options, rel string) FileResult {
 	// prelude, the harness, the completion collector, the META scripts, then
 	// the test itself. They run as separate evaluations so a syntax error in
 	// one is reported against that file.
-	steps := []struct{ name, src string }{{"<prelude>", preludeFor(opts.BaseURL, rel)}}
+	steps := []struct{ name, src string }{{"<prelude>", preludeFor(opts.BaseURL, rel+c.Variant, c.Scope)}}
 	harness, err := os.ReadFile(path.Join(opts.Root, "resources/testharness.js"))
 	if err != nil {
 		res.Harness, res.Message = string(StatusError), "testharness.js: "+err.Error()

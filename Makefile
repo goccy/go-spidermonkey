@@ -28,10 +28,17 @@ NODE_SUITE_DIRS := test/common test/parallel test/es-module test/fixtures
 
 WPT_SUITE_REPO ?= https://github.com/web-platform-tests/wpt.git
 WPT_SUITE_REV  ?= f4b24b414258bfdca10fbb0f8d646b97fc6657ec
-WPT_SUITE_DIRS := resources common url encoding streams WebCryptoAPI console \
-                  hr-time performance-timeline FileAPI urlpattern fetch dom \
-                  html/webappapis service-workers/service-worker/resources \
-                  compression user-timing webmessaging mimesniff
+# The union of what Bun and Deno support, which is the first milestone: every
+# directory either of them covers is covered here, whether or not this runtime
+# implements the API yet. A directory left out because the API is missing is a
+# gap that stops being visible, which is exactly backwards — the suite is the
+# specification of what to support, not a report on what already works.
+WPT_SUITE_DIRS := resources common interfaces \
+                  url encoding streams WebCryptoAPI console hr-time \
+                  performance-timeline FileAPI urlpattern fetch dom html \
+                  compression user-timing webmessaging mimesniff \
+                  css eventsource schema service-workers wasm web-locks \
+                  webidl webstorage websockets workers xhr
 
 BABEL_SUITE_REPO ?= https://github.com/babel/babel.git
 BABEL_SUITE_REV  ?= 6d0dbd2a92aefe03cf1f7d49ebb39acd56e11c72   # v8.0.4

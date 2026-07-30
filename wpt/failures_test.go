@@ -32,6 +32,10 @@ func TestWPTFailureBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cases, err := wpt.Expand(suiteDir, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv, err := wpt.StartServer(suiteDir)
 	if err != nil {
 		t.Fatal(err)
@@ -44,8 +48,8 @@ func TestWPTFailureBuckets(t *testing.T) {
 	grep := os.Getenv("WPT_BUCKETS_GREP")
 	counts := map[string]int{}
 	failing := 0
-	for _, p := range paths {
-		r := wpt.Run(context.Background(), wpt.Options{Root: suiteDir, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}, p)
+	for _, c := range cases {
+		r := wpt.Run(context.Background(), wpt.Options{Root: suiteDir, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}, c)
 		for _, s := range r.Subtests {
 			if s.Status == wpt.StatusPass || !strings.Contains(s.Message, grep) {
 				continue

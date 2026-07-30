@@ -48,36 +48,50 @@ const (
 	expectationsFile = "expectations.json"
 )
 
-// DefaultDirs are the WPT directories whose APIs compat/web implements. Adding
-// a capability adds its directory here; nothing is listed that could only ever
-// report "not implemented".
+// DefaultDirs are the WPT directories this runtime is measured against: the
+// union of what Bun and Deno cover, plus anything else already implemented here.
+//
+// The list is deliberately NOT "the directories whose APIs we implement". That
+// was the earlier rule, and it inverted what a conformance run is for: a missing
+// API had no failing tests, so the score went up by not implementing something,
+// and the number was quoted as "WPT" while covering a subset chosen to flatter
+// it. A directory where everything fails is the point — it is the statement of
+// work remaining.
+//
+// Top-level directories are named, not narrower paths, so that a subdirectory
+// added upstream is picked up rather than silently missed.
 var DefaultDirs = []string{
-	"url",
-	"encoding",
-	"streams",
-	"WebCryptoAPI",
+	// Covered by both Bun and Deno.
 	"console",
-	"hr-time",
-	"performance-timeline",
-	"FileAPI",
-	"urlpattern",
-	"fetch/api",
-	"fetch/data-urls",
-	"dom/events",
-	"dom/abort",
-	"html/webappapis/microtask-queuing",
-	"html/webappapis/timers",
-	"html/webappapis/structured-clone",
-	"html/webappapis/atob",
-	// Directories Deno also tracks whose APIs this embedding claims to provide.
-	// They are listed even where the score is currently zero: a capability that
-	// is documented as present and scores nothing is exactly what a conformance
-	// run exists to surface (CompressionStream and MessageChannel turned out to
-	// live only in compat/nodejs, though both are web APIs).
 	"compression",
+	"dom",
+	"encoding",
+	"fetch",
+	"FileAPI",
+	"hr-time",
+	"html",
+	"mimesniff",
+	"streams",
+	"url",
+	"urlpattern",
 	"user-timing",
 	"webmessaging",
-	"mimesniff",
+	"WebCryptoAPI",
+	// Covered by Deno, not yet implemented here. Listed because that is what
+	// makes the gap visible.
+	"css",
+	"eventsource",
+	"schema",
+	"service-workers",
+	"wasm",
+	"web-locks",
+	"webidl",
+	"webstorage",
+	"websockets",
+	"workers",
+	"xhr",
+	// Implemented here; Deno does not track it.
+	"performance-timeline",
 }
 
 func TestWPTSuite(t *testing.T) {
@@ -100,18 +114,24 @@ func TestWPTSuite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One source file becomes one case per target scope and per variant, which is
+	// what a browser runs. See wpt.Expand.
+	cases, err := wpt.Expand(root, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
 	filter := os.Getenv("WPT_FILTER")
 	if filter != "" {
-		var keep []string
-		for _, p := range paths {
-			if strings.Contains(p, filter) {
-				keep = append(keep, p)
+		var keep []wpt.Case
+		for _, c := range cases {
+			if strings.Contains(c.Path, filter) {
+				keep = append(keep, c)
 			}
 		}
-		paths = keep
+		cases = keep
 	}
-	sort.Strings(paths)
-	if len(paths) == 0 {
+	sort.Slice(cases, func(i, j int) bool { return cases[i].Key() < cases[j].Key() })
+	if len(cases) == 0 {
 		t.Fatalf("no tests selected (dirs=%v filter=%q)", dirs, filter)
 	}
 
@@ -124,6 +144,7 @@ func TestWPTSuite(t *testing.T) {
 	defer srv.Close()
 
 	opts := wpt.Options{Root: root, BaseURL: srv.BaseURL(), SubVars: srv.SubVars()}
+	stable := stabilizer(srv.SubVars())
 	if s := os.Getenv("WPT_TIMEOUT"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
@@ -135,23 +156,24 @@ func TestWPTSuite(t *testing.T) {
 	if n, err := strconv.Atoi(os.Getenv("WPT_WORKERS")); err == nil && n > 0 {
 		workers = n
 	}
-	t.Logf("running %d files from %d directories on %d workers", len(paths), len(dirs), workers)
+	t.Logf("running %d cases from %d files in %d directories on %d workers",
+		len(cases), len(paths), len(dirs), workers)
 
-	jobs := make(chan string)
+	jobs := make(chan wpt.Case)
 	results := make(chan wpt.FileResult, workers)
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for p := range jobs {
-				results <- wpt.Run(context.Background(), opts, p)
+			for c := range jobs {
+				results <- wpt.Run(context.Background(), opts, c)
 			}
 		}()
 	}
 	go func() {
-		for _, p := range paths {
-			jobs <- p
+		for _, c := range cases {
+			jobs <- c
 		}
 		close(jobs)
 		wg.Wait()
@@ -171,7 +193,7 @@ func TestWPTSuite(t *testing.T) {
 	done, start := 0, time.Now()
 	for r := range results {
 		if done++; done%100 == 0 {
-			t.Logf("%d/%d files in %v", done, len(paths), time.Since(start).Round(time.Second))
+			t.Logf("%d/%d cases in %v", done, len(cases), time.Since(start).Round(time.Second))
 		}
 		area := topDir(r.Path)
 		s := byArea[area]
@@ -187,8 +209,8 @@ func TestWPTSuite(t *testing.T) {
 			harnessReasons["skip: "+r.Message]++
 		default:
 			s.broken++
-			harnessReasons[r.Harness+": "+bucket(r.Message)]++
-			failures[r.Path] = r.Harness + ": " + bucket(r.Message)
+			harnessReasons[r.Harness+": "+bucket(stable.Replace(r.Message))]++
+			failures[r.Path] = r.Harness + ": " + bucket(stable.Replace(r.Message))
 			continue
 		}
 		var failed []string
@@ -198,7 +220,7 @@ func TestWPTSuite(t *testing.T) {
 				continue
 			}
 			s.fail++
-			failed = append(failed, string(sub.Status)+" "+sub.Name)
+			failed = append(failed, string(sub.Status)+" "+stable.Replace(sub.Name))
 		}
 		if len(failed) > 0 {
 			sort.Strings(failed)
@@ -274,9 +296,9 @@ func TestWPTSuite(t *testing.T) {
 	// Staleness is only meaningful for files this invocation actually RAN: a
 	// narrowed run (WPT_DIRS, WPT_FILTER) must not report every other directory's
 	// expectations as stale.
-	ran := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		ran[p] = true
+	ran := make(map[string]bool, len(cases))
+	for _, c := range cases {
+		ran[c.Key()] = true
 	}
 	for k := range expected {
 		if _, ok := failures[k]; !ok && ran[k] {
@@ -317,6 +339,22 @@ func topDir(p string) string {
 		return parts[0] + "/" + parts[1]
 	}
 	return parts[0]
+}
+
+// stabilizer removes this process's own volatile values from a subtest name or
+// a harness message. The two loopback ports are assigned by the kernel at
+// start-up, and a ".sub." test's subtest name usually carries the URL it
+// fetched — so the name, and any digest of it, differed on every run for a
+// reason that had nothing to do with the outcome, and expectations.json could
+// never be clean. The ports are known structurally (this process assigned
+// them), so each goes back to the token it was substituted from.
+func stabilizer(vars map[string]string) *strings.Replacer {
+	// One token per distinct value, not per variable: ports[http][0],
+	// ports[https][0] and ports[ws][0] are all the same listener here.
+	return strings.NewReplacer(
+		":"+vars["ports[http][0]"], ":{{port}}",
+		":"+vars["ports[http][1]"], ":{{altport}}",
+	)
 }
 
 func bucket(s string) string {

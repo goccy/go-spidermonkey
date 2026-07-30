@@ -1,57 +1,122 @@
-# Plan: reach the level Bun and Deno are held to
+# Plan: reach the level Bun and Deno are held to, then pass all of WPT
 
 The goal is not a number of our own choosing. Bun and Deno are measured against
-the Node.js test suite and the Web Platform Tests, so those are the bar, and
-[external-suites.md](external-suites.md) records what they actually run
-(Deno: 3,411 of 3,786 registered Node tests; 26 WPT directories).
+the Node.js test suite and the Web Platform Tests, so those are the bar. Beyond
+that bar the target is all of WPT; Bun and Deno are the first milestone, not the
+destination.
 
-Everything below is ordered by MEASURED tests unlocked per unit of work, taken
-from the runs in this repository rather than from intuition.
+## What the suite is for
+
+The suite defines what to support. It is not a report on what already works.
+
+This was wrong for a long time, and the wrong version is worth stating so it is
+not reintroduced: the WPT directory list used to be "the directories whose APIs
+compat/web implements", so a directory was added when a capability was added. A
+missing API therefore had no failing tests, and the score went UP by not
+implementing something. That inverts what a conformance run is for. Worse, the
+resulting number was quoted as "WPT", when it covered a subset chosen to
+flatter it.
+
+The list is now the union of what Bun and Deno cover, whether or not this
+runtime implements the API. A directory where everything fails is the point.
 
 ## Where it stands
 
+Measured with the harness in `wpt/`, which runs each `.any.js` / `.worker.js`
+file once. See "What the harness does not run yet" below: the number is not
+comparable to a browser's until that list is empty.
+
 | suite | measured |
 |---|---|
-| WPT | **35,694 / 43,142 subtests = 82.7%** |
-| Node.js | 2,611 tests run, **795 pass = 30.4%** (see the note below) |
+| WPT | **42,591 / 43,401 subtests** in the directories run so far |
+| Node.js | 2,611 tests run, **795 pass = 30.4%** |
 | Babel | 4,170 / 4,189 fixtures = 99.6% |
 | test262 | 52,266 / 53,329 = 98.0% |
 
-The Node figure is a full sharded sweep, and it is the number to quote. It
-lags HEAD: a sweep takes about half an hour, so anything committed after its
-binary was built is measured per module instead. Re-run the sweep before
-quoting a new total rather than adding module deltas to an old one.
+### Against Deno, like for like
 
-WPT by directory, largest first:
+Deno publishes its expectations (`tests/wpt/runner/expectations/`), so its rate
+is computable rather than guessed. Comparing the metric both sides can produce —
+the share of test files with ZERO failing subtests, over the `.any.*` corpus:
 
-| directory | passing |
-|---|---|
-| WebCryptoAPI | 83.8% — and **93.8% on the stable spec** (see below) |
-| mimesniff | 98.6% |
-| compression | 95.6% |
-| url | 81.1% |
-| fetch/data-urls | 78.6% |
-| html/webappapis | 76.9% |
-| FileAPI | 73.3% |
-| dom/events | 80% |
-| user-timing | 70.8% |
-| fetch/api | 65.3% |
-| encoding | 60.2% |
-| streams | 56.1% |
-| urlpattern | 54.9% |
-| webmessaging | 42.9% |
+| | files | zero failures | rate |
+|---|---|---|---|
+| Deno | 2,190 | 1,361 | **62.2%** |
+| this runtime | 564 | 336 | **59.6%** |
 
-WebCryptoAPI splits by whether the spec is stable:
+Per directory, where both cover it:
 
-| | subtests | passing |
+| directory | Deno | here |
 |---|---|---|
-| `.tentative.` files (draft algorithms) | 8,544 | 51.4% |
-| the stable Web Crypto spec | 27,378 | **93.8%** |
+| streams | 90.4% | 37.0% |
+| encoding | 92.4% | 64.9% |
+| FileAPI | 88.9% | 52.5% |
+| user-timing | 95.2% | 69.6% |
+| webmessaging | 80.0% | 40.0% |
+| console | 100% | 57.1% |
+| WebCryptoAPI | 85.8% | 82.9% |
+| fetch | 45.8% | 44.9% |
+| compression | 50.0% | 52.6% |
+| urlpattern | 28.6% | 57.1% |
+| url | 75.9% | 95.8% |
 
-The tentative set is ML-DSA, AES-OCB, KMAC, cSHAKE, X448, Ed448 and
-ChaCha20-Poly1305 — draft algorithms that neither Node nor Deno implements
-either. ML-KEM was the largest of them and is implemented (768 and 1024; Go has
-no 512, and that is reported rather than faked).
+Only `url` and `urlpattern` are ahead. Bun publishes no WPT results, so Bun can
+only be compared by API surface, not by rate.
+
+## The API surface Bun and Deno have and this runtime does not
+
+Measured by probing the globals after `web.Install`:
+
+| API | Bun | Deno | here |
+|---|---|---|---|
+| `WebSocket` | yes | yes | **no** |
+| `Worker`, `SharedWorker` | yes | yes | **no** |
+| `BroadcastChannel` | yes | yes | **no** (compat/nodejs only) |
+| `WebAssembly` | yes | yes | **no** |
+| `localStorage`, `sessionStorage`, `Storage` | no | yes | **no** |
+| `caches`, `CacheStorage` | no | yes | **no** |
+| `navigator` (and `navigator.locks`) | yes | yes | **no** |
+| `EventSource` | no | yes | **no** |
+| `CloseEvent` | yes | yes | **no** |
+| `alert`, `confirm`, `prompt` | yes | yes | **no** |
+| `ShadowRealm` | yes | no | **no** |
+
+## The order of work
+
+Ordered by measured test files unlocked per unit of work.
+
+1. **Harness scope.** Add every directory either Bun or Deno covers, and make
+   the harness run what a browser runs (see below). Until this is done no number
+   here is comparable to theirs.
+2. **`WebSocket`** — 79 files.
+3. **`EventSource`** — 34 files.
+4. **`Worker` / `SharedWorker` / `BroadcastChannel`** — 52 files in `workers`,
+   plus the worker scopes of every `.any.js` that declares one.
+5. **`webstorage`** — `localStorage` / `sessionStorage`.
+6. **`caches`** — the Cache API.
+7. **`web-locks`** — 16 files, via `navigator.locks`.
+8. **`WebAssembly`** — 101 files. Investigate the wasm build first: the engine
+   reports `typeof WebAssembly === "undefined"`, so this may be a build flag in
+   spidermonkey-wasm rather than work here.
+9. **The directories already covered where Deno is ahead**: streams, FileAPI,
+   encoding, webmessaging, user-timing, console.
+
+## What the harness does not run yet
+
+Each of these makes the current number higher than a browser-comparable one.
+
+- **Only `.any.js` and `.worker.js`.** `.window.js` files and testharness
+  `.html` files are not run at all. In the covered directories that is 59 and
+  620 files respectively.
+- **No scope expansion.** WPT expands one `.any.js` into every scope its
+  `META: global=` names — window, dedicatedworker, sharedworker,
+  serviceworker, shadowrealm. Each file runs once here. Of 564 files, 532
+  declare two scopes or more, so a browser runs roughly twice as many tests.
+- **No variant expansion.** Ten files declare `META: variant=`, 59 variants in
+  total; each runs once here.
+- **reftests, crashtests, manual tests, wdspec.** Rendering, human interaction
+  and the WebDriver protocol are out of scope for a runtime with no DOM.
+  Crashtests are not, and are not run either.
 
 ## The Node gap, stated plainly
 
