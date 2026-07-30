@@ -344,7 +344,11 @@ func newHTTPClient(cfg spidermonkey.Config) *http.Client {
 		}
 		return nil, lastErr
 	}
-	return &http.Client{Transport: &http.Transport{DialContext: dial}}
+	// The transport is wrapped so that a request whose header values net/http
+	// refuses to write is still sent — over the same permission-checked dial.
+	// See fetchraw.go.
+	std := &http.Transport{DialContext: dial}
+	return &http.Client{Transport: &permissiveTransport{std: std, dial: dial}}
 }
 
 // checkRequestPermission applies Config.Resolve/Dial to a request's target

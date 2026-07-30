@@ -49,9 +49,19 @@ type Web struct {
 	start  time.Time
 }
 
-// Install defines the web globals on js and returns the handle that drives
-// the event loop (Wait) and cleanup (Close). Install once per interpreter.
+// Install defines the whole web platform surface on js and returns the handle
+// that drives the event loop (Wait) and cleanup (Close). Install once per
+// interpreter. Use InstallWith to expose only part of it.
 func Install(js *spidermonkey.JS) (*Web, error) {
+	return InstallWith(js, Options{})
+}
+
+// InstallWith installs the features opts names. A caller that is not a browser
+// wants MinimumCommonFeatures: it is the surface the non-browser runtimes
+// converged on, and it leaves out the browser-only APIs — which is how
+// compat/nodejs shares this implementation without inheriting a surface Node
+// does not have. See features.go.
+func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	w := &Web{js: js, loop: eventloop.New(js), start: time.Now()}
 	// What existed before this installation, so the globals it adds can be given
 	// the property attributes a real runtime gives them (see HideNewGlobals).
@@ -120,6 +130,9 @@ func Install(js *spidermonkey.JS) (*Web, error) {
 	w.fetch, err = installFetch(js, w.loop)
 	if err != nil {
 		return nil, fmt.Errorf("web: installing fetch: %w", err)
+	}
+	if err := removeUnselected(js, opts.Features); err != nil {
+		return nil, err
 	}
 	if err := HideNewGlobals(js, preexisting); err != nil {
 		return nil, err

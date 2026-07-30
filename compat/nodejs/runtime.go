@@ -148,7 +148,12 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 		rt.opts.Argv = []string{"node", "main"}
 	}
 
-	w, err := web.Install(js)
+	// The minimum common API and no more. Node adopted a slice of the web
+	// platform and sharing that implementation is right, but the browser-only part
+	// of it is not Node's: a runtime that answers to XMLHttpRequest is not the one
+	// this package claims to be. compat/web names the surface at feature
+	// granularity precisely so this line can say which part is Node's.
+	w, err := web.InstallWith(js, web.Options{Features: web.MinimumCommonFeatures()})
 	if err != nil {
 		return nil, err
 	}

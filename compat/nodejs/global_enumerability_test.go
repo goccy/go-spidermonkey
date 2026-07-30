@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"testing"
 	"testing/fstest"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
+	"github.com/goccy/go-spidermonkey/compat/web"
 )
 
 // Node defines its globals NON-enumerable, apart from a specific handful, so
@@ -60,5 +62,25 @@ func TestGlobalsAreNonEnumerableLikeNode(t *testing.T) {
 		}
 		sort.Strings(names)
 		t.Errorf("these globals are enumerable but are not in Node: %v", names)
+	}
+}
+
+// TestNodeDoesNotExposeBrowserOnlyGlobals is the other half of the feature
+// boundary in compat/web: Node shares that implementation, so something has to
+// assert that it shares only the part Node actually has. Without this, a global
+// added to compat/web for a browser API would appear in the Node runtime and
+// nothing would notice.
+func TestNodeDoesNotExposeBrowserOnlyGlobals(t *testing.T) {
+	js, rt := newRuntime(t, spidermonkey.Config{FS: fstest.MapFS{}})
+	_ = rt
+	for _, name := range web.FeatureGlobals(web.FeatureXMLHttpRequest) {
+		r, err := js.Eval(context.Background(), "String(typeof globalThis["+strconv.Quote(name)+"])")
+		if err != nil {
+			t.Fatalf("eval: %v", err)
+		}
+		if got := r.Value.String(); got != "undefined" {
+			t.Errorf("Node exposes %s (typeof %s); it is a browser API and compat/nodejs "+
+				"must not inherit it from compat/web", name, got)
+		}
 	}
 }
