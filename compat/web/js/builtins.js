@@ -1664,9 +1664,17 @@
 		"referer", "set-cookie", "te", "trailer", "transfer-encoding", "upgrade", "via",
 	]);
 
+	// The methods a request may never use. A header that smuggles one past the
+	// method field is forbidden for the same reason the method itself is.
+	const FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
+	const METHOD_OVERRIDE_HEADERS = new Set(["x-http-method", "x-http-method-override", "x-method-override"]);
+
 	function isForbiddenRequestHeader(name, value) {
 		if (FORBIDDEN_REQUEST_HEADERS.has(name) || name.startsWith("proxy-") || name.startsWith("sec-")) {
 			return true;
+		}
+		if (METHOD_OVERRIDE_HEADERS.has(name)) {
+			return value.split(",").some((m) => FORBIDDEN_METHODS.has(m.trim().toUpperCase()));
 		}
 		// A Range header is forbidden except in the one shape a media element
 		// would send.
@@ -2360,7 +2368,24 @@
 		"unsafe-url",
 	]);
 
+	// A filtered response is what the caller sees when it is not allowed to see
+	// the real one. The status of 0 and the empty headers are not a placeholder —
+	// they are the whole point: an opaque response carries no information about
+	// the resource beyond the fact that the request completed.
+	function filteredResponse(type, url) {
+		const res = new Response(null, { status: 200 });
+		for (const [k, v] of [["status", 0], ["statusText", ""], ["ok", false],
+			["type", type], ["url", url ?? ""], ["redirected", false]]) {
+			try { Object.defineProperty(res, k, { configurable: true, value: v }); } catch { /* ignore */ }
+		}
+		res.headers = setHeadersGuard(new Headers(), "immutable");
+		return res;
+	}
+
 	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer) {
+		// "error" and "manual" never follow anything: the first redirect is either
+		// a network error or the end of the exchange.
+		const mode = String(nInit.__redirect ?? "follow");
 		let current = url;
 		let origin = envURL.origin;
 		let hops = 0;
@@ -2368,6 +2393,11 @@
 		// hop uses THAT. Carrying the caller's policy the whole way down ignored
 		// the server's instruction.
 		let policy = referrerPolicy;
+		// The referrer NARROWS as the chain proceeds and never widens again: once a
+		// hop has stripped it to an origin, a later hop with a permissive policy
+		// still has only that origin to send. Recomputing from the document URL
+		// each time handed the full URL back after it had already been withheld.
+		let refSource = envURL;
 		for (;;) {
 			// The headers are materialized per hop: nInit.headers is only filled
 			// in by the single-shot dispatch path, and the Origin changes once a
@@ -2380,9 +2410,10 @@
 			// one. Computing it once sent the first hop's referrer all the way
 			// down the chain.
 			if (!explicitReferrer) {
-				const ref = referrerHeaderFor(policy, envURL, new URL(current));
+				const ref = refSource ? referrerHeaderFor(policy, refSource, new URL(current)) : null;
 				if (ref) hdrObj.referer = ref;
 				else delete hdrObj.referer;
+				try { refSource = ref ? new URL(ref) : null; } catch { refSource = null; }
 			}
 			const step = { ...nInit, redirect: "manual", headers: hdrObj };
 			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
@@ -2398,6 +2429,14 @@
 					try { Object.defineProperty(res, "type", { configurable: true, value: "cors" }); } catch { /* ignore */ }
 				}
 				return res;
+			}
+			if (mode === "error") {
+				throw corsError("the response is a redirect and redirect mode is \"error\"");
+			}
+			if (mode === "manual") {
+				// The caller asked to see the redirect itself, and is shown nothing
+				// about it: the URL is the one it requested, not the one it was sent to.
+				return filteredResponse("opaqueredirect", current);
 			}
 			const loc = res.headers.get("location");
 			if (!loc) return res;
@@ -2447,10 +2486,14 @@
 			if (parsed && (parsed.username || parsed.password)) {
 				throw new TypeError("Request cannot be constructed from a URL that includes credentials");
 			}
-			const headers = new Headers(isReq ? input.headers : undefined);
+			const headers = setHeadersGuard(new Headers(isReq ? input.headers : undefined), "request");
 			if (init.headers !== undefined && init.headers !== null) {
 				for (const [k, v] of new Headers(init.headers)) headers.set(k, v);
 			}
+			// Past this point the user agent is speaking, not the caller, so its own
+			// headers are written straight into the map: Origin and Referer are
+			// forbidden to the caller precisely because they are set here.
+			const uaSet = (k, v) => headers._map.set(k, [String(v)]);
 			const nInit = {};
 			const method = init.method || (isReq ? input.method : undefined);
 			if (method !== undefined) nInit.method = method;
@@ -2460,7 +2503,7 @@
 			const mode = String(init.mode ?? (isReq ? input.mode : undefined) ?? "cors");
 			if (!headers.has("origin")) {
 				const origin = originHeaderFor(mode, method, envURL);
-				if (origin) headers.set("origin", origin);
+				if (origin) uaSet("origin", origin);
 			}
 			// A blob: URL is served from memory, not the network.
 			if (parsed && parsed.protocol === "blob:") {
@@ -2508,7 +2551,7 @@
 				} else {
 					ref = referrerHeaderFor(policy, envURL, parsed);
 				}
-				if (ref) headers.set("referer", ref);
+				if (ref) uaSet("referer", ref);
 			}
 			if (init.redirect !== undefined && init.redirect !== null) nInit.redirect = String(init.redirect);
 			const signal = init.signal || (isReq ? input.signal : undefined);
@@ -2573,7 +2616,11 @@
 			// the host follow it hid them: a redirect to a URL carrying
 			// credentials, or one whose new origin does not permit us, went
 			// through unnoticed.
-			const chained = !!envURL && networkScheme && mode !== "no-cors" && redirectMode === "follow";
+			// The chain is driven in the guest for EVERY redirect mode, not just
+			// "follow": "error" and "manual" are answers about the redirect itself,
+			// and only the guest knows it saw one.
+			nInit.__redirect = redirectMode;
+			const chained = !!envURL && networkScheme && mode !== "no-cors";
 			const send = () => {
 				const go = chained
 					? () => {
