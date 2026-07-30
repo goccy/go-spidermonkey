@@ -2291,6 +2291,10 @@
 			return;
 		}
 		const { bytes, contentType } = normalizeBody(init);
+		// An EMPTY body is still a body: `new Response("")` has a body of zero
+		// bytes, and `res.body` is a stream that closes at once — where a null body
+		// has no stream at all. Storing the empty case as null erased the
+		// difference, and `body === null` is exactly what the tests check.
 		target._body = bytes;
 		if (contentType && target.headers && !target.headers.has("content-type")) {
 			target.headers.set("content-type", contentType);
@@ -2463,6 +2467,10 @@
 			this.redirected = false;
 			this.url = "";
 			this.bodyUsed = false;
+			// A Response the caller constructed has type "default": it did not come
+			// from a fetch, so it is neither basic nor cors nor opaque. Only fetch
+			// itself, and Response.error(), say otherwise.
+			this.type = "default";
 		}
 		clone() {
 			// Build without a status in the init so the constructor range guard is
@@ -2508,6 +2516,7 @@
 			const r = new Response(null);
 			r.status = 0;
 			r.ok = false;
+			r.type = "error";
 			return r;
 		}
 	}
@@ -2907,6 +2916,12 @@
 			// hop has left the origin.
 			const hdrObj = {};
 			for (const [k, v] of headers) hdrObj[k] = v;
+			// The request's origin can become OPAQUE part-way down a redirect chain:
+			// once a hop leaves the origin the request came from, the next request no
+			// longer speaks for that origin and says so with the literal "null".
+			// Fetch's rule keys on the CURRENT url, not on the destination — a hop
+			// from the request's own origin to another one still carries the real
+			// origin, and only a hop that starts somewhere else loses it.
 			hdrObj.origin = origin;
 			// The referrer is decided per HOP, not once: a policy that gives the
 			// full URL to a same-origin peer gives only the origin to the next
@@ -2960,9 +2975,14 @@
 			}
 			hops++;
 			if (hops > 20) throw corsError("too many redirects");
-			// Once a hop has left the origin the request is no longer same-origin
-			// to anything: its origin becomes opaque.
-			if (next.origin !== target.origin) origin = "null";
+			// The origin goes opaque only when a CROSS-origin hop starts somewhere
+			// that is not the request's own origin. Leaving your own origin still
+			// carries it — that is how a cross-origin request states who is asking —
+			// and it is the SECOND departure, from a place you were only sent to,
+			// that leaves nothing left to speak for. Treating every crossing as
+			// opaque sent "null" on the first hop, where the origin is exactly what
+			// the server needs to decide.
+			if (next.origin !== target.origin && origin !== target.origin) origin = "null";
 			// 303, and 301/302 on a non-GET, drop the method and body.
 			if (res.status === 303 || ((res.status === 301 || res.status === 302) &&
 				String(step.method || "GET").toUpperCase() === "POST")) {
