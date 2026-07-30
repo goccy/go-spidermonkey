@@ -1358,6 +1358,10 @@
 			this._queueSizes = [];
 			this._queueTotalSize = 0;
 			this._closed = true;
+			// Recorded separately from _closed: a body whose stream was CANCELLED is
+			// disturbed and can never be read again, where one that merely reached
+			// its end is simply finished.
+			this._cancelled = true;
 			// Resolve any read pending at cancel time with {done:true}; a later
 			// controller.close() would now no-op (closed guard), so cancel must
 			// flush the waiters itself.
@@ -1988,18 +1992,31 @@
 		get body() {
 			if (this._bodyStream) return this._bodyStream;
 			if (this._body === null) return null;
+			// ONE stream, memoized. A fresh stream per access meant cancelling
+			// `response.body` cancelled something nobody else could see, and the body
+			// stayed readable — where the standard has that cancel disturb the body
+			// for good.
 			const chunk = new Uint8Array(this._body);
 			let delivered = false;
-			return new ReadableStream({
+			this._bodyStream = new ReadableStream({
 				pull(controller) {
 					if (delivered) controller.close();
 					else { delivered = true; controller.enqueue(chunk); }
 				},
 			});
+			return this._bodyStream;
 		},
 		// A guest-constructed Request/Response body may be read only once (WHATWG);
 		// a second read throws a TypeError, and bodyUsed reflects that.
-		_useBody() { if (this.bodyUsed) throw new TypeError("Body has already been consumed."); this.bodyUsed = true; },
+		_useBody() {
+			// A body is "disturbed" once its stream has been read from OR cancelled,
+			// not only once a consumer here has taken it: `body.cancel()` ends the
+			// body just as surely as reading it does.
+			if (this.bodyUsed || (this._bodyStream && (this._bodyStream.locked || this._bodyStream._cancelled))) {
+				throw new TypeError("Body has already been consumed.");
+			}
+			this.bodyUsed = true;
+		},
 		// _bodyBytes: the single "fully read body" step every consumer shares. A
 		// stream body is drained to completion (rejecting if locked/already used).
 		async _bodyBytes() {
