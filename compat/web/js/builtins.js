@@ -2894,7 +2894,7 @@
 		return res;
 	}
 
-	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer) {
+	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode) {
 		// "error" and "manual" never follow anything: the first redirect is either
 		// a network error or the end of the exchange.
 		const mode = String(nInit.__redirect ?? "follow");
@@ -2934,8 +2934,17 @@
 				try { refSource = ref ? new URL(ref) : null; } catch { refSource = null; }
 			}
 			const step = { ...nInit, redirect: "manual", headers: hdrObj };
-			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
 			const target = new URL(current);
+			// A preflight is required for EVERY cross-origin hop that needs one, not
+			// only for the first: a redirect to a URL whose headers are not
+			// safelisted must ask that server's permission before it is sent
+			// anything. Doing it once, before the chain, meant the second server was
+			// never consulted and the request went out regardless.
+			if (corsMode === "cors" && target.origin !== envURL.origin) {
+				const hopNeed = needsPreflight(step.method, headers);
+				if (hopNeed) await runPreflight(current, hopNeed, origin);
+			}
+			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
 			const crossHop = target.origin !== envURL.origin;
 			if (crossHop && !corsAllowsResponse(res, origin)) {
 				throw corsError("no Access-Control-Allow-Origin for " + origin + " at " + target.origin);
@@ -3194,7 +3203,7 @@
 				const go = chained
 					? () => {
 						if (signal && onAbort) signal.addEventListener("abort", onAbort);
-						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer).then(
+						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode).then(
 							(res) => { cleanup(); return res; },
 							(err) => {
 								cleanup();
@@ -3203,7 +3212,11 @@
 							});
 					}
 					: dispatch;
-				const need = crossOrigin && mode === "cors" ? needsPreflight(method, headers) : null;
+				// The chained path preflights each hop itself, including the first;
+				// preflighting here as well would ask the same server twice and the
+				// suite counts preflights.
+				const need = !chained && crossOrigin && mode === "cors"
+					? needsPreflight(method, headers) : null;
 				if (!need) return go();
 				return runPreflight(url, need, envURL.origin).then(go);
 			};
