@@ -156,6 +156,9 @@
 	// it produces must say "RSA-OAEP". Echoing the caller's casing back made
 	// every such call fail its own identity check.
 	const CANONICAL_NAMES = {
+		ARGON2I: "Argon2i",
+		ARGON2D: "Argon2d",
+		ARGON2ID: "Argon2id",
 		[CHACHA]: "ChaCha20-Poly1305",
 		"RSASSA-PKCS1-V1_5": "RSASSA-PKCS1-v1_5",
 		"ED25519": "Ed25519",
@@ -165,6 +168,10 @@
 	// KMAC128/KMAC256 are keyed hashes: secret keys that sign and verify, with
 	// the digest length chosen per call rather than fixed by the algorithm.
 	const KMAC_NAMES = ["KMAC128", "KMAC256"];
+	// The password-based key derivations. Argon2 has three variants, which differ
+	// in which parts of the memory they read; all three take the same key.
+	const ARGON2_NAMES = ["ARGON2I", "ARGON2D", "ARGON2ID"];
+	const KDF_NAMES = ["HKDF", "PBKDF2", ...ARGON2_NAMES];
 
 	// A host failure carries the DOMException name the spec asks for in its own
 	// field. Which name it is matters — a malformed key must be a DataError, not
@@ -198,6 +205,9 @@
 		"SHA-1": [], "SHA-256": [], "SHA-384": [], "SHA-512": [],
 		"TURBOSHAKE128": [], "TURBOSHAKE256": [], KT128: [], KT256: [],
 		"SHA3-256": [], "SHA3-384": [], "SHA3-512": [], CSHAKE128: [], CSHAKE256: [],
+		ARGON2I: ["deriveKey", "deriveBits"],
+		ARGON2D: ["deriveKey", "deriveBits"],
+		ARGON2ID: ["deriveKey", "deriveBits"],
 		"AES-CBC": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-CTR": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
 		"AES-GCM": ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
@@ -240,6 +250,7 @@
 		// The digest-only algorithms. They are names an operation can be asked for,
 		// so they belong here even though no key is ever made for them.
 		"SHA3-256", "SHA3-384", "SHA3-512", "CSHAKE128", "CSHAKE256",
+		"ARGON2I", "ARGON2D", "ARGON2ID",
 		"ML-DSA-44", "ML-DSA-65", "ML-DSA-87",
 	]);
 
@@ -874,8 +885,8 @@
 			}
 			if (name === "ED25519") {
 				let r;
-				if (format === "jwk") r = ops.subtle_ed_import("jwk", JSON.stringify(keyData));
-				else if (["raw", "pkcs8", "spki"].includes(format)) r = ops.subtle_ed_import(format, toU8(keyData));
+				if (format === "jwk") r = subtleFail(ops.subtle_ed_import("jwk", JSON.stringify(keyData)));
+				else if (["raw", "pkcs8", "spki"].includes(format)) r = subtleFail(ops.subtle_ed_import(format, toU8(keyData)));
 				else unsupported(`Ed25519 key format ${format}`);
 				return new CryptoKey(r.type, extractable, { name: "Ed25519" }, usages, r.id);
 			}
@@ -889,9 +900,14 @@
 				const kUsages = r.type === "public" ? usages.filter((u) => name === "ECDSA" && u === "verify") : usages;
 				return new CryptoKey(r.type, extractable, { name: canonicalName(algName(alg)), namedCurve: r.crv }, kUsages, r.id);
 			}
-			if (name === "HKDF" || name === "PBKDF2") {
-				if (format !== "raw") unsupported(`${name} key format ${format}`);
-				const key = new CryptoKey("secret", false, { name }, usages, null);
+			if (KDF_NAMES.includes(name)) {
+				// A KDF key is never extractable: it is a password, and the whole
+				// point of importing it is that it cannot be read back out. The
+				// Argon2 family names its raw format "raw-secret"; the older two
+				// call the same thing "raw".
+				const want = ARGON2_NAMES.includes(name) ? "raw-secret" : "raw";
+				if (format !== want) unsupported(`${name} key format ${format}`);
+				const key = new CryptoKey("secret", false, { name: canonicalName(name) }, usages, null);
 				keyRaw.set(key, toU8(keyData));
 				return key;
 			}

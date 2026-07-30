@@ -8,6 +8,7 @@ package web
 // unsupported. Go's crypto/ecdh provides the primitive.
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/x509"
@@ -88,6 +89,12 @@ func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.
 		if jwk.Kty != "OKP" || jwk.Crv != "X25519" {
 			return subtleErr(errData, "not an X25519 JWK"), nil
 		}
+		// "x" is required for both halves; a private JWK carries the public key
+		// beside the scalar, and the two have to agree.
+		x, err := base64.RawURLEncoding.DecodeString(jwk.X)
+		if err != nil || len(x) == 0 {
+			return subtleErr(errData, "bad x"), nil
+		}
 		if jwk.D != "" {
 			d, err := base64.RawURLEncoding.DecodeString(jwk.D)
 			if err != nil {
@@ -97,11 +104,10 @@ func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.
 			if err != nil {
 				return subtleErr(errData, err.Error()), nil
 			}
+			if !bytes.Equal(priv.PublicKey().Bytes(), x) {
+				return subtleErr(errData, "JWK x is not the public key of d"), nil
+			}
 			return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{xPriv: priv})}), nil
-		}
-		x, err := base64.RawURLEncoding.DecodeString(jwk.X)
-		if err != nil {
-			return subtleErr(errData, "bad x"), nil
 		}
 		pub, err := ecdh.X25519().NewPublicKey(x)
 		if err != nil {

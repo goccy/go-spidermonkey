@@ -9,6 +9,7 @@ package web
 // key, a 56-byte X448 one.
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/asn1"
 	"encoding/base64"
@@ -120,23 +121,32 @@ func (s *subtleAPI) opEd448Import(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{ed448Priv: ed448.NewKeyFromSeed(seed)})}), nil
 	case "jwk":
-		var jwk struct{ Kty, Crv, X, D string }
+		var jwk struct{ Kty, Crv, Alg, X, D string }
 		if err := json.Unmarshal([]byte(args[1].String()), &jwk); err != nil {
 			return subtleErr(errData, err.Error()), nil
 		}
 		if jwk.Kty != "OKP" || jwk.Crv != "Ed448" {
 			return subtleErr(errData, "not an Ed448 JWK"), nil
 		}
+		if jwk.Alg != "" && jwk.Alg != "Ed448" && jwk.Alg != "EdDSA" {
+			return subtleErr(errData, "JWK alg "+jwk.Alg+" is not Ed448"), nil
+		}
+		// "x" is required for both halves, and must be the public key that "d"
+		// derives; a JWK that disagrees with itself is not a key.
+		pub, err := base64.RawURLEncoding.DecodeString(jwk.X)
+		if err != nil || len(pub) != ed448.PublicKeySize {
+			return subtleErr(errData, "bad Ed448 JWK x"), nil
+		}
 		if jwk.D != "" {
 			seed, err := base64.RawURLEncoding.DecodeString(jwk.D)
 			if err != nil || len(seed) != ed448.SeedSize {
 				return subtleErr(errData, "bad Ed448 JWK d"), nil
 			}
-			return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{ed448Priv: ed448.NewKeyFromSeed(seed)})}), nil
-		}
-		pub, err := base64.RawURLEncoding.DecodeString(jwk.X)
-		if err != nil || len(pub) != ed448.PublicKeySize {
-			return subtleErr(errData, "bad Ed448 JWK x"), nil
+			priv := ed448.NewKeyFromSeed(seed)
+			if !bytes.Equal(priv.Public().(ed448.PublicKey), pub) {
+				return subtleErr(errData, "JWK x is not the public key of d"), nil
+			}
+			return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{ed448Priv: priv})}), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{ed448Pub: ed448.PublicKey(pub)})}), nil
 	}
@@ -180,7 +190,7 @@ func (s *subtleAPI) opEd448Export(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		return bytesValueOK(der)
 	case "jwk":
-		out := map[string]any{"kty": "OKP", "crv": "Ed448", "x": b64(pub)}
+		out := map[string]any{"kty": "OKP", "crv": "Ed448", "alg": "Ed448", "x": b64(pub)}
 		if k.ed448Priv != nil {
 			out["d"] = b64(k.ed448Priv.Seed())
 		}
@@ -295,16 +305,22 @@ func (s *subtleAPI) opX448Import(cfg spidermonkey.Config, args []spidermonkey.Va
 		if jwk.Kty != "OKP" || jwk.Crv != "X448" {
 			return subtleErr(errData, "not an X448 JWK"), nil
 		}
+		x, err := base64.RawURLEncoding.DecodeString(jwk.X)
+		if err != nil || len(x) != x448.Size {
+			return subtleErr(errData, "bad X448 JWK x"), nil
+		}
 		if jwk.D != "" {
 			d, err := base64.RawURLEncoding.DecodeString(jwk.D)
 			if err != nil || len(d) != x448.Size {
 				return subtleErr(errData, "bad X448 JWK d"), nil
 			}
-			return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{x448Priv: asKey(d)})}), nil
-		}
-		x, err := base64.RawURLEncoding.DecodeString(jwk.X)
-		if err != nil || len(x) != x448.Size {
-			return subtleErr(errData, "bad X448 JWK x"), nil
+			priv := asKey(d)
+			var derived x448.Key
+			x448.KeyGen(&derived, priv)
+			if !bytes.Equal(derived[:], x) {
+				return subtleErr(errData, "JWK x is not the public key of d"), nil
+			}
+			return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{x448Priv: priv})}), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{x448Pub: asKey(x)})}), nil
 	}

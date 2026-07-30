@@ -6,6 +6,7 @@ package web
 // plain arrays — data, not handles — so nothing stays pinned.
 
 import (
+	"bytes"
 	"container/list"
 	"crypto"
 	"crypto/ecdh"
@@ -244,6 +245,9 @@ var b64u = base64.RawURLEncoding
 type jwkDoc struct {
 	Kty string `json:"kty"`
 	Crv string `json:"crv,omitempty"`
+	// Alg names the algorithm the key is for. An Ed JWK carries it; an X one does
+	// not, and the member count is part of what the suite checks.
+	Alg string `json:"alg,omitempty"`
 	X   string `json:"x,omitempty"`
 	Y   string `json:"y,omitempty"`
 	D   string `json:"d,omitempty"`
@@ -955,20 +959,28 @@ func (s *subtleAPI) opEdGenerate(cfg spidermonkey.Config, args []spidermonkey.Va
 
 func (s *subtleAPI) opEdImport(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	if len(args) < 2 {
-		return nil, fmt.Errorf("ed25519 import: (format, keyData) required")
+		return subtleErr(errData, "ed25519 import: (format, keyData) required"), nil
 	}
 	switch args[0].String() {
 	case "jwk":
 		var j jwkDoc
 		if err := json.Unmarshal([]byte(args[1].String()), &j); err != nil {
-			return nil, fmt.Errorf("bad JWK: %w", err)
+			return subtleErr(errData, fmt.Sprintf("bad JWK: %v", err)), nil
 		}
 		if j.Kty != "OKP" || j.Crv != "Ed25519" {
-			return nil, fmt.Errorf("not an Ed25519 JWK")
+			return subtleErr(errData, "not an Ed25519 JWK"), nil
 		}
+		// "alg" is optional, but if present it must be the algorithm's own name or
+		// the JOSE name for the family. A near miss like "EDDSA" is a mistake, and
+		// accepting it would mean importing a key under an algorithm nobody named.
+		if j.Alg != "" && j.Alg != "Ed25519" && j.Alg != "EdDSA" {
+			return subtleErr(errData, "JWK alg "+j.Alg+" is not Ed25519"), nil
+		}
+		// "x" is required for BOTH halves: a private OKP JWK carries the public key
+		// beside the seed, and the two have to agree.
 		x, err := b64u.DecodeString(j.X)
 		if err != nil || len(x) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("bad JWK x")
+			return subtleErr(errData, "bad JWK x"), nil
 		}
 		if j.D == "" {
 			return spidermonkey.ValueOf(map[string]any{
@@ -977,18 +989,22 @@ func (s *subtleAPI) opEdImport(cfg spidermonkey.Config, args []spidermonkey.Valu
 		}
 		seed, err := b64u.DecodeString(j.D)
 		if err != nil || len(seed) != ed25519.SeedSize {
-			return nil, fmt.Errorf("bad JWK d")
+			return subtleErr(errData, "bad JWK d"), nil
+		}
+		priv := ed25519.NewKeyFromSeed(seed)
+		if !bytes.Equal(priv.Public().(ed25519.PublicKey), x) {
+			return subtleErr(errData, "JWK x is not the public key of d"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
-			"id": s.put(&subtleKey{edPriv: ed25519.NewKeyFromSeed(seed)}), "type": "private",
+			"id": s.put(&subtleKey{edPriv: priv}), "type": "private",
 		}), nil
 	case "raw":
 		x, err := argBytes(args[1])
 		if err != nil {
-			return nil, err
+			return subtleErr(errData, err.Error()), nil
 		}
 		if len(x) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("bad raw Ed25519 public key")
+			return subtleErr(errData, "bad raw Ed25519 public key"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{edPub: ed25519.PublicKey(append([]byte(nil), x...))}), "type": "public",
@@ -996,15 +1012,15 @@ func (s *subtleAPI) opEdImport(cfg spidermonkey.Config, args []spidermonkey.Valu
 	case "pkcs8":
 		der, err := argBytes(args[1])
 		if err != nil {
-			return nil, err
+			return subtleErr(errData, err.Error()), nil
 		}
 		key, err := x509.ParsePKCS8PrivateKey(der)
 		if err != nil {
-			return nil, err
+			return subtleErr(errData, err.Error()), nil
 		}
 		priv, ok := key.(ed25519.PrivateKey)
 		if !ok {
-			return nil, fmt.Errorf("pkcs8 key is not Ed25519")
+			return subtleErr(errData, "pkcs8 key is not Ed25519"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{edPriv: priv}), "type": "private",
@@ -1012,21 +1028,21 @@ func (s *subtleAPI) opEdImport(cfg spidermonkey.Config, args []spidermonkey.Valu
 	case "spki":
 		der, err := argBytes(args[1])
 		if err != nil {
-			return nil, err
+			return subtleErr(errData, err.Error()), nil
 		}
 		key, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
-			return nil, err
+			return subtleErr(errData, err.Error()), nil
 		}
 		pub, ok := key.(ed25519.PublicKey)
 		if !ok {
-			return nil, fmt.Errorf("spki key is not Ed25519")
+			return subtleErr(errData, "spki key is not Ed25519"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{edPub: pub}), "type": "public",
 		}), nil
 	}
-	return nil, fmt.Errorf("ed25519 import: unsupported format")
+	return subtleErr(errData, "ed25519 import: unsupported format"), nil
 }
 
 func (s *subtleAPI) opEdExport(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -1046,7 +1062,7 @@ func (s *subtleAPI) opEdExport(cfg spidermonkey.Config, args []spidermonkey.Valu
 	}
 	switch args[0].String() {
 	case "jwk":
-		j := jwkDoc{Kty: "OKP", Crv: "Ed25519", Ext: true, X: b64u.EncodeToString(pub)}
+		j := jwkDoc{Kty: "OKP", Crv: "Ed25519", Alg: "Ed25519", Ext: true, X: b64u.EncodeToString(pub)}
 		if k.edPriv != nil {
 			j.D = b64u.EncodeToString(k.edPriv.Seed())
 		}
