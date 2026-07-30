@@ -131,9 +131,9 @@ func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.
 	format := args[0].String()
 	b64 := base64.RawURLEncoding.EncodeToString
 	switch {
-	case format == "raw" && k.xPub != nil:
+	case (format == "raw" || format == "raw-public") && k.xPub != nil:
 		return bytesValueOK(k.xPub.Bytes())
-	case format == "raw" && k.xPriv != nil:
+	case (format == "raw" || format == "raw-public") && k.xPriv != nil:
 		// "raw" of a private key is not exportable in Web Crypto.
 		return subtleErr(errInvalidAccess, "cannot export a private key as raw"), nil
 	case format == "spki":

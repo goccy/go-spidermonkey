@@ -530,13 +530,19 @@
 		}
 		if (name === "HMAC") {
 			const raw = Uint8Array.from(ops.subtle_hmac_export(key._h));
-			if (format === "raw") return raw.buffer;
-			if (format === "jwk") return { kty: "oct", k: b64uEncode(raw), ext: true, key_ops: [...key.usages] };
+			if (format === "raw" || format === "raw-secret") return raw.buffer;
+			if (format === "jwk") {
+				// An HMAC JWK names its hash through the JOSE algorithm — HS256 for
+				// SHA-256. Without it the key exports as a different key from the one
+				// that was imported, since the hash is part of what an HMAC key is.
+				const bits = String(key.algorithm.hash.name).replace("SHA-", "");
+				return { kty: "oct", k: b64uEncode(raw), alg: "HS" + bits, ext: true, key_ops: [...key.usages] };
+			}
 			unsupported(`HMAC export format ${format}`);
 		}
 		if (name === "ECDSA" || name === "ECDH") {
 			if (format === "jwk") return JSON.parse(ops.subtle_ec_export_jwk(key._h));
-			if (format === "raw") return toBuf(subtleFail(ops.subtle_ec_export_der("raw", key._h)));
+			if (format === "raw" || format === "raw-public") return toBuf(subtleFail(ops.subtle_ec_export_der("raw", key._h)));
 			if (format === "pkcs8" || format === "spki") return toBuf(subtleFail(ops.subtle_ec_export_der(format, key._h)));
 			unsupported(`EC export format ${format}`);
 		}
@@ -547,7 +553,7 @@
 		}
 		if (name === "ED25519") {
 			if (format === "jwk") return JSON.parse(ops.subtle_ed_export("jwk", key._h));
-			if (format === "raw") return Uint8Array.from(ops.subtle_ed_export("raw", key._h)).buffer;
+			if (format === "raw" || format === "raw-public") return Uint8Array.from(ops.subtle_ed_export("raw", key._h)).buffer;
 			if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_ed_export(format, key._h));
 			unsupported(`Ed25519 export format ${format}`);
 		}
@@ -763,7 +769,7 @@
 				// A private JWK carries "d" (EC/RSA/OKP) or "priv" (AKP, the
 				// post-quantum key type); either one means this is the private half.
 				(format === "jwk" && keyData && keyData.kty !== "oct" && keyData.d === undefined && keyData.priv === undefined) ||
-				(format === "raw" && ["ECDH", "ECDSA", "X25519", "ED25519", "X448", "ED448"].includes(name));
+				((format === "raw" || format === "raw-public") && ["ECDH", "ECDSA", "X25519", "ED25519", "X448", "ED448"].includes(name));
 			usages = checkUsages(declared, usages, "importKey", { allowEmpty: isPublicImport });
 			// A key's usages are bounded by what its HALF can do, not by what the
 			// algorithm can do overall: a public key cannot sign and a private one
@@ -893,7 +899,7 @@
 			if (name === "ECDH" || name === "ECDSA") {
 				let r;
 				if (format === "jwk") r = subtleFail(ops.subtle_ec_import_jwk(JSON.stringify(keyData)));
-				else if (format === "raw") r = subtleFail(ops.subtle_ec_import_der("raw", toU8(keyData), String(alg.namedCurve)));
+				else if (format === "raw" || format === "raw-public") r = subtleFail(ops.subtle_ec_import_der("raw", toU8(keyData), String(alg.namedCurve)));
 				else if (format === "pkcs8" || format === "spki") r = subtleFail(ops.subtle_ec_import_der(format, toU8(keyData)));
 				else unsupported(`EC key format ${format}`);
 				// A public key carries no usages in WebCrypto, whatever was asked for.
@@ -905,8 +911,7 @@
 				// point of importing it is that it cannot be read back out. The
 				// Argon2 family names its raw format "raw-secret"; the older two
 				// call the same thing "raw".
-				const want = ARGON2_NAMES.includes(name) ? "raw-secret" : "raw";
-				if (format !== want) unsupported(`${name} key format ${format}`);
+				if (format !== "raw" && format !== "raw-secret") unsupported(`${name} key format ${format}`);
 				const key = new CryptoKey("secret", false, { name: canonicalName(name) }, usages, null);
 				keyRaw.set(key, toU8(keyData));
 				return key;

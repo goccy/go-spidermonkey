@@ -21,6 +21,7 @@ import (
 	_ "crypto/sha3"
 	_ "crypto/sha512"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -469,20 +470,36 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 		if len(args) < 3 {
 			return subtleErr(errData, "raw EC import needs a named curve"), nil
 		}
-		curve, cerr := ecdhCurve(args[2].String())
+		curveName := args[2].String()
+		curve, cerr := ecdhCurve(curveName)
 		if cerr != nil {
 			return subtleErr(errData, cerr.Error()), nil
+		}
+		// A compressed point carries only the x coordinate and the parity of y,
+		// behind a 0x02 or 0x03 tag. crypto/ecdh takes uncompressed points only,
+		// so the point is decompressed and re-marshalled first — the alternative
+		// is refusing a form the standard accepts.
+		if len(der) > 0 && (der[0] == 0x02 || der[0] == 0x03) {
+			ec, eerr := curveByName(curveName)
+			if eerr != nil {
+				return subtleErr(errData, eerr.Error()), nil
+			}
+			x, y := elliptic.UnmarshalCompressed(ec, der)
+			if x == nil {
+				return subtleErr(errData, "not a point on "+curveName), nil
+			}
+			der = elliptic.Marshal(ec, x, y)
 		}
 		pt, perr := curve.NewPublicKey(der)
 		if perr != nil {
 			return subtleErr(errData, perr.Error()), nil
 		}
-		pub, perr := ecdsaFromECDHPublic(pt, args[2].String())
+		pub, perr := ecdsaFromECDHPublic(pt, curveName)
 		if perr != nil {
 			return subtleErr(errData, perr.Error()), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
-			"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": args[2].String(),
+			"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": curveName,
 		}), nil
 	case "pkcs8":
 		key, err := x509.ParsePKCS8PrivateKey(der)
@@ -499,7 +516,15 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 	case "spki":
 		key, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
-			return subtleErr(errData, err.Error()), nil
+			// crypto/x509 takes uncompressed points only. A compressed one is a
+			// legal SPKI, so it is read here instead of refused.
+			pub, cerr := parseECSPKICompressed(der)
+			if cerr != nil {
+				return subtleErr(errData, err.Error()), nil
+			}
+			return spidermonkey.ValueOf(map[string]any{
+				"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": curveName(pub.Curve),
+			}), nil
 		}
 		pub, ok := key.(*ecdsa.PublicKey)
 		if !ok {
@@ -853,9 +878,24 @@ func (s *subtleAPI) opRSAExportDER(cfg spidermonkey.Config, args []spidermonkey.
 // rather than silently signing with an auto/hash-length salt — which would
 // produce a signature a strict saltLength:0 verifier rejects — we fail loudly.
 // (A few JOSE libraries pin saltLength:0; those must use a non-zero salt here.)
-func rsaPSSOptions(saltLen int, h crypto.Hash) (*rsa.PSSOptions, error) {
+// rsaPSSOptions maps a WebCrypto saltLength onto rsa.PSSOptions. A negative
+// value (the JS side's stand-in for "not given") means the default of a salt as
+// long as the hash; a positive one is used as it is.
+//
+// A saltLength of ZERO cannot be expressed: rsa.PSSOptions overloads 0 as
+// PSSSaltLengthAuto, and crypto/rsa exposes no way to ask for a genuinely empty
+// salt. For VERIFICATION that is harmless — auto-detect accepts a signature made
+// with any salt length, including none — so verifying works and only signing
+// with an explicit zero cannot be done here. Producing one would mean a raw RSA
+// private-key operation over math/big, whose Exp is documented as NOT
+// cryptographically constant-time; a library that other code trusts with its
+// keys should not contain that to gain a conformance case.
+func rsaPSSOptions(saltLen int, h crypto.Hash, verifying bool) (*rsa.PSSOptions, error) {
 	if saltLen == 0 {
-		return nil, fmt.Errorf("RSA-PSS saltLength 0 is not supported (Go crypto/rsa cannot express a zero-length PSS salt); use a positive saltLength or the default")
+		if !verifying {
+			return nil, fmt.Errorf("RSA-PSS saltLength 0 is not supported for signing (crypto/rsa cannot express a zero-length salt); use a positive saltLength or the default")
+		}
+		return &rsa.PSSOptions{Hash: h, SaltLength: rsa.PSSSaltLengthAuto}, nil
 	}
 	opts := &rsa.PSSOptions{Hash: h, SaltLength: rsa.PSSSaltLengthEqualsHash}
 	if saltLen > 0 {
@@ -889,7 +929,7 @@ func (s *subtleAPI) opRSASign(cfg spidermonkey.Config, args []spidermonkey.Value
 	case "pkcs1":
 		sig, err = rsa.SignPKCS1v15(rand.Reader, k.rsaPriv, h, digest)
 	case "pss":
-		opts, oerr := rsaPSSOptions(intArg(args[2]), h)
+		opts, oerr := rsaPSSOptions(intArg(args[2]), h, false)
 		if oerr != nil {
 			return subtleErr(errOperation, oerr.Error()), nil
 		}
@@ -935,7 +975,7 @@ func (s *subtleAPI) opRSAVerify(cfg spidermonkey.Config, args []spidermonkey.Val
 	case "pkcs1":
 		return spidermonkey.ValueOf(rsa.VerifyPKCS1v15(pub, h, digest, sig) == nil), nil
 	case "pss":
-		opts, oerr := rsaPSSOptions(intArg(args[2]), h)
+		opts, oerr := rsaPSSOptions(intArg(args[2]), h, true)
 		if oerr != nil {
 			return subtleErr(errOperation, oerr.Error()), nil
 		}
@@ -1071,7 +1111,7 @@ func (s *subtleAPI) opEdExport(cfg spidermonkey.Config, args []spidermonkey.Valu
 			return nil, err
 		}
 		return spidermonkey.ValueOf(string(out)), nil
-	case "raw":
+	case "raw", "raw-public":
 		return bytesValue(pub), nil
 	case "pkcs8":
 		if k.edPriv == nil {
@@ -1168,4 +1208,46 @@ func (s *subtleAPI) ops() map[string]spidermonkey.Func {
 		"subtle_ed_sign":         s.opEdSign,
 		"subtle_ed_verify":       s.opEdVerify,
 	}
+}
+
+// ecCurveOIDs maps the named-curve OID an EC SubjectPublicKeyInfo carries in its
+// algorithm parameters onto the curve.
+var ecCurveOIDs = []struct {
+	oid   asn1.ObjectIdentifier
+	curve elliptic.Curve
+}{
+	{asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7}, elliptic.P256()},
+	{asn1.ObjectIdentifier{1, 3, 132, 0, 34}, elliptic.P384()},
+	{asn1.ObjectIdentifier{1, 3, 132, 0, 35}, elliptic.P521()},
+}
+
+// parseECSPKICompressed reads an EC SubjectPublicKeyInfo whose point is
+// compressed. It exists only because crypto/x509 rejects that form; the
+// encoding is otherwise the one x509 already understands, so only the point
+// needs different treatment.
+func parseECSPKICompressed(der []byte) (*ecdsa.PublicKey, error) {
+	var doc struct {
+		Algorithm struct {
+			Algorithm  asn1.ObjectIdentifier
+			Parameters asn1.ObjectIdentifier
+		}
+		PublicKey asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(der, &doc); err != nil {
+		return nil, err
+	}
+	if !doc.Algorithm.Algorithm.Equal(asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}) {
+		return nil, fmt.Errorf("spki key is not EC")
+	}
+	for _, c := range ecCurveOIDs {
+		if !c.oid.Equal(doc.Algorithm.Parameters) {
+			continue
+		}
+		x, y := elliptic.UnmarshalCompressed(c.curve, doc.PublicKey.Bytes)
+		if x == nil {
+			return nil, fmt.Errorf("not a point on the named curve")
+		}
+		return &ecdsa.PublicKey{Curve: c.curve, X: x, Y: y}, nil
+	}
+	return nil, fmt.Errorf("unsupported EC curve")
 }

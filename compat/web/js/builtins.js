@@ -9,10 +9,36 @@
 
 	// ---------------------------------------------------------------- errors
 
+	// The legacy numeric codes. They are not decoration: the Web Platform Tests'
+	// assert_throws_dom checks `code` as well as `name`, so a DOMException without
+	// one fails every such assertion no matter which name it carries. Names added
+	// after the legacy list have no code and report 0.
+	const DOM_EXCEPTION_CODES = {
+		IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+		InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+		NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+		SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+		InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+		NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+		QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+		DataCloneError: 25,
+	};
+
 	class DOMException extends Error {
 		constructor(message = "", name = "Error") {
 			super(message);
 			this.name = name;
+		}
+		get code() { return DOM_EXCEPTION_CODES[this.name] ?? 0; }
+	}
+	// The constants live on both the interface and its prototype, as they do for
+	// every Web IDL interface that has them.
+	for (const [name, code] of Object.entries(DOM_EXCEPTION_CODES)) {
+		// INDEX_SIZE_ERR from IndexSizeError: the legacy spelling is the name with
+		// its words separated and "Error" shortened to "ERR".
+		const legacy = name.replace(/Error$/, "").replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase() + "_ERR";
+		for (const target of [DOMException, DOMException.prototype]) {
+			Object.defineProperty(target, legacy, { value: code, enumerable: true });
 		}
 	}
 	globalThis.DOMException ??= DOMException;
