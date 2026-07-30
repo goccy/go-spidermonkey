@@ -406,31 +406,31 @@ func (s *subtleAPI) opECImportJWK(cfg spidermonkey.Config, args []spidermonkey.V
 	// that was. Returning a bare Go error surfaced as a plain Error instead.
 	var j jwkDoc
 	if err := json.Unmarshal([]byte(args[0].String()), &j); err != nil {
-		return subtleErr("DataError: bad JWK: " + err.Error()), nil
+		return subtleErr(errData, "bad JWK: "+err.Error()), nil
 	}
 	if j.Kty != "EC" {
-		return subtleErr(fmt.Sprintf("DataError: not an EC JWK (kty=%q)", j.Kty)), nil
+		return subtleErr(errData, fmt.Sprintf("not an EC JWK (kty=%q)", j.Kty)), nil
 	}
 	curve, err := curveByName(j.Crv)
 	if err != nil {
-		return subtleErr("DataError: " + err.Error()), nil
+		return subtleErr(errData, err.Error()), nil
 	}
 	x, err := b64uBig(j.X)
 	if err != nil {
-		return subtleErr("DataError: bad JWK x: " + err.Error()), nil
+		return subtleErr(errData, "bad JWK x: "+err.Error()), nil
 	}
 	y, err := b64uBig(j.Y)
 	if err != nil {
-		return subtleErr("DataError: bad JWK y: " + err.Error()), nil
+		return subtleErr(errData, "bad JWK y: "+err.Error()), nil
 	}
 	// The coordinates must be exactly the curve's field width. A short or long
 	// one is a different point, or none — never something to zero-extend.
 	if size := (curve.Params().BitSize + 7) / 8; b64uLen(j.X) != size || b64uLen(j.Y) != size {
-		return subtleErr("DataError: JWK coordinate length does not match the curve"), nil
+		return subtleErr(errData, "JWK coordinate length does not match the curve"), nil
 	}
 	pub := ecdsa.PublicKey{Curve: curve, X: x, Y: y}
 	if !curve.IsOnCurve(x, y) {
-		return subtleErr("DataError: JWK point is not on " + j.Crv), nil
+		return subtleErr(errData, "JWK point is not on "+j.Crv), nil
 	}
 	if j.D == "" {
 		return spidermonkey.ValueOf(map[string]any{
@@ -439,10 +439,10 @@ func (s *subtleAPI) opECImportJWK(cfg spidermonkey.Config, args []spidermonkey.V
 	}
 	d, err := b64uBig(j.D)
 	if err != nil {
-		return subtleErr("DataError: bad JWK d: " + err.Error()), nil
+		return subtleErr(errData, "bad JWK d: "+err.Error()), nil
 	}
 	if size := (curve.Params().BitSize + 7) / 8; b64uLen(j.D) != size {
-		return subtleErr("DataError: JWK private scalar length does not match the curve"), nil
+		return subtleErr(errData, "JWK private scalar length does not match the curve"), nil
 	}
 	priv := &ecdsa.PrivateKey{PublicKey: pub, D: d}
 	return spidermonkey.ValueOf(map[string]any{
@@ -463,19 +463,19 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 		// A raw EC key is a bare uncompressed point, so the curve cannot be
 		// recovered from the bytes — the caller names it.
 		if len(args) < 3 {
-			return subtleErr("DataError: raw EC import needs a named curve"), nil
+			return subtleErr(errData, "raw EC import needs a named curve"), nil
 		}
 		curve, cerr := ecdhCurve(args[2].String())
 		if cerr != nil {
-			return subtleErr("DataError: " + cerr.Error()), nil
+			return subtleErr(errData, cerr.Error()), nil
 		}
 		pt, perr := curve.NewPublicKey(der)
 		if perr != nil {
-			return subtleErr("DataError: " + perr.Error()), nil
+			return subtleErr(errData, perr.Error()), nil
 		}
 		pub, perr := ecdsaFromECDHPublic(pt, args[2].String())
 		if perr != nil {
-			return subtleErr("DataError: " + perr.Error()), nil
+			return subtleErr(errData, perr.Error()), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": args[2].String(),
@@ -483,11 +483,11 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 	case "pkcs8":
 		key, err := x509.ParsePKCS8PrivateKey(der)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		priv, ok := key.(*ecdsa.PrivateKey)
 		if !ok {
-			return subtleErr("DataError: pkcs8 key is not EC"), nil
+			return subtleErr(errData, "pkcs8 key is not EC"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{ecPriv: priv}), "type": "private", "crv": curveName(priv.Curve),
@@ -495,17 +495,17 @@ func (s *subtleAPI) opECImportDER(cfg spidermonkey.Config, args []spidermonkey.V
 	case "spki":
 		key, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		pub, ok := key.(*ecdsa.PublicKey)
 		if !ok {
-			return subtleErr("DataError: spki key is not EC"), nil
+			return subtleErr(errData, "spki key is not EC"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{
 			"id": s.put(&subtleKey{ecPub: pub}), "type": "public", "crv": curveName(pub.Curve),
 		}), nil
 	}
-	return subtleErr("NotSupportedError: unsupported EC key format"), nil
+	return subtleErr(errNotSupported, "unsupported EC key format"), nil
 }
 
 func (s *subtleAPI) opECExportJWK(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -551,16 +551,16 @@ func (s *subtleAPI) opECExportDER(cfg spidermonkey.Config, args []spidermonkey.V
 			pub = &k.ecPriv.PublicKey
 		}
 		if pub == nil {
-			return subtleErr("InvalidAccessError: raw export needs a public key"), nil
+			return subtleErr(errInvalidAccess, "raw export needs a public key"), nil
 		}
 		pt, perr := pub.ECDH()
 		if perr != nil {
-			return subtleErr("OperationError: " + perr.Error()), nil
+			return subtleErr(errOperation, perr.Error()), nil
 		}
 		return bytesValue(pt.Bytes()), nil
 	case "pkcs8":
 		if k.ecPriv == nil {
-			return subtleErr("InvalidAccessError: pkcs8 export needs a private key"), nil
+			return subtleErr(errInvalidAccess, "pkcs8 export needs a private key"), nil
 		}
 		der, err := x509.MarshalPKCS8PrivateKey(k.ecPriv)
 		if err != nil {
@@ -581,7 +581,7 @@ func (s *subtleAPI) opECExportDER(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		return bytesValue(der), nil
 	}
-	return subtleErr("NotSupportedError: unsupported EC export format"), nil
+	return subtleErr(errNotSupported, "unsupported EC export format"), nil
 }
 
 func (s *subtleAPI) opECSign(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -887,7 +887,7 @@ func (s *subtleAPI) opRSASign(cfg spidermonkey.Config, args []spidermonkey.Value
 	case "pss":
 		opts, oerr := rsaPSSOptions(intArg(args[2]), h)
 		if oerr != nil {
-			return subtleErr("OperationError: " + oerr.Error()), nil
+			return subtleErr(errOperation, oerr.Error()), nil
 		}
 		sig, err = rsa.SignPSS(rand.Reader, k.rsaPriv, h, digest, opts)
 	default:
@@ -933,7 +933,7 @@ func (s *subtleAPI) opRSAVerify(cfg spidermonkey.Config, args []spidermonkey.Val
 	case "pss":
 		opts, oerr := rsaPSSOptions(intArg(args[2]), h)
 		if oerr != nil {
-			return subtleErr("OperationError: " + oerr.Error()), nil
+			return subtleErr(errOperation, oerr.Error()), nil
 		}
 		return spidermonkey.ValueOf(rsa.VerifyPSS(pub, h, digest, sig, opts) == nil), nil
 	}

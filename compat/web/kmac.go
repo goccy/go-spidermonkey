@@ -108,14 +108,14 @@ func (s *subtleAPI) opKMAC(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	custom, _ := argBytes(args[3])
 	outBits := intArg(args[4])
 	if outBits <= 0 || outBits%8 != 0 {
-		return subtleErr("OperationError: KMAC length must be a positive multiple of 8"), nil
+		return subtleErr(errOperation, "KMAC length must be a positive multiple of 8"), nil
 	}
 	if outBits/8 > maxSubtleKDFBytes {
-		return subtleErr("OperationError: KMAC length is too large"), nil
+		return subtleErr(errOperation, "KMAC length is too large"), nil
 	}
 	out, err := kmac(bits, key, msg, custom, outBits/8)
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	return bytesValue(out), nil
 }
@@ -136,10 +136,10 @@ func (s *subtleAPI) opCShake(cfg spidermonkey.Config, args []spidermonkey.Value)
 	custom, _ := argBytes(args[2])
 	outBits := intArg(args[3])
 	if outBits <= 0 || outBits%8 != 0 {
-		return subtleErr("OperationError: cSHAKE length must be a positive multiple of 8"), nil
+		return subtleErr(errOperation, "cSHAKE length must be a positive multiple of 8"), nil
 	}
 	if outBits/8 > maxSubtleKDFBytes {
-		return subtleErr("OperationError: cSHAKE length is too large"), nil
+		return subtleErr(errOperation, "cSHAKE length is too large"), nil
 	}
 	var h sha3.ShakeHash
 	switch bits {
@@ -148,14 +148,14 @@ func (s *subtleAPI) opCShake(cfg spidermonkey.Config, args []spidermonkey.Value)
 	case 256:
 		h = sha3.NewCShake256(nil, custom)
 	default:
-		return subtleErr("OperationError: cSHAKE must be 128 or 256"), nil
+		return subtleErr(errOperation, "cSHAKE must be 128 or 256"), nil
 	}
 	if _, err := h.Write(data); err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	out := make([]byte, outBits/8)
 	if _, err := h.Read(out); err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	return bytesValue(out), nil
 }

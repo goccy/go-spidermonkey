@@ -193,7 +193,7 @@ func (s *subtleAPI) opMLKEMGenerate(cfg spidermonkey.Config, args []spidermonkey
 	}
 	set, ok := mlkemSet(args[0].String())
 	if !ok {
-		return subtleErr("NotSupportedError: unsupported algorithm " + args[0].String()), nil
+		return subtleErr(errNotSupported, "unsupported algorithm "+args[0].String()), nil
 	}
 	var k *mlkemKey
 	if set.name == "ML-KEM-512" {
@@ -201,29 +201,29 @@ func (s *subtleAPI) opMLKEMGenerate(cfg spidermonkey.Config, args []spidermonkey
 		// the format the spec prefers for a private ML-KEM key.
 		seed := make([]byte, mlkem512.KeySeedSize)
 		if _, err := rand.Read(seed); err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		gk, err := mlkemFromSeed(set, seed)
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		k = gk
 	} else if set.name == "ML-KEM-768" {
 		dk, err := mlkem.GenerateKey768()
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		k = &mlkemKey{set: set, dk768: dk}
 	} else {
 		dk, err := mlkem.GenerateKey1024()
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		k = &mlkemKey{set: set, dk1k: dk}
 	}
 	pub, err := mlkemFromPublic(set, k.publicBytes())
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	return spidermonkey.ValueOf(map[string]any{
 		"priv": s.put(&subtleKey{mlkem: k}),
@@ -241,7 +241,7 @@ func (s *subtleAPI) opMLKEMImport(cfg spidermonkey.Config, args []spidermonkey.V
 	declared := args[0].String()
 	set, ok := mlkemSet(declared)
 	if !ok {
-		return subtleErr("NotSupportedError: unsupported algorithm " + declared), nil
+		return subtleErr(errNotSupported, "unsupported algorithm "+declared), nil
 	}
 	format := args[1].String()
 
@@ -249,7 +249,7 @@ func (s *subtleAPI) opMLKEMImport(cfg spidermonkey.Config, args []spidermonkey.V
 	// an ML-KEM-768 SPKI as ML-KEM-1024 is a DataError, not a silent reinterpret.
 	finish := func(k *mlkemKey, err error) (spidermonkey.Value, error) {
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		kind := "public"
 		if k.private() {
@@ -264,66 +264,66 @@ func (s *subtleAPI) opMLKEMImport(cfg spidermonkey.Config, args []spidermonkey.V
 	case "raw-seed":
 		b, err := argBytes(args[2])
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		return finish(mlkemFromSeed(set, b))
 	case "raw-public":
 		b, err := argBytes(args[2])
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		return finish(mlkemFromPublic(set, b))
 	case "pkcs8":
 		b, err := argBytes(args[2])
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		got, seed, err := mlkemParsePKCS8(b)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		if got.name != set.name {
-			return subtleErr("DataError: key is " + got.name + ", not " + set.name), nil
+			return subtleErr(errData, "key is "+got.name+", not "+set.name), nil
 		}
 		return finish(mlkemFromSeed(set, seed))
 	case "spki":
 		b, err := argBytes(args[2])
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		got, pub, err := mlkemParseSPKI(b)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		if got.name != set.name {
-			return subtleErr("DataError: key is " + got.name + ", not " + set.name), nil
+			return subtleErr(errData, "key is "+got.name+", not "+set.name), nil
 		}
 		return finish(mlkemFromPublic(set, pub))
 	case "jwk":
 		var j struct{ Kty, Alg, Priv, Pub string }
 		if err := json.Unmarshal([]byte(args[2].String()), &j); err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		if j.Kty != "AKP" {
-			return subtleErr("DataError: ML-KEM JWK must have kty AKP"), nil
+			return subtleErr(errData, "ML-KEM JWK must have kty AKP"), nil
 		}
 		if j.Alg != "" && j.Alg != set.name {
-			return subtleErr("DataError: JWK alg is " + j.Alg + ", not " + set.name), nil
+			return subtleErr(errData, "JWK alg is "+j.Alg+", not "+set.name), nil
 		}
 		if j.Priv != "" {
 			seed, err := base64.RawURLEncoding.DecodeString(j.Priv)
 			if err != nil {
-				return subtleErr("DataError: bad JWK priv"), nil
+				return subtleErr(errData, "bad JWK priv"), nil
 			}
 			return finish(mlkemFromSeed(set, seed))
 		}
 		pub, err := base64.RawURLEncoding.DecodeString(j.Pub)
 		if err != nil {
-			return subtleErr("DataError: bad JWK pub"), nil
+			return subtleErr(errData, "bad JWK pub"), nil
 		}
 		return finish(mlkemFromPublic(set, pub))
 	}
-	return subtleErr("NotSupportedError: unsupported ML-KEM key format " + format), nil
+	return subtleErr(errNotSupported, "unsupported ML-KEM key format "+format), nil
 }
 
 // opMLKEMExport(format, handle) -> bytes, or a JWK object for "jwk".
@@ -333,7 +333,7 @@ func (s *subtleAPI) opMLKEMExport(cfg spidermonkey.Config, args []spidermonkey.V
 	}
 	sk, err := s.get(args[1])
 	if err != nil || sk.mlkem == nil {
-		return subtleErr("InvalidAccessError: not an ML-KEM key"), nil
+		return subtleErr(errInvalidAccess, "not an ML-KEM key"), nil
 	}
 	k := sk.mlkem
 	b64 := base64.RawURLEncoding.EncodeToString
@@ -342,22 +342,22 @@ func (s *subtleAPI) opMLKEMExport(cfg spidermonkey.Config, args []spidermonkey.V
 		return bytesValueOK(k.publicBytes())
 	case "raw-seed":
 		if !k.private() {
-			return subtleErr("InvalidAccessError: raw-seed export needs a private key"), nil
+			return subtleErr(errInvalidAccess, "raw-seed export needs a private key"), nil
 		}
 		return bytesValueOK(k.seed())
 	case "spki":
 		der, err := akpSPKI(k.set.oid, k.publicBytes())
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		return bytesValueOK(der)
 	case "pkcs8":
 		if !k.private() {
-			return subtleErr("InvalidAccessError: pkcs8 export needs a private key"), nil
+			return subtleErr(errInvalidAccess, "pkcs8 export needs a private key"), nil
 		}
 		der, err := akpPKCS8(k.set.oid, k.seed())
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		return bytesValueOK(der)
 	case "jwk":
@@ -367,7 +367,7 @@ func (s *subtleAPI) opMLKEMExport(cfg spidermonkey.Config, args []spidermonkey.V
 		}
 		return spidermonkey.ValueOf(out), nil
 	}
-	return subtleErr("NotSupportedError: unsupported ML-KEM export format"), nil
+	return subtleErr(errNotSupported, "unsupported ML-KEM export format"), nil
 }
 
 // opMLKEMEncapsulate(handle) -> {sharedKey, ciphertext}.
@@ -377,13 +377,13 @@ func (s *subtleAPI) opMLKEMEncapsulate(cfg spidermonkey.Config, args []spidermon
 	}
 	sk, err := s.get(args[0])
 	if err != nil || sk.mlkem == nil {
-		return subtleErr("InvalidAccessError: not an ML-KEM key"), nil
+		return subtleErr(errInvalidAccess, "not an ML-KEM key"), nil
 	}
 	k := sk.mlkem
 	// Encapsulation needs the public half, which a private handle can derive.
 	pub, perr := mlkemFromPublic(k.set, k.publicBytes())
 	if perr != nil {
-		return subtleErr("OperationError: " + perr.Error()), nil
+		return subtleErr(errOperation, perr.Error()), nil
 	}
 	var shared, ct []byte
 	switch {
@@ -394,7 +394,7 @@ func (s *subtleAPI) opMLKEMEncapsulate(cfg spidermonkey.Config, args []spidermon
 		shared = make([]byte, mlkem512.SharedKeySize)
 		seed := make([]byte, mlkem512.EncapsulationSeedSize)
 		if _, rerr := rand.Read(seed); rerr != nil {
-			return subtleErr("OperationError: " + rerr.Error()), nil
+			return subtleErr(errOperation, rerr.Error()), nil
 		}
 		pub.ek512.EncapsulateTo(ct, shared, seed)
 	case pub.ek768 != nil:
@@ -414,17 +414,17 @@ func (s *subtleAPI) opMLKEMDecapsulate(cfg spidermonkey.Config, args []spidermon
 	}
 	sk, err := s.get(args[0])
 	if err != nil || sk.mlkem == nil || !sk.mlkem.private() {
-		return subtleErr("InvalidAccessError: decapsulation needs an ML-KEM private key"), nil
+		return subtleErr(errInvalidAccess, "decapsulation needs an ML-KEM private key"), nil
 	}
 	ct, err := argBytes(args[1])
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	var shared []byte
 	switch {
 	case sk.mlkem.dk512 != nil:
 		if len(ct) != mlkem512.CiphertextSize {
-			return subtleErr(fmt.Sprintf("OperationError: ML-KEM-512 ciphertext must be %d bytes", mlkem512.CiphertextSize)), nil
+			return subtleErr(errOperation, fmt.Sprintf("ML-KEM-512 ciphertext must be %d bytes", mlkem512.CiphertextSize)), nil
 		}
 		shared = make([]byte, mlkem512.SharedKeySize)
 		sk.mlkem.dk512.DecapsulateTo(shared, ct)
@@ -434,7 +434,7 @@ func (s *subtleAPI) opMLKEMDecapsulate(cfg spidermonkey.Config, args []spidermon
 		shared, err = sk.mlkem.dk1k.Decapsulate(ct)
 	}
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	return bytesValueOK(shared)
 }

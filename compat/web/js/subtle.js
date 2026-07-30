@@ -166,16 +166,12 @@
 	// the digest length chosen per call rather than fixed by the algorithm.
 	const KMAC_NAMES = ["KMAC128", "KMAC256"];
 
-	// The host tags an error with the DOMException name the spec asks for, as a
-	// "DataError: ..." / "InvalidAccessError: ..." prefix. Reporting every one
-	// as an OperationError threw that away: a malformed key must be a
-	// DataError, and the suite checks which name it got.
+	// A host failure carries the DOMException name the spec asks for in its own
+	// field. Which name it is matters — a malformed key must be a DataError, not
+	// the OperationError everything used to collapse into — so it is passed as
+	// data rather than written into the message and read back out of it.
 	const subtleFail = (r) => {
-		if (r && r.__subtleError) {
-			const m = /^([A-Za-z]+Error): ([\s\S]*)$/.exec(String(r.message));
-			if (m && m[1] !== "Error") throw new DOMException(m[2], m[1]);
-			throw new DOMException(r.message, "OperationError");
-		}
+		if (r && r.__subtleError) throw new DOMException(r.message, r.name);
 		return r;
 	};
 
@@ -301,8 +297,24 @@
 		"HMAC", "RSASSA-PKCS1-V1_5", "RSA-PSS", "RSA-OAEP",
 	]);
 
+	// The curves an EC algorithm can name. Spelled exactly: unlike an algorithm
+	// name, a namedCurve is compared case-sensitively.
+	const EC_CURVES = new Set(["P-256", "P-384", "P-521"]);
+
 	function checkInnerAlgorithms(alg, name, op) {
-		if (!NEEDS_HASH.has(String(name).toUpperCase())) return;
+		const upper = String(name).toUpperCase();
+		// The curve is part of the algorithm, so a curve this platform does not
+		// have is NotSupportedError — the same answer an unknown algorithm gets,
+		// and reached before the usages are looked at. Unchecked, a bad curve
+		// surfaced as whatever the host happened to say about it.
+		if (upper === "ECDSA" || upper === "ECDH") {
+			const crv = alg === null || typeof alg !== "object" ? undefined : alg.namedCurve;
+			if (crv !== undefined && !EC_CURVES.has(String(crv))) {
+				throw new DOMException(
+					`Failed to execute '${op}': unsupported curve ${String(crv)}`, "NotSupportedError");
+			}
+		}
+		if (!NEEDS_HASH.has(upper)) return;
 		if (alg === null || typeof alg !== "object") return;
 		const h = alg.hash;
 		// The hash is required for these, and must name a hash this platform has.
@@ -478,6 +490,79 @@
 		}
 	}
 
+	// The body of exportKey, without its extractable check. getPublicKey needs
+	// exactly this: a private key's public half is not a secret, so it can be
+	// written out even when the private key it came from cannot.
+	async function exportInner(format, key) {
+		const name = key.algorithm.name.toUpperCase();
+		if (MLDSA_NAMES.includes(name)) {
+			const r = subtleFail(ops.subtle_mldsa_export(format, key._h));
+			return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+		}
+		if (MLKEM_NAMES.includes(name)) {
+			const r = subtleFail(ops.subtle_mlkem_export(format, key._h));
+			return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+		}
+		if (name === "X25519") {
+			const r = subtleFail(ops.subtle_x25519_export(format, key._h));
+			return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+		}
+		if (name === "ED448" || name === "X448") {
+			const r = subtleFail((name === "ED448" ? ops.subtle_ed448_export : ops.subtle_x448_export)(format, key._h));
+			return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+		}
+		if (name === "HMAC") {
+			const raw = Uint8Array.from(ops.subtle_hmac_export(key._h));
+			if (format === "raw") return raw.buffer;
+			if (format === "jwk") return { kty: "oct", k: b64uEncode(raw), ext: true, key_ops: [...key.usages] };
+			unsupported(`HMAC export format ${format}`);
+		}
+		if (name === "ECDSA" || name === "ECDH") {
+			if (format === "jwk") return JSON.parse(ops.subtle_ec_export_jwk(key._h));
+			if (format === "raw") return toBuf(subtleFail(ops.subtle_ec_export_der("raw", key._h)));
+			if (format === "pkcs8" || format === "spki") return toBuf(subtleFail(ops.subtle_ec_export_der(format, key._h)));
+			unsupported(`EC export format ${format}`);
+		}
+		if (RSA_ALL.includes(name)) {
+			if (format === "jwk") return JSON.parse(ops.subtle_rsa_export_jwk(key._h));
+			if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_rsa_export_der(format, key._h));
+			unsupported(`RSA export format ${format}`);
+		}
+		if (name === "ED25519") {
+			if (format === "jwk") return JSON.parse(ops.subtle_ed_export("jwk", key._h));
+			if (format === "raw") return Uint8Array.from(ops.subtle_ed_export("raw", key._h)).buffer;
+			if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_ed_export(format, key._h));
+			unsupported(`Ed25519 export format ${format}`);
+		}
+		if (AES_ALL.includes(name)) {
+			if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
+			if (format === "jwk") {
+				// The JWK alg encodes the AES variant AND the key size, e.g.
+				// A128GCM/A192GCM/A256GCM, A256CBC, A256CTR — derive it from the
+				// actual key length, not a hardcoded A256GCM.
+				const bits = (rawOf(key).length * 8);
+				const suffix = name === "AES-GCM" ? "GCM" : name === "AES-CBC" ? "CBC" : name === "AES-CTR" ? "CTR" : name === "AES-OCB" ? "OCB" : "KW";
+				return { kty: "oct", k: b64uEncode(rawOf(key)), alg: `A${bits}${suffix}`, ext: true, key_ops: [...key.usages] };
+			}
+			unsupported(`AES export format ${format}`);
+		}
+		if (KMAC_NAMES.includes(name)) {
+			if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
+			if (format === "jwk") {
+				return { kty: "oct", k: b64uEncode(rawOf(key)), alg: `K${name.substring(4)}`, ext: true, key_ops: [...key.usages] };
+			}
+			unsupported(`${name} export format ${format}`);
+		}
+		if (name === CHACHA) {
+			// No `alg` in the JWK: unlike AES there is no registered name for
+			// it, because there is only one variant to name.
+			if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
+			if (format === "jwk") return { kty: "oct", k: b64uEncode(rawOf(key)), ext: true, key_ops: [...key.usages] };
+			unsupported(`ChaCha20-Poly1305 export format ${format}`);
+		}
+		unsupported(`algorithm ${key.algorithm.name}`);
+	}
+
 	const subtle = {
 		async digest(alg, data) {
 			// cSHAKE is an extendable-output function: the caller names the digest
@@ -594,8 +679,11 @@
 					publicKey: new CryptoKey("public", true, algo, usages.filter((u) => u === "verify"), r.pub),
 				};
 			}
-			if (MLKEM_NAMES.includes(algName(alg))) {
-				const r = subtleFail(ops.subtle_mlkem_generate(algName(alg)));
+			if (MLKEM_NAMES.includes(name)) {
+				// `name` and not alg.name: the caller's spelling is only required to
+				// match case-insensitively, and the host looks the parameter set up
+				// by its registered name.
+				const r = subtleFail(ops.subtle_mlkem_generate(name));
 				const algo = { name: r.name };
 				return {
 					privateKey: new CryptoKey("private", extractable, algo,
@@ -657,9 +745,9 @@
 				return new CryptoKey(r.type, extractable, { name: r.name },
 					usages.filter((u) => (isPub ? u === "verify" : u === "sign")), r.id);
 			}
-			if (MLKEM_NAMES.includes(algName(alg))) {
+			if (MLKEM_NAMES.includes(name)) {
 				const payload = format === "jwk" ? JSON.stringify(keyData) : toU8(keyData);
-				const r = subtleFail(ops.subtle_mlkem_import(algName(alg), format, payload));
+				const r = subtleFail(ops.subtle_mlkem_import(name, format, payload));
 				const isPub = r.type === "public";
 				return new CryptoKey(r.type, extractable, { name: r.name },
 					usages.filter((u) => isPub
@@ -789,73 +877,24 @@
 		async exportKey(format, key) {
 			if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
 			if (!key.extractable) throw new DOMException("key is not extractable", "InvalidAccessError");
-			const name = key.algorithm.name.toUpperCase();
-			if (MLDSA_NAMES.includes(name)) {
-				const r = subtleFail(ops.subtle_mldsa_export(format, key._h));
-				return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+			return exportInner(format, key);
+		},
+
+		// getPublicKey derives the public half of a private key. It goes through
+		// spki rather than a per-algorithm host op: every algorithm here can
+		// already write the public half of a private handle, and coming back in
+		// through importKey is what gets the usages judged as a public key's.
+		async getPublicKey(key, usages) {
+			if (!(key instanceof CryptoKey)) throw new TypeError("expected a CryptoKey");
+			if (key.type === "secret") {
+				throw new DOMException(
+					`Failed to execute 'getPublicKey': ${key.algorithm.name} has no public half`, "NotSupportedError");
 			}
-			if (MLKEM_NAMES.includes(key.algorithm.name)) {
-				const r = subtleFail(ops.subtle_mlkem_export(format, key._h));
-				return format === "jwk" ? { ...r, ext: key.extractable, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
+			if (key.type !== "private") {
+				throw new DOMException(
+					"Failed to execute 'getPublicKey': the key is not a private key", "InvalidAccessError");
 			}
-			if (name === "X25519") {
-				const r = subtleFail(ops.subtle_x25519_export(format, key._h));
-				return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
-			}
-			if (name === "ED448" || name === "X448") {
-				const r = subtleFail((name === "ED448" ? ops.subtle_ed448_export : ops.subtle_x448_export)(format, key._h));
-				return format === "jwk" ? { ...r, ext: true, key_ops: [...key.usages] } : Uint8Array.from(r).buffer;
-			}
-			if (name === "HMAC") {
-				const raw = Uint8Array.from(ops.subtle_hmac_export(key._h));
-				if (format === "raw") return raw.buffer;
-				if (format === "jwk") return { kty: "oct", k: b64uEncode(raw), ext: true, key_ops: [...key.usages] };
-				unsupported(`HMAC export format ${format}`);
-			}
-			if (name === "ECDSA" || name === "ECDH") {
-				if (format === "jwk") return JSON.parse(ops.subtle_ec_export_jwk(key._h));
-				if (format === "raw") return toBuf(subtleFail(ops.subtle_ec_export_der("raw", key._h)));
-				if (format === "pkcs8" || format === "spki") return toBuf(subtleFail(ops.subtle_ec_export_der(format, key._h)));
-				unsupported(`EC export format ${format}`);
-			}
-			if (RSA_ALL.includes(name)) {
-				if (format === "jwk") return JSON.parse(ops.subtle_rsa_export_jwk(key._h));
-				if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_rsa_export_der(format, key._h));
-				unsupported(`RSA export format ${format}`);
-			}
-			if (name === "ED25519") {
-				if (format === "jwk") return JSON.parse(ops.subtle_ed_export("jwk", key._h));
-				if (format === "raw") return Uint8Array.from(ops.subtle_ed_export("raw", key._h)).buffer;
-				if (format === "pkcs8" || format === "spki") return toBuf(ops.subtle_ed_export(format, key._h));
-				unsupported(`Ed25519 export format ${format}`);
-			}
-			if (AES_ALL.includes(name)) {
-				if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
-				if (format === "jwk") {
-					// The JWK alg encodes the AES variant AND the key size, e.g.
-					// A128GCM/A192GCM/A256GCM, A256CBC, A256CTR — derive it from the
-					// actual key length, not a hardcoded A256GCM.
-					const bits = (rawOf(key).length * 8);
-					const suffix = name === "AES-GCM" ? "GCM" : name === "AES-CBC" ? "CBC" : name === "AES-CTR" ? "CTR" : name === "AES-OCB" ? "OCB" : "KW";
-					return { kty: "oct", k: b64uEncode(rawOf(key)), alg: `A${bits}${suffix}`, ext: true, key_ops: [...key.usages] };
-				}
-				unsupported(`AES export format ${format}`);
-			}
-			if (KMAC_NAMES.includes(name)) {
-				if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
-				if (format === "jwk") {
-					return { kty: "oct", k: b64uEncode(rawOf(key)), alg: `K${name.substring(4)}`, ext: true, key_ops: [...key.usages] };
-				}
-				unsupported(`${name} export format ${format}`);
-			}
-			if (name === CHACHA) {
-				// No `alg` in the JWK: unlike AES there is no registered name for
-				// it, because there is only one variant to name.
-				if (format === "raw" || format === "raw-secret") return rawOf(key).slice().buffer;
-				if (format === "jwk") return { kty: "oct", k: b64uEncode(rawOf(key)), ext: true, key_ops: [...key.usages] };
-				unsupported(`ChaCha20-Poly1305 export format ${format}`);
-			}
-			unsupported(`algorithm ${key.algorithm.name}`);
+			return subtle.importKey("spki", await exportInner("spki", key), key.algorithm, true, usages ?? []);
 		},
 
 		async sign(alg, key, data) {

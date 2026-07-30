@@ -43,39 +43,39 @@ func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.
 	case "raw":
 		raw, err := argBytes(args[1])
 		if err != nil {
-			return subtleErr(err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		pub, err := ecdh.X25519().NewPublicKey(raw)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{xPub: pub})}), nil
 	case "spki":
 		der, err := argBytes(args[1])
 		if err != nil {
-			return subtleErr(err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		parsed, err := x509.ParsePKIXPublicKey(der)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		pub, ok := parsed.(*ecdh.PublicKey)
 		if !ok || pub.Curve() != ecdh.X25519() {
-			return subtleErr("DataError: spki key is not X25519"), nil
+			return subtleErr(errData, "spki key is not X25519"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{xPub: pub})}), nil
 	case "pkcs8":
 		der, err := argBytes(args[1])
 		if err != nil {
-			return subtleErr(err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		parsed, err := x509.ParsePKCS8PrivateKey(der)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		priv, ok := parsed.(*ecdh.PrivateKey)
 		if !ok || priv.Curve() != ecdh.X25519() {
-			return subtleErr("DataError: pkcs8 key is not X25519"), nil
+			return subtleErr(errData, "pkcs8 key is not X25519"), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{xPriv: priv})}), nil
 	case "jwk":
@@ -83,33 +83,33 @@ func (s *subtleAPI) opX25519Import(cfg spidermonkey.Config, args []spidermonkey.
 			Kty, Crv, X, D string
 		}
 		if err := json.Unmarshal([]byte(args[1].String()), &jwk); err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		if jwk.Kty != "OKP" || jwk.Crv != "X25519" {
-			return subtleErr("DataError: not an X25519 JWK"), nil
+			return subtleErr(errData, "not an X25519 JWK"), nil
 		}
 		if jwk.D != "" {
 			d, err := base64.RawURLEncoding.DecodeString(jwk.D)
 			if err != nil {
-				return subtleErr("DataError: bad d"), nil
+				return subtleErr(errData, "bad d"), nil
 			}
 			priv, err := ecdh.X25519().NewPrivateKey(d)
 			if err != nil {
-				return subtleErr("DataError: " + err.Error()), nil
+				return subtleErr(errData, err.Error()), nil
 			}
 			return spidermonkey.ValueOf(map[string]any{"priv": s.put(&subtleKey{xPriv: priv})}), nil
 		}
 		x, err := base64.RawURLEncoding.DecodeString(jwk.X)
 		if err != nil {
-			return subtleErr("DataError: bad x"), nil
+			return subtleErr(errData, "bad x"), nil
 		}
 		pub, err := ecdh.X25519().NewPublicKey(x)
 		if err != nil {
-			return subtleErr("DataError: " + err.Error()), nil
+			return subtleErr(errData, err.Error()), nil
 		}
 		return spidermonkey.ValueOf(map[string]any{"pub": s.put(&subtleKey{xPub: pub})}), nil
 	}
-	return subtleErr("NotSupportedError: unsupported X25519 key format"), nil
+	return subtleErr(errNotSupported, "unsupported X25519 key format"), nil
 }
 
 // opX25519Export writes a key back out as "raw" (public only), "spki",
@@ -120,7 +120,7 @@ func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.
 	}
 	k, kerr := s.get(args[1])
 	if kerr != nil {
-		return subtleErr("InvalidAccessError: " + kerr.Error()), nil
+		return subtleErr(errInvalidAccess, kerr.Error()), nil
 	}
 	format := args[0].String()
 	b64 := base64.RawURLEncoding.EncodeToString
@@ -129,7 +129,7 @@ func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.
 		return bytesValueOK(k.xPub.Bytes())
 	case format == "raw" && k.xPriv != nil:
 		// "raw" of a private key is not exportable in Web Crypto.
-		return subtleErr("InvalidAccessError: cannot export a private key as raw"), nil
+		return subtleErr(errInvalidAccess, "cannot export a private key as raw"), nil
 	case format == "spki":
 		pub := k.xPub
 		if pub == nil && k.xPriv != nil {
@@ -140,13 +140,13 @@ func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.
 		}
 		der, err := x509.MarshalPKIXPublicKey(pub)
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		return bytesValueOK(der)
 	case format == "pkcs8" && k.xPriv != nil:
 		der, err := x509.MarshalPKCS8PrivateKey(k.xPriv)
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		return bytesValueOK(der)
 	case format == "jwk" && k.xPriv != nil:
@@ -160,7 +160,7 @@ func (s *subtleAPI) opX25519Export(cfg spidermonkey.Config, args []spidermonkey.
 			"kty": "OKP", "crv": "X25519", "x": b64(k.xPub.Bytes()),
 		}), nil
 	}
-	return subtleErr("NotSupportedError: unsupported X25519 export"), nil
+	return subtleErr(errNotSupported, "unsupported X25519 export"), nil
 }
 
 // opX25519Derive computes the shared secret. A requested length longer than the
@@ -172,16 +172,16 @@ func (s *subtleAPI) opX25519Derive(cfg spidermonkey.Config, args []spidermonkey.
 	privKey, perr := s.get(args[0])
 	pubKey, uerr := s.get(args[1])
 	if perr != nil || uerr != nil || privKey.xPriv == nil || pubKey.xPub == nil {
-		return subtleErr("InvalidAccessError: X25519 derive needs a private and a public key"), nil
+		return subtleErr(errInvalidAccess, "X25519 derive needs a private and a public key"), nil
 	}
 	secret, err := privKey.xPriv.ECDH(pubKey.xPub)
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	if bits := intArg(args[2]); bits > 0 {
 		want := bits / 8
 		if want > len(secret) {
-			return subtleErr("OperationError: requested length exceeds the X25519 shared secret"), nil
+			return subtleErr(errOperation, "requested length exceeds the X25519 shared secret"), nil
 		}
 		secret = secret[:want]
 	}

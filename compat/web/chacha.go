@@ -35,26 +35,26 @@ func (s *subtleAPI) opChaChaSeal(cfg spidermonkey.Config, args []spidermonkey.Va
 		aad, _ = argBytes(args[4])
 	}
 	if len(key) != chacha20poly1305.KeySize {
-		return subtleErr("OperationError: ChaCha20-Poly1305 key must be 256 bits"), nil
+		return subtleErr(errOperation, "ChaCha20-Poly1305 key must be 256 bits"), nil
 	}
 	// The nonce length is fixed at 96 bits. Saying so is better than letting the
 	// construction fail somewhere less legible.
 	if len(nonce) != chacha20poly1305.NonceSize {
-		return subtleErr("OperationError: ChaCha20-Poly1305 nonce must be 96 bits"), nil
+		return subtleErr(errOperation, "ChaCha20-Poly1305 nonce must be 96 bits"), nil
 	}
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	if encrypt {
 		return bytesValue(aead.Seal(nil, nonce, data, aad)), nil
 	}
 	if len(data) < aead.Overhead() {
-		return subtleErr("OperationError: decryption failed"), nil
+		return subtleErr(errOperation, "decryption failed"), nil
 	}
 	pt, err := aead.Open(nil, nonce, data, aad)
 	if err != nil {
-		return subtleErr("OperationError: decryption failed"), nil
+		return subtleErr(errOperation, "decryption failed"), nil
 	}
 	return bytesValue(pt), nil
 }

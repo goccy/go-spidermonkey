@@ -78,7 +78,7 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	switch mode {
 	case "AES-GCM":
@@ -94,16 +94,16 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 		// the tag is cut to size on the way out and checked by recomputation on
 		// the way in.
 		if len(iv) == 0 {
-			return subtleErr("OperationError: AES-GCM IV must not be empty"), nil
+			return subtleErr(errOperation, "AES-GCM IV must not be empty"), nil
 		}
 		switch tagBytes {
 		case 4, 8, 12, 13, 14, 15, 16:
 		default:
-			return subtleErr("OperationError: AES-GCM tagLength must be 32, 64, 96, 104, 112, 120 or 128 bits"), nil
+			return subtleErr(errOperation, "AES-GCM tagLength must be 32, 64, 96, 104, 112, 120 or 128 bits"), nil
 		}
 		gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		if encrypt {
 			sealed := gcm.Seal(nil, iv, data, aad)
@@ -111,17 +111,17 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 			return bytesValue(sealed[:len(data)+tagBytes]), nil
 		}
 		if len(data) < tagBytes {
-			return subtleErr("OperationError: decryption failed"), nil
+			return subtleErr(errOperation, "decryption failed"), nil
 		}
 		pt, ok := gcmOpenTruncated(gcm, iv, data, aad, tagBytes)
 		if !ok {
-			return subtleErr("OperationError: decryption failed"), nil
+			return subtleErr(errOperation, "decryption failed"), nil
 		}
 		return bytesValue(pt), nil
 	case "AES-CBC":
 		bs := block.BlockSize()
 		if len(iv) != bs {
-			return subtleErr("OperationError: AES-CBC IV must be 16 bytes"), nil
+			return subtleErr(errOperation, "AES-CBC IV must be 16 bytes"), nil
 		}
 		if encrypt {
 			padded := pad7(data, bs)
@@ -130,29 +130,29 @@ func (s *subtleAPI) aesRun(args []spidermonkey.Value, encrypt bool) (spidermonke
 			return bytesValue(out), nil
 		}
 		if len(data) == 0 || len(data)%bs != 0 {
-			return subtleErr("OperationError: bad block size"), nil
+			return subtleErr(errOperation, "bad block size"), nil
 		}
 		out := make([]byte, len(data))
 		cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, data)
 		unpadded, err := unpad7(out, bs)
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		return bytesValue(unpadded), nil
 	case "AES-CTR":
 		if len(iv) != block.BlockSize() {
-			return subtleErr("OperationError: AES-CTR counter block must be 16 bytes"), nil
+			return subtleErr(errOperation, "AES-CTR counter block must be 16 bytes"), nil
 		}
 		ctrBits := 128
 		if len(args) > 6 && !args[6].IsUndefined() {
 			ctrBits = intArg(args[6])
 		}
 		if ctrBits <= 0 || ctrBits > 128 {
-			return subtleErr("OperationError: AES-CTR length must be in 1..128"), nil
+			return subtleErr(errOperation, "AES-CTR length must be in 1..128"), nil
 		}
 		return bytesValue(aesCTR(block, iv, ctrBits, data)), nil
 	}
-	return subtleErr(fmt.Sprintf("unsupported AES mode %q", mode)), nil
+	return subtleErr(errOperation, fmt.Sprintf("unsupported AES mode %q", mode)), nil
 }
 
 // aesCTR runs AES in counter mode where only the low ctrBits of the 16-byte
@@ -234,22 +234,22 @@ func (s *subtleAPI) opECDHDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	privKey, perr := s.get(args[0])
 	pubKey, uerr := s.get(args[1])
 	if perr != nil || uerr != nil || privKey.ecPriv == nil || pubKey.ecPub == nil {
-		return subtleErr("InvalidAccessError: ECDH needs a private and a public EC key"), nil
+		return subtleErr(errInvalidAccess, "ECDH needs a private and a public EC key"), nil
 	}
 	if privKey.ecPriv.Curve != pubKey.ecPub.Curve {
-		return subtleErr("InvalidAccessError: ECDH keys are on different curves"), nil
+		return subtleErr(errInvalidAccess, "ECDH keys are on different curves"), nil
 	}
 	priv, err := privKey.ecPriv.ECDH()
 	if err != nil {
-		return subtleErr("InvalidAccessError: " + err.Error()), nil
+		return subtleErr(errInvalidAccess, err.Error()), nil
 	}
 	pub, err := pubKey.ecPub.ECDH()
 	if err != nil {
-		return subtleErr("InvalidAccessError: " + err.Error()), nil
+		return subtleErr(errInvalidAccess, err.Error()), nil
 	}
 	secret, err := priv.ECDH(pub)
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	// A requested length longer than the shared secret is an OperationError in
 	// WebCrypto, not a silently-shortened (weaker) key.
@@ -257,7 +257,7 @@ func (s *subtleAPI) opECDHDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	if bits > 0 {
 		want := bits / 8
 		if want > len(secret) {
-			return subtleErr("OperationError: requested length exceeds the ECDH shared secret"), nil
+			return subtleErr(errOperation, "requested length exceeds the ECDH shared secret"), nil
 		}
 		secret = secret[:want]
 	}
@@ -302,14 +302,14 @@ func (s *subtleAPI) opHKDFDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	}
 	newHash, err := hashNewByName(args[0].String())
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	ikm, _ := argBytes(args[1])
 	salt, _ := argBytes(args[2])
 	info, _ := argBytes(args[3])
 	length := intArg(args[4]) / 8
 	if length < 0 || length > maxSubtleKDFBytes {
-		return subtleErr("OperationError: invalid derived-bits length"), nil
+		return subtleErr(errOperation, "invalid derived-bits length"), nil
 	}
 	if length == 0 {
 		return bytesValue(nil), nil
@@ -317,7 +317,7 @@ func (s *subtleAPI) opHKDFDerive(cfg spidermonkey.Config, args []spidermonkey.Va
 	r := hkdf.New(newHash, ikm, salt, info)
 	out := make([]byte, length)
 	if _, err := r.Read(out); err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	return bytesValue(out), nil
 }
@@ -329,7 +329,7 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 	}
 	newHash, err := hashNewByName(args[0].String())
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	pw, _ := argBytes(args[1])
 	salt, _ := argBytes(args[2])
@@ -337,11 +337,11 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 	// iterations < 1 would silently degrade to a one-round KDF (no stretching);
 	// WebCrypto requires iterations >= 1.
 	if iter < 1 || iter > maxSubtlePBKDF2Iter {
-		return subtleErr("OperationError: PBKDF2 iterations out of range"), nil
+		return subtleErr(errOperation, "PBKDF2 iterations out of range"), nil
 	}
 	length := intArg(args[4]) / 8
 	if length < 0 || length > maxSubtleKDFBytes {
-		return subtleErr("OperationError: invalid derived-bits length"), nil
+		return subtleErr(errOperation, "invalid derived-bits length"), nil
 	}
 	// A zero-length derivation is a legal request for an empty key; Go's
 	// pbkdf2 does not accept a zero key length, so answer it directly.
@@ -351,8 +351,25 @@ func (s *subtleAPI) opPBKDF2Derive(cfg spidermonkey.Config, args []spidermonkey.
 	return bytesValue(pbkdf2.Key(pw, salt, iter, length, newHash)), nil
 }
 
-func subtleErr(msg string) spidermonkey.Value {
-	return spidermonkey.ValueOf(map[string]any{"__subtleError": true, "message": msg})
+// domError is the DOMException name the Web Crypto spec assigns to a failure.
+// Which one is returned is part of the contract — the suite checks it on every
+// rejected call — so it travels as its own field. It used to be prefixed onto
+// the message and recovered by matching at the JS side, which meant any message
+// beginning with a word ending in "Error" was silently read as a name.
+type domError string
+
+const (
+	errData          domError = "DataError"
+	errOperation     domError = "OperationError"
+	errNotSupported  domError = "NotSupportedError"
+	errInvalidAccess domError = "InvalidAccessError"
+	errSyntax        domError = "SyntaxError"
+)
+
+func subtleErr(name domError, msg string) spidermonkey.Value {
+	return spidermonkey.ValueOf(map[string]any{
+		"__subtleError": true, "name": string(name), "message": msg,
+	})
 }
 
 // opRSAOAEP(encrypt, keyHandle, hash, data, label) -> bytes. Uses the RSA key
@@ -364,11 +381,11 @@ func (s *subtleAPI) opRSAOAEP(cfg spidermonkey.Config, args []spidermonkey.Value
 	encrypt := args[0].Bool()
 	k, err := s.get(args[1])
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	newHash, err := hashNewByName(args[2].String())
 	if err != nil {
-		return subtleErr(err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	data, err := argBytes(args[3])
 	if err != nil {
@@ -384,20 +401,20 @@ func (s *subtleAPI) opRSAOAEP(cfg spidermonkey.Config, args []spidermonkey.Value
 			pub = &k.rsaPriv.PublicKey
 		}
 		if pub == nil {
-			return subtleErr("not an RSA key"), nil
+			return subtleErr(errOperation, "not an RSA key"), nil
 		}
 		ct, e := rsa.EncryptOAEP(newHash(), rand.Reader, pub, data, label)
 		if e != nil {
-			return subtleErr(e.Error()), nil
+			return subtleErr(errOperation, e.Error()), nil
 		}
 		return bytesValue(ct), nil
 	}
 	if k.rsaPriv == nil {
-		return subtleErr("decrypt needs an RSA private key"), nil
+		return subtleErr(errOperation, "decrypt needs an RSA private key"), nil
 	}
 	pt, e := rsa.DecryptOAEP(newHash(), rand.Reader, k.rsaPriv, data, label)
 	if e != nil {
-		return subtleErr("OperationError: decryption failed"), nil
+		return subtleErr(errOperation, "decryption failed"), nil
 	}
 	return bytesValue(pt), nil
 }
@@ -422,7 +439,7 @@ func (s *subtleAPI) opAESKW(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	}
 	block, err := aes.NewCipher(kek)
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	wrap := aesKWWrap
 	if !args[0].Bool() {
@@ -430,7 +447,7 @@ func (s *subtleAPI) opAESKW(cfg spidermonkey.Config, args []spidermonkey.Value) 
 	}
 	out, err := wrap(block, data)
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	return bytesValue(out), nil
 }

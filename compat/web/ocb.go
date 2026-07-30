@@ -259,22 +259,22 @@ func (s *subtleAPI) opAESOCB(cfg spidermonkey.Config, args []spidermonkey.Value)
 		tagBytes = intArg(args[5]) / 8
 	}
 	if tagBytes < 8 || tagBytes > 16 {
-		return subtleErr("OperationError: AES-OCB tagLength must be 64..128 bits"), nil
+		return subtleErr(errOperation, "AES-OCB tagLength must be 64..128 bits"), nil
 	}
 	st, err := newOCB(key)
 	if err != nil {
-		return subtleErr("OperationError: " + err.Error()), nil
+		return subtleErr(errOperation, err.Error()), nil
 	}
 	if encrypt {
 		out, err := st.seal(nonce, data, aad, tagBytes)
 		if err != nil {
-			return subtleErr("OperationError: " + err.Error()), nil
+			return subtleErr(errOperation, err.Error()), nil
 		}
 		return bytesValue(out), nil
 	}
 	out, err := st.open(nonce, data, aad, tagBytes)
 	if err != nil {
-		return subtleErr("OperationError: decryption failed"), nil
+		return subtleErr(errOperation, "decryption failed"), nil
 	}
 	return bytesValue(out), nil
 }
