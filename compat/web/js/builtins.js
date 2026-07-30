@@ -1939,6 +1939,7 @@
 			p.catch((e) => {
 				if (s._state === "writable") {
 					s._state = "errored";
+					s._storedError = e;
 					if (s._closedReject) s._closedReject(e);
 				}
 			});
@@ -1951,6 +1952,13 @@
 			const s = this._stream;
 			if (!s || s._state !== "writable") throw new TypeError("cannot close this stream");
 			await (s._writeChain || Promise.resolve()); // flush queued writes first
+			// A write that failed while this close waited for it has errored the
+			// stream, and closing an errored stream fails with what errored it —
+			// not with whatever the sink's close would have said about a codec the
+			// failed write has already released.
+			if (s._state !== "writable") {
+				throw s._storedError !== undefined ? s._storedError : new TypeError("cannot close this stream");
+			}
 			s._state = "closed";
 			if (s._sink.close) await s._sink.close();
 			s._closedResolve();

@@ -326,7 +326,6 @@ func parseConstructorString(input string) (map[string]string, error) {
 	return p.out, nil
 }
 
-
 // isNonSpecialPatternChar reports whether token i is the given literal
 // character, not escaped and not part of a group or regular expression.
 func (p *ctorParser) isNonSpecialPatternChar(i int, want string) bool {

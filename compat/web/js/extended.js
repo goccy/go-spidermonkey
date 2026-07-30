@@ -690,59 +690,82 @@
 	// in what it is — the formats involved have no partial-flush semantics a
 	// consumer can rely on anyway.
 	// Captured now: __web_ops is deleted once the builtins have been evaluated.
-	const compressOp = __web_ops.compress;
+	const codecNew = __web_ops.codec_new;
+	const codecPush = __web_ops.codec_push;
+	const codecFinish = __web_ops.codec_finish;
+	const codecFree = __web_ops.codec_free;
 	// brotli is in the shared codec already (compat/internal/compress, which the
 	// Node zlib binding uses); the stream constructors just never offered the
 	// label, so every brotli case failed as an unsupported format.
-	const COMPRESS = { gzip: "gzip", deflate: "deflate", "deflate-raw": "deflateRaw", brotli: "brotliCompress" };
-	const DECOMPRESS = { gzip: "gunzip", deflate: "inflate", "deflate-raw": "inflateRaw", brotli: "brotliDecompress" };
 
-	function compressionTransform(table, format, name) {
-		if (arguments.length < 3 || format === undefined) {
-			throw new TypeError(`Failed to construct '${name}': 1 argument required`);
+	// A codec is a HANDLE with state on the host: created, fed, finished. The
+	// whole-buffer path cannot serve a stream — a consumer that writes one chunk
+	// and then reads, which is what these streams are for, would wait for a
+	// codec that only produces at close.
+	// A BufferSource is an ArrayBuffer or a view onto one; a SHARED one is
+	// neither, whatever it looks like. Both are asked structurally — the
+	// constructor a value came from, not the name it reports.
+	const isBufferSource = (v) => ArrayBuffer.isView(v) || v instanceof ArrayBuffer
+		|| (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
+	const isShared = (v) => typeof SharedArrayBuffer !== "undefined"
+		&& (v instanceof SharedArrayBuffer || (ArrayBuffer.isView(v) && v.buffer instanceof SharedArrayBuffer));
+
+	function compressionTransform(decompress, format, who) {
+		if (arguments.length < 2 || format === undefined) {
+			throw new TypeError(`${who}: a format is required`);
 		}
-		const method = table[String(format)];
-		if (!method) {
-			throw new TypeError(`Failed to construct '${name}': Unsupported compression format`);
+		const name = String(format);
+		// "brotli" is not in the standard's list; it is offered here because this
+		// runtime has offered it since before that list existed.
+		if (name !== "gzip" && name !== "deflate" && name !== "deflate-raw" && name !== "brotli") {
+			throw new TypeError(`${who}: ${name} is not a supported format`);
 		}
-		const chunks = [];
-		let rc, cancelled = false;
+		const handle = codecNew(name, decompress);
+		if (handle && typeof handle === "object" && handle.error) {
+			throw new TypeError(`${who}: ${handle.error}`);
+		}
+		let rc = null;
+		let freed = false;
+		const free = () => { if (!freed) { freed = true; codecFree(handle); } };
+		// A codec op answers with both what it produced and what went wrong, and
+		// the order here is why: a stream with junk after its end produced real
+		// bytes first, and those have to reach the reader before the stream errors.
+		const emit = (out, controller) => {
+			if (out.bytes) controller.enqueue(out.bytes);
+			if (out.error) {
+				const e = new TypeError(out.error);
+				free();
+				controller.error(e);
+				throw e;
+			}
+		};
 		const readable = new ReadableStream({
 			start(c) { rc = c; },
-			cancel() { cancelled = true; },
 		});
 		const writable = new WritableStream({
 			write(chunk) {
-				// The spec accepts only BufferSource; anything else is a TypeError
-				// on the write, which is what the tests assert.
-				if (chunk instanceof Uint8Array) { chunks.push(chunk); return; }
-				if (ArrayBuffer.isView(chunk)) {
-					chunks.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-					return;
-				}
-				if (chunk instanceof ArrayBuffer) { chunks.push(new Uint8Array(chunk)); return; }
-				throw new TypeError("Can only write BufferSource to a compression stream");
-			},
-			close() {
-				// A cancelled readable no longer accepts chunks; close() still
-				// resolves cleanly rather than throwing from enqueue.
-				if (cancelled) return;
-				let total = 0;
-				for (const c of chunks) total += c.length;
-				const joined = new Uint8Array(total);
-				let off = 0;
-				for (const c of chunks) { joined.set(c, off); off += c.length; }
-				const out = compressOp(method, joined);
-				if (out && out.error !== undefined) {
-					// A codec failure must ERROR the readable side, or a consumer
-					// waits on it forever.
-					const e = new TypeError(out.error);
+				// Only a BufferSource may be written: a stream that silently encoded
+				// a string would produce bytes the caller never asked for. A SHARED
+				// buffer is not one — the IDL is BufferSource, not
+				// [AllowShared] BufferSource — and it could not be one, since
+				// another agent may rewrite it while the codec is reading it.
+				if (!isBufferSource(chunk) || isShared(chunk)) {
+					const e = new TypeError(`${who}: only a BufferSource can be written`);
+					free();
 					rc.error(e);
 					throw e;
 				}
-				rc.enqueue(out);
+				const bytes = chunk instanceof ArrayBuffer
+					? new Uint8Array(chunk) : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+				emit(codecPush(handle, bytes), rc);
+			},
+			close() {
+				const out = codecFinish(handle);
+				free();
+				emit(out, rc);
 				rc.close();
 			},
+			abort() { free(); },
 		});
 		return { readable, writable };
 	}
@@ -753,7 +776,7 @@
 	// prototype was Object's, and the class string said so.
 	class CompressionStream {
 		constructor(format) {
-			const pair = compressionTransform(COMPRESS, format, "CompressionStream");
+			const pair = compressionTransform(false, format, "CompressionStream");
 			Object.defineProperty(this, "_pair", { value: pair });
 		}
 		get readable() { return this._pair.readable; }
@@ -761,7 +784,7 @@
 	}
 	class DecompressionStream {
 		constructor(format) {
-			const pair = compressionTransform(DECOMPRESS, format, "DecompressionStream");
+			const pair = compressionTransform(true, format, "DecompressionStream");
 			Object.defineProperty(this, "_pair", { value: pair });
 		}
 		get readable() { return this._pair.readable; }

@@ -78,6 +78,7 @@ type Web struct {
 	wasm   *wasmAPI
 	worker *workerAPI
 	subtle *subtleAPI
+	codecs *codecAPI
 	start  time.Time
 }
 
@@ -138,6 +139,11 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 
 		"text_encoding_name": w.opTextEncodingName,
 		"text_decode":        w.opTextDecode,
+	}
+	codecs := newCodecAPI(js)
+	w.codecs = codecs
+	for name, fn := range codecs.ops() {
+		opTable[name] = fn
 	}
 	subtle := newSubtleAPI()
 	w.subtle = subtle
@@ -314,6 +320,9 @@ func (w *Web) Close() error {
 	}
 	if w.wasm != nil {
 		w.wasm.close()
+	}
+	if w.codecs != nil {
+		w.codecs.closeAll()
 	}
 	return nil
 }
