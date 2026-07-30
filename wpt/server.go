@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -185,15 +186,98 @@ func substituteRequest(data []byte, r *http.Request) []byte {
 
 // wantsPipeSub reports whether the request asked for substitution explicitly:
 // wptserve's `?pipe=sub` applies the same templating to a file whose NAME does
-// not carry ".sub.". Pipes compose with "|"; only sub is supported here, and an
-// unsupported pipe leaves the file unprocessed, which the test then reports.
+// not carry ".sub.".
 func wantsPipeSub(r *http.Request) bool {
-	for _, p := range strings.Split(r.URL.Query().Get("pipe"), "|") {
+	for _, p := range pipeStages(r) {
 		if p == "sub" {
 			return true
 		}
 	}
 	return false
+}
+
+// pipeStages splits a `?pipe=` query into its stages. wptserve composes them
+// with "|", and each is `name(arg,arg)` or a bare name.
+func pipeStages(r *http.Request) []string {
+	raw := r.URL.Query().Get("pipe")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "|")
+}
+
+// pipeCallRE splits one stage into its name and its argument list. The pipe
+// syntax is wptserve's own text format, which is the legitimate kind of thing
+// to read with a pattern.
+var pipeCallRE = regexp.MustCompile(`^([a-z]+)\((.*)\)$`)
+
+// applyPipes runs the response-shaping stages a `?pipe=` query names. Two are
+// implemented, and they are the two the suite actually uses on a static file:
+//
+//	header(name,value[,append])  set (or append) a response header
+//	status(code)                 replace the status code
+//
+// A stage this does not know is IGNORED rather than guessed at, and the test
+// that asked for it fails on what it was checking — which is the honest
+// outcome, because a stage silently skipped is indistinguishable from one
+// applied wrongly only if nobody looks at the result. `sub` is handled
+// separately, before the body is written.
+//
+// It reports the status to write, or 0 for the default.
+func applyPipes(w http.ResponseWriter, r *http.Request) int {
+	status := 0
+	for _, stage := range pipeStages(r) {
+		m := pipeCallRE.FindStringSubmatch(stage)
+		if m == nil {
+			continue
+		}
+		args := splitPipeArgs(m[2])
+		switch m[1] {
+		case "header":
+			if len(args) < 2 {
+				continue
+			}
+			// An empty value is meaningful — several tests set Content-Type to ""
+			// deliberately — so it is written rather than treated as absent.
+			if len(args) > 2 && strings.EqualFold(args[2], "true") {
+				w.Header().Add(args[0], args[1])
+			} else {
+				w.Header()[http.CanonicalHeaderKey(args[0])] = []string{args[1]}
+			}
+		case "status":
+			if len(args) < 1 {
+				continue
+			}
+			if n, err := strconv.Atoi(strings.TrimSpace(args[0])); err == nil {
+				status = n
+			}
+		}
+	}
+	return status
+}
+
+// splitPipeArgs splits a stage's arguments on commas, honouring wptserve's
+// backslash escape so a value may contain one.
+func splitPipeArgs(s string) []string {
+	var out []string
+	var cur strings.Builder
+	escaped := false
+	for _, c := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(c)
+			escaped = false
+		case c == '\\':
+			escaped = true
+		case c == ',':
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(c)
+		}
+	}
+	out = append(out, cur.String())
+	return out
 }
 
 // serveWPTFile serves one file, honouring the suite conventions that matter
@@ -245,6 +329,11 @@ func serveWPT(root string, srv *Server, w http.ResponseWriter, r *http.Request) 
 	// WPT's cross-origin tests need the suite's own server; permissive CORS
 	// here is what lets the same-origin majority run.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// The pipes go LAST, so a test that asks for a particular Content-Type — or
+	// for none at all — overrides what was guessed from the file name.
+	if status := applyPipes(w, r); status != 0 {
+		w.WriteHeader(status)
+	}
 	w.Write(data)
 }
 

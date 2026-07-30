@@ -2387,9 +2387,24 @@
 					throw new TypeError("Request cannot be constructed from a URL that includes credentials");
 				}
 			}
+			// A method must be a token, and CONNECT, TRACE and TRACK are forbidden
+			// to script outright — they let a page reach through a proxy or reflect
+			// its own request headers back, which is why they are the user agent's
+			// alone. The normalization to upper case applies only to the methods the
+			// standard names, so `patch` stays `patch` where `post` becomes `POST`.
+			const rawMethod = String(init.method ?? (from ? from.method : "GET"));
+			if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(rawMethod)) {
+				throw new TypeError(`Request: ${rawMethod} is not a method`);
+			}
+			if (FORBIDDEN_METHODS.has(rawMethod.toUpperCase())) {
+				throw new TypeError(`Request: ${rawMethod} is a forbidden method`);
+			}
+			const NORMALIZED_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"];
+			const method = NORMALIZED_METHODS.includes(rawMethod.toUpperCase())
+				? rawMethod.toUpperCase() : rawMethod;
 			this[kRequestState] = {
 				url,
-				method: String(init.method ?? (from ? from.method : "GET")).toUpperCase(),
+				method,
 				headers: setHeadersGuard(
 					new Headers(init.headers ?? (from ? from.headers : undefined)),
 					String(init.mode ?? (from ? from.mode : "") ?? "") === "no-cors" ? "request-no-cors" : "request"),
