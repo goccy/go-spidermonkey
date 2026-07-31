@@ -954,6 +954,10 @@
 				alpha: this._state.globalAlpha,
 				composite: this._state.composite,
 				smooth: this._state.imageSmoothingEnabled,
+				// An image casts a shadow from its own ALPHA, so a transparent part
+				// of it casts none.
+				...(this._paintSpec(this._state.fill, null, null).shadow
+					? { shadow: this._paintSpec(this._state.fill, null, null).shadow } : {}),
 			});
 			if (info.temporary) canvasFree(info.handle);
 		}
@@ -1040,6 +1044,24 @@
 				alpha: this._state.globalAlpha,
 				composite: this._state.composite,
 			};
+			// A shadow needs a colour with some alpha and something to displace it:
+			// with no offset and no blur it would land exactly under the shape and
+			// never be seen.
+			const st = this._state;
+			if (st.shadowColor[3] > 0 && (st.shadowOffsetX !== 0 || st.shadowOffsetY !== 0 || st.shadowBlur > 0)) {
+				// The offset is in the OUTPUT bitmap's space and the transform does
+				// not touch it: a shadow is cast by the light on the page, not by
+				// anything in the drawing's own coordinate system.
+				spec.shadow = {
+					dx: st.shadowOffsetX,
+					dy: st.shadowOffsetY,
+					blur: st.shadowBlur,
+					color: new Float64Array([
+						st.shadowColor[0] / 255, st.shadowColor[1] / 255,
+						st.shadowColor[2] / 255, st.shadowColor[3],
+					]),
+				};
+			}
 			if (pat) {
 				// The pattern's own transform sits UNDER the drawing transform: the
 				// image is placed by the first and then moved by the second.

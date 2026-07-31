@@ -500,8 +500,127 @@ func (a *canvasAPI) opFill(cfg spidermonkey.Config, args []spidermonkey.Value) (
 		}
 	}
 	mask := rasterize(s.w, s.h, subpaths, objBool(spec, "evenOdd"))
+	// The shadow is the SAME shape, offset, blurred and painted in one colour,
+	// and it goes down first — the shape is drawn over its own shadow.
+	if sh, ok := readShadow(spec); ok {
+		s.fillMask(shadowMask(mask, s.w, s.h, sh), paint{solid: sh.color}, alpha, op, a.clips[id])
+	}
 	s.fillMask(mask, p, alpha, op, a.clips[id])
 	return spidermonkey.Undefined(), nil
+}
+
+// shadow is the offset, blur and colour a draw casts.
+type shadow struct {
+	dx, dy float64
+	blur   float64
+	color  [4]float64
+}
+
+func readShadow(spec *spidermonkey.Object) (shadow, bool) {
+	v, err := spec.Get("shadow")
+	if err != nil || v == nil {
+		return shadow{}, false
+	}
+	o := v.Object()
+	if o == nil {
+		return shadow{}, false
+	}
+	defer o.Free()
+	var sh shadow
+	sh.dx, sh.dy = objFloat(o, "dx", 0), objFloat(o, "dy", 0)
+	sh.blur = objFloat(o, "blur", 0)
+	cv, cerr := o.Get("color")
+	if cerr != nil || cv == nil {
+		return shadow{}, false
+	}
+	co := cv.Object()
+	if co == nil {
+		return shadow{}, false
+	}
+	b, berr := co.Bytes()
+	co.Free()
+	if berr != nil {
+		return shadow{}, false
+	}
+	f := bytesToFloat64s(b)
+	for i := 0; i < 4 && i < len(f); i++ {
+		sh.color[i] = f[i]
+	}
+	// A fully transparent shadow colour is no shadow at all, and neither is a
+	// draw with no offset and no blur: it would land exactly under the shape.
+	if sh.color[3] == 0 {
+		return shadow{}, false
+	}
+	return sh, true
+}
+
+// shadowMask offsets a coverage mask and blurs it. The blur is three box passes,
+// which is the standard approximation of a Gaussian and the one the
+// specification's "2 * sigma = blur" is calibrated against.
+func shadowMask(mask []byte, w, h int, sh shadow) []byte {
+	out := make([]byte, len(mask))
+	ox, oy := int(math.Round(sh.dx)), int(math.Round(sh.dy))
+	for y := 0; y < h; y++ {
+		sy := y - oy
+		if sy < 0 || sy >= h {
+			continue
+		}
+		for x := 0; x < w; x++ {
+			sx := x - ox
+			if sx < 0 || sx >= w {
+				continue
+			}
+			out[y*w+x] = mask[sy*w+sx]
+		}
+	}
+	if sh.blur <= 0 {
+		return out
+	}
+	sigma := sh.blur / 2
+	radius := int(math.Round(sigma * 1.5))
+	if radius < 1 {
+		return out
+	}
+	for pass := 0; pass < 3; pass++ {
+		out = boxBlur(out, w, h, radius)
+	}
+	return out
+}
+
+func boxBlur(src []byte, w, h, r int) []byte {
+	tmp := make([]byte, len(src))
+	// Horizontal, then vertical: a box blur is separable, which is what makes
+	// three passes affordable.
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			sum, n := 0, 0
+			for k := -r; k <= r; k++ {
+				i := x + k
+				if i < 0 || i >= w {
+					continue
+				}
+				sum += int(src[y*w+i])
+				n++
+			}
+			tmp[y*w+x] = byte(sum / n)
+		}
+	}
+	out := make([]byte, len(src))
+	for x := 0; x < w; x++ {
+		for y := 0; y < h; y++ {
+			sum, n := 0, 0
+			for k := -r; k <= r; k++ {
+				i := y + k
+				if i < 0 || i >= h {
+					continue
+				}
+				sum += int(tmp[i*w+x])
+				n++
+			}
+			out[y*w+x] = byte(sum / n)
+		}
+	}
+	return out
 }
 
 // opClear(handle, spec) is clearRect: the shape's pixels become transparent
@@ -735,6 +854,27 @@ func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Val
 		minX, minY, maxX, maxY = quadBounds(fwd, dst.w, dst.h)
 	}
 	clip := a.clips[dstID]
+	// An image casts a shadow from its own alpha: the mask is where the image is
+	// opaque, so a transparent part of it casts nothing.
+	if cast, ok := readShadow(spec); ok {
+		mask := make([]byte, dst.w*dst.h)
+		for y := minY; y < maxY; y++ {
+			for x := minX; x < maxX; x++ {
+				px, py := float64(x)+0.5, float64(y)+0.5
+				u := inv[0]*px + inv[2]*py + inv[4]
+				v := inv[1]*px + inv[3]*py + inv[5]
+				if u < 0 || u >= 1 || v < 0 || v >= 1 {
+					continue
+				}
+				col, okPix := sampleSurface(src, sx+u*sw, sy+v*sh, smooth)
+				if !okPix {
+					continue
+				}
+				mask[y*dst.w+x] = clamp255(col[3])
+			}
+		}
+		dst.fillMask(shadowMask(mask, dst.w, dst.h, cast), paint{solid: cast.color}, alpha, op, clip)
+	}
 	for y := minY; y < maxY; y++ {
 		for x := minX; x < maxX; x++ {
 			// The centre of the destination pixel, mapped back into the unit square
