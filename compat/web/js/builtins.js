@@ -2254,6 +2254,20 @@
 		return new TypeError("Failed to fetch: " + String(err));
 	}
 
+	// Cross-Origin-Resource-Policy is enforced on no-cors responses only: it
+	// is a server's way of refusing to be embedded, and a CORS response has
+	// already negotiated access more explicitly. "same-site" compares the
+	// scheme and host, ports aside.
+	function corpCheck(res, envURL, target) {
+		const v = String((res.headers && res.headers.get("cross-origin-resource-policy")) || "").trim().toLowerCase();
+		if (v === "same-origin") {
+			throw corsError("Cross-Origin-Resource-Policy: same-origin at " + target.origin);
+		}
+		if (v === "same-site" && (target.hostname !== envURL.hostname || target.protocol !== envURL.protocol)) {
+			throw corsError("Cross-Origin-Resource-Policy: same-site at " + target.origin);
+		}
+	}
+
 	function corsAllowsResponse(res, origin) {
 		const allow = res.headers && res.headers.get("access-control-allow-origin");
 		if (!allow) return false;
@@ -2504,10 +2518,14 @@
 			abortIfAborted();
 			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
 			const crossHop = target.origin !== envURL.origin;
-			if (crossHop && !corsAllowsResponse(res, origin)) {
+			if (crossHop && corsMode !== "no-cors" && !corsAllowsResponse(res, origin)) {
 				throw corsError("no Access-Control-Allow-Origin for " + origin + " at " + target.origin);
 			}
+			// A no-cors response never negotiates; the server's only word is
+			// Cross-Origin-Resource-Policy, and it is final.
+			if (crossHop && corsMode === "no-cors") corpCheck(res, envURL, target);
 			if (!REDIRECT_STATUSES.has(res.status)) {
+				if (corsMode === "no-cors" && tainted) return opaqueResponse(res);
 				if (crossHop) filterCORSResponseHeaders(res);
 				try { Object.defineProperty(res, "redirected", { configurable: true, value: hops > 0 }); } catch { /* ignore */ }
 				if (crossHop) {
@@ -2519,6 +2537,11 @@
 				throw corsError("the response is a redirect and redirect mode is \"error\"");
 			}
 			if (mode === "manual") {
+				// A no-cors caller may only observe a redirect that never left
+				// the origin; a cross-origin one is a network error.
+				if (corsMode === "no-cors" && crossHop) {
+					throw corsError("a no-cors request cannot observe a cross-origin redirect");
+				}
 				// The caller asked to see the redirect itself, and is shown nothing
 				// about it: the URL is the one it requested, not the one it was sent to.
 				return filteredResponse("opaqueredirect", current);
@@ -2765,7 +2788,7 @@
 			// "follow": "error" and "manual" are answers about the redirect itself,
 			// and only the guest knows it saw one.
 			nInit.__redirect = redirectMode;
-			const chained = !!envURL && networkScheme && mode !== "no-cors";
+			const chained = !!envURL && networkScheme;
 			const send = () => {
 				const go = chained
 					? () => {

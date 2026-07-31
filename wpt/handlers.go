@@ -81,6 +81,8 @@ func handlerFor(rel string) wptHandler {
 		return preflightHandler
 	case "fetch/api/resources/redirect.py":
 		return redirectHandler
+	case "common/redirect.py":
+		return commonRedirectHandler
 	case "fetch/api/resources/trickle.py":
 		return trickleHandler
 	case "fetch/api/resources/cache.py":
@@ -480,6 +482,29 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 // against its two behaviours: it counts the hops it has served under a stash
 // token, and it carries the whole query string forward so the next hop behaves
 // the same way.
+// commonRedirectHandler is /common/redirect.py: a bare redirection, CORS
+// headers only when asked for with enable-cors.
+func commonRedirectHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	query := r.URL.Query()
+	status := 302
+	if v := query.Get("status"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			status = n
+		}
+	}
+	if query.Has("enable-cors") {
+		if origin := r.Header.Get("Origin"); origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+	}
+	w.Header().Set("Location", query.Get("location"))
+	w.WriteHeader(status)
+	return true
+}
+
 func redirectHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	query := r.URL.Query()
 	w.Header().Set("Content-Type", "text/plain")
