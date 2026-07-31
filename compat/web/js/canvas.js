@@ -35,6 +35,8 @@
 	const canvasLayerBegin = ops.canvas_layer_begin;
 	const canvasLayerEnd = ops.canvas_layer_end;
 	const canvasEncode = ops.canvas_encode;
+	const canvasTextPath = ops.canvas_text_path;
+	const canvasFontRegister = ops.canvas_font_register;
 
 	// ------------------------------------------------------------- colours
 
@@ -1257,7 +1259,7 @@
 	// parseSpacing is letterSpacing/wordSpacing's value: a CSS <length>,
 	// serialized with its number and lowercased unit.
 	function parseSpacing(v) {
-		const m = /^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(px|pt|pc|in|cm|mm|q|em|rem|ex|ch)\s*$/i.exec(String(v));
+		const m = /^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(px|pt|pc|in|cm|mm|q|em|rem|ex|ch|ic|cap|lh|rlh)\s*$/i.exec(String(v));
 		if (!m) return null;
 		const n = parseFloat(m[1]);
 		if (!Number.isFinite(n)) return null;
@@ -1334,6 +1336,300 @@
 			style, variant, weight, stretch, sizePx, families,
 			serialized: parts.join(" ") + " " + families.map(serializeFontFamily).join(", "),
 		};
+	}
+
+	// ------------------------------------------------------------ text
+	// The host shapes a string into glyph outlines on the alphabetic
+	// baseline; everything else — alignment, the baseline offset, maxWidth
+	// condensation, the transform, paints and shadows — happens by feeding
+	// those outlines through the same path pipeline as every other shape.
+
+	class TextMetrics {
+		constructor(internal, m, layout) {
+			if (internal !== METRICS_INTERNAL) throw new TypeError("Illegal constructor");
+			Object.defineProperty(this, "_m", { value: m });
+			Object.defineProperty(this, "_layout", { value: layout });
+		}
+		// _range validates a [start, end) code-unit range the way the
+		// tentative TextMetrics APIs do: negatives are TypeErrors (unsigned
+		// conversion), and a range that leaves the text is an IndexSizeError.
+		_range(start, end, strictOrder) {
+			const len = this._layout.textLength;
+			start = enforcedLong(start, "start", true);
+			end = enforcedLong(end, "end", true);
+			// A range that leaves the text throws. A BACKWARDS range throws
+			// for the box and cluster queries but merely names an empty
+			// selection for getSelectionRects — that is how the proposal has
+			// it, odd as the asymmetry looks.
+			if (start > len || end > len || (strictOrder && start > end)) {
+				throw new DOMException("the range is outside the text", "IndexSizeError");
+			}
+			return [start, end];
+		}
+		getIndexFromOffset(offset) {
+			const L = this._layout;
+			offset = +offset;
+			if (Number.isNaN(offset)) return 0;
+			// The offset is measured from the anchor point along the VISUAL
+			// x axis; the boundary positions are logical. In a right-to-left
+			// run the logical axis runs against the visual one, with the
+			// run's visual right edge at width + dx from the anchor.
+			const v = L.rtl ? (L.starts[L.starts.length - 1] + L.dx - offset) : (offset - L.dx);
+			let best = 0, bestDist = Infinity;
+			for (let i = 0; i < L.starts.length; i++) {
+				const d = Math.abs(L.starts[i] - v);
+				if (d < bestDist) { best = i; bestDist = d; }
+			}
+			return best;
+		}
+		getActualBoundingBox(start, end) {
+			const L = this._layout;
+			[start, end] = this._range(start, end, true);
+			let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+			for (let i = start; i < end; i++) {
+				const ix = L.inks[i * 4];
+				if (Number.isNaN(ix)) continue;
+				minX = Math.min(minX, ix);
+				maxX = Math.max(maxX, L.inks[i * 4 + 1]);
+				minY = Math.min(minY, L.inks[i * 4 + 2]);
+				maxY = Math.max(maxY, L.inks[i * 4 + 3]);
+			}
+			if (minX === Infinity) return domRectLike(0, 0, 0, 0);
+			return domRectLike(minX + L.dx, minY + L.dy, maxX - minX, maxY - minY);
+		}
+		getSelectionRects(start, end) {
+			const L = this._layout;
+			[start, end] = this._range(start, end);
+			// A backwards range yields a zero-width rectangle at the start.
+			if (start > end) end = start;
+			return [domRectLike(
+				L.starts[start] + L.dx,
+				L.dy - L.ascent,
+				L.starts[end] - L.starts[start],
+				L.ascent + L.descent,
+			)];
+		}
+		getTextClusters(a, b, c) {
+			const L = this._layout;
+			let start = 0, end = L.textLength, options;
+			if (typeof a === "object" && a !== null && b === undefined) {
+				options = a;
+			} else if (a !== undefined) {
+				[start, end] = this._range(a, b, true);
+				options = c;
+			}
+			const align = clusterAlign(options?.align, L.align);
+			const baseline = clusterBaseline(options?.baseline, L.baseline);
+			const clusters = [];
+			for (const [from, to, ch] of graphemeClusters(L.text)) {
+				if (from < start || to > end) continue;
+				const w = L.starts[to] - L.starts[from];
+				let frac = 0;
+				if (align === "center") frac = 0.5;
+				else if (align === "right" || (align === "end" && !L.rtl) || (align === "start" && L.rtl)) frac = 1;
+				clusters.push(new TextCluster(METRICS_INTERNAL, {
+					begin: from, end: to,
+					x: L.dx + L.starts[from] + frac * w,
+					y: L.dy - baselineOffset(L, baseline),
+					align, baseline,
+					text: ch,
+				}));
+			}
+			return clusters;
+		}
+	}
+	// graphemeClusters splits a string into [start, end, text] extended
+	// grapheme clusters (UAX #29), which is what a text cluster IS.
+	function graphemeClusters(text) {
+		if (typeof Intl !== "undefined" && Intl.Segmenter) {
+			return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)]
+				.map((seg) => [seg.index, seg.index + seg.segment.length, seg.segment]);
+		}
+		const out = [];
+		let u = 0;
+		for (const ch of text) {
+			out.push([u, u + ch.length, ch]);
+			u += ch.length;
+		}
+		return out;
+	}
+
+	function domRectLike(x, y, w, h) {
+		return {
+			x, y, width: w, height: h,
+			top: y, bottom: y + h, left: x, right: x + w,
+		};
+	}
+	// baselineOffset is the y-down distance from the alphabetic baseline to
+	// the named baseline's anchor, the same table prepareText uses.
+	function baselineOffset(L, baseline) {
+		switch (baseline) {
+			case "top": return L.ascent;
+			case "hanging": return L.hanging;
+			case "middle": return (L.ascent - L.descent) / 2;
+			case "ideographic": return L.ideo;
+			case "bottom": return -L.descent;
+		}
+		return 0;
+	}
+	function clusterAlign(v, def) {
+		if (v === undefined) return def;
+		if (!["start", "end", "left", "right", "center"].includes(v)) {
+			throw new TypeError(`${v} is not a text alignment`);
+		}
+		return v;
+	}
+	function clusterBaseline(v, def) {
+		if (v === undefined) return def;
+		if (!["top", "hanging", "middle", "alphabetic", "ideographic", "bottom"].includes(v)) {
+			throw new TypeError(`${v} is not a text baseline`);
+		}
+		return v;
+	}
+	class TextCluster {
+		constructor(internal, data) {
+			if (internal !== METRICS_INTERNAL) throw new TypeError("Illegal constructor");
+			Object.defineProperty(this, "_c", { value: data });
+		}
+	}
+	for (const name of ["begin", "start", "end", "x", "y", "align", "baseline"]) {
+		Object.defineProperty(TextCluster.prototype, name, {
+			get() { return name === "start" ? this._c.begin : this._c[name]; }, configurable: true,
+		});
+	}
+	Object.defineProperty(TextCluster.prototype, Symbol.toStringTag, {
+		value: "TextCluster", configurable: true,
+	});
+	const METRICS_INTERNAL = Symbol("TextMetrics.internal");
+	for (const name of [
+		"width", "actualBoundingBoxLeft", "actualBoundingBoxRight",
+		"actualBoundingBoxAscent", "actualBoundingBoxDescent",
+		"fontBoundingBoxAscent", "fontBoundingBoxDescent",
+		"emHeightAscent", "emHeightDescent",
+		"hangingBaseline", "alphabeticBaseline", "ideographicBaseline",
+	]) {
+		Object.defineProperty(TextMetrics.prototype, name, {
+			get() { return this._m[name]; }, configurable: true,
+		});
+	}
+	Object.defineProperty(TextMetrics.prototype, Symbol.toStringTag, {
+		value: "TextMetrics", configurable: true,
+	});
+
+	// prepareText resolves the string against the current text state: shaped
+	// outline commands in user space, positioned for textAlign and
+	// textBaseline, plus the numbers measureText reports.
+	function prepareText(ctx, text, maxWidth, overrides = {}) {
+		const st = ctx._state;
+		// Every whitespace character is replaced by a space; none collapse.
+		text = String(text).replace(/[\t\n\r\f\x0b]/g, " ");
+		const f = st.fontParsed ?? parseFontShorthand(st.font) ?? parseFontShorthand("10px sans-serif");
+		const smallCaps = f.variant === "small-caps" || st.fontVariantCaps === "small-caps"
+			|| st.fontVariantCaps === "all-small-caps";
+		const weight = f.weight === "bold" || f.weight === "bolder" || parseInt(f.weight, 10) >= 600;
+		// Spacing lengths resolve when USED, against the font in force then:
+		// a 1em letter-spacing doubles when the font grows.
+		const spacing = (v) => {
+			const n = parseFloat(v);
+			if (!Number.isFinite(n)) return 0;
+			const m = /[a-z]+$/.exec(v);
+			const unit = m ? m[0] : "px";
+			switch (unit) {
+				case "em": case "ic": case "lh": return n * f.sizePx;
+				case "ex": case "ch": return n * f.sizePx / 2;
+				case "cap": return n * f.sizePx * 0.7;
+				case "rem": case "rlh": return n * 16;
+				default: return n * (FONT_UNITS[unit] ?? 1);
+			}
+		};
+		const r = canvasTextPath(text, {
+			size: f.sizePx,
+			families: f.families.map((fam) => fam.name).join("\x00"),
+			bold: weight,
+			italic: f.style !== "normal",
+			smallCaps,
+			letterSpacing: spacing(st.letterSpacing),
+			wordSpacing: spacing(st.wordSpacing),
+			kerning: st.fontKerning !== "none",
+		});
+		const width = r.width;
+		// The anchor point: textAlign moves the whole run relative to it.
+		const rtl = st.direction === "rtl";
+		const align = overrides.align ?? st.textAlign;
+		const baseline = overrides.baseline ?? st.textBaseline;
+		let dx = 0;
+		switch (align) {
+			case "center": dx = -width / 2; break;
+			case "right": dx = -width; break;
+			case "left": dx = 0; break;
+			case "start": dx = rtl ? -width : 0; break;
+			case "end": dx = rtl ? 0 : -width; break;
+		}
+		// The baseline offset, in the same y-down space the outlines are in.
+		let dy = 0;
+		switch (baseline) {
+			case "top": dy = r.ascent; break;
+			case "hanging": dy = r.hanging; break;
+			case "middle": dy = (r.ascent - r.descent) / 2; break;
+			case "ideographic": dy = r.ideo; break;
+			case "bottom": dy = -r.descent; break;
+		}
+		// maxWidth condenses the run horizontally about the anchor.
+		let scaleX = 1;
+		if (maxWidth !== undefined && width > 0 && Number.isFinite(maxWidth) && maxWidth < width) {
+			scaleX = maxWidth / width;
+		}
+		const emTotal = r.emAscent + r.emDescent;
+		const emAsc = emTotal > 0 ? r.emAscent / emTotal * f.sizePx : f.sizePx;
+		const emDesc = emTotal > 0 ? r.emDescent / emTotal * f.sizePx : 0;
+		const metrics = {
+			width,
+			actualBoundingBoxLeft: -(r.inkLeft + dx),
+			actualBoundingBoxRight: r.inkRight + dx,
+			actualBoundingBoxAscent: -(r.inkTop + dy),
+			actualBoundingBoxDescent: r.inkBottom + dy,
+			fontBoundingBoxAscent: r.ascent - dy,
+			fontBoundingBoxDescent: r.descent + dy,
+			// The em heights split the EM SQUARE itself: the typographic
+			// ascent/descent ratio applied to the font size, so the two always
+			// sum to it.
+			emHeightAscent: emAsc - dy,
+			emHeightDescent: emDesc + dy,
+			hangingBaseline: r.hanging - dy,
+			alphabeticBaseline: -dy,
+			ideographicBaseline: r.ideo - dy,
+		};
+		const layout = {
+			text,
+			textLength: [...text].reduce((n, ch) => n + ch.length, 0),
+			starts: new Float64Array(r.starts.buffer, r.starts.byteOffset, r.starts.byteLength / 8),
+			inks: new Float64Array(r.inks.buffer, r.inks.byteOffset, r.inks.byteLength / 8),
+			dx, dy, rtl,
+			align, baseline,
+			ascent: r.ascent, descent: r.descent, hanging: r.hanging, ideo: r.ideo,
+		};
+		return { r, dx, dy, scaleX, metrics, layout };
+	}
+
+	// textCommands turns the host's flat [op, coords...] stream into path
+	// commands translated to (x, y) with the run's alignment applied.
+	function textCommands(prep, x, y) {
+		const { r, dx, dy, scaleX } = prep;
+		const raw = new Float64Array(r.path.buffer, r.path.byteOffset, r.path.byteLength / 8);
+		const cmds = [];
+		const tx = (v) => x + (v + dx) * scaleX;
+		const ty = (v) => y + v + dy;
+		let i = 0;
+		while (i < raw.length) {
+			switch (raw[i]) {
+				case 0: cmds.push(["M", tx(raw[i + 1]), ty(raw[i + 2])]); i += 3; break;
+				case 1: cmds.push(["L", tx(raw[i + 1]), ty(raw[i + 2])]); i += 3; break;
+				case 2: cmds.push(["Q", tx(raw[i + 1]), ty(raw[i + 2]), tx(raw[i + 3]), ty(raw[i + 4])]); i += 3 + 2; break;
+				case 3: cmds.push(["C", tx(raw[i + 1]), ty(raw[i + 2]), tx(raw[i + 3]), ty(raw[i + 4]), tx(raw[i + 5]), ty(raw[i + 6])]); i += 7; break;
+				default: cmds.push(["Z"]); i += 1; break;
+			}
+		}
+		return cmds;
 	}
 
 	// ------------------------------------------------- layer filter checking
@@ -1971,6 +2267,57 @@
 			return pointInPolys(polys, +x, +y, false);
 		}
 
+		measureText(text) {
+			if (arguments.length < 1) throw new TypeError("measureText requires 1 argument");
+			const prep = prepareText(this, text, undefined);
+			return new TextMetrics(METRICS_INTERNAL, prep.metrics, prep.layout);
+		}
+		fillTextCluster(cluster, x, y, options = undefined) {
+			const cmds = this._clusterCommands(cluster, x, y, options);
+			if (!cmds) return;
+			this._paint(flatten(cmds, this._state.transform), false);
+		}
+		strokeTextCluster(cluster, x, y, options = undefined) {
+			const cmds = this._clusterCommands(cluster, x, y, options);
+			if (!cmds) return;
+			this._paintStroke(this._strokePolys(flatten(cmds, IDENTITY)));
+		}
+		_clusterCommands(cluster, x, y, options) {
+			if (!(cluster instanceof TextCluster)) {
+				throw new TypeError("a TextCluster is required");
+			}
+			x = +x; y = +y;
+			if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+			const align = clusterAlign(options?.align, cluster.align);
+			const baseline = clusterBaseline(options?.baseline, cluster.baseline);
+			const cx = options?.x !== undefined ? +options.x : cluster.x;
+			const cy = options?.y !== undefined ? +options.y : cluster.y;
+			if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+			const prep = prepareText(this, cluster._c.text, undefined, { align, baseline });
+			return textCommands(prep, x + cx, y + cy);
+		}
+		fillText(text, x, y, maxWidth = undefined) {
+			const cmds = this._textCommands(text, x, y, maxWidth, arguments.length);
+			if (!cmds) return;
+			this._paint(flatten(cmds, this._state.transform), false);
+		}
+		strokeText(text, x, y, maxWidth = undefined) {
+			const cmds = this._textCommands(text, x, y, maxWidth, arguments.length);
+			if (!cmds) return;
+			this._paintStroke(this._strokePolys(flatten(cmds, IDENTITY)));
+		}
+		_textCommands(text, x, y, maxWidth, argc) {
+			if (argc < 3) throw new TypeError("fillText requires 3 arguments");
+			x = +x; y = +y;
+			if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+			if (maxWidth !== undefined) {
+				maxWidth = +maxWidth;
+				// A maxWidth that is NaN or not positive draws nothing at all.
+				if (Number.isNaN(maxWidth) || maxWidth <= 0) return null;
+			}
+			const prep = prepareText(this, text, maxWidth);
+			return textCommands(prep, x, y);
+		}
 		drawImage(source, ...rest) {
 			if (arguments.length < 3) throw new TypeError("drawImage requires at least 3 arguments");
 			// A zero-sized CANVAS has no bitmap to draw — that is an error; a
@@ -2499,6 +2846,149 @@
 	globalThis.DOMMatrixReadOnly ??= DOMMatrixReadOnly;
 	globalThis.DOMMatrix ??= DOMMatrix;
 
+	// ------------------------------------------------------- font loading
+	// FontFace/FontFaceSet (CSS Font Loading): a face registers its bytes
+	// with the host under its family name, which is what makes it reachable
+	// from the font attribute. Binary sources parse at construction; URL
+	// sources fetch when load() is called.
+
+	class FontFace {
+		constructor(family, source, descriptors = undefined) {
+			if (arguments.length < 2) throw new TypeError("FontFace requires 2 arguments");
+			Object.defineProperties(this, {
+				_family: { value: String(family), writable: true },
+				_status: { value: "unloaded", writable: true },
+				_src: { value: null, writable: true },
+				_settle: { value: {}, writable: false },
+			});
+			const d = descriptors !== null && typeof descriptors === "object" ? descriptors : {};
+			for (const [key, def] of [["style", "normal"], ["weight", "normal"],
+				["stretch", "normal"], ["unicodeRange", "U+0-10FFFF"],
+				["featureSettings", "normal"], ["variationSettings", "normal"],
+				["display", "auto"], ["ascentOverride", "normal"],
+				["descentOverride", "normal"], ["lineGapOverride", "normal"]]) {
+				this["_" + key] = d[key] !== undefined ? String(d[key]) : def;
+			}
+			const loaded = new Promise((resolve, reject) => {
+				this._settle.resolve = resolve;
+				this._settle.reject = reject;
+			});
+			Object.defineProperty(this, "_loaded", { value: loaded });
+			if (typeof source === "string") {
+				this._src = source;
+				return;
+			}
+			// A binary source parses NOW; the outcome is the face's fate.
+			let bytes;
+			if (source instanceof ArrayBuffer) bytes = new Uint8Array(source.slice(0));
+			else if (ArrayBuffer.isView(source)) {
+				bytes = new Uint8Array(source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength));
+			} else {
+				throw new TypeError("FontFace: the source must be a URL string or binary data");
+			}
+			const r = canvasFontRegister(this._family, bytes);
+			if (r.error !== undefined) {
+				this._status = "error";
+				this._settle.reject(new DOMException(`FontFace: ${r.error}`, "SyntaxError"));
+			} else {
+				this._status = "loaded";
+				this._settle.resolve(this);
+			}
+		}
+		get family() { return this._family; }
+		set family(v) { this._family = String(v); }
+		get status() { return this._status; }
+		get loaded() { return this._loaded; }
+		load() {
+			if (this._status === "unloaded" && this._src !== null) {
+				this._status = "loading";
+				const m = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")]*))\s*\)/i.exec(this._src);
+				const url = m ? (m[1] ?? m[2] ?? m[3]).trim() : null;
+				if (url === null || typeof fetch !== "function") {
+					this._status = "error";
+					this._settle.reject(new DOMException("FontFace: the source is not loadable", "SyntaxError"));
+				} else {
+					fetch(url)
+						.then((resp) => {
+							if (!resp.ok) throw new DOMException("FontFace: the font could not be fetched", "NetworkError");
+							return resp.arrayBuffer();
+						})
+						.then((buf) => {
+							const r = canvasFontRegister(this._family, new Uint8Array(buf));
+							if (r.error !== undefined) {
+								throw new DOMException(`FontFace: ${r.error}`, "SyntaxError");
+							}
+							this._status = "loaded";
+							this._settle.resolve(this);
+						})
+						.catch((e) => {
+							this._status = "error";
+							this._settle.reject(e instanceof Error ? e : new DOMException(String(e), "NetworkError"));
+						});
+				}
+			}
+			return this._loaded;
+		}
+	}
+	for (const key of ["style", "weight", "stretch", "unicodeRange", "featureSettings",
+		"variationSettings", "display", "ascentOverride", "descentOverride", "lineGapOverride"]) {
+		Object.defineProperty(FontFace.prototype, key, {
+			get() { return this["_" + key]; },
+			set(v) { this["_" + key] = String(v); },
+			configurable: true,
+		});
+	}
+	Object.defineProperty(FontFace.prototype, Symbol.toStringTag, { value: "FontFace", configurable: true });
+
+	const FONTFACESET_INTERNAL = Symbol("FontFaceSet.internal");
+	class FontFaceSet extends (typeof EventTarget === "function" ? EventTarget : Object) {
+		constructor(internal) {
+			if (internal !== FONTFACESET_INTERNAL) throw new TypeError("Illegal constructor");
+			super();
+			Object.defineProperty(this, "_faces", { value: new Set() });
+		}
+		add(face) {
+			if (!(face instanceof FontFace)) throw new TypeError("add: a FontFace is required");
+			this._faces.add(face);
+			return this;
+		}
+		delete(face) { return this._faces.delete(face); }
+		clear() { this._faces.clear(); }
+		has(face) { return this._faces.has(face); }
+		get size() { return this._faces.size; }
+		[Symbol.iterator]() { return this._faces[Symbol.iterator](); }
+		values() { return this._faces.values(); }
+		keys() { return this._faces.keys(); }
+		entries() { return this._faces.entries(); }
+		forEach(fn, thisArg) { this._faces.forEach((v) => fn.call(thisArg, v, v, this)); }
+		get status() {
+			for (const f of this._faces) if (f.status === "loading") return "loading";
+			return "loaded";
+		}
+		get ready() {
+			return Promise.allSettled([...this._faces].map((f) => f._loaded)).then(() => this);
+		}
+		load(fontSpec, text = " ") {
+			const parsed = parseFontShorthand(fontSpec);
+			if (!parsed) return Promise.reject(new DOMException("load: not a font", "SyntaxError"));
+			const wanted = new Set(parsed.families.map((f) => f.name.toLowerCase()));
+			const matches = [...this._faces].filter((f) => wanted.has(f.family.toLowerCase()));
+			return Promise.all(matches.map((f) => f.load()));
+		}
+		check(fontSpec, text = " ") {
+			const parsed = parseFontShorthand(fontSpec);
+			if (!parsed) throw new DOMException("check: not a font", "SyntaxError");
+			const wanted = new Set(parsed.families.map((f) => f.name.toLowerCase()));
+			const matches = [...this._faces].filter((f) => wanted.has(f.family.toLowerCase()));
+			return matches.every((f) => f.status === "loaded");
+		}
+	}
+	Object.defineProperty(FontFaceSet.prototype, Symbol.toStringTag, { value: "FontFaceSet", configurable: true });
+
+	globalThis.FontFace = FontFace;
+	globalThis.FontFaceSet = FontFaceSet;
+	globalThis.fonts = new FontFaceSet(FONTFACESET_INTERNAL);
+	globalThis.TextMetrics = TextMetrics;
 	globalThis.CanvasFilter = CanvasFilter;
 	globalThis.ImageBitmap = ImageBitmap;
 	globalThis.CanvasPattern = CanvasPattern;

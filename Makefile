@@ -37,7 +37,7 @@ WPT_SUITE_REV  ?= f4b24b414258bfdca10fbb0f8d646b97fc6657ec
 # tests of their own: the canvas suite draws them and asserts on the pixels, so
 # without them those tests fail on a missing file rather than on anything the
 # runtime does.
-WPT_SUITE_DIRS := resources common interfaces images media \
+WPT_SUITE_DIRS := resources common interfaces images media fonts \
                   url encoding streams WebCryptoAPI console hr-time \
                   performance-timeline FileAPI urlpattern fetch dom html \
                   compression user-timing webmessaging mimesniff \

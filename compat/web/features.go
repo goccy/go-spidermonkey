@@ -63,6 +63,9 @@ const (
 	FeatureBroadcastChannel Feature = "broadcast-channel"
 	FeatureGeometry         Feature = "geometry"
 	FeatureImageBitmap      Feature = "imagebitmap"
+	// Font loading (CSS Font Loading Module) is its own specification: a
+	// runtime can render canvas text without letting pages register fonts.
+	FeatureFonts Feature = "fonts"
 	FeatureWorker           Feature = "worker"
 )
 
@@ -82,7 +85,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureURLPattern: {"URLPattern"},
 	FeatureCanvas: {
 		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
-		"Path2D", "ImageData", "CanvasPattern", "CanvasFilter",
+		"Path2D", "ImageData", "CanvasPattern", "CanvasFilter", "TextMetrics",
 	},
 	// An ImageBitmap is what a canvas DRAWS, not part of the canvas: it is
 	// created from a blob or an ImageData and can be handed between agents.
@@ -90,6 +93,7 @@ var featureGlobals = map[Feature][]string{
 	// The geometry interfaces are their own specification, and a canvas is only
 	// one of the things that speaks in them.
 	FeatureGeometry: {"DOMPoint", "DOMPointReadOnly", "DOMMatrix", "DOMMatrixReadOnly"},
+	FeatureFonts:    {"FontFace", "FontFaceSet", "fonts"},
 	// Observable is its own feature rather than part of events, even though it
 	// is an event stream: it is not in the Minimum Common API, and a profile
 	// that offers the standard's surface must be able to leave it out.

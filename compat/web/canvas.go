@@ -579,13 +579,16 @@ type canvasAPI struct {
 	// the top of the stack, and endLayer composites it onto what is below.
 	layers map[int64][]*surface
 	clips  map[int64][]byte
-	next   int64
+	// fonts is the FontFace registry: lowercase family name to parsed face.
+	fonts map[string]*fontFace
+	next  int64
 }
 
 func newCanvasAPI(js *spidermonkey.JS) *canvasAPI {
 	return &canvasAPI{
 		js: js, surfaces: map[int64]*surface{},
 		layers: map[int64][]*surface{}, clips: map[int64][]byte{},
+		fonts: map[string]*fontFace{},
 	}
 }
 
@@ -605,6 +608,8 @@ func (a *canvasAPI) ops() map[string]spidermonkey.Func {
 		"canvas_layer_begin":    a.opLayerBegin,
 		"canvas_layer_end":      a.opLayerEnd,
 		"canvas_encode":         a.opEncode,
+		"canvas_text_path":      a.opTextPath,
+		"canvas_font_register":  a.opFontRegister,
 	}
 }
 
