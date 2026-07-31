@@ -19,9 +19,16 @@ package web
 // have to round twice on every read, and the tests compare exact bytes.
 
 import (
+	"bytes"
 	"fmt"
 	"image"
+	"image/draw"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"math"
+
+	_ "golang.org/x/image/webp"
 
 	"golang.org/x/image/vector"
 
@@ -48,6 +55,43 @@ func newSurface(w, h int) *surface {
 type paint struct {
 	solid    [4]float64 // r,g,b,a in 0..1, non-premultiplied
 	gradient *gradient
+	pattern  *pattern
+}
+
+// pattern is an image tiled across the plane. inverse maps a device point back
+// into the image's own pixels, so each destination pixel finds its own source
+// point — the same direction drawImage works in, and for the same reason.
+type pattern struct {
+	src        *surface
+	repeatX    bool
+	repeatY    bool
+	inverse    [6]float64
+	hasInverse bool
+}
+
+func (p *pattern) at(dx, dy float64) ([4]float64, bool) {
+	x, y := dx, dy
+	if p.hasInverse {
+		m := p.inverse
+		x = m[0]*dx + m[2]*dy + m[4]
+		y = m[1]*dx + m[3]*dy + m[5]
+	}
+	ix, iy := int(math.Floor(x)), int(math.Floor(y))
+	if p.repeatX {
+		ix = ((ix % p.src.w) + p.src.w) % p.src.w
+	} else if ix < 0 || ix >= p.src.w {
+		return [4]float64{}, false
+	}
+	if p.repeatY {
+		iy = ((iy % p.src.h) + p.src.h) % p.src.h
+	} else if iy < 0 || iy >= p.src.h {
+		return [4]float64{}, false
+	}
+	o := (iy*p.src.w + ix) * 4
+	return [4]float64{
+		float64(p.src.pix[o]) / 255, float64(p.src.pix[o+1]) / 255,
+		float64(p.src.pix[o+2]) / 255, float64(p.src.pix[o+3]) / 255,
+	}, true
 }
 
 // gradient is a linear or radial colour ramp in USER space, with the transform
@@ -247,6 +291,17 @@ func (s *surface) fillMask(mask []byte, p paint, alpha float64, op composite, cl
 			src := p.solid
 			if p.gradient != nil {
 				src = p.gradient.at(float64(x)+0.5, float64(y)+0.5)
+			} else if p.pattern != nil {
+				col, ok := p.pattern.at(float64(x)+0.5, float64(y)+0.5)
+				if !ok {
+					// Outside a non-repeating pattern there is no source at all, which
+					// is transparent — and under source-over that is a no-op.
+					if !wholeSurface {
+						continue
+					}
+					col = [4]float64{}
+				}
+				src = col
 			}
 			src[3] *= alpha
 			o := i * 4
@@ -353,6 +408,9 @@ func newCanvasAPI(js *spidermonkey.JS) *canvasAPI {
 func (a *canvasAPI) ops() map[string]spidermonkey.Func {
 	return map[string]spidermonkey.Func{
 		"canvas_new":            a.opNew,
+		"canvas_from_bytes":     a.opFromBytes,
+		"canvas_decode_image":   a.opDecodeImage,
+		"canvas_draw_image":     a.opDrawImage,
 		"canvas_free":           a.opFree,
 		"canvas_resize":         a.opResize,
 		"canvas_fill":           a.opFill,
@@ -430,7 +488,7 @@ func (a *canvasAPI) opFill(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	if len(subpaths) == 0 {
 		return spidermonkey.Undefined(), nil
 	}
-	p, err := readPaint(spec)
+	p, err := a.readPaint(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -576,6 +634,218 @@ func (a *canvasAPI) opPutImageData(cfg spidermonkey.Config, args []spidermonkey.
 	return spidermonkey.Undefined(), nil
 }
 
+// opFromBytes(width, height, bytes) -> handle. This is how an ImageBitmap is
+// made from pixels that already exist: an ImageData's array, or the result of
+// decoding an encoded image.
+func (a *canvasAPI) opFromBytes(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 3 {
+		return nil, fmt.Errorf("canvas_from_bytes: (width, height, bytes) required")
+	}
+	w, h := int(args[0].Float()), int(args[1].Float())
+	if w <= 0 || h <= 0 || w*h > maxCanvasPixels {
+		return nil, fmt.Errorf("canvas_from_bytes: %dx%d is not an allocatable size", w, h)
+	}
+	data, err := argBytes(args[2])
+	if err != nil {
+		return nil, err
+	}
+	s := newSurface(w, h)
+	copy(s.pix, data)
+	a.next++
+	a.surfaces[a.next] = s
+	return spidermonkey.ValueOf(float64(a.next)), nil
+}
+
+// opDecodeImage(bytes) -> {width, height, handle}. The formats are the ones the
+// standard library and golang.org/x decode; anything else is reported rather
+// than guessed at, because a wrong guess would produce an image made of noise.
+func (a *canvasAPI) opDecodeImage(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	data, err := argBytes(args[0])
+	if err != nil {
+		return nil, err
+	}
+	img, _, derr := image.Decode(bytes.NewReader(data))
+	if derr != nil {
+		return spidermonkey.ValueOf(map[string]any{"error": derr.Error()}), nil
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 || w*h > maxCanvasPixels {
+		return spidermonkey.ValueOf(map[string]any{"error": "the image is not an allocatable size"}), nil
+	}
+	s := newSurface(w, h)
+	// image/draw gives premultiplied RGBA; the surface is non-premultiplied, so
+	// each pixel is divided back out — which is exactly what getImageData
+	// reports, and what the tests compare.
+	rgba := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(rgba, rgba.Bounds(), img, b.Min, draw.Src)
+	for i := 0; i < w*h; i++ {
+		r, g, bl, al := rgba.Pix[i*4], rgba.Pix[i*4+1], rgba.Pix[i*4+2], rgba.Pix[i*4+3]
+		if al == 0 {
+			continue
+		}
+		s.pix[i*4] = byte(int(r) * 255 / int(al))
+		s.pix[i*4+1] = byte(int(g) * 255 / int(al))
+		s.pix[i*4+2] = byte(int(bl) * 255 / int(al))
+		s.pix[i*4+3] = al
+	}
+	a.next++
+	a.surfaces[a.next] = s
+	return spidermonkey.ValueOf(map[string]any{
+		"width": float64(w), "height": float64(h), "handle": float64(a.next),
+	}), nil
+}
+
+// opDrawImage(dst, src, spec) paints a rectangle of one surface onto another.
+// The destination is described by the INVERSE of the transform that maps the
+// source rectangle onto it, so each destination pixel finds its own source
+// point rather than the source having to be walked forward — which is what
+// makes an arbitrary transform work without gaps.
+func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	dst, dstID, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	src, _, err := a.surface(args[1])
+	if err != nil {
+		return nil, err
+	}
+	spec := args[2].Object()
+	if spec == nil {
+		return nil, fmt.Errorf("canvas_draw_image: a spec is required")
+	}
+	defer spec.Free()
+	sx, sy := objFloat(spec, "sx", 0), objFloat(spec, "sy", 0)
+	sw, sh := objFloat(spec, "sw", float64(src.w)), objFloat(spec, "sh", float64(src.h))
+	alpha := objFloat(spec, "alpha", 1)
+	smooth := objBool(spec, "smooth")
+	op := compSourceOver
+	if c, ok := compositeByName[objString(spec, "composite", "source-over")]; ok {
+		op = c
+	}
+	inv, ok := readMatrix(spec, "inverse")
+	if !ok {
+		return spidermonkey.Undefined(), nil
+	}
+	// The destination's extent is the bounding box of the mapped rectangle, so
+	// only the pixels that can be covered are visited.
+	fwd, hasFwd := readMatrix(spec, "forward")
+	minX, minY, maxX, maxY := 0, 0, dst.w, dst.h
+	if hasFwd {
+		minX, minY, maxX, maxY = quadBounds(fwd, dst.w, dst.h)
+	}
+	clip := a.clips[dstID]
+	for y := minY; y < maxY; y++ {
+		for x := minX; x < maxX; x++ {
+			// The centre of the destination pixel, mapped back into the unit square
+			// of the source rectangle.
+			px, py := float64(x)+0.5, float64(y)+0.5
+			u := inv[0]*px + inv[2]*py + inv[4]
+			v := inv[1]*px + inv[3]*py + inv[5]
+			if u < 0 || u >= 1 || v < 0 || v >= 1 {
+				continue
+			}
+			fx := sx + u*sw
+			fy := sy + v*sh
+			col, okPix := sampleSurface(src, fx, fy, smooth)
+			if !okPix {
+				continue
+			}
+			i := y*dst.w + x
+			cov := 1.0
+			if clip != nil {
+				cov = float64(clip[i]) / 255
+				if cov == 0 {
+					continue
+				}
+			}
+			col[3] *= alpha
+			o := i * 4
+			d := [4]float64{
+				float64(dst.pix[o]) / 255, float64(dst.pix[o+1]) / 255,
+				float64(dst.pix[o+2]) / 255, float64(dst.pix[o+3]) / 255,
+			}
+			out := blend(op, col, d, cov)
+			dst.pix[o] = clamp255(out[0])
+			dst.pix[o+1] = clamp255(out[1])
+			dst.pix[o+2] = clamp255(out[2])
+			dst.pix[o+3] = clamp255(out[3])
+		}
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// sampleSurface reads one source pixel. Nearest is the honest default: the
+// tests that check exact bytes draw at integer offsets, where a bilinear filter
+// would round differently for no benefit.
+func sampleSurface(s *surface, x, y float64, smooth bool) ([4]float64, bool) {
+	ix, iy := int(math.Floor(x)), int(math.Floor(y))
+	if ix < 0 || iy < 0 || ix >= s.w || iy >= s.h {
+		return [4]float64{}, false
+	}
+	o := (iy*s.w + ix) * 4
+	return [4]float64{
+		float64(s.pix[o]) / 255, float64(s.pix[o+1]) / 255,
+		float64(s.pix[o+2]) / 255, float64(s.pix[o+3]) / 255,
+	}, true
+}
+
+// quadBounds is the pixel range the unit square can reach under one transform.
+func quadBounds(m [6]float64, w, h int) (int, int, int, int) {
+	minX, minY := math.Inf(1), math.Inf(1)
+	maxX, maxY := math.Inf(-1), math.Inf(-1)
+	for _, c := range [][2]float64{{0, 0}, {1, 0}, {1, 1}, {0, 1}} {
+		x := m[0]*c[0] + m[2]*c[1] + m[4]
+		y := m[1]*c[0] + m[3]*c[1] + m[5]
+		minX, maxX = math.Min(minX, x), math.Max(maxX, x)
+		minY, maxY = math.Min(minY, y), math.Max(maxY, y)
+	}
+	lo := func(v float64, cap int) int {
+		n := int(math.Floor(v))
+		if n < 0 {
+			return 0
+		}
+		if n > cap {
+			return cap
+		}
+		return n
+	}
+	hi := func(v float64, cap int) int {
+		n := int(math.Ceil(v)) + 1
+		if n < 0 {
+			return 0
+		}
+		if n > cap {
+			return cap
+		}
+		return n
+	}
+	return lo(minX, w), lo(minY, h), hi(maxX, w), hi(maxY, h)
+}
+
+func readMatrix(o *spidermonkey.Object, name string) ([6]float64, bool) {
+	var m [6]float64
+	v, err := o.Get(name)
+	if err != nil || v == nil {
+		return m, false
+	}
+	io := v.Object()
+	if io == nil {
+		return m, false
+	}
+	defer io.Free()
+	b, berr := io.Bytes()
+	if berr != nil {
+		return m, false
+	}
+	f := bytesToFloat64s(b)
+	if len(f) < 6 {
+		return m, false
+	}
+	copy(m[:], f[:6])
+	return m, true
+}
+
 // closeAll drops every surface. Called from Web.Close.
 func (a *canvasAPI) closeAll() {
 	a.surfaces = map[int64]*surface{}
@@ -633,8 +903,21 @@ func readSubpaths(spec *spidermonkey.Object) ([][]point, error) {
 	return out, nil
 }
 
-func readPaint(spec *spidermonkey.Object) (paint, error) {
+func (a *canvasAPI) readPaint(spec *spidermonkey.Object) (paint, error) {
 	var p paint
+	if pv, err := spec.Get("pattern"); err == nil && pv != nil {
+		if po := pv.Object(); po != nil {
+			pat, perr := a.readPattern(po)
+			po.Free()
+			if perr != nil {
+				return p, perr
+			}
+			if pat != nil {
+				p.pattern = pat
+				return p, nil
+			}
+		}
+	}
 	if gv, err := spec.Get("gradient"); err == nil && gv != nil {
 		if go_ := gv.Object(); go_ != nil {
 			g, gerr := readGradient(go_)
@@ -662,6 +945,19 @@ func readPaint(spec *spidermonkey.Object) (paint, error) {
 	f := bytesToFloat64s(b)
 	for i := 0; i < 4 && i < len(f); i++ {
 		p.solid[i] = f[i]
+	}
+	return p, nil
+}
+
+func (a *canvasAPI) readPattern(o *spidermonkey.Object) (*pattern, error) {
+	src := a.surfaces[int64(objFloat(o, "handle", 0))]
+	if src == nil || src.w == 0 || src.h == 0 {
+		return nil, nil
+	}
+	p := &pattern{src: src, repeatX: objBool(o, "repeatX"), repeatY: objBool(o, "repeatY")}
+	if m, ok := readMatrix(o, "inverse"); ok {
+		p.inverse = m
+		p.hasInverse = true
 	}
 	return p, nil
 }

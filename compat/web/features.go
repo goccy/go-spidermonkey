@@ -64,6 +64,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureCanvas: {
 		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
 		"Path2D", "ImageData", "DOMPoint", "DOMPointReadOnly",
+		"ImageBitmap", "CanvasPattern", "createImageBitmap",
 	},
 	FeatureEvents: {
 		"Observable", "Subscriber",

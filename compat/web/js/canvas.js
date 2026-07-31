@@ -29,6 +29,9 @@
 	const canvasClip = ops.canvas_clip;
 	const canvasGetImageData = ops.canvas_get_image_data;
 	const canvasPutImageData = ops.canvas_put_image_data;
+	const canvasFromBytes = ops.canvas_from_bytes;
+	const canvasDecodeImage = ops.canvas_decode_image;
+	const canvasDrawImage = ops.canvas_draw_image;
 
 	// ------------------------------------------------------------- colours
 
@@ -494,6 +497,30 @@
 	});
 	const GRADIENT_INTERNAL = Symbol("CanvasGradient.internal");
 
+	// A pattern is an image and how it tiles. It carries its own transform,
+	// which setTransform on the pattern replaces — the drawing transform is
+	// applied on top of it.
+	class CanvasPattern {
+		constructor(internal, info, repetition) {
+			if (internal !== PATTERN_INTERNAL) throw new TypeError("Illegal constructor");
+			Object.defineProperties(this, {
+				_info: { value: info },
+				_repetition: { value: repetition },
+				_transform: { value: IDENTITY.slice(), writable: true },
+			});
+		}
+		setTransform(matrix = undefined) {
+			if (matrix === undefined || matrix === null) { this._transform = IDENTITY.slice(); return; }
+			const next = [Number(matrix.a ?? 1), Number(matrix.b ?? 0), Number(matrix.c ?? 0),
+				Number(matrix.d ?? 1), Number(matrix.e ?? 0), Number(matrix.f ?? 0)];
+			if (finiteMatrix(next)) this._transform = next;
+		}
+	}
+	Object.defineProperty(CanvasPattern.prototype, Symbol.toStringTag, {
+		value: "CanvasPattern", configurable: true,
+	});
+	const PATTERN_INTERNAL = Symbol("CanvasPattern.internal");
+
 	// ---------------------------------------------------------- ImageData
 
 	class ImageData {
@@ -535,12 +562,96 @@
 		value: "ImageData", configurable: true,
 	});
 
+	// ------------------------------------------------------- ImageBitmap
+	// A bitmap is a surface and its size. It is a distinct type from a canvas
+	// because it is IMMUTABLE and because closing it releases the pixels — which
+	// is the whole reason the interface exists.
+
+	class ImageBitmap {
+		constructor(internal, handle, width, height) {
+			if (internal !== BITMAP_INTERNAL) throw new TypeError("Illegal constructor");
+			Object.defineProperties(this, {
+				_handle: { value: handle, writable: true },
+				_width: { value: width, writable: true },
+				_height: { value: height, writable: true },
+			});
+		}
+		get width() { return this._width; }
+		get height() { return this._height; }
+		close() {
+			if (this._handle === null) return;
+			canvasFree(this._handle);
+			this._handle = null;
+			this._width = 0;
+			this._height = 0;
+		}
+	}
+	Object.defineProperty(ImageBitmap.prototype, Symbol.toStringTag, {
+		value: "ImageBitmap", configurable: true,
+	});
+	const BITMAP_INTERNAL = Symbol("ImageBitmap.internal");
+
+	// sourceSurface answers the handle and size of anything that can be drawn:
+	// a bitmap, a canvas, or an ImageData. Anything else is not an image source,
+	// and saying so is better than drawing nothing.
+	function sourceSurface(source) {
+		if (source instanceof ImageBitmap) {
+			if (source._handle === null) {
+				throw new DOMException("the ImageBitmap has been closed", "InvalidStateError");
+			}
+			return { handle: source._handle, width: source._width, height: source._height };
+		}
+		if (source instanceof OffscreenCanvas) {
+			return { handle: source._handle, width: source.width, height: source.height };
+		}
+		if (source instanceof ImageData) {
+			const handle = canvasFromBytes(source.width, source.height,
+				new Uint8Array(source.data.buffer, source.data.byteOffset, source.data.byteLength));
+			return { handle, width: source.width, height: source.height, temporary: true };
+		}
+		return null;
+	}
+
+	globalThis.createImageBitmap = function createImageBitmap(source, ...rest) {
+		if (arguments.length < 1) {
+			return Promise.reject(new TypeError("createImageBitmap requires 1 argument"));
+		}
+		// A Blob has to be DECODED, which is the one source that is not already
+		// pixels; everything else is a surface that exists.
+		if (typeof Blob === "function" && source instanceof Blob) {
+			return source.bytes().then((bytes) => {
+				const r = canvasDecodeImage(bytes);
+				if (r.error !== undefined) {
+					throw new DOMException(`createImageBitmap: ${r.error}`, "InvalidStateError");
+				}
+				return new ImageBitmap(BITMAP_INTERNAL, r.handle, r.width, r.height);
+			});
+		}
+		let info;
+		try {
+			info = sourceSurface(source);
+		} catch (e) {
+			return Promise.reject(e);
+		}
+		if (!info) {
+			return Promise.reject(new TypeError("createImageBitmap: the source is not an image"));
+		}
+		if (info.width === 0 || info.height === 0) {
+			return Promise.reject(new DOMException("createImageBitmap: the source is empty", "InvalidStateError"));
+		}
+		// A bitmap is a COPY: it must not change when its source does.
+		const copy = canvasFromBytes(info.width, info.height,
+			new Uint8Array(canvasGetImageData(info.handle, 0, 0, info.width, info.height)));
+		if (info.temporary) canvasFree(info.handle);
+		return Promise.resolve(new ImageBitmap(BITMAP_INTERNAL, copy, info.width, info.height));
+	};
+
 	// ------------------------------------------------------- the context
 
 	const DEFAULT_STATE = () => ({
 		transform: IDENTITY.slice(),
-		fill: [0, 0, 0, 1], fillGradient: null,
-		stroke: [0, 0, 0, 1], strokeGradient: null,
+		fill: [0, 0, 0, 1], fillGradient: null, fillPattern: null,
+		stroke: [0, 0, 0, 1], strokeGradient: null, strokePattern: null,
 		globalAlpha: 1,
 		composite: "source-over",
 		lineWidth: 1, lineCap: "butt", lineJoin: "miter", miterLimit: 10,
@@ -575,6 +686,8 @@
 			this._stack[this._stack.length - 1].clip = this._state.clip;
 			this._stack[this._stack.length - 1].fillGradient = this._state.fillGradient;
 			this._stack[this._stack.length - 1].strokeGradient = this._state.strokeGradient;
+			this._stack[this._stack.length - 1].fillPattern = this._state.fillPattern;
+			this._stack[this._stack.length - 1].strokePattern = this._state.strokePattern;
 		}
 		restore() {
 			const s = this._stack.pop();
@@ -622,24 +735,28 @@
 
 		// ---------------------------------------------------------- styles
 		get fillStyle() {
-			return this._state.fillGradient ?? serializeColor(this._state.fill);
+			return this._state.fillGradient ?? this._state.fillPattern ?? serializeColor(this._state.fill);
 		}
 		set fillStyle(v) {
-			if (v instanceof CanvasGradient) { this._state.fillGradient = v; return; }
+			if (v instanceof CanvasGradient) { this._state.fillGradient = v; this._state.fillPattern = null; return; }
+			if (v instanceof CanvasPattern) { this._state.fillPattern = v; this._state.fillGradient = null; return; }
 			const c = parseColor(v);
 			if (c === null) return;
 			this._state.fill = c;
 			this._state.fillGradient = null;
+			this._state.fillPattern = null;
 		}
 		get strokeStyle() {
-			return this._state.strokeGradient ?? serializeColor(this._state.stroke);
+			return this._state.strokeGradient ?? this._state.strokePattern ?? serializeColor(this._state.stroke);
 		}
 		set strokeStyle(v) {
-			if (v instanceof CanvasGradient) { this._state.strokeGradient = v; return; }
+			if (v instanceof CanvasGradient) { this._state.strokeGradient = v; this._state.strokePattern = null; return; }
+			if (v instanceof CanvasPattern) { this._state.strokePattern = v; this._state.strokeGradient = null; return; }
 			const c = parseColor(v);
 			if (c === null) return;
 			this._state.stroke = c;
 			this._state.strokeGradient = null;
+			this._state.strokePattern = null;
 		}
 		get globalAlpha() { return this._state.globalAlpha; }
 		set globalAlpha(v) {
@@ -796,6 +913,63 @@
 			return pointInPolys(polys, +x, +y, false);
 		}
 
+		drawImage(source, ...rest) {
+			if (arguments.length < 3) throw new TypeError("drawImage requires at least 3 arguments");
+			const info = sourceSurface(source);
+			if (!info) throw new TypeError("drawImage: the source is not an image");
+			if (info.width === 0 || info.height === 0) return;
+			let sx = 0, sy = 0, sw = info.width, sh = info.height, dx, dy, dw, dh;
+			if (rest.length === 2) {
+				[dx, dy] = rest.map(Number);
+				dw = sw; dh = sh;
+			} else if (rest.length === 4) {
+				[dx, dy, dw, dh] = rest.map(Number);
+			} else if (rest.length === 8) {
+				[sx, sy, sw, sh, dx, dy, dw, dh] = rest.map(Number);
+			} else {
+				throw new TypeError("drawImage: 2, 4 or 8 coordinates are required");
+			}
+			if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite)) return;
+			if (sw === 0 || sh === 0 || dw === 0 || dh === 0) return;
+			// The source rectangle must lie inside the image; one that does not is
+			// an IndexSizeError rather than a clamp, because the caller named a
+			// region that is not there.
+			if (rest.length === 8 && (sx < 0 || sy < 0 || sw < 0 || sh < 0
+				|| sx + sw > info.width || sy + sh > info.height)) {
+				if (info.temporary) canvasFree(info.handle);
+				throw new DOMException("drawImage: the source rectangle is outside the image", "IndexSizeError");
+			}
+			// forward maps the UNIT SQUARE onto the destination rectangle, through
+			// the current transform; the host walks the destination and inverts it.
+			const forward = multiply(this._state.transform, [dw, 0, 0, dh, dx, dy]);
+			const inverse = invertMatrix(forward);
+			if (!inverse) {
+				if (info.temporary) canvasFree(info.handle);
+				return;
+			}
+			canvasDrawImage(this._canvas._handle, info.handle, {
+				sx, sy, sw, sh,
+				forward: new Float64Array(forward),
+				inverse: new Float64Array(inverse),
+				alpha: this._state.globalAlpha,
+				composite: this._state.composite,
+				smooth: this._state.imageSmoothingEnabled,
+			});
+			if (info.temporary) canvasFree(info.handle);
+		}
+
+		createPattern(source, repetition) {
+			if (arguments.length < 2) throw new TypeError("createPattern requires 2 arguments");
+			const rep = repetition === null || repetition === "" ? "repeat" : String(repetition);
+			if (!["repeat", "repeat-x", "repeat-y", "no-repeat"].includes(rep)) {
+				throw new DOMException(`createPattern: ${rep} is not a repetition`, "SyntaxError");
+			}
+			const info = sourceSurface(source);
+			if (!info) throw new TypeError("createPattern: the source is not an image");
+			if (info.width === 0 || info.height === 0) return null;
+			return new CanvasPattern(PATTERN_INTERNAL, info, rep);
+		}
+
 		// --------------------------------------------------------- pixels
 		createImageData(a, b) {
 			if (a instanceof ImageData) return new ImageData(a.width, a.height);
@@ -847,7 +1021,7 @@
 			const { subpaths, lengths } = packSubpaths(polys);
 			canvasFill(this._canvas._handle, {
 				subpaths, lengths, evenOdd,
-				...this._paintSpec(this._state.fill, this._state.fillGradient),
+				...this._paintSpec(this._state.fill, this._state.fillGradient, this._state.fillPattern),
 			});
 		}
 		_paintStroke(polys) {
@@ -858,14 +1032,26 @@
 			const { subpaths, lengths } = packSubpaths(outline);
 			canvasFill(this._canvas._handle, {
 				subpaths, lengths, evenOdd: false,
-				...this._paintSpec(this._state.stroke, this._state.strokeGradient),
+				...this._paintSpec(this._state.stroke, this._state.strokeGradient, this._state.strokePattern),
 			});
 		}
-		_paintSpec(color, grad) {
+		_paintSpec(color, grad, pat) {
 			const spec = {
 				alpha: this._state.globalAlpha,
 				composite: this._state.composite,
 			};
+			if (pat) {
+				// The pattern's own transform sits UNDER the drawing transform: the
+				// image is placed by the first and then moved by the second.
+				const inverse = invertMatrix(multiply(this._state.transform, pat._transform));
+				spec.pattern = {
+					handle: pat._info.handle,
+					repeatX: pat._repetition === "repeat" || pat._repetition === "repeat-x",
+					repeatY: pat._repetition === "repeat" || pat._repetition === "repeat-y",
+					inverse: new Float64Array(inverse ?? IDENTITY),
+				};
+				return spec;
+			}
 			if (grad) {
 				const inverse = invertMatrix(this._state.transform);
 				spec.gradient = {
@@ -1025,6 +1211,8 @@
 		globalThis[cls.name] ??= cls;
 	}
 
+	globalThis.ImageBitmap = ImageBitmap;
+	globalThis.CanvasPattern = CanvasPattern;
 	globalThis.OffscreenCanvas = OffscreenCanvas;
 	globalThis.OffscreenCanvasRenderingContext2D = OffscreenCanvasRenderingContext2D;
 	globalThis.CanvasGradient = CanvasGradient;
