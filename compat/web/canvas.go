@@ -4,9 +4,8 @@ package web
 //
 // The DRAWING is here, in Go, because it is an algorithm: flattening curves,
 // filling a path by a winding rule, stroking one into an outline, compositing
-// with an alpha. golang.org/x/image/vector rasterizes an anti-aliased coverage
-// mask for a polygon, which is the one piece that is genuinely hard to get
-// right, and everything else is built on it.
+// with an alpha. rasterize() computes an anti-aliased coverage mask straight
+// from the winding rule, and everything else is built on it.
 //
 // What stays in JavaScript is the API surface and the drawing STATE — the
 // save/restore stack, the current transform, the styles — because that is what
@@ -27,10 +26,9 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"math"
+	"sort"
 
 	_ "golang.org/x/image/webp"
-
-	"golang.org/x/image/vector"
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
@@ -330,49 +328,128 @@ func clamp255(v float64) byte {
 }
 
 // rasterize turns a set of already-transformed device-space subpaths into a
-// coverage mask. x/image/vector fills by the NONZERO rule; even-odd is done by
-// rasterizing each subpath separately and combining, which is what the rule
-// means.
+// coverage mask by evaluating the winding rule itself: each pixel row is
+// sampled on a few sub-rows, the edge crossings of a sub-row are sorted, and
+// the rule (nonzero winding or even-odd parity) decides the inside spans,
+// whose coverage is accumulated with exact fractional ends.
+//
+// The rule must be evaluated per SAMPLE, not per polygon: a stroke is a pile
+// of deliberately overlapping same-winding pieces whose union is the shape,
+// and a summed-area rasterizer (x/image/vector, which accumulates signed area
+// and clamps) over-covers wherever pieces overlap inside a partially covered
+// pixel — dozens of slivers each holding 3% of a pixel read as 90% when the
+// union is 7%. Winding evaluation also gives even-odd within a single
+// self-intersecting subpath, which no per-subpath combination can.
 func rasterize(w, h int, subpaths [][]point, evenOdd bool) []byte {
-	if !evenOdd {
-		r := vector.NewRasterizer(w, h)
-		for _, sp := range subpaths {
-			if len(sp) < 2 {
-				continue
-			}
-			r.MoveTo(float32(sp[0].x), float32(sp[0].y))
-			for _, pt := range sp[1:] {
-				r.LineTo(float32(pt.x), float32(pt.y))
-			}
-			r.ClosePath()
-		}
-		dst := image.NewAlpha(image.Rect(0, 0, w, h))
-		r.Draw(dst, dst.Bounds(), image.Opaque, image.Point{})
-		return dst.Pix
+	// subRows is the vertical sampling density; horizontal coverage is exact.
+	const subRows = 4
+	type edge struct {
+		yMin, yMax float64
+		x0, y0     float64
+		dxdy       float64
+		dir        int
 	}
-	// Even-odd: a pixel is inside when an ODD number of subpaths contain it, so
-	// each is rasterized alone and the coverages are combined as a parity.
-	acc := make([]byte, w*h)
+	var edges []edge
 	for _, sp := range subpaths {
 		if len(sp) < 2 {
 			continue
 		}
-		r := vector.NewRasterizer(w, h)
-		r.MoveTo(float32(sp[0].x), float32(sp[0].y))
-		for _, pt := range sp[1:] {
-			r.LineTo(float32(pt.x), float32(pt.y))
-		}
-		r.ClosePath()
-		dst := image.NewAlpha(image.Rect(0, 0, w, h))
-		r.Draw(dst, dst.Bounds(), image.Opaque, image.Point{})
-		for i, v := range dst.Pix {
-			a, b := int(acc[i]), int(v)
-			// a XOR b on coverage: a + b - 2ab, which is the parity rule for the
-			// fractional coverages anti-aliasing produces.
-			acc[i] = byte(a + b - 2*a*b/255)
+		for i := range sp {
+			a, b := sp[i], sp[(i+1)%len(sp)]
+			if a.y == b.y || math.IsNaN(a.y) || math.IsNaN(b.y) {
+				continue
+			}
+			e := edge{x0: a.x, y0: a.y, dxdy: (b.x - a.x) / (b.y - a.y), dir: 1}
+			if a.y < b.y {
+				e.yMin, e.yMax = a.y, b.y
+			} else {
+				e.yMin, e.yMax, e.dir = b.y, a.y, -1
+			}
+			edges = append(edges, e)
 		}
 	}
-	return acc
+	out := make([]byte, w*h)
+	if len(edges) == 0 {
+		return out
+	}
+	type crossing struct {
+		x   float64
+		dir int
+	}
+	crossings := make([]crossing, 0, 64)
+	acc := make([]float64, w)
+	addSpan := func(xa, xb float64) {
+		xa = math.Max(xa, 0)
+		xb = math.Min(xb, float64(w))
+		if !(xb > xa) {
+			return
+		}
+		ia, ib := int(xa), int(xb)
+		if ib >= w {
+			ib = w - 1
+		}
+		if ia == ib {
+			acc[ia] += (xb - xa) / subRows
+			return
+		}
+		acc[ia] += (float64(ia+1) - xa) / subRows
+		for i := ia + 1; i < ib; i++ {
+			acc[i] += 1.0 / subRows
+		}
+		acc[ib] += (xb - float64(ib)) / subRows
+	}
+	for row := 0; row < h; row++ {
+		for i := range acc {
+			acc[i] = 0
+		}
+		for k := 0; k < subRows; k++ {
+			ys := float64(row) + (float64(k)+0.5)/subRows
+			crossings = crossings[:0]
+			for i := range edges {
+				e := &edges[i]
+				if ys < e.yMin || ys >= e.yMax {
+					continue
+				}
+				x := e.x0 + (ys-e.y0)*e.dxdy
+				if math.IsNaN(x) {
+					continue
+				}
+				crossings = append(crossings, crossing{x: x, dir: e.dir})
+			}
+			if len(crossings) < 2 {
+				continue
+			}
+			sort.Slice(crossings, func(i, j int) bool { return crossings[i].x < crossings[j].x })
+			winding, parity := 0, 0
+			inside := false
+			var spanStart float64
+			for _, c := range crossings {
+				was := inside
+				if evenOdd {
+					parity ^= 1
+					inside = parity == 1
+				} else {
+					winding += c.dir
+					inside = winding != 0
+				}
+				if !was && inside {
+					spanStart = c.x
+				} else if was && !inside {
+					addSpan(spanStart, c.x)
+				}
+			}
+		}
+		for i, v := range acc {
+			c := int(v*255 + 0.5)
+			if c > 255 {
+				c = 255
+			} else if c < 0 {
+				c = 0
+			}
+			out[row*w+i] = byte(c)
+		}
+	}
+	return out
 }
 
 type point struct{ x, y float64 }

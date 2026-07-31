@@ -146,50 +146,240 @@
 
 	// ---------------------------------------------------------------- paths
 	// A Path2D holds its commands in USER space; they are flattened into device
-	// space when the path is drawn, with the transform in force then.
+	// space when the path is drawn, with the transform in force then. The
+	// context's default path is the other way round: the specification
+	// transforms points AS THEY ARE ADDED, so the context bakes the matrix in
+	// force into each point and its command list is device-space already
+	// (bézier control points transform exactly — an affine map of a bézier is
+	// the bézier of the mapped control points — which is why arcs are baked as
+	// béziers rather than sampled).
+
+	const TAU = Math.PI * 2;
+	// Transformed coordinates are clamped rather than dropped: a rectangle
+	// scaled by 1e308 must still CONTAIN the origin, and a clamped huge value
+	// preserves which side of every edge a queried point is on.
+	const COORD_LIMIT = 1e154;
+	const clampCoord = (v) => (v > COORD_LIMIT ? COORD_LIMIT : v < -COORD_LIMIT ? -COORD_LIMIT : v);
+
+	// arcSweep resolves start/end/direction into a signed sweep. A difference
+	// of a whole number of turns is a FULL circle when the endpoints differ
+	// and an empty arc when they are the same value: arc(…, 2π, 0) draws the
+	// circle, arc(…, 0, 0) draws nothing.
+	function arcSweep(a0, a1, ccwFlag) {
+		if (!ccwFlag && a1 - a0 >= TAU) return TAU;
+		if (ccwFlag && a0 - a1 >= TAU) return -TAU;
+		if (a0 === a1) return 0;
+		let d = (a1 - a0) % TAU;
+		if (!ccwFlag && d <= 0) d += TAU;
+		else if (ccwFlag && d >= 0) d -= TAU;
+		return d;
+	}
+
+	// arcBeziers approximates an elliptical arc with one cubic per quarter
+	// turn, the standard tangent-length construction. The worst radial error
+	// of a quarter is 2.7e-4 of the radius, which survives any later affine
+	// transform because the béziers do.
+	function arcBeziers(x, y, rx, ry, rot, a0, sweep) {
+		const cosR = Math.cos(rot), sinR = Math.sin(rot);
+		const pt = (t) => {
+			const px = rx * Math.cos(t), py = ry * Math.sin(t);
+			return [x + px * cosR - py * sinR, y + px * sinR + py * cosR];
+		};
+		const deriv = (t) => {
+			const dx = -rx * Math.sin(t), dy = ry * Math.cos(t);
+			return [dx * cosR - dy * sinR, dx * sinR + dy * cosR];
+		};
+		const [sx, sy] = pt(a0);
+		const curves = [];
+		const n = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 2)));
+		for (let i = 0; i < n; i++) {
+			const t0 = a0 + sweep * (i / n), t1 = a0 + sweep * ((i + 1) / n);
+			const k = (4 / 3) * Math.tan((t1 - t0) / 4);
+			const [p0x, p0y] = pt(t0), [p3x, p3y] = pt(t1);
+			const [d0x, d0y] = deriv(t0), [d1x, d1y] = deriv(t1);
+			curves.push([p0x + k * d0x, p0y + k * d0y, p3x - k * d1x, p3y - k * d1y, p3x, p3y]);
+		}
+		return { sx, sy, curves };
+	}
+
+	// arcToCommands is the arcTo geometry: from the current point (x0, y0),
+	// the arc of radius r tangent to both lines through (x1, y1), reached by a
+	// straight line. Degenerate inputs collapse to a line to (x1, y1), as the
+	// specification says.
+	function arcToCommands(x0, y0, x1, y1, x2, y2, r) {
+		const v1x = x0 - x1, v1y = y0 - y1, v2x = x2 - x1, v2y = y2 - y1;
+		const l1 = Math.hypot(v1x, v1y), l2 = Math.hypot(v2x, v2y);
+		if (l1 === 0 || l2 === 0 || r === 0) return [["L", x1, y1]];
+		const u1x = v1x / l1, u1y = v1y / l1, u2x = v2x / l2, u2y = v2y / l2;
+		if (Math.abs(u1x * u2y - u1y * u2x) < 1e-12) return [["L", x1, y1]];
+		const angle = Math.acos(Math.min(1, Math.max(-1, u1x * u2x + u1y * u2y)));
+		const tanDist = r / Math.tan(angle / 2);
+		const t1x = x1 + u1x * tanDist, t1y = y1 + u1y * tanDist;
+		const t2x = x1 + u2x * tanDist, t2y = y1 + u2y * tanDist;
+		// The centre is off the angle bisector by r/sin(angle/2).
+		const bx = u1x + u2x, by = u1y + u2y;
+		const bl = Math.hypot(bx, by);
+		const cx = x1 + (bx / bl) * (r / Math.sin(angle / 2));
+		const cy = y1 + (by / bl) * (r / Math.sin(angle / 2));
+		const s0 = Math.atan2(t1y - cy, t1x - cx);
+		const s1 = Math.atan2(t2y - cy, t2x - cx);
+		let sweep = s1 - s0;
+		while (sweep > Math.PI) sweep -= TAU;
+		while (sweep < -Math.PI) sweep += TAU;
+		const arc = arcBeziers(cx, cy, r, r, 0, s0, sweep);
+		return [["L", t1x, t1y], ...arc.curves.map((b) => ["C", ...b])];
+	}
+
+	// rectCommandList: four connected lines, the subpath marked closed, and a
+	// NEW subpath at (x, y) — which is where the specification leaves the
+	// current point, so a following lineTo draws from the rectangle's corner.
+	function rectCommandList(x, y, w, h) {
+		return [
+			["M", x, y], ["L", x + w, y], ["L", x + w, y + h], ["L", x, y + h], ["Z"],
+			["M", x, y],
+		];
+	}
+
+	// KAPPA is the tangent length that makes one cubic a quarter circle.
+	const KAPPA = 0.5522847498307936;
+
+	// normRoundRect converts and validates roundRect's arguments: each radius
+	// is a number or a DOMPointInit (an elliptical corner), one to four of
+	// them fill in like a CSS shorthand, a negative component is a RangeError,
+	// a non-finite one silently ignores the whole call, negative width or
+	// height flips the corner assignment, and radii too large for an edge are
+	// scaled down together. Returns null when the call is to be ignored.
+	function normRoundRect(x, y, w, h, radii) {
+		x = +x; y = +y; w = +w; h = +h;
+		if (radii === undefined) radii = 0;
+		const list = (radii !== null && typeof radii === "object" && Symbol.iterator in radii)
+			? [...radii] : [radii];
+		if (list.length < 1 || list.length > 4) {
+			throw new RangeError("roundRect: between one and four radii are required");
+		}
+		let ignore = false;
+		const norm = list.map((v) => {
+			let rx, ry;
+			if (v !== null && v !== undefined && typeof v === "object") {
+				rx = +(v.x ?? 0); ry = +(v.y ?? 0);
+			} else if (v === null || v === undefined) {
+				rx = 0; ry = 0;
+			} else {
+				rx = ry = +v;
+			}
+			if (!Number.isFinite(rx) || !Number.isFinite(ry)) { ignore = true; return { x: 0, y: 0 }; }
+			if (rx < 0 || ry < 0) throw new RangeError("roundRect: a radius must not be negative");
+			return { x: rx, y: ry };
+		});
+		if (ignore || ![x, y, w, h].every(Number.isFinite)) return null;
+		const c = (r) => ({ x: r.x, y: r.y });
+		let [ul, ur, lr, ll] =
+			norm.length === 1 ? [c(norm[0]), c(norm[0]), c(norm[0]), c(norm[0])]
+				: norm.length === 2 ? [c(norm[0]), c(norm[1]), c(norm[0]), c(norm[1])]
+					: norm.length === 3 ? [c(norm[0]), c(norm[1]), c(norm[2]), c(norm[1])]
+						: [c(norm[0]), c(norm[1]), c(norm[2]), c(norm[3])];
+		// Exactly one negative dimension reverses the traversal direction, so
+		// a flipped roundRect cancels an unflipped one under the nonzero rule
+		// — the same winding rect() gets for free from its signed arithmetic.
+		const reversed = (w < 0) !== (h < 0);
+		if (w < 0) { x += w; w = -w; [ul, ur] = [ur, ul]; [ll, lr] = [lr, ll]; }
+		if (h < 0) { y += h; h = -h; [ul, ll] = [ll, ul]; [ur, lr] = [lr, ur]; }
+		let scale = 1;
+		for (const [sum, edge] of [[ul.x + ur.x, w], [ll.x + lr.x, w], [ul.y + ll.y, h], [ur.y + lr.y, h]]) {
+			if (sum > edge) scale = Math.min(scale, edge / sum);
+		}
+		if (scale < 1) {
+			for (const r of [ul, ur, lr, ll]) { r.x *= scale; r.y *= scale; }
+		}
+		return { x, y, w, h, ul, ur, lr, ll, reversed };
+	}
+
+	function roundRectCommandList(v) {
+		const { x, y, w, h, ul, ur, lr, ll, reversed } = v;
+		if (reversed) {
+			return [
+				["M", x + ul.x, y],
+				["C", x + ul.x - KAPPA * ul.x, y, x, y + ul.y - KAPPA * ul.y, x, y + ul.y],
+				["L", x, y + h - ll.y],
+				["C", x, y + h - ll.y + KAPPA * ll.y, x + ll.x - KAPPA * ll.x, y + h, x + ll.x, y + h],
+				["L", x + w - lr.x, y + h],
+				["C", x + w - lr.x + KAPPA * lr.x, y + h, x + w, y + h - lr.y + KAPPA * lr.y, x + w, y + h - lr.y],
+				["L", x + w, y + ur.y],
+				["C", x + w, y + ur.y - KAPPA * ur.y, x + w - ur.x + KAPPA * ur.x, y, x + w - ur.x, y],
+				["Z"],
+				["M", x, y],
+			];
+		}
+		return [
+			["M", x + ul.x, y],
+			["L", x + w - ur.x, y],
+			["C", x + w - ur.x + KAPPA * ur.x, y, x + w, y + ur.y - KAPPA * ur.y, x + w, y + ur.y],
+			["L", x + w, y + h - lr.y],
+			["C", x + w, y + h - lr.y + KAPPA * lr.y, x + w - lr.x + KAPPA * lr.x, y + h, x + w - lr.x, y + h],
+			["L", x + ll.x, y + h],
+			["C", x + ll.x - KAPPA * ll.x, y + h, x, y + h - ll.y + KAPPA * ll.y, x, y + h - ll.y],
+			["L", x, y + ul.y],
+			["C", x, y + ul.y - KAPPA * ul.y, x + ul.x - KAPPA * ul.x, y, x + ul.x, y],
+			["Z"],
+			["M", x, y],
+		];
+	}
 
 	class Path2D {
 		constructor(source = undefined) {
 			Object.defineProperty(this, "_cmds", { value: [], writable: true });
 			if (source instanceof Path2D) this._cmds = source._cmds.map((c) => c.slice());
 		}
-		moveTo(x, y) { this._cmds.push(["M", +x, +y]); }
-		lineTo(x, y) { this._cmds.push(["L", +x, +y]); }
-		closePath() { this._cmds.push(["Z"]); }
-		quadraticCurveTo(cx, cy, x, y) { this._cmds.push(["Q", +cx, +cy, +x, +y]); }
-		bezierCurveTo(c1x, c1y, c2x, c2y, x, y) { this._cmds.push(["C", +c1x, +c1y, +c2x, +c2y, +x, +y]); }
-		rect(x, y, w, h) { this._cmds.push(["R", +x, +y, +w, +h]); }
-		arc(x, y, r, start, end, ccw = false) {
-			if (r < 0) throw new DOMException("arc: the radius must not be negative", "IndexSizeError");
-			this._cmds.push(["A", +x, +y, +r, +r, 0, +start, +end, Boolean(ccw)]);
+		// Every method converts its arguments FIRST (the conversion is what
+		// throws for a BigInt), then a non-finite value silently ignores the
+		// call — the whole call, not just one point — and only then a negative
+		// radius throws. That order is the specification's.
+		moveTo(x, y) {
+			x = +x; y = +y;
+			if (Number.isFinite(x) && Number.isFinite(y)) this._cmds.push(["M", x, y]);
 		}
-		ellipse(x, y, rx, ry, rotation, start, end, ccw = false) {
-			if (rx < 0 || ry < 0) throw new DOMException("ellipse: the radii must not be negative", "IndexSizeError");
-			this._cmds.push(["A", +x, +y, +rx, +ry, +rotation, +start, +end, Boolean(ccw)]);
+		lineTo(x, y) {
+			x = +x; y = +y;
+			if (Number.isFinite(x) && Number.isFinite(y)) this._cmds.push(["L", x, y]);
+		}
+		closePath() { this._cmds.push(["Z"]); }
+		quadraticCurveTo(cpx, cpy, x, y) {
+			const a = [+cpx, +cpy, +x, +y];
+			if (a.every(Number.isFinite)) this._cmds.push(["Q", ...a]);
+		}
+		bezierCurveTo(c1x, c1y, c2x, c2y, x, y) {
+			const a = [+c1x, +c1y, +c2x, +c2y, +x, +y];
+			if (a.every(Number.isFinite)) this._cmds.push(["C", ...a]);
+		}
+		rect(x, y, w, h) {
+			const a = [+x, +y, +w, +h];
+			if (a.every(Number.isFinite)) this._cmds.push(["R", ...a]);
+		}
+		roundRect(x, y, w, h, radii) {
+			const v = normRoundRect(x, y, w, h, radii);
+			if (v) this._cmds.push(["RR", v]);
+		}
+		arc(x, y, r, start, end, ccwFlag = false) {
+			const a = [+x, +y, +r, +start, +end];
+			ccwFlag = Boolean(ccwFlag);
+			if (!a.every(Number.isFinite)) return;
+			if (a[2] < 0) throw new DOMException("arc: the radius must not be negative", "IndexSizeError");
+			this._cmds.push(["A", a[0], a[1], a[2], a[2], 0, a[3], a[4], ccwFlag]);
+		}
+		ellipse(x, y, rx, ry, rotation, start, end, ccwFlag = false) {
+			const a = [+x, +y, +rx, +ry, +rotation, +start, +end];
+			ccwFlag = Boolean(ccwFlag);
+			if (!a.every(Number.isFinite)) return;
+			if (a[2] < 0 || a[3] < 0) {
+				throw new DOMException("ellipse: the radii must not be negative", "IndexSizeError");
+			}
+			this._cmds.push(["A", ...a, ccwFlag]);
 		}
 		arcTo(x1, y1, x2, y2, r) {
-			if (r < 0) throw new DOMException("arcTo: the radius must not be negative", "IndexSizeError");
-			this._cmds.push(["T", +x1, +y1, +x2, +y2, +r]);
-		}
-		// The radii are one to four corners, each a number or a DOMPointInit, and
-		// they fill in the same way a CSS shorthand does: one for all, two for the
-		// diagonals, three with the last pair mirrored, four in order from the
-		// top-left clockwise.
-		roundRect(x, y, w, h, radii = 0) {
-			const list = Array.isArray(radii) ? radii : [radii];
-			if (list.length < 1 || list.length > 4) {
-				throw new RangeError("roundRect: between one and four radii are required");
-			}
-			const one = (v) => {
-				if (v !== null && typeof v === "object") return Math.abs(Number(v.x ?? 0));
-				return Math.abs(Number(v));
-			};
-			const r = list.map(one);
-			if (r.some((n) => !Number.isFinite(n))) return;
-			const corners = r.length === 1 ? [r[0], r[0], r[0], r[0]]
-				: r.length === 2 ? [r[0], r[1], r[0], r[1]]
-					: r.length === 3 ? [r[0], r[1], r[2], r[1]] : r;
-			this._cmds.push(["RR", +x, +y, +w, +h, corners[0], corners[1], corners[2], corners[3]]);
+			const a = [+x1, +y1, +x2, +y2, +r];
+			if (!a.every(Number.isFinite)) return;
+			if (a[4] < 0) throw new DOMException("arcTo: the radius must not be negative", "IndexSizeError");
+			this._cmds.push(["T", ...a]);
 		}
 		addPath(path) {
 			if (!(path instanceof Path2D)) throw new TypeError("addPath: a Path2D is required");
@@ -203,17 +393,19 @@
 	// step keeps the point count — and so the cost of a crossing — predictable.
 	const CURVE_STEPS = 48;
 
-	// flatten turns a command list into device-space polygons.
+	// flatten turns a command list into polygons in the matrix's target space.
+	// A subpath that a closePath (or a rect) sealed carries `closed: true`,
+	// which is what tells the stroker to join its ends instead of capping them.
 	function flatten(cmds, matrix) {
 		const subpaths = [];
 		let current = null;
-		let cx = 0, cy = 0;     // current point, USER space
+		let cx = 0, cy = 0;     // current point in the commands' own space
 		let startX = 0, startY = 0;
 		const push = (x, y) => {
 			const [dx, dy] = applyMatrix(matrix, x, y);
-			if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+			if (Number.isNaN(dx) || Number.isNaN(dy)) return;
 			if (current === null) current = [];
-			current.push(dx, dy);
+			current.push(clampCoord(dx), clampCoord(dy));
 		};
 		const begin = (x, y) => {
 			if (current && current.length >= 4) subpaths.push(current);
@@ -222,7 +414,7 @@
 			cy = startY = y;
 			push(x, y);
 		};
-		for (const c of cmds) {
+		const step = (c) => {
 			switch (c[0]) {
 				case "M":
 					begin(c[1], c[2]);
@@ -234,6 +426,7 @@
 				case "Z":
 					if (current && current.length >= 4) {
 						push(startX, startY);
+						current.closed = true;
 						subpaths.push(current);
 					}
 					current = null;
@@ -243,130 +436,104 @@
 					push(startX, startY);
 					break;
 				case "Q": {
-					if (current === null) begin(cx, cy);
+					// With no subpath yet, the curve's first control point is where
+					// the subpath begins — "ensure there is a subpath", per spec.
+					if (current === null) begin(c[1], c[2]);
 					const [qx, qy, ex, ey] = [c[1], c[2], c[3], c[4]];
+					const x0 = cx, y0 = cy;
 					for (let i = 1; i <= CURVE_STEPS; i++) {
 						const t = i / CURVE_STEPS, u = 1 - t;
-						push(u * u * cx + 2 * u * t * qx + t * t * ex, u * u * cy + 2 * u * t * qy + t * t * ey);
+						push(u * u * x0 + 2 * u * t * qx + t * t * ex, u * u * y0 + 2 * u * t * qy + t * t * ey);
 					}
 					cx = ex; cy = ey;
 					break;
 				}
 				case "C": {
-					if (current === null) begin(cx, cy);
+					if (current === null) begin(c[1], c[2]);
 					const [c1x, c1y, c2x, c2y, ex, ey] = c.slice(1);
+					const x0 = cx, y0 = cy;
 					for (let i = 1; i <= CURVE_STEPS; i++) {
 						const t = i / CURVE_STEPS, u = 1 - t;
 						push(
-							u * u * u * cx + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * ex,
-							u * u * u * cy + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * ey,
+							u * u * u * x0 + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * ex,
+							u * u * u * y0 + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * ey,
 						);
 					}
 					cx = ex; cy = ey;
 					break;
 				}
-				case "R": {
-					const [x, y, w, h] = c.slice(1);
-					if (current && current.length >= 4) subpaths.push(current);
-					current = null;
-					push(x, y); push(x + w, y); push(x + w, y + h); push(x, y + h); push(x, y);
-					if (current) subpaths.push(current);
-					current = null;
-					cx = startX = x; cy = startY = y;
+				case "R":
+					for (const s of rectCommandList(c[1], c[2], c[3], c[4])) step(s);
 					break;
-				}
-				case "RR": {
-					const [x, y, w, h] = c.slice(1, 5);
-					const cap = Math.min(Math.abs(w), Math.abs(h)) / 2;
-					const [tl, tr, br, bl] = c.slice(5).map((v) => Math.min(v, cap));
-					if (current && current.length >= 4) subpaths.push(current);
-					current = null;
-					const corner = (ax, ay, r, from) => {
-						for (let i = 0; i <= 16; i++) {
-							const t = from + (Math.PI / 2) * (i / 16);
-							push(ax + r * Math.cos(t), ay + r * Math.sin(t));
-						}
-					};
-					push(x + tl, y);
-					push(x + w - tr, y);
-					corner(x + w - tr, y + tr, tr, -Math.PI / 2);
-					push(x + w, y + h - br);
-					corner(x + w - br, y + h - br, br, 0);
-					push(x + bl, y + h);
-					corner(x + bl, y + h - bl, bl, Math.PI / 2);
-					push(x, y + tl);
-					corner(x + tl, y + tl, tl, Math.PI);
-					if (current) subpaths.push(current);
-					current = null;
-					cx = startX = x + tl; cy = startY = y;
+				case "RR":
+					for (const s of roundRectCommandList(c[1])) step(s);
 					break;
-				}
 				case "A": {
-					const [ax, ay, rx, ry, rot, start, end, ccw] = c.slice(1);
-					let a0 = start, a1 = end;
-					const TWO_PI = Math.PI * 2;
-					if (!ccw && a1 - a0 >= TWO_PI) a1 = a0 + TWO_PI;
-					else if (ccw && a0 - a1 >= TWO_PI) a1 = a0 - TWO_PI;
-					else if (!ccw && a1 < a0) a1 += TWO_PI * Math.ceil((a0 - a1) / TWO_PI);
-					else if (ccw && a1 > a0) a1 -= TWO_PI * Math.ceil((a1 - a0) / TWO_PI);
-					const steps = Math.max(8, Math.ceil(Math.abs(a1 - a0) / (Math.PI / 32)));
-					const cosR = Math.cos(rot), sinR = Math.sin(rot);
-					const at = (t) => {
-						const px = rx * Math.cos(t), py = ry * Math.sin(t);
-						return [ax + px * cosR - py * sinR, ay + px * sinR + py * cosR];
-					};
-					if (current === null) {
-						const [sx, sy] = at(a0);
-						begin(sx, sy);
-					} else {
-						const [sx, sy] = at(a0);
-						push(sx, sy);
-					}
-					for (let i = 1; i <= steps; i++) {
-						const [px, py] = at(a0 + (a1 - a0) * (i / steps));
-						push(px, py);
-					}
-					const [ex, ey] = at(a1);
-					cx = ex; cy = ey;
+					const [ax, ay, rx, ry, rot, a0, a1, ccwFlag] = c.slice(1);
+					const arc = arcBeziers(ax, ay, rx, ry, rot, a0, arcSweep(a0, a1, ccwFlag));
+					step([current === null ? "M" : "L", arc.sx, arc.sy]);
+					for (const b of arc.curves) step(["C", ...b]);
 					break;
 				}
 				case "T": {
-					// arcTo: the arc tangent to both lines, then a line to its start.
-					const [x1, y1, x2, y2, r] = c.slice(1);
-					if (current === null) begin(cx, cy);
-					const v1 = [cx - x1, cy - y1];
-					const v2 = [x2 - x1, y2 - y1];
-					const l1 = Math.hypot(v1[0], v1[1]), l2 = Math.hypot(v2[0], v2[1]);
-					if (l1 === 0 || l2 === 0 || r === 0) { push(x1, y1); cx = x1; cy = y1; break; }
-					const u1 = [v1[0] / l1, v1[1] / l1], u2 = [v2[0] / l2, v2[1] / l2];
-					const cross = u1[0] * u2[1] - u1[1] * u2[0];
-					if (Math.abs(cross) < 1e-12) { push(x1, y1); cx = x1; cy = y1; break; }
-					const angle = Math.acos(Math.min(1, Math.max(-1, u1[0] * u2[0] + u1[1] * u2[1])));
-					const tanDist = r / Math.tan(angle / 2);
-					const t1 = [x1 + u1[0] * tanDist, y1 + u1[1] * tanDist];
-					const t2 = [x1 + u2[0] * tanDist, y1 + u2[1] * tanDist];
-					push(t1[0], t1[1]);
-					// The centre is off the bisector by r/sin(angle/2).
-					const bis = [u1[0] + u2[0], u1[1] + u2[1]];
-					const bl = Math.hypot(bis[0], bis[1]);
-					const centre = [x1 + bis[0] / bl * (r / Math.sin(angle / 2)), y1 + bis[1] / bl * (r / Math.sin(angle / 2))];
-					let s0 = Math.atan2(t1[1] - centre[1], t1[0] - centre[0]);
-					let s1 = Math.atan2(t2[1] - centre[1], t2[0] - centre[0]);
-					let sweep = s1 - s0;
-					while (sweep > Math.PI) sweep -= Math.PI * 2;
-					while (sweep < -Math.PI) sweep += Math.PI * 2;
-					const steps = Math.max(4, Math.ceil(Math.abs(sweep) / (Math.PI / 32)));
-					for (let i = 1; i <= steps; i++) {
-						const t = s0 + sweep * (i / steps);
-						push(centre[0] + r * Math.cos(t), centre[1] + r * Math.sin(t));
-					}
-					cx = t2[0]; cy = t2[1];
+					// With no subpath, arcTo only ensures one at (x1, y1): the arc
+					// from a point to itself is zero-length and pruned.
+					if (current === null) { begin(c[1], c[2]); break; }
+					for (const s of arcToCommands(cx, cy, c[1], c[2], c[3], c[4], c[5])) step(s);
 					break;
 				}
 			}
-		}
+		};
+		for (const c of cmds) step(c);
 		if (current && current.length >= 4) subpaths.push(current);
 		return subpaths;
+	}
+
+	// dashPolys cuts polylines into their dashed pieces, measured along the
+	// path in the space the polylines are in (which is USER space when a
+	// stroke is being built — dash lengths scale with the transform because
+	// the whole outline does).
+	function dashPolys(subpaths, pattern, offset) {
+		if (!pattern.length) return subpaths;
+		let total = 0;
+		for (const d of pattern) total += d;
+		if (!(total > 0) || !Number.isFinite(total) || !Number.isFinite(offset)) return subpaths;
+		const out = [];
+		for (const sp of subpaths) {
+			let phase = offset % total;
+			if (phase < 0) phase += total;
+			let idx = 0;
+			while (phase >= pattern[idx]) { phase -= pattern[idx]; idx = (idx + 1) % pattern.length; }
+			let on = idx % 2 === 0;
+			let run = null;
+			for (let i = 0; i + 3 < sp.length; i += 2) {
+				const x0 = sp[i], y0 = sp[i + 1], x1 = sp[i + 2], y1 = sp[i + 3];
+				const segLen = Math.hypot(x1 - x0, y1 - y0);
+				if (segLen === 0) continue;
+				const ux = (x1 - x0) / segLen, uy = (y1 - y0) / segLen;
+				let pos = 0;
+				while (pos < segLen) {
+					const remain = pattern[idx] - phase;
+					const take = Math.min(remain, segLen - pos);
+					if (on) {
+						if (run === null) run = [x0 + ux * pos, y0 + uy * pos];
+						run.push(x0 + ux * (pos + take), y0 + uy * (pos + take));
+					}
+					pos += take;
+					phase += take;
+					if (pattern[idx] - phase <= 1e-9) {
+						if (run && run.length >= 4) out.push(run);
+						run = null;
+						phase = 0;
+						idx = (idx + 1) % pattern.length;
+						on = !on;
+					}
+				}
+			}
+			if (run && run.length >= 4) out.push(run);
+			run = null;
+		}
+		return out;
 	}
 
 	// signedArea decides a polygon's winding. Every piece of a stroke is emitted
@@ -389,15 +556,19 @@
 		return poly;
 	}
 
-	// strokeOutline turns device-space polylines into the polygons that, filled
-	// by the nonzero rule, ARE the stroke.
-	function strokeOutline(subpaths, width, cap, join) {
+	// strokeOutline turns polylines into the polygons that, filled by the
+	// nonzero rule, ARE the stroke: a quad per segment, a join per interior
+	// vertex (every vertex, when the subpath is closed), and caps on open
+	// ends. A subpath with no length is pruned entirely — it draws neither
+	// caps nor joins, which is the specification's "prune" step.
+	function strokeOutline(subpaths, width, cap, join, miterLimit) {
 		const hw = width / 2;
 		const out = [];
-		const circle = (x, y) => {
+		if (!(hw > 0)) return out;
+		const disc = (x, y) => {
 			const poly = [];
 			for (let i = 0; i < 24; i++) {
-				const t = (i / 24) * Math.PI * 2;
+				const t = (i / 24) * TAU;
 				poly.push(x + hw * Math.cos(t), y + hw * Math.sin(t));
 			}
 			return ccw(poly);
@@ -410,43 +581,77 @@
 					&& Math.abs(pts[pts.length - 1] - y) < 1e-12) continue;
 				pts.push(x, y);
 			}
-			if (pts.length < 4) {
-				// A subpath with no length draws a round cap's dot and nothing else.
-				if (pts.length === 2 && cap === "round") out.push(circle(pts[0], pts[1]));
-				continue;
+			let closed = sp.closed === true;
+			// A closed polyline repeats its first point; drop the repeat so the
+			// wrap-around segment and join don't see a zero-length edge.
+			if (closed && pts.length >= 4
+				&& Math.abs(pts[0] - pts[pts.length - 2]) < 1e-12
+				&& Math.abs(pts[1] - pts[pts.length - 1]) < 1e-12) {
+				pts.length -= 2;
 			}
-			for (let i = 0; i + 3 < pts.length; i += 2) {
-				const x0 = pts[i], y0 = pts[i + 1], x1 = pts[i + 2], y1 = pts[i + 3];
+			const n = pts.length / 2;
+			if (n < 2) continue;
+			// A closed 2-point subpath (a zero-height rect) is a hairpin: the
+			// segment out and back, with a JOIN at each end — which is what
+			// puts round-join discs on the ends of a degenerate rectangle.
+			const segCount = closed ? n : n - 1;
+			for (let s = 0; s < segCount; s++) {
+				const i1 = (s + 1) % n;
+				const x0 = pts[s * 2], y0 = pts[s * 2 + 1], x1 = pts[i1 * 2], y1 = pts[i1 * 2 + 1];
 				const dx = x1 - x0, dy = y1 - y0;
 				const len = Math.hypot(dx, dy);
 				if (len === 0) continue;
-				const nx = -dy / len * hw, ny = dx / len * hw;
+				const ux = dx / len, uy = dy / len;
 				let ex0 = x0, ey0 = y0, ex1 = x1, ey1 = y1;
-				const first = i === 0, last = i + 4 >= pts.length;
+				const first = !closed && s === 0, last = !closed && s === segCount - 1;
 				if (cap === "square") {
 					// A square cap extends the segment by half the width at each end
 					// that is not joined to another segment.
-					if (first) { ex0 -= dx / len * hw; ey0 -= dy / len * hw; }
-					if (last) { ex1 += dx / len * hw; ey1 += dy / len * hw; }
+					if (first) { ex0 -= ux * hw; ey0 -= uy * hw; }
+					if (last) { ex1 += ux * hw; ey1 += uy * hw; }
 				}
+				const nx = -uy * hw, ny = ux * hw;
 				out.push(ccw([ex0 + nx, ey0 + ny, ex1 + nx, ey1 + ny, ex1 - nx, ey1 - ny, ex0 - nx, ey0 - ny]));
-				// The join at the far end of every segment but the last, and the caps
-				// at both ends, are filled with a disc for "round" and with a triangle
-				// for the others — which is what bevel is, and what a miter degrades
-				// to beyond its limit.
-				if (!last || join === "round") out.push(circle(x1, y1));
-				if (i > 0 && join !== "round") {
-					const px = pts[i - 2], py = pts[i - 1];
-					const pdx = x0 - px, pdy = y0 - py, plen = Math.hypot(pdx, pdy);
-					if (plen > 0) {
-						const pnx = -pdy / plen * hw, pny = pdx / plen * hw;
-						out.push(ccw([x0, y0, x0 + pnx, y0 + pny, x0 + nx, y0 + ny]));
-						out.push(ccw([x0, y0, x0 - pnx, y0 - pny, x0 - nx, y0 - ny]));
-					}
+				if (cap === "round") {
+					if (first) out.push(disc(x0, y0));
+					if (last) out.push(disc(x1, y1));
 				}
-				if (cap === "round" && (first || last)) {
-					if (first) out.push(circle(x0, y0));
-					if (last) out.push(circle(x1, y1));
+			}
+			for (let k = closed ? 0 : 1; k < (closed ? n : n - 1); k++) {
+				const vx = pts[k * 2], vy = pts[k * 2 + 1];
+				const pk = (k - 1 + n) % n, nk = (k + 1) % n;
+				const inX = vx - pts[pk * 2], inY = vy - pts[pk * 2 + 1];
+				const outX = pts[nk * 2] - vx, outY = pts[nk * 2 + 1] - vy;
+				const inLen = Math.hypot(inX, inY), outLen = Math.hypot(outX, outY);
+				if (inLen === 0 || outLen === 0) continue;
+				const u1x = inX / inLen, u1y = inY / inLen, u2x = outX / outLen, u2y = outY / outLen;
+				if (join === "round") { out.push(disc(vx, vy)); continue; }
+				// The bevel is a triangle on each side; the inner one is already
+				// inside the union and costs nothing.
+				const n1x = -u1y * hw, n1y = u1x * hw, n2x = -u2y * hw, n2y = u2x * hw;
+				out.push(ccw([vx, vy, vx + n1x, vy + n1y, vx + n2x, vy + n2y]));
+				out.push(ccw([vx, vy, vx - n1x, vy - n1y, vx - n2x, vy - n2y]));
+				if (join === "miter") {
+					const cosPhi = u1x * u2x + u1y * u2y;
+					// The miter ratio is 1/sin(θ/2) for interior angle θ, and
+					// sin(θ/2) = √((1+cos φ)/2) for turn angle φ.
+					const sinHalf = Math.sqrt(Math.max(0, (1 + cosPhi) / 2));
+					if (sinHalf > 0 && 1 / sinHalf <= miterLimit) {
+						const crossZ = u1x * u2y - u1y * u2x;
+						if (Math.abs(crossZ) > 1e-12) {
+							const sgn = crossZ > 0 ? 1 : -1;
+							// The outer side is the one the path turns away from.
+							const o1x = sgn * u1y * hw, o1y = -sgn * u1x * hw;
+							const o2x = sgn * u2y * hw, o2y = -sgn * u2x * hw;
+							const bx = o1x + o2x, by = o1y + o2y;
+							const bl = Math.hypot(bx, by);
+							if (bl > 0) {
+								const apexX = vx + (bx / bl) * (hw / sinHalf);
+								const apexY = vy + (by / bl) * (hw / sinHalf);
+								out.push(ccw([vx, vy, vx + o1x, vy + o1y, apexX, apexY, vx + o2x, vy + o2y]));
+							}
+						}
+					}
 				}
 			}
 		}
@@ -672,7 +877,14 @@
 				_canvas: { value: canvas },
 				_state: { value: DEFAULT_STATE(), writable: true },
 				_stack: { value: [] },
+				// The default path holds DEVICE-space commands: each point was
+				// transformed by the matrix in force when it was added. _dcur is
+				// the device-space current point (null while the path is empty),
+				// which arcTo maps back through the inverse transform to find its
+				// user-space start.
 				_path: { value: new Path2D(), writable: true },
+				_dcur: { value: null, writable: true },
+				_dstart: { value: null, writable: true },
 			});
 		}
 
@@ -700,6 +912,8 @@
 			this._state = DEFAULT_STATE();
 			this._stack.length = 0;
 			this._path = new Path2D();
+			this._dcur = null;
+			this._dstart = null;
 			canvasResize(this._canvas._handle, this._canvas.width, this._canvas.height);
 		}
 		isContextLost() { return false; }
@@ -855,17 +1069,99 @@
 			return new CanvasGradient(GRADIENT_INTERNAL, true, coords);
 		}
 
-		beginPath() { this._path = new Path2D(); }
-		moveTo(x, y) { this._path.moveTo(x, y); }
-		lineTo(x, y) { this._path.lineTo(x, y); }
-		closePath() { this._path.closePath(); }
-		quadraticCurveTo(a, b, c, d) { this._path.quadraticCurveTo(a, b, c, d); }
-		bezierCurveTo(a, b, c, d, e, f) { this._path.bezierCurveTo(a, b, c, d, e, f); }
-		rect(x, y, w, h) { this._path.rect(x, y, w, h); }
-		roundRect(x, y, w, h, r) { this._path.roundRect(x, y, w, h, r); }
-		arc(x, y, r, s, e, ccwFlag) { this._path.arc(x, y, r, s, e, ccwFlag); }
-		ellipse(x, y, rx, ry, rot, s, e, ccwFlag) { this._path.ellipse(x, y, rx, ry, rot, s, e, ccwFlag); }
-		arcTo(x1, y1, x2, y2, r) { this._path.arcTo(x1, y1, x2, y2, r); }
+		beginPath() { this._path = new Path2D(); this._dcur = null; this._dstart = null; }
+		// _appendUser bakes user-space M/L/Q/C/Z commands into the default
+		// path through the current transform — the specification transforms
+		// points when they are ADDED, not when the path is drawn. Only those
+		// five commands ever reach it: arcs arrive as béziers, which an affine
+		// matrix maps exactly.
+		_appendUser(cmds) {
+			const m = this._state.transform;
+			for (const c of cmds) {
+				if (c[0] === "Z") {
+					this._path._cmds.push(["Z"]);
+					if (this._dstart) this._dcur = this._dstart.slice();
+					continue;
+				}
+				const out = [c[0]];
+				for (let i = 1; i + 1 < c.length; i += 2) {
+					const [dx, dy] = applyMatrix(m, c[i], c[i + 1]);
+					out.push(clampCoord(dx), clampCoord(dy));
+				}
+				this._path._cmds.push(out);
+				this._dcur = [out[out.length - 2], out[out.length - 1]];
+				if (c[0] === "M") this._dstart = this._dcur.slice();
+			}
+		}
+		moveTo(x, y) {
+			x = +x; y = +y;
+			if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+			this._appendUser([["M", x, y]]);
+		}
+		lineTo(x, y) {
+			x = +x; y = +y;
+			if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+			this._appendUser([[this._dcur === null ? "M" : "L", x, y]]);
+		}
+		closePath() {
+			if (this._dcur !== null) this._appendUser([["Z"]]);
+		}
+		quadraticCurveTo(cpx, cpy, x, y) {
+			const a = [+cpx, +cpy, +x, +y];
+			if (!a.every(Number.isFinite)) return;
+			const cmds = this._dcur === null ? [["M", a[0], a[1]]] : [];
+			cmds.push(["Q", ...a]);
+			this._appendUser(cmds);
+		}
+		bezierCurveTo(c1x, c1y, c2x, c2y, x, y) {
+			const a = [+c1x, +c1y, +c2x, +c2y, +x, +y];
+			if (!a.every(Number.isFinite)) return;
+			const cmds = this._dcur === null ? [["M", a[0], a[1]]] : [];
+			cmds.push(["C", ...a]);
+			this._appendUser(cmds);
+		}
+		rect(x, y, w, h) {
+			const a = [+x, +y, +w, +h];
+			if (!a.every(Number.isFinite)) return;
+			this._appendUser(rectCommandList(...a));
+		}
+		roundRect(x, y, w, h, r) {
+			const v = normRoundRect(x, y, w, h, r);
+			if (v) this._appendUser(roundRectCommandList(v));
+		}
+		arc(x, y, r, s, e, ccwFlag = false) {
+			const a = [+x, +y, +r, +s, +e];
+			ccwFlag = Boolean(ccwFlag);
+			if (!a.every(Number.isFinite)) return;
+			if (a[2] < 0) throw new DOMException("arc: the radius must not be negative", "IndexSizeError");
+			this._appendArc(a[0], a[1], a[2], a[2], 0, a[3], a[4], ccwFlag);
+		}
+		ellipse(x, y, rx, ry, rot, s, e, ccwFlag = false) {
+			const a = [+x, +y, +rx, +ry, +rot, +s, +e];
+			ccwFlag = Boolean(ccwFlag);
+			if (!a.every(Number.isFinite)) return;
+			if (a[2] < 0 || a[3] < 0) {
+				throw new DOMException("ellipse: the radii must not be negative", "IndexSizeError");
+			}
+			this._appendArc(...a, ccwFlag);
+		}
+		_appendArc(x, y, rx, ry, rot, s, e, ccwFlag) {
+			const arc = arcBeziers(x, y, rx, ry, rot, s, arcSweep(s, e, ccwFlag));
+			const cmds = [[this._dcur === null ? "M" : "L", arc.sx, arc.sy]];
+			for (const b of arc.curves) cmds.push(["C", ...b]);
+			this._appendUser(cmds);
+		}
+		arcTo(x1, y1, x2, y2, r) {
+			const a = [+x1, +y1, +x2, +y2, +r];
+			if (!a.every(Number.isFinite)) return;
+			if (a[4] < 0) throw new DOMException("arcTo: the radius must not be negative", "IndexSizeError");
+			if (this._dcur === null) { this._appendUser([["M", a[0], a[1]]]); return; }
+			// The tangent geometry works from the user-space current point,
+			// which is the device-space one pulled back through the transform.
+			const inv = invertMatrix(this._state.transform);
+			const [x0, y0] = inv ? applyMatrix(inv, this._dcur[0], this._dcur[1]) : [a[0], a[1]];
+			this._appendUser(arcToCommands(x0, y0, a[0], a[1], a[2], a[3], a[4]));
+		}
 
 		fillRect(x, y, w, h) {
 			if (!allFinite(arguments)) return;
@@ -874,8 +1170,13 @@
 		}
 		strokeRect(x, y, w, h) {
 			if (!allFinite(arguments)) return;
-			const polys = (+w === 0 && +h === 0) ? [] : this._rectPolys(+x, +y, +w, +h);
-			this._paintStroke(polys.length ? polys : []);
+			x = +x; y = +y; w = +w; h = +h;
+			// A zero-by-zero rectangle draws nothing; a rectangle that is zero
+			// in ONE dimension strokes as a line (the degenerate closed path).
+			if (w === 0 && h === 0) return;
+			const poly = [x, y, x + w, y, x + w, y + h, x, y + h, x, y];
+			poly.closed = true;
+			this._paintStroke(this._strokePolys([poly]));
 		}
 		clearRect(x, y, w, h) {
 			if (!allFinite(arguments)) return;
@@ -883,33 +1184,76 @@
 			const { subpaths, lengths } = packSubpaths(this._rectPolys(+x, +y, +w, +h));
 			canvasClear(this._canvas._handle, { subpaths, lengths });
 		}
+		// _fillPolys is the intended path as device-space polygons. The default
+		// path is device-space already; a Path2D argument is user-space and is
+		// transformed by the matrix in force NOW — the two halves of "the
+		// transformation applies when points are added to the default path".
+		_fillPolys(path) {
+			if (path) return flatten(path._cmds, this._state.transform);
+			return flatten(this._path._cmds, IDENTITY);
+		}
+		// _userPolys is the intended path as USER-space polylines, which is
+		// the space a stroke's geometry lives in: the line width, the dashes
+		// and the joins are laid out there and the finished outline is then
+		// transformed, so a scale in force at stroke() time scales the width
+		// too — even for a default path whose points were baked earlier.
+		_userPolys(path) {
+			if (path) return flatten(path._cmds, IDENTITY);
+			const inv = invertMatrix(this._state.transform);
+			return inv ? flatten(this._path._cmds, inv) : [];
+		}
+		_strokePolys(userPolys) {
+			const st = this._state;
+			const dashed = dashPolys(userPolys, st.lineDash, st.lineDashOffset);
+			const outline = strokeOutline(dashed, st.lineWidth, st.lineCap, st.lineJoin, st.miterLimit);
+			const m = st.transform;
+			const out = [];
+			for (const poly of outline) {
+				const mapped = [];
+				for (let i = 0; i < poly.length; i += 2) {
+					const [dx, dy] = applyMatrix(m, poly[i], poly[i + 1]);
+					if (Number.isNaN(dx) || Number.isNaN(dy)) { mapped.length = 0; break; }
+					mapped.push(clampCoord(dx), clampCoord(dy));
+				}
+				if (mapped.length >= 6) out.push(mapped);
+			}
+			return out;
+		}
 		fill(a, b) {
 			const { path, rule } = fillArgs(a, b);
-			this._paint(flatten((path ?? this._path)._cmds, this._state.transform), rule === "evenodd");
+			this._paint(this._fillPolys(path), rule === "evenodd");
 		}
 		stroke(a) {
-			const path = a instanceof Path2D ? a : this._path;
-			this._paintStroke(flatten(path._cmds, this._state.transform));
+			if (a !== undefined && !(a instanceof Path2D)) {
+				throw new TypeError("stroke: a Path2D is required");
+			}
+			this._paintStroke(this._strokePolys(this._userPolys(a instanceof Path2D ? a : null)));
 		}
 		clip(a, b) {
 			const { path, rule } = fillArgs(a, b);
-			const polys = flatten((path ?? this._path)._cmds, this._state.transform);
+			const polys = this._fillPolys(path);
 			const { subpaths, lengths } = packSubpaths(polys);
 			this._state.clip = { subpaths, lengths, evenOdd: rule === "evenodd", prev: this._state.clip };
 			canvasClip(this._canvas._handle, { subpaths, lengths, evenOdd: rule === "evenodd", replace: false });
 		}
 		isPointInPath(a, b, c, d) {
 			// Answered from the flattened path with a crossing count, which is the
-			// same question the rasterizer answers per pixel.
-			let path = this._path, x = a, y = b, rule = c;
-			if (a instanceof Path2D) { path = a; x = b; y = c; rule = d; }
-			return pointInPolys(flatten(path._cmds, this._state.transform), +x, +y, rule === "evenodd");
+			// same question the rasterizer answers per pixel. The point is in the
+			// canvas coordinate space, unaffected by the current transformation.
+			let path = null, x = a, y = b, rule = c;
+			if (arguments.length >= 4) {
+				if (!(a instanceof Path2D)) throw new TypeError("isPointInPath: a Path2D is required");
+				path = a; x = b; y = c; rule = d;
+			} else if (a instanceof Path2D) {
+				path = a; x = b; y = c; rule = undefined;
+			}
+			rule = parseFillRule(rule);
+			return pointInPolys(this._fillPolys(path), +x, +y, rule === "evenodd");
 		}
 		isPointInStroke(a, b, c) {
-			let path = this._path, x = a, y = b;
+			let path = null, x = a, y = b;
 			if (a instanceof Path2D) { path = a; x = b; y = c; }
-			const polys = strokeOutline(flatten(path._cmds, this._state.transform),
-				this._deviceLineWidth(), this._state.lineCap, this._state.lineJoin);
+			const polys = this._strokePolys(this._userPolys(path));
 			return pointInPolys(polys, +x, +y, false);
 		}
 
@@ -1011,15 +1355,6 @@
 			}
 			return [poly];
 		}
-		_deviceLineWidth() {
-			// The stroke width is in USER space; the device width is it scaled by
-			// the transform. A non-uniform scale has no single answer, so the
-			// geometric mean of the two axes is used, which is what a uniform scale
-			// reduces to.
-			const m = this._state.transform;
-			const sx = Math.hypot(m[0], m[1]), sy = Math.hypot(m[2], m[3]);
-			return this._state.lineWidth * Math.sqrt(Math.abs(sx * sy) || 1);
-		}
 		_paint(polys, evenOdd) {
 			if (!polys.length) return;
 			const { subpaths, lengths } = packSubpaths(polys);
@@ -1030,10 +1365,7 @@
 		}
 		_paintStroke(polys) {
 			if (!polys.length) return;
-			const outline = strokeOutline(polys, this._deviceLineWidth(),
-				this._state.lineCap, this._state.lineJoin);
-			if (!outline.length) return;
-			const { subpaths, lengths } = packSubpaths(outline);
+			const { subpaths, lengths } = packSubpaths(polys);
 			canvasFill(this._canvas._handle, {
 				subpaths, lengths, evenOdd: false,
 				...this._paintSpec(this._state.stroke, this._state.strokeGradient, this._state.strokePattern),
@@ -1115,21 +1447,47 @@
 		return true;
 	}
 
-	function fillArgs(a, b) {
-		if (a instanceof Path2D) return { path: a, rule: b === undefined ? "nonzero" : String(b) };
-		return { path: null, rule: a === undefined ? "nonzero" : String(a) };
+	// parseFillRule is the CanvasFillRule enumeration: an argument that is not
+	// one of its values is a TypeError, as Web IDL says for operation
+	// arguments (an attribute would silently keep its old value instead).
+	function parseFillRule(v) {
+		if (v === undefined) return "nonzero";
+		const rule = String(v);
+		if (rule !== "nonzero" && rule !== "evenodd") {
+			throw new TypeError(`${rule} is not a fill rule`);
+		}
+		return rule;
 	}
 
-	// pointInPolys is the crossing count isPointInPath answers with.
+	function fillArgs(a, b) {
+		if (a instanceof Path2D) return { path: a, rule: parseFillRule(b) };
+		return { path: null, rule: parseFillRule(a) };
+	}
+
+	// pointInPolys is the crossing count isPointInPath answers with, over the
+	// CLOSED ring of each polygon (a fill closes an open subpath implicitly).
+	// A point exactly ON a non-degenerate edge is inside under either rule —
+	// the boundary belongs to the path — which a crossing count alone cannot
+	// decide consistently. A degenerate polygon (every point the same, which
+	// is what a singular transform produces) contains nothing.
 	function pointInPolys(polys, x, y, evenOdd) {
 		let winding = 0, crossings = 0;
 		for (const poly of polys) {
-			for (let i = 0; i + 1 < poly.length / 2; i++) {
+			const n = poly.length / 2;
+			for (let i = 0; i < n; i++) {
+				const j = (i + 1) % n;
 				const x0 = poly[i * 2], y0 = poly[i * 2 + 1];
-				const x1 = poly[i * 2 + 2], y1 = poly[i * 2 + 3];
+				const x1 = poly[j * 2], y1 = poly[j * 2 + 1];
+				const dx = x1 - x0, dy = y1 - y0;
+				const lenSq = dx * dx + dy * dy;
+				if (lenSq > 0) {
+					const t = Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / lenSq));
+					const ex = x - (x0 + t * dx), ey = y - (y0 + t * dy);
+					if (ex * ex + ey * ey < 1e-18) return true;
+				}
 				if ((y0 <= y) === (y1 <= y)) continue;
-				const t = (y - y0) / (y1 - y0);
-				if (x0 + t * (x1 - x0) <= x) continue;
+				const s = (y - y0) / (y1 - y0);
+				if (x0 + s * (x1 - x0) <= x) continue;
 				crossings++;
 				winding += y1 > y0 ? 1 : -1;
 			}
