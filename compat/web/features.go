@@ -89,7 +89,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureImageBitmap: {"ImageBitmap", "createImageBitmap"},
 	// The geometry interfaces are their own specification, and a canvas is only
 	// one of the things that speaks in them.
-	FeatureGeometry: {"DOMPoint", "DOMPointReadOnly"},
+	FeatureGeometry: {"DOMPoint", "DOMPointReadOnly", "DOMMatrix", "DOMMatrixReadOnly"},
 	// Observable is its own feature rather than part of events, even though it
 	// is an event stream: it is not in the Minimum Common API, and a profile
 	// that offers the standard's surface must be able to leave it out.

@@ -96,6 +96,8 @@ func (p *pattern) at(dx, dy float64) ([4]float64, bool) {
 // that maps user space to device space already applied by the caller.
 type gradient struct {
 	radial                bool
+	conic                 bool
+	angle                 float64 // conic start angle, from the +x axis
 	x0, y0, r0            float64
 	x1, y1, r1            float64
 	stops                 []gradientStop
@@ -122,22 +124,57 @@ func (g *gradient) at(dx, dy float64) [4]float64 {
 		y = m[1]*dx + m[3]*dy + m[5]
 	}
 	var t float64
-	if g.radial {
-		// The offset along a radial gradient is the solution of the pencil of
-		// circles; for the common concentric case it reduces to a ratio of
-		// distances, which is what this computes.
-		dxc, dyc := x-g.x1, y-g.y1
-		d := math.Hypot(dxc, dyc)
-		if g.r1 == g.r0 {
-			t = 0
+	if g.conic {
+		// The colour cycles once around the centre, clockwise on screen from
+		// the start angle (the +y-down atan2 direction IS clockwise).
+		t = math.Mod((math.Atan2(y-g.y0, x-g.x0)-g.angle)/(2*math.Pi), 1)
+		if t < 0 {
+			t++
+		}
+	} else if g.radial {
+		// The gradient is the pencil of circles C(ω) interpolating from
+		// (x0, y0, r0) to (x1, y1, r1): a point takes the colour of the
+		// LARGEST ω whose circle passes through it with a non-negative
+		// radius, and a point on no such circle is not painted at all —
+		// which is what makes a cone light only its own side.
+		cdx, cdy, dr := g.x1-g.x0, g.y1-g.y0, g.r1-g.r0
+		pdx, pdy := x-g.x0, y-g.y0
+		a := cdx*cdx + cdy*cdy - dr*dr
+		b := -2 * (pdx*cdx + pdy*cdy + g.r0*dr)
+		c := pdx*pdx + pdy*pdy - g.r0*g.r0
+		if a == 0 {
+			if b == 0 {
+				return [4]float64{0, 0, 0, 0}
+			}
+			t = -c / b
+			if g.r0+t*dr < 0 {
+				return [4]float64{0, 0, 0, 0}
+			}
 		} else {
-			t = (d - g.r0) / (g.r1 - g.r0)
+			disc := b*b - 4*a*c
+			if disc < 0 {
+				return [4]float64{0, 0, 0, 0}
+			}
+			sq := math.Sqrt(disc)
+			w0, w1 := (-b-sq)/(2*a), (-b+sq)/(2*a)
+			if w0 > w1 {
+				w0, w1 = w1, w0
+			}
+			switch {
+			case g.r0+w1*dr >= 0:
+				t = w1
+			case g.r0+w0*dr >= 0:
+				t = w0
+			default:
+				return [4]float64{0, 0, 0, 0}
+			}
 		}
 	} else {
 		vx, vy := g.x1-g.x0, g.y1-g.y0
 		den := vx*vx + vy*vy
 		if den == 0 {
-			return g.stops[len(g.stops)-1].color
+			// A zero-length linear gradient paints nothing, per spec.
+			return [4]float64{0, 0, 0, 0}
 		}
 		t = ((x-g.x0)*vx + (y-g.y0)*vy) / den
 	}
@@ -189,7 +226,19 @@ const (
 	compLighter
 	compCopy
 	compXOR
+	compClear
 )
+
+// wholeSurfaceOp reports whether an operator affects pixels the source does
+// not cover: where the source is transparent, these operators still rewrite
+// the destination.
+func wholeSurfaceOp(op composite) bool {
+	switch op {
+	case compSourceOver, compDestinationOut, compLighter, compClear:
+		return false
+	}
+	return true
+}
 
 var compositeByName = map[string]composite{
 	"source-over":      compSourceOver,
@@ -203,6 +252,7 @@ var compositeByName = map[string]composite{
 	"lighter":          compLighter,
 	"copy":             compCopy,
 	"xor":              compXOR,
+	"clear":            compClear,
 }
 
 // blend applies one operator to a single pixel. src and dst are
@@ -246,6 +296,10 @@ func blend(op composite, src, dst [4]float64, cov float64) [4]float64 {
 		fs, fd = 1, 0
 	case compXOR:
 		fs, fd = 1-da, 1-sa
+	case compClear:
+		// clear empties the pixels the SHAPE covers, whatever the source's
+		// own alpha is — a transparent fill still erases.
+		fs, fd = 0, 1-cov
 	}
 	var out [4]float64
 	for i := 0; i < 4; i++ {
@@ -275,14 +329,20 @@ func blend(op composite, src, dst [4]float64, cov float64) [4]float64 {
 // is: every operator, including the destination-only ones, is applied over the
 // whole surface, because that is what "the source is transparent here" means.
 func (s *surface) fillMask(mask []byte, p paint, alpha float64, op composite, clip []byte) {
-	wholeSurface := op != compSourceOver && op != compDestinationOut && op != compLighter
+	wholeSurface := wholeSurfaceOp(op)
 	for y := 0; y < s.h; y++ {
 		for x := 0; x < s.w; x++ {
 			i := (y*s.w + x)
-			cov := float64(mask[i]) / 255
+			// A clip bounds EVERY operator: pixels outside the clipping region
+			// are never touched, even by the whole-surface ones.
+			clipCov := 1.0
 			if clip != nil {
-				cov *= float64(clip[i]) / 255
+				clipCov = float64(clip[i]) / 255
+				if clipCov == 0 {
+					continue
+				}
 			}
+			cov := float64(mask[i]) / 255
 			if cov == 0 && !wholeSurface {
 				continue
 			}
@@ -308,12 +368,32 @@ func (s *surface) fillMask(mask []byte, p paint, alpha float64, op composite, cl
 				float64(s.pix[o+2]) / 255, float64(s.pix[o+3]) / 255,
 			}
 			out := blend(op, src, dst, cov)
+			if clipCov < 1 {
+				out = lerpPremul(dst, out, clipCov)
+			}
 			s.pix[o] = clamp255(out[0])
 			s.pix[o+1] = clamp255(out[1])
 			s.pix[o+2] = clamp255(out[2])
 			s.pix[o+3] = clamp255(out[3])
 		}
 	}
+}
+
+// lerpPremul mixes two non-premultiplied colours by t in premultiplied space,
+// which is the only space a partial-coverage mix is linear in.
+func lerpPremul(a, b [4]float64, t float64) [4]float64 {
+	var out [4]float64
+	out[3] = a[3]*(1-t) + b[3]*t
+	if out[3] <= 0 {
+		return [4]float64{}
+	}
+	for i := 0; i < 3; i++ {
+		out[i] = (a[i]*a[3]*(1-t) + b[i]*b[3]*t) / out[3]
+		if out[i] > 1 {
+			out[i] = 1
+		}
+	}
+	return out
 }
 
 func clamp255(v float64) byte {
@@ -512,13 +592,28 @@ func (a *canvasAPI) opNew(cfg spidermonkey.Config, args []spidermonkey.Value) (s
 	if len(args) < 2 {
 		return nil, fmt.Errorf("canvas_new: (width, height) required")
 	}
-	w, h := int(args[0].Float()), int(args[1].Float())
-	if w < 0 || h < 0 || w*h > maxCanvasPixels {
-		return nil, fmt.Errorf("canvas_new: %dx%d is not an allocatable size", w, h)
-	}
+	w, h := clampCanvasSize(args[0].Float(), args[1].Float())
 	a.next++
 	a.surfaces[a.next] = newSurface(w, h)
 	return spidermonkey.ValueOf(float64(a.next)), nil
+}
+
+// clampCanvasSize bounds an allocation. A size too large to back is allocated
+// as EMPTY rather than refused: the IDL attribute keeps the value the caller
+// set, drawing simply has nowhere to land — which is how the platform treats
+// an unbackable canvas.
+func clampCanvasSize(wf, hf float64) (int, int) {
+	w, h := int(wf), int(hf)
+	if w < 0 {
+		w = 0
+	}
+	if h < 0 {
+		h = 0
+	}
+	if w > maxCanvasPixels || h > maxCanvasPixels || (h > 0 && w > maxCanvasPixels/h) {
+		return 0, 0
+	}
+	return w, h
 }
 
 func (a *canvasAPI) opFree(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
@@ -535,10 +630,7 @@ func (a *canvasAPI) opResize(cfg spidermonkey.Config, args []spidermonkey.Value)
 	if err != nil {
 		return nil, err
 	}
-	w, h := int(args[1].Float()), int(args[2].Float())
-	if w < 0 || h < 0 || w*h > maxCanvasPixels {
-		return nil, fmt.Errorf("canvas_resize: %dx%d is not an allocatable size", w, h)
-	}
+	w, h := clampCanvasSize(args[1].Float(), args[2].Float())
 	_ = s
 	a.surfaces[id] = newSurface(w, h)
 	delete(a.clips, id)
@@ -580,7 +672,8 @@ func (a *canvasAPI) opFill(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	// The shadow is the SAME shape, offset, blurred and painted in one colour,
 	// and it goes down first — the shape is drawn over its own shadow.
 	if sh, ok := readShadow(spec); ok {
-		s.fillMask(shadowMask(mask, s.w, s.h, sh), paint{solid: sh.color}, alpha, op, a.clips[id])
+		smask := shadowAlphaMask(s.w, s.h, subpaths, objBool(spec, "evenOdd"), sh, p)
+		s.fillMask(smask, paint{solid: sh.color}, alpha, op, a.clips[id])
 	}
 	s.fillMask(mask, p, alpha, op, a.clips[id])
 	return spidermonkey.Undefined(), nil
@@ -631,37 +724,90 @@ func readShadow(spec *spidermonkey.Object) (shadow, bool) {
 	return sh, true
 }
 
-// shadowMask offsets a coverage mask and blurs it. The blur is three box passes,
-// which is the standard approximation of a Gaussian and the one the
-// specification's "2 * sigma = blur" is calibrated against.
-func shadowMask(mask []byte, w, h int, sh shadow) []byte {
-	out := make([]byte, len(mask))
-	ox, oy := int(math.Round(sh.dx)), int(math.Round(sh.dy))
+// blurRadius is the box-blur radius the specification's shadowBlur maps to:
+// sigma is blur/2, and three box passes of radius ~1.5*sigma approximate the
+// Gaussian that sigma describes.
+func blurRadius(blur float64) int {
+	if blur <= 0 {
+		return 0
+	}
+	return int(math.Round(blur / 2 * 1.5))
+}
+
+// shadowPad bounds the padding a shadow buffer carries so blur can pull
+// coverage in from outside the visible canvas.
+func shadowPad(blur float64) int {
+	pad := 3 * blurRadius(blur)
+	if pad > 1024 {
+		pad = 1024
+	}
+	return pad
+}
+
+// cropPadded cuts the w×h centre out of a (w+2p)×(h+2p) buffer.
+func cropPadded(m []byte, w, h, pad int) []byte {
+	if pad == 0 {
+		return m
+	}
+	bw := w + 2*pad
+	out := make([]byte, w*h)
 	for y := 0; y < h; y++ {
-		sy := y - oy
-		if sy < 0 || sy >= h {
-			continue
-		}
-		for x := 0; x < w; x++ {
-			sx := x - ox
-			if sx < 0 || sx >= w {
-				continue
-			}
-			out[y*w+x] = mask[sy*w+sx]
-		}
-	}
-	if sh.blur <= 0 {
-		return out
-	}
-	sigma := sh.blur / 2
-	radius := int(math.Round(sigma * 1.5))
-	if radius < 1 {
-		return out
-	}
-	for pass := 0; pass < 3; pass++ {
-		out = boxBlur(out, w, h, radius)
+		copy(out[y*w:(y+1)*w], m[(y+pad)*bw+pad:(y+pad)*bw+pad+w])
 	}
 	return out
+}
+
+// paintAlphaAt is a paint's alpha at a device point — the alpha channel a
+// shadow is cast from, so a transparent part of a gradient or pattern casts
+// nothing.
+func paintAlphaAt(p paint, x, y float64) float64 {
+	if p.gradient != nil {
+		return p.gradient.at(x, y)[3]
+	}
+	if p.pattern != nil {
+		if c, ok := p.pattern.at(x, y); ok {
+			return c[3]
+		}
+		return 0
+	}
+	return p.solid[3]
+}
+
+// shadowAlphaMask rasterizes a shape's shadow: the GEOMETRY translated by the
+// offset — not a shifted copy of the visible mask, because a shape entirely
+// outside the canvas still throws its shadow onto it — scaled by the paint's
+// alpha at each source point, and blurred on a padded buffer so coverage
+// beyond the edges still contributes, then cropped to the surface.
+func shadowAlphaMask(w, h int, subpaths [][]point, evenOdd bool, sh shadow, p paint) []byte {
+	pad := shadowPad(sh.blur)
+	bw, bh := w+2*pad, h+2*pad
+	shifted := make([][]point, len(subpaths))
+	for i, sp := range subpaths {
+		out := make([]point, len(sp))
+		for j, pt := range sp {
+			out[j] = point{pt.x + sh.dx + float64(pad), pt.y + sh.dy + float64(pad)}
+		}
+		shifted[i] = out
+	}
+	m := rasterize(bw, bh, shifted, evenOdd)
+	if p.gradient != nil || p.pattern != nil || p.solid[3] < 1 {
+		for y := 0; y < bh; y++ {
+			for x := 0; x < bw; x++ {
+				i := y*bw + x
+				if m[i] == 0 {
+					continue
+				}
+				a := paintAlphaAt(p, float64(x-pad)+0.5-sh.dx, float64(y-pad)+0.5-sh.dy)
+				m[i] = byte(float64(m[i])*a + 0.5)
+			}
+		}
+	}
+	if r := blurRadius(sh.blur); r >= 1 {
+		for pass := 0; pass < 3; pass++ {
+			m = boxBlur(m, bw, bh, r)
+		}
+	}
+	return cropPadded(m, w, h, pad)
 }
 
 func boxBlur(src []byte, w, h, r int) []byte {
@@ -931,13 +1077,18 @@ func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Val
 		minX, minY, maxX, maxY = quadBounds(fwd, dst.w, dst.h)
 	}
 	clip := a.clips[dstID]
-	// An image casts a shadow from its own alpha: the mask is where the image is
-	// opaque, so a transparent part of it casts nothing.
+	// An image casts a shadow from its own alpha: each shadow pixel maps back
+	// through the offset and the inverse transform to the source point whose
+	// alpha it carries, so an image drawn outside the canvas still throws its
+	// shadow onto it, and a transparent part of it casts nothing.
 	if cast, ok := readShadow(spec); ok {
-		mask := make([]byte, dst.w*dst.h)
-		for y := minY; y < maxY; y++ {
-			for x := minX; x < maxX; x++ {
-				px, py := float64(x)+0.5, float64(y)+0.5
+		pad := shadowPad(cast.blur)
+		bw, bh := dst.w+2*pad, dst.h+2*pad
+		mask := make([]byte, bw*bh)
+		for y := 0; y < bh; y++ {
+			for x := 0; x < bw; x++ {
+				px := float64(x-pad) + 0.5 - cast.dx
+				py := float64(y-pad) + 0.5 - cast.dy
 				u := inv[0]*px + inv[2]*py + inv[4]
 				v := inv[1]*px + inv[3]*py + inv[5]
 				if u < 0 || u >= 1 || v < 0 || v >= 1 {
@@ -947,10 +1098,21 @@ func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Val
 				if !okPix {
 					continue
 				}
-				mask[y*dst.w+x] = clamp255(col[3])
+				mask[y*bw+x] = clamp255(col[3])
 			}
 		}
-		dst.fillMask(shadowMask(mask, dst.w, dst.h, cast), paint{solid: cast.color}, alpha, op, clip)
+		if r := blurRadius(cast.blur); r >= 1 {
+			for pass := 0; pass < 3; pass++ {
+				mask = boxBlur(mask, bw, bh, r)
+			}
+		}
+		dst.fillMask(cropPadded(mask, dst.w, dst.h, pad), paint{solid: cast.color}, alpha, op, clip)
+	}
+	// A whole-surface operator rewrites pixels the image does not cover — the
+	// source is transparent there, and "transparent" is an answer, not a skip
+	// — so the walk must visit the entire destination.
+	if wholeSurfaceOp(op) {
+		minX, minY, maxX, maxY = 0, 0, dst.w, dst.h
 	}
 	for y := minY; y < maxY; y++ {
 		for x := minX; x < maxX; x++ {
@@ -959,20 +1121,24 @@ func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Val
 			px, py := float64(x)+0.5, float64(y)+0.5
 			u := inv[0]*px + inv[2]*py + inv[4]
 			v := inv[1]*px + inv[3]*py + inv[5]
-			if u < 0 || u >= 1 || v < 0 || v >= 1 {
-				continue
+			var col [4]float64
+			covered := u >= 0 && u < 1 && v >= 0 && v < 1
+			if covered {
+				var okPix bool
+				col, okPix = sampleSurface(src, sx+u*sw, sy+v*sh, smooth)
+				covered = covered && okPix
 			}
-			fx := sx + u*sw
-			fy := sy + v*sh
-			col, okPix := sampleSurface(src, fx, fy, smooth)
-			if !okPix {
-				continue
+			if !covered {
+				if !wholeSurfaceOp(op) {
+					continue
+				}
+				col = [4]float64{}
 			}
 			i := y*dst.w + x
-			cov := 1.0
+			clipCov := 1.0
 			if clip != nil {
-				cov = float64(clip[i]) / 255
-				if cov == 0 {
+				clipCov = float64(clip[i]) / 255
+				if clipCov == 0 {
 					continue
 				}
 			}
@@ -982,7 +1148,10 @@ func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Val
 				float64(dst.pix[o]) / 255, float64(dst.pix[o+1]) / 255,
 				float64(dst.pix[o+2]) / 255, float64(dst.pix[o+3]) / 255,
 			}
-			out := blend(op, col, d, cov)
+			out := blend(op, col, d, 1)
+			if clipCov < 1 {
+				out = lerpPremul(d, out, clipCov)
+			}
 			dst.pix[o] = clamp255(out[0])
 			dst.pix[o+1] = clamp255(out[1])
 			dst.pix[o+2] = clamp255(out[2])
@@ -1182,6 +1351,8 @@ func (a *canvasAPI) readPattern(o *spidermonkey.Object) (*pattern, error) {
 func readGradient(o *spidermonkey.Object) (*gradient, error) {
 	g := &gradient{}
 	g.radial = objBool(o, "radial")
+	g.conic = objBool(o, "conic")
+	g.angle = objFloat(o, "angle", 0)
 	g.x0, g.y0, g.r0 = objFloat(o, "x0", 0), objFloat(o, "y0", 0), objFloat(o, "r0", 0)
 	g.x1, g.y1, g.r1 = objFloat(o, "x1", 0), objFloat(o, "y1", 0), objFloat(o, "r1", 0)
 	g.degenerateTransparent = objBool(o, "degenerate")

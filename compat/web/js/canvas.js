@@ -52,6 +52,36 @@
 		lightgray: [211, 211, 211, 1], lightgrey: [211, 211, 211, 1],
 	};
 
+	// CSS system colours (css-color-4 §6.1), resolved for a light theme. The
+	// deprecated names alias the modern ones the specification maps them to.
+	{
+		const sys = {
+			accentcolor: [0, 117, 255, 1], accentcolortext: [255, 255, 255, 1],
+			activetext: [255, 0, 0, 1], buttonborder: [118, 118, 118, 1],
+			buttonface: [239, 239, 239, 1], buttontext: [0, 0, 0, 1],
+			canvas: [255, 255, 255, 1], canvastext: [0, 0, 0, 1],
+			field: [255, 255, 255, 1], fieldtext: [0, 0, 0, 1],
+			graytext: [128, 128, 128, 1], highlight: [181, 213, 255, 1],
+			highlighttext: [0, 0, 0, 1], linktext: [0, 0, 238, 1],
+			mark: [255, 255, 0, 1], marktext: [0, 0, 0, 1],
+			selecteditem: [0, 117, 255, 1], selecteditemtext: [255, 255, 255, 1],
+			visitedtext: [85, 26, 139, 1],
+		};
+		const aliases = {
+			activeborder: "buttonborder", activecaption: "canvas", appworkspace: "canvas",
+			background: "canvas", buttonhighlight: "buttonface", buttonshadow: "buttonborder",
+			captiontext: "canvastext", inactiveborder: "buttonborder", inactivecaption: "canvas",
+			inactivecaptiontext: "graytext", infobackground: "canvas", infotext: "canvastext",
+			menu: "canvas", menutext: "canvastext", scrollbar: "canvas",
+			threeddarkshadow: "buttonborder", threedface: "buttonface",
+			threedhighlight: "buttonborder", threedlightshadow: "buttonborder",
+			threedshadow: "buttonborder", window: "canvas", windowframe: "buttonborder",
+			windowtext: "canvastext",
+		};
+		Object.assign(NAMED_COLORS, sys);
+		for (const [from, to] of Object.entries(aliases)) NAMED_COLORS[from] = sys[to];
+	}
+
 	// parseColor answers [r,g,b,a] with r/g/b as bytes and a in 0..1, or null
 	// when the value is not a colour at all — which the setters treat as "leave
 	// the style alone", because an unparseable style is ignored rather than
@@ -73,27 +103,111 @@
 			}
 			return null;
 		}
-		const fn = /^(rgba?|hsla?)\s*\(([^)]*)\)$/.exec(s);
+		// An unclosed function is legal — the CSS tokenizer closes every open
+		// block at the end of input — but nothing may follow the ')'.
+		const fn = /^(rgba?|hsla?)\(\s*([^()]*?)\s*\)?$/.exec(s);
 		if (!fn) return null;
-		const name = fn[1];
-		const parts = fn[2].split(/[\s,/]+/).filter((p) => p !== "");
-		if (parts.length < 3) return null;
-		const num = (p, scale) => {
-			if (p.endsWith("%")) return parseFloat(p) / 100 * scale;
-			return parseFloat(p);
-		};
-		const alpha = parts.length > 3 ? Math.min(1, Math.max(0, num(parts[3], 1))) : 1;
-		if (Number.isNaN(alpha)) return null;
-		if (name === "rgb" || name === "rgba") {
-			const rgb = [0, 1, 2].map((i) => Math.round(Math.min(255, Math.max(0, num(parts[i], 255)))));
-			if (rgb.some(Number.isNaN)) return null;
-			return [rgb[0], rgb[1], rgb[2], alpha];
+		return parseColorFunction(fn[1], fn[2]);
+	}
+
+	const ANGLE_UNITS = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
+
+	// tokenizeColorArgs splits a colour function's arguments into value,
+	// comma and slash tokens. A CSS number never ends with a bare dot, which
+	// is what makes "100." (and so "1. 0") a parse error rather than 100.
+	function tokenizeColorArgs(body) {
+		const re = /\s*(?:([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(%|[a-z]+)?|(,)|(\/)|none)\s*/y;
+		const tokens = [];
+		while (re.lastIndex < body.length) {
+			const at = re.lastIndex;
+			const m = re.exec(body);
+			if (!m || m.index !== at || m[0].length === 0) return null;
+			if (m[1] !== undefined) tokens.push({ v: parseFloat(m[1]), unit: m[2] ?? "" });
+			else if (m[3]) tokens.push(",");
+			else if (m[4]) tokens.push("/");
+			else tokens.push({ none: true });
 		}
-		const hue = ((parseFloat(parts[0]) % 360) + 360) % 360;
-		const sat = Math.min(1, Math.max(0, parseFloat(parts[1]) / 100));
-		const light = Math.min(1, Math.max(0, parseFloat(parts[2]) / 100));
-		if ([hue, sat, light].some(Number.isNaN)) return null;
-		const rgb = hslToRgb(hue, sat, light);
+		return tokens;
+	}
+
+	// parseColorFunction is the rgb()/hsl() grammar of CSS Color 4. The two
+	// syntaxes never mix: a comma anywhere selects the LEGACY form (values
+	// separated by commas, an optional fourth value as the alpha, and — for
+	// rgb — all three channels the same kind, number or percentage, with the
+	// hsl saturation and lightness percentages only); no comma selects the
+	// MODERN form (space-separated, "/" before the alpha, "none" allowed,
+	// kinds free to mix).
+	function parseColorFunction(name, body) {
+		const tokens = tokenizeColorArgs(body);
+		if (!tokens || tokens.length === 0) return null;
+		const legacy = tokens.includes(",");
+		let vals, alphaTok;
+		if (legacy) {
+			const seq = [];
+			let expectValue = true;
+			for (const t of tokens) {
+				if (expectValue) {
+					if (t === "," || t === "/" || t.none) return null;
+					seq.push(t);
+					expectValue = false;
+				} else {
+					if (t !== ",") return null;
+					expectValue = true;
+				}
+			}
+			if (expectValue) return null; // a trailing comma names a missing value
+			if (seq.length !== 3 && seq.length !== 4) return null;
+			vals = seq.slice(0, 3);
+			alphaTok = seq[3];
+		} else {
+			const slash = tokens.indexOf("/");
+			const head = slash === -1 ? tokens : tokens.slice(0, slash);
+			if (head.length !== 3) return null;
+			vals = head;
+			if (slash !== -1) {
+				const tail = tokens.slice(slash + 1);
+				if (tail.length !== 1 || tail[0] === "/" ) return null;
+				alphaTok = tail[0];
+			}
+		}
+		let alpha = 1;
+		if (alphaTok !== undefined) {
+			if (alphaTok.none) alpha = 0;
+			else if (alphaTok.unit === "%") alpha = alphaTok.v / 100;
+			else if (alphaTok.unit === "") alpha = alphaTok.v;
+			else return null;
+			alpha = Math.min(1, Math.max(0, alpha));
+		}
+		if (name === "rgb" || name === "rgba") {
+			if (legacy) {
+				const units = vals.map((t) => t.unit);
+				if (!(units.every((u) => u === "") || units.every((u) => u === "%"))) return null;
+			}
+			const rgb = [];
+			for (const t of vals) {
+				if (t.none) rgb.push(0);
+				else if (t.unit === "") rgb.push(t.v);
+				else if (t.unit === "%") rgb.push(t.v / 100 * 255);
+				else return null;
+			}
+			return [...rgb.map((v) => Math.round(Math.min(255, Math.max(0, v)))), alpha];
+		}
+		const [h, sTok, lTok] = vals;
+		let hue;
+		if (h.none) hue = 0;
+		else if (h.unit === "") hue = h.v;
+		else if (ANGLE_UNITS[h.unit] !== undefined) hue = h.v * ANGLE_UNITS[h.unit];
+		else return null;
+		const component = (t) => {
+			if (t.none) return 0;
+			if (t.unit === "%") return t.v;
+			if (t.unit === "" && !legacy) return t.v;
+			return null;
+		};
+		const sat = component(sTok), light = component(lTok);
+		if (sat === null || light === null || !Number.isFinite(hue)) return null;
+		const rgb = hslToRgb(((hue % 360) + 360) % 360,
+			Math.min(1, Math.max(0, sat / 100)), Math.min(1, Math.max(0, light / 100)));
 		return [rgb[0], rgb[1], rgb[2], alpha];
 	}
 
@@ -143,6 +257,25 @@
 		];
 	}
 	const finiteMatrix = (m) => m.every((v) => Number.isFinite(v));
+
+	// fixup2D is the DOMMatrix2DInit validate-and-fixup algorithm: each 2D
+	// component may be spelled by its legacy alias (a..f) or its matrix name
+	// (m11..m42), and naming BOTH with different values is a TypeError.
+	function fixup2D(init) {
+		const fields = [["a", "m11", 1], ["b", "m12", 0], ["c", "m21", 0],
+			["d", "m22", 1], ["e", "m41", 0], ["f", "m42", 0]];
+		const out = [];
+		for (const [alias, canon, def] of fields) {
+			const va = init[alias] === undefined ? undefined : Number(init[alias]);
+			const vc = init[canon] === undefined ? undefined : Number(init[canon]);
+			if (va !== undefined && vc !== undefined && va !== vc
+				&& !(Number.isNaN(va) && Number.isNaN(vc))) {
+				throw new TypeError(`the ${alias} and ${canon} members must agree`);
+			}
+			out.push(vc !== undefined ? vc : va !== undefined ? va : def);
+		}
+		return out;
+	}
 
 	// ---------------------------------------------------------------- paths
 	// A Path2D holds its commands in USER space; they are flattened into device
@@ -677,18 +810,21 @@
 	// --------------------------------------------------------- gradients
 
 	class CanvasGradient {
-		constructor(internal, radial, coords) {
+		constructor(internal, kind, coords) {
 			if (internal !== GRADIENT_INTERNAL) throw new TypeError("Illegal constructor");
 			Object.defineProperties(this, {
-				_radial: { value: radial },
+				_kind: { value: kind },
 				_coords: { value: coords },
 				_stops: { value: [] },
 			});
 		}
 		addColorStop(offset, color) {
 			if (arguments.length < 2) throw new TypeError("addColorStop requires 2 arguments");
-			const o = Number(offset);
-			if (!Number.isFinite(o) || o < 0 || o > 1) {
+			// A non-finite offset is a TypeError (the Web IDL double conversion
+			// rejects it); a finite one outside [0, 1] is an IndexSizeError.
+			const o = +offset;
+			if (!Number.isFinite(o)) throw new TypeError("addColorStop: the offset must be finite");
+			if (o < 0 || o > 1) {
 				throw new DOMException("addColorStop: the offset must be between 0 and 1", "IndexSizeError");
 			}
 			const c = parseColor(color);
@@ -716,8 +852,7 @@
 		}
 		setTransform(matrix = undefined) {
 			if (matrix === undefined || matrix === null) { this._transform = IDENTITY.slice(); return; }
-			const next = [Number(matrix.a ?? 1), Number(matrix.b ?? 0), Number(matrix.c ?? 0),
-				Number(matrix.d ?? 1), Number(matrix.e ?? 0), Number(matrix.f ?? 0)];
+			const next = fixup2D(matrix);
 			if (finiteMatrix(next)) this._transform = next;
 		}
 	}
@@ -728,40 +863,101 @@
 
 	// ---------------------------------------------------------- ImageData
 
+	// enforcedLong is Web IDL's [EnforceRange] long conversion, which is what
+	// every ImageData dimension and pixel coordinate goes through: a value
+	// that is not finite, or that truncates outside the type's range, is a
+	// TypeError rather than a wrap-around.
+	function enforcedLong(v, what, unsigned = false) {
+		const n = Math.trunc(+v);
+		const lo = unsigned ? 0 : -2147483648;
+		const hi = unsigned ? 4294967295 : 2147483647;
+		if (!Number.isFinite(n) || n < lo || n > hi) {
+			throw new TypeError(`${what} is out of range`);
+		}
+		// Math.trunc(-0.5) is -0; normalize so later comparisons see plain 0.
+		return n === 0 ? 0 : n;
+	}
+
+	function imageDataSettings(settings, what) {
+		let pixelFormat = "rgba-unorm8", colorSpace = "srgb";
+		if (settings !== undefined && settings !== null) {
+			if (settings.pixelFormat !== undefined) {
+				pixelFormat = String(settings.pixelFormat);
+				if (pixelFormat !== "rgba-unorm8" && pixelFormat !== "rgba-float16") {
+					throw new TypeError(`${what}: ${pixelFormat} is not a pixel format`);
+				}
+			}
+			if (settings.colorSpace !== undefined) {
+				colorSpace = String(settings.colorSpace);
+				if (colorSpace !== "srgb" && colorSpace !== "display-p3") {
+					throw new TypeError(`${what}: ${colorSpace} is not a color space`);
+				}
+			}
+		}
+		return { pixelFormat, colorSpace };
+	}
+
+	// imageDataBytes is an ImageData's pixels as the RGBA bytes the host
+	// stores: a float16 buffer holds 0..1 values and is quantized here.
+	function imageDataBytes(data) {
+		if (data.pixelFormat !== "rgba-float16") {
+			return new Uint8Array(data.data.buffer, data.data.byteOffset, data.data.byteLength);
+		}
+		const out = new Uint8Array(data.data.length);
+		for (let i = 0; i < data.data.length; i++) {
+			const v = data.data[i];
+			out[i] = v <= 0 ? 0 : v >= 1 ? 255 : Math.round(v * 255);
+		}
+		return out;
+	}
+
 	class ImageData {
-		constructor(a, b, c) {
-			let data, width, height;
-			if (a instanceof Uint8ClampedArray) {
+		constructor(a, b, c, d) {
+			let data, width, height, settings;
+			if (a instanceof Uint8ClampedArray || (typeof Float16Array !== "undefined" && a instanceof Float16Array)) {
 				data = a;
-				width = Number(b);
-				if (!Number.isInteger(width) || width <= 0) {
+				settings = imageDataSettings(c !== undefined && typeof c === "object" ? c : d, "ImageData");
+				if (a instanceof Uint8ClampedArray && settings.pixelFormat === "rgba-float16") {
+					throw new TypeError("ImageData: rgba-float16 needs a Float16Array");
+				}
+				if (!(a instanceof Uint8ClampedArray) && settings.pixelFormat === "rgba-unorm8") {
+					settings = { ...settings, pixelFormat: "rgba-float16" };
+				}
+				width = enforcedLong(b, "ImageData: the width", true);
+				if (width === 0) {
 					throw new DOMException("ImageData: the width must be a positive integer", "IndexSizeError");
 				}
 				if (data.length % 4 !== 0 || (data.length / 4) % width !== 0) {
 					throw new DOMException("ImageData: the data does not fill whole rows", "InvalidStateError");
 				}
 				height = data.length / 4 / width;
-				if (c !== undefined && Number(c) !== height) {
+				if (c !== undefined && typeof c !== "object" && enforcedLong(c, "ImageData: the height", true) !== height) {
 					throw new DOMException("ImageData: the height does not match the data", "IndexSizeError");
 				}
 			} else {
-				width = Number(a);
-				height = Number(b);
-				if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+				width = enforcedLong(a, "ImageData: the width", true);
+				height = enforcedLong(b, "ImageData: the height", true);
+				settings = imageDataSettings(c, "ImageData");
+				if (width === 0 || height === 0) {
 					throw new DOMException("ImageData: the dimensions must be positive integers", "IndexSizeError");
 				}
-				data = new Uint8ClampedArray(width * height * 4);
+				data = settings.pixelFormat === "rgba-float16"
+					? new Float16Array(width * height * 4)
+					: new Uint8ClampedArray(width * height * 4);
 			}
 			Object.defineProperties(this, {
 				_data: { value: data },
 				_width: { value: width },
 				_height: { value: height },
+				_pixelFormat: { value: settings.pixelFormat },
+				_colorSpace: { value: settings.colorSpace },
 			});
 		}
 		get data() { return this._data; }
 		get width() { return this._width; }
 		get height() { return this._height; }
-		get colorSpace() { return "srgb"; }
+		get colorSpace() { return this._colorSpace; }
+		get pixelFormat() { return this._pixelFormat; }
 	}
 	Object.defineProperty(ImageData.prototype, Symbol.toStringTag, {
 		value: "ImageData", configurable: true,
@@ -810,8 +1006,7 @@
 			return { handle: source._handle, width: source.width, height: source.height };
 		}
 		if (source instanceof ImageData) {
-			const handle = canvasFromBytes(source.width, source.height,
-				new Uint8Array(source.data.buffer, source.data.byteOffset, source.data.byteLength));
+			const handle = canvasFromBytes(source.width, source.height, imageDataBytes(source));
 			return { handle, width: source.width, height: source.height, temporary: true };
 		}
 		return null;
@@ -928,9 +1123,8 @@
 		transform(a, b, c, d, e, f) { this._mul([+a, +b, +c, +d, +e, +f]); }
 		setTransform(a, b, c, d, e, f) {
 			if (a === undefined) { this._state.transform = IDENTITY.slice(); return; }
-			if (typeof a === "object") {
-				const m = a;
-				const next = [Number(m.a), Number(m.b), Number(m.c), Number(m.d), Number(m.e), Number(m.f)];
+			if (typeof a === "object" && a !== null) {
+				const next = fixup2D(a);
 				if (finiteMatrix(next)) this._state.transform = next;
 				return;
 			}
@@ -940,7 +1134,7 @@
 		resetTransform() { this._state.transform = IDENTITY.slice(); }
 		getTransform() {
 			const m = this._state.transform;
-			return new DOMMatrixLike(m);
+			return new DOMMatrix(m);
 		}
 		_mul(m) {
 			if (!finiteMatrix(m)) return;
@@ -1055,7 +1249,7 @@
 			if (!coords.every(Number.isFinite)) {
 				throw new TypeError("createLinearGradient: the coordinates must be finite");
 			}
-			return new CanvasGradient(GRADIENT_INTERNAL, false, coords);
+			return new CanvasGradient(GRADIENT_INTERNAL, "linear", coords);
 		}
 		createRadialGradient(x0, y0, r0, x1, y1, r1) {
 			if (arguments.length < 6) throw new TypeError("createRadialGradient requires 6 arguments");
@@ -1066,7 +1260,15 @@
 			if (coords[2] < 0 || coords[5] < 0) {
 				throw new DOMException("createRadialGradient: a radius must not be negative", "IndexSizeError");
 			}
-			return new CanvasGradient(GRADIENT_INTERNAL, true, coords);
+			return new CanvasGradient(GRADIENT_INTERNAL, "radial", coords);
+		}
+		createConicGradient(startAngle, x, y) {
+			if (arguments.length < 3) throw new TypeError("createConicGradient requires 3 arguments");
+			const coords = [+startAngle, +x, +y];
+			if (!coords.every(Number.isFinite)) {
+				throw new TypeError("createConicGradient: the arguments must be finite");
+			}
+			return new CanvasGradient(GRADIENT_INTERNAL, "conic", coords);
 		}
 
 		beginPath() { this._path = new Path2D(); this._dcur = null; this._dstart = null; }
@@ -1314,33 +1516,72 @@
 			}
 			const info = sourceSurface(source);
 			if (!info) throw new TypeError("createPattern: the source is not an image");
-			if (info.width === 0 || info.height === 0) return null;
-			return new CanvasPattern(PATTERN_INTERNAL, info, rep);
+			if (info.width === 0 || info.height === 0) {
+				if (info.temporary) canvasFree(info.handle);
+				throw new DOMException("createPattern: the source has no pixels", "InvalidStateError");
+			}
+			// A pattern is a SNAPSHOT: later drawing into the source canvas must
+			// not show through it.
+			const copy = canvasFromBytes(info.width, info.height,
+				new Uint8Array(canvasGetImageData(info.handle, 0, 0, info.width, info.height)));
+			if (info.temporary) canvasFree(info.handle);
+			return new CanvasPattern(PATTERN_INTERNAL,
+				{ handle: copy, width: info.width, height: info.height }, rep);
 		}
 
 		// --------------------------------------------------------- pixels
-		createImageData(a, b) {
-			if (a instanceof ImageData) return new ImageData(a.width, a.height);
-			return new ImageData(Number(a), Number(b));
+		createImageData(a, b, c) {
+			if (arguments.length < 1) throw new TypeError("createImageData requires 1 argument");
+			if (arguments.length === 1 || a instanceof ImageData) {
+				if (!(a instanceof ImageData)) {
+					throw new TypeError("createImageData: an ImageData is required");
+				}
+				return new ImageData(a.width, a.height,
+					{ pixelFormat: a.pixelFormat, colorSpace: a.colorSpace });
+			}
+			const sw = enforcedLong(a, "createImageData: the width");
+			const sh = enforcedLong(b, "createImageData: the height");
+			const settings = imageDataSettings(c, "createImageData");
+			if (sw === 0 || sh === 0) {
+				throw new DOMException("createImageData: the size must not be zero", "IndexSizeError");
+			}
+			return new ImageData(Math.abs(sw), Math.abs(sh), settings);
 		}
-		getImageData(x, y, w, h) {
+		getImageData(x, y, w, h, settings = undefined) {
 			if (arguments.length < 4) throw new TypeError("getImageData requires 4 arguments");
-			const sw = Math.trunc(Number(w)), sh = Math.trunc(Number(h));
+			const sw = enforcedLong(w, "getImageData: the width");
+			const sh = enforcedLong(h, "getImageData: the height");
+			const sx = enforcedLong(x, "getImageData: x");
+			const sy = enforcedLong(y, "getImageData: y");
+			const st = imageDataSettings(settings, "getImageData");
 			if (sw === 0 || sh === 0) {
 				throw new DOMException("getImageData: the size must not be zero", "IndexSizeError");
 			}
-			const ax = sw < 0 ? Math.trunc(Number(x)) + sw : Math.trunc(Number(x));
-			const ay = sh < 0 ? Math.trunc(Number(y)) + sh : Math.trunc(Number(y));
+			const ax = sw < 0 ? sx + sw : sx;
+			const ay = sh < 0 ? sy + sh : sy;
 			const bytes = canvasGetImageData(this._canvas._handle, ax, ay, Math.abs(sw), Math.abs(sh));
-			return new ImageData(new Uint8ClampedArray(bytes), Math.abs(sw), Math.abs(sh));
+			if (st.pixelFormat === "rgba-float16") {
+				const out = new ImageData(Math.abs(sw), Math.abs(sh), st);
+				const u8 = new Uint8Array(bytes);
+				for (let i = 0; i < u8.length; i++) out.data[i] = u8[i] / 255;
+				return out;
+			}
+			return new ImageData(new Uint8ClampedArray(bytes), Math.abs(sw), Math.abs(sh),
+				{ colorSpace: st.colorSpace });
 		}
-		putImageData(data, dx, dy, sx = 0, sy = 0, sw = undefined, sh = undefined) {
+		putImageData(data, dx, dy, sx = undefined, sy = undefined, sw = undefined, sh = undefined) {
 			if (!(data instanceof ImageData)) throw new TypeError("putImageData: an ImageData is required");
-			const useW = sw === undefined ? data.width : Math.trunc(Number(sw));
-			const useH = sh === undefined ? data.height : Math.trunc(Number(sh));
-			canvasPutImageData(this._canvas._handle, new Uint8Array(data.data.buffer, data.data.byteOffset, data.data.byteLength),
-				data.width, data.height, Math.trunc(Number(dx)), Math.trunc(Number(dy)),
-				Math.trunc(Number(sx)), Math.trunc(Number(sy)), useW, useH);
+			dx = enforcedLong(dx, "putImageData: dx");
+			dy = enforcedLong(dy, "putImageData: dy");
+			let dirtyX = sx === undefined ? 0 : enforcedLong(sx, "putImageData: dirtyX");
+			let dirtyY = sy === undefined ? 0 : enforcedLong(sy, "putImageData: dirtyY");
+			let dirtyW = sw === undefined ? data.width : enforcedLong(sw, "putImageData: dirtyWidth");
+			let dirtyH = sh === undefined ? data.height : enforcedLong(sh, "putImageData: dirtyHeight");
+			// A negative dirty dimension names the rectangle from its other side.
+			if (dirtyW < 0) { dirtyX += dirtyW; dirtyW = -dirtyW; }
+			if (dirtyH < 0) { dirtyY += dirtyH; dirtyH = -dirtyH; }
+			canvasPutImageData(this._canvas._handle, imageDataBytes(data),
+				data.width, data.height, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH);
 		}
 
 		// -------------------------------------------------------- internals
@@ -1409,9 +1650,16 @@
 			if (grad) {
 				const inverse = invertMatrix(this._state.transform);
 				spec.gradient = {
-					radial: grad._radial,
-					x0: grad._coords[0], y0: grad._coords[1], r0: grad._coords[2],
-					x1: grad._coords[3], y1: grad._coords[4], r1: grad._coords[5],
+					radial: grad._kind === "radial",
+					conic: grad._kind === "conic",
+					// A conic gradient's coords are [startAngle, x, y]; the others
+					// carry the declaration-order coordinates.
+					...(grad._kind === "conic"
+						? { angle: grad._coords[0], x0: grad._coords[1], y0: grad._coords[2] }
+						: {
+							x0: grad._coords[0], y0: grad._coords[1], r0: grad._coords[2],
+							x1: grad._coords[3], y1: grad._coords[4], r1: grad._coords[5],
+						}),
 					degenerate: grad._stops.length === 0,
 					inverse: new Float64Array(inverse ?? IDENTITY),
 					stops: new Float64Array(grad._stops.flatMap((s) => [
@@ -1439,7 +1687,7 @@
 	const COMPOSITE_NAMES = new Set([
 		"source-over", "source-in", "source-out", "source-atop",
 		"destination-over", "destination-in", "destination-out", "destination-atop",
-		"lighter", "copy", "xor",
+		"lighter", "copy", "xor", "clear",
 	]);
 
 	function allFinite(args) {
@@ -1495,18 +1743,73 @@
 		return evenOdd ? crossings % 2 === 1 : winding !== 0;
 	}
 
-	// DOMMatrixLike is what getTransform answers with. The full DOMMatrix is a
-	// geometry interface of its own; what a caller does with this one is read its
-	// six components back, and that is what it offers.
-	class DOMMatrixLike {
-		constructor(m) {
-			const [a, b, c, d, e, f] = m;
-			Object.assign(this, {
-				a, b, c, d, e, f,
-				m11: a, m12: b, m21: c, m22: d, m41: e, m42: f,
-				m13: 0, m14: 0, m23: 0, m24: 0, m31: 0, m32: 0, m33: 1, m34: 0, m43: 0, m44: 1,
-				is2D: true, isIdentity: a === 1 && b === 0 && c === 0 && d === 1 && e === 0 && f === 0,
+	// DOMMatrixReadOnly/DOMMatrix (geometry) — the 4x4 matrix getTransform
+	// answers with and setTransform accepts. Stored as the 16 column-major
+	// components; a 2D matrix is one whose 3D components were never set.
+	const M2D = [0, 1, 4, 5, 12, 13]; // where a..f live among m11..m44
+	const IDENTITY16 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+	class DOMMatrixReadOnly {
+		constructor(init = undefined) {
+			let m = IDENTITY16.slice(), is2D = true;
+			if (init !== undefined) {
+				const list = [...init].map(Number);
+				if (list.length === 6) {
+					for (let i = 0; i < 6; i++) m[M2D[i]] = list[i];
+				} else if (list.length === 16) {
+					m = list;
+					is2D = false;
+				} else {
+					throw new TypeError("DOMMatrix: 6 or 16 numbers are required");
+				}
+			}
+			Object.defineProperties(this, {
+				_m: { value: m, writable: true },
+				_is2D: { value: is2D, writable: true },
 			});
+		}
+		get is2D() { return this._is2D; }
+		get isIdentity() { return this._m.every((v, i) => v === IDENTITY16[i]); }
+		toJSON() {
+			const out = {};
+			for (const k of ["a", "b", "c", "d", "e", "f", "is2D", "isIdentity"]) out[k] = this[k];
+			for (let r = 1; r <= 4; r++) for (let c = 1; c <= 4; c++) out[`m${r}${c}`] = this[`m${r}${c}`];
+			return out;
+		}
+		static fromMatrix(init = {}) {
+			return new this(fixup2D(init));
+		}
+	}
+	class DOMMatrix extends DOMMatrixReadOnly {}
+	{
+		const alias = { a: "m11", b: "m12", c: "m21", d: "m22", e: "m41", f: "m42" };
+		const names = [];
+		for (let r = 1; r <= 4; r++) for (let c = 1; c <= 4; c++) names.push(`m${r}${c}`);
+		names.forEach((name, i) => {
+			Object.defineProperty(DOMMatrixReadOnly.prototype, name, {
+				get() { return this._m[i]; }, configurable: true,
+			});
+			Object.defineProperty(DOMMatrix.prototype, name, {
+				get() { return this._m[i]; },
+				set(v) {
+					this._m[i] = Number(v);
+					if (IDENTITY16[i] !== this._m[i] && !M2D.includes(i)) this._is2D = false;
+				},
+				configurable: true,
+			});
+		});
+		for (const [short, long] of Object.entries(alias)) {
+			const i = names.indexOf(long);
+			Object.defineProperty(DOMMatrixReadOnly.prototype, short, {
+				get() { return this._m[i]; }, configurable: true,
+			});
+			Object.defineProperty(DOMMatrix.prototype, short, {
+				get() { return this._m[i]; },
+				set(v) { this._m[i] = Number(v); },
+				configurable: true,
+			});
+		}
+		for (const cls of [DOMMatrixReadOnly, DOMMatrix]) {
+			Object.defineProperty(cls.prototype, Symbol.toStringTag, { value: cls.name, configurable: true });
 		}
 	}
 
@@ -1515,7 +1818,8 @@
 	class OffscreenCanvas {
 		constructor(width, height) {
 			if (arguments.length < 2) throw new TypeError("OffscreenCanvas requires 2 arguments");
-			const w = toUnsignedLong(width), h = toUnsignedLong(height);
+			const w = enforcedSize(width, "OffscreenCanvas: the width");
+			const h = enforcedSize(height, "OffscreenCanvas: the height");
 			Object.defineProperties(this, {
 				_width: { value: w, writable: true },
 				_height: { value: h, writable: true },
@@ -1525,18 +1829,19 @@
 		}
 		get width() { return this._width; }
 		set width(v) {
-			const w = toUnsignedLong(v);
+			const w = enforcedSize(v, "width");
 			this._width = w;
-			canvasResize(this._handle, w, this._height);
-			// Resizing RESETS the context, which is what assigning to width means.
-			if (this._context) this._context._state = DEFAULT_STATE();
+			// Resizing RESETS the context — state, stack and path — which is
+			// what assigning to width means, even when the size is unchanged.
+			if (this._context) this._context.reset();
+			else canvasResize(this._handle, w, this._height);
 		}
 		get height() { return this._height; }
 		set height(v) {
-			const h = toUnsignedLong(v);
+			const h = enforcedSize(v, "height");
 			this._height = h;
-			canvasResize(this._handle, this._width, h);
-			if (this._context) this._context._state = DEFAULT_STATE();
+			if (this._context) this._context.reset();
+			else canvasResize(this._handle, this._width, h);
 		}
 		getContext(type, options = undefined) {
 			if (arguments.length < 1) throw new TypeError("getContext requires 1 argument");
@@ -1551,10 +1856,14 @@
 		value: "OffscreenCanvas", configurable: true,
 	});
 
-	function toUnsignedLong(v) {
-		const n = Number(v);
-		if (!Number.isFinite(n) || n < 0) return 0;
-		return Math.floor(n) % 4294967296;
+	// enforcedSize is the [EnforceRange] unsigned long long conversion the
+	// canvas dimensions go through: junk is a TypeError, not a zero.
+	function enforcedSize(v, what) {
+		const n = Math.trunc(+v);
+		if (!Number.isFinite(n) || n < 0 || n > Number.MAX_SAFE_INTEGER) {
+			throw new TypeError(`${what} is out of range`);
+		}
+		return n === 0 ? 0 : n;
 	}
 
 	// DOMPointReadOnly/DOMPoint are the geometry interface roundRect's radii and
@@ -1590,6 +1899,8 @@
 		Object.defineProperty(cls.prototype, Symbol.toStringTag, { value: cls.name, configurable: true });
 		globalThis[cls.name] ??= cls;
 	}
+	globalThis.DOMMatrixReadOnly ??= DOMMatrixReadOnly;
+	globalThis.DOMMatrix ??= DOMMatrix;
 
 	globalThis.ImageBitmap = ImageBitmap;
 	globalThis.CanvasPattern = CanvasPattern;
