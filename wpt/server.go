@@ -1,6 +1,7 @@
 package wpt
 
 import (
+	"bytes"
 	"crypto/x509"
 	"fmt"
 	"net"
@@ -308,6 +309,31 @@ func serveWPT(root string, srv *Server, w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		http.NotFound(w, r)
 		return
+	}
+	// A .asis file IS the response, byte for byte — status line, headers,
+	// separator and body — which is how the suite serves the header shapes
+	// (duplicates, empty members, NUL bytes) net/http would normalize away.
+	// The connection is hijacked so nothing rewrites them, and closed so a
+	// response without a Content-Length still ends.
+	if strings.HasSuffix(rel, ".asis") {
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, buf, herr := hj.Hijack(); herr == nil {
+				buf.Write(data)
+				// Several .asis fixtures end mid-header-block, with no blank
+				// line: a browser treats the close as the end of the headers,
+				// but Go's response reader calls it an unexpected EOF. The
+				// terminator is added, never the content changed.
+				if !bytes.Contains(data, []byte("\n\r\n")) && !bytes.Contains(data, []byte("\n\n")) {
+					if !bytes.HasSuffix(data, []byte("\n")) {
+						buf.WriteString("\r\n")
+					}
+					buf.WriteString("\r\n")
+				}
+				buf.Flush()
+				conn.Close()
+				return
+			}
+		}
 	}
 	data = substituteWPT(rel, data, vars)
 	if wantsPipeSub(r) {

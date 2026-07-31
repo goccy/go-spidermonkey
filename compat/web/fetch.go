@@ -45,13 +45,14 @@ import (
 // (built lazily from the Config the first call carries), the guest builtins
 // it keeps resolved, and the set of response bodies still open.
 type fetchAPI struct {
-	js           *spidermonkey.JS
-	loop         *eventloop.Loop
-	promiseCls   *spidermonkey.Object // Promise constructor
-	jsonObj      *spidermonkey.Object // JSON namespace object
-	streamCls    *spidermonkey.Object // ReadableStream class (from builtins.js)
-	deferredFn   *spidermonkey.Object // __web_deferred(): {promise, resolve, reject}
-	typeErrorCls *spidermonkey.Object // TypeError constructor (redirect:"error" rejection)
+	js             *spidermonkey.JS
+	loop           *eventloop.Loop
+	promiseCls     *spidermonkey.Object // Promise constructor
+	jsonObj        *spidermonkey.Object // JSON namespace object
+	streamCls      *spidermonkey.Object // ReadableStream class (from builtins.js)
+	deferredFn     *spidermonkey.Object // __web_deferred(): {promise, resolve, reject}
+	typeErrorCls   *spidermonkey.Object // TypeError constructor (redirect:"error" rejection)
+	syntaxErrorCls *spidermonkey.Object // SyntaxError constructor (json() parse failures)
 
 	// roots, when set, are trusted in ADDITION to the system pool. It is how an
 	// embedding reaches a server whose certificate is not publicly signed — a
@@ -273,6 +274,7 @@ func installFetch(js *spidermonkey.JS, loop *eventloop.Loop, roots *x509.CertPoo
 		"ReadableStream": &a.streamCls,
 		"__web_deferred": &a.deferredFn,
 		"TypeError":      &a.typeErrorCls,
+		"SyntaxError":    &a.syntaxErrorCls,
 	} {
 		v, err := js.Global().Get(name)
 		if err != nil {
@@ -912,8 +914,17 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 					if rerr != nil {
 						return a.typeError(rerr.Error()), true
 					}
+					// A UTF-8 BOM is not part of the JSON text.
+					if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+						data = data[3:]
+					}
 					parsed, perr := a.jsonObj.CallMethod("parse", spidermonkey.ValueOf(string(data)))
 					if perr != nil {
+						// The rejection is a real SyntaxError, which is what a
+						// caller expecting JSON.parse's failure mode checks for.
+						if se, serr := a.syntaxErrorCls.New(spidermonkey.ValueOf(perr.Error())); serr == nil {
+							return se, true
+						}
 						return spidermonkey.ValueOf(perr.Error()), true
 					}
 					return parsed, false

@@ -1749,7 +1749,12 @@
 			return this._body === null ? new Uint8Array(0) : new Uint8Array(this._body);
 		},
 		async text() { const b = await this._bodyBytes(); return b.length === 0 ? "" : utf8Decode(b, false); },
-		async json() { return JSON.parse(await this.text()); },
+		async json() {
+			// A leading BOM is not part of the JSON text; the UTF-8 decode that
+			// produced the string already dropped an encoded one, and a LITERAL
+			// U+FEFF (a data: URL can carry it) gets the same treatment.
+			return JSON.parse((await this.text()).replace(/^\uFEFF/, ""));
+		},
 		async bytes() { return this._bodyBytes(); },
 		async arrayBuffer() { return (await this._bodyBytes()).buffer; },
 		async blob() {
@@ -1921,7 +1926,13 @@
 			// headers). Apply application/json unless the caller set one (preserving
 			// e.g. application/problem+json).
 			const callerCT = init.headers !== undefined && new Headers(init.headers).has("content-type");
-			const r = new Response(JSON.stringify(data), init);
+			const text = JSON.stringify(data);
+			// Serializing to BYTES is part of the contract: a string that is
+			// not well-formed UTF-16 (a lone surrogate) has no UTF-8 form.
+			if (text === undefined || (text.isWellFormed && !text.isWellFormed())) {
+				throw new TypeError("Response.json: the data cannot be encoded");
+			}
+			const r = new Response(text, init);
 			if (!callerCT) r.headers.set("content-type", "application/json");
 			return r;
 		}
@@ -2821,6 +2832,9 @@
 			const cleanup = () => { if (signal && onAbort) signal.removeEventListener("abort", onAbort); };
 			let bodyInit = init.body;
 			if (bodyInit === undefined && isReq) bodyInit = input._bodyStream ?? input._body;
+			if (bodyInit !== undefined && bodyInit !== null && (method === "GET" || method === "HEAD")) {
+				return Promise.reject(new TypeError(`fetch: a ${method} request cannot have a body`));
+			}
 			const dispatch = () => {
 				const hdrObj = {};
 				for (const [k, v] of headers) hdrObj[k] = v;

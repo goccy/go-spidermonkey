@@ -83,6 +83,8 @@ func handlerFor(rel string) wptHandler {
 		return redirectHandler
 	case "common/redirect.py":
 		return commonRedirectHandler
+	case "xhr/resources/parse-headers.py":
+		return parseHeadersHandler
 	case "fetch/api/resources/trickle.py":
 		return trickleHandler
 	case "fetch/api/resources/cache.py":
@@ -486,6 +488,17 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 // against its two behaviours: it counts the hops it has served under a stash
 // token, and it carries the whole query string forward so the next hop behaves
 // the same way.
+// parseHeadersHandler is xhr/resources/parse-headers.py: it echoes the
+// my-custom-header query value back as a response header — including values
+// (a NUL byte, say) that a client must then refuse to accept.
+func parseHeadersHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	if v := r.URL.Query().Get("my-custom-header"); v != "" {
+		w.Header()["My-Custom-Header"] = []string{v}
+	}
+	w.WriteHeader(http.StatusOK)
+	return true
+}
+
 // commonRedirectHandler is /common/redirect.py: a bare redirection, CORS
 // headers only when asked for with enable-cors.
 func commonRedirectHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
