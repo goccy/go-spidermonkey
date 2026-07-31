@@ -21,10 +21,22 @@ rev=$2
 dest=$3
 shift 3
 
+# The checkout is identified by BOTH the revision and the set of paths: adding
+# a directory to the list is a change to what is checked out even though the
+# revision has not moved, and a run that ignored that left the new directory
+# missing while reporting success.
+want_paths=$(printf '%s\n' "$@" | sort | tr '\n' ' ')
 if [ -d "$dest/.git" ]; then
 	have=$(git -C "$dest" rev-parse HEAD 2>/dev/null || echo none)
+	have_paths=$(git -C "$dest" sparse-checkout list 2>/dev/null | sort | tr '\n' ' ' || echo "")
+	if [ "$have" = "$rev" ] && [ "$have_paths" = "$want_paths" ]; then
+		echo "==> $dest already at $rev with the requested paths"
+		exit 0
+	fi
 	if [ "$have" = "$rev" ]; then
-		echo "==> $dest already at $rev"
+		echo "==> $dest is at $rev but the paths differ; widening the checkout"
+		git -C "$dest" sparse-checkout set "$@"
+		echo "==> $dest now has $want_paths"
 		exit 0
 	fi
 	echo "==> $dest is at $have, want $rev; refetching"
