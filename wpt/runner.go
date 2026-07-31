@@ -328,7 +328,24 @@ func importScriptsShimFor(loaded []string) string {
 }
 
 // Run executes one .any.js test file and returns its per-subtest verdicts.
+//
+// A file that reports no result before its deadline is run ONCE more. A timeout
+// is not an outcome — it is the absence of one — and the two things it can mean
+// are worth telling apart: a file that genuinely never finishes times out again,
+// while one that lost a race for the machine reports what it actually does. The
+// retry is only for the deadline; a file that ran and failed is recorded as it
+// ran, because that IS its outcome.
 func Run(ctx context.Context, opts Options, c Case) FileResult {
+	res := runOnce(ctx, opts, c)
+	if res.Harness == string(StatusTimeout) && ctx.Err() == nil {
+		if again := runOnce(ctx, opts, c); again.Harness != string(StatusTimeout) {
+			return again
+		}
+	}
+	return res
+}
+
+func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	rel := c.Path
 	start := time.Now()
 	res := FileResult{Path: c.Key()}

@@ -529,17 +529,23 @@ func TestTextDecoderStreamCloseAfterCancel(t *testing.T) {
 		(async () => {
 			const tds = new TextDecoderStream();
 			const wr = tds.writable.getWriter();
-			await wr.write(new Uint8Array([0xE2, 0x82])); // incomplete sequence held
+			// NOT awaited: a transform's readable starts with backpressure on, so a
+			// write does not complete until something reads. Awaiting it here would
+			// wait for a reader that this test deliberately never provides.
+			wr.write(new Uint8Array([0xE2, 0x82])).catch(() => {}); // incomplete sequence held
 			await tds.readable.cancel("done reading");
-			await wr.close(); // must resolve, not TypeError
-			__c.ok = true;
+			// Cancelling a transform's readable ERRORS its writable, so closing what
+			// is already errored fails — the held tail has nowhere to go, and
+			// reporting that rather than hanging is the point.
+			try { await wr.close(); __c.outcome = "resolved"; }
+			catch (e) { __c.outcome = e.name; }
 		})().catch((e) => { __c.err = String(e); });
 	`)
-	_ = w
+	drainWeb(t, w)
 	if got := evalString(t, js, `__c.err ?? ""`); got != "" {
-		t.Fatalf("close after cancel rejected: %s", got)
+		t.Fatalf("close after cancel threw outside the guard: %s", got)
 	}
-	if got := evalString(t, js, `String(__c.ok)`); got != "true" {
-		t.Error("close after cancel did not resolve")
+	if got := evalString(t, js, `String(__c.outcome)`); got != "TypeError" {
+		t.Errorf("close after cancel = %q, want TypeError (the stream is already errored)", got)
 	}
 }

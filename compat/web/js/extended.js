@@ -508,80 +508,94 @@
 
 	// -------------------------------------- TextEncoder/DecoderStream
 
-	globalThis.TextEncoderStream = class TextEncoderStream {
+	// Both are GenericTransformStreams: the pair IS a TransformStream, and
+	// readable/writable are accessors over it. Built by hand out of a
+	// ReadableStream and a WritableStream — which is what these were — they had
+	// no backpressure at all (a writer never waited for a reader), the error
+	// propagation had to be re-derived at each site, and `encoding`, `fatal` and
+	// `ignoreBOM` were own data properties instead of the interface's attributes.
+	class TextEncoderStream {
 		constructor() {
 			const enc = new TextEncoder();
 			let pending = ""; // a lone high surrogate carried from the previous chunk
-			this.encoding = "utf-8";
-			this.readable = new ReadableStream({
-				start: (c) => (this._rc = c),
-				cancel: (reason) => { this._cancelled = true; this._cancelReason = reason; },
+			const transform = new TransformStream({
+				transform(chunk, controller) {
+					let s = pending + String(chunk);
+					pending = "";
+					// Hold a trailing lone high surrogate for the next chunk so a
+					// surrogate pair split across writes isn't corrupted to U+FFFD.
+					if (s.length) {
+						const last = s.charCodeAt(s.length - 1);
+						if (last >= 0xd800 && last <= 0xdbff) { pending = s.slice(-1); s = s.slice(0, -1); }
+					}
+					if (s) controller.enqueue(enc.encode(s));
+				},
+				flush(controller) {
+					if (pending) controller.enqueue(enc.encode(pending)); // lone surrogate -> U+FFFD
+				},
 			});
-			this.writable = new WritableStream({
-				write: (chunk) => {
-					if (this._cancelled) throw this._cancelReason ?? new DOMException("The readable side was cancelled", "AbortError");
-					try {
-						let s = pending + String(chunk);
-						pending = "";
-						// Hold a trailing lone high surrogate for the next chunk so a
-						// surrogate pair split across writes isn't corrupted to U+FFFD.
-						if (s.length) {
-							const last = s.charCodeAt(s.length - 1);
-							if (last >= 0xd800 && last <= 0xdbff) { pending = s.slice(-1); s = s.slice(0, -1); }
-						}
-						if (s) this._rc.enqueue(enc.encode(s));
-					} catch (e) { this._rc.error(e); throw e; }
+			Object.defineProperty(this, "_transform", { value: transform });
+		}
+		get encoding() { return "utf-8"; }
+		get readable() { return this._transform.readable; }
+		get writable() { return this._transform.writable; }
+	}
+	Object.defineProperty(TextEncoderStream.prototype, Symbol.toStringTag, {
+		value: "TextEncoderStream", configurable: true,
+	});
+	globalThis.TextEncoderStream = TextEncoderStream;
+
+	class TextDecoderStream {
+		constructor(label = "utf-8", options = undefined) {
+			const opts = options === undefined || options === null ? {} : options;
+			const dec = new TextDecoder(label, opts);
+			const transform = new TransformStream({
+				transform(chunk, controller) {
+					// Only a BufferSource may be decoded. A DETACHED one carries no
+					// bytes and decodes to nothing, which is not the same as an error:
+					// the buffer was legitimately handed away.
+					if (!isBufferSource(chunk)) {
+						throw new TypeError("TextDecoderStream: only a BufferSource can be decoded");
+					}
+					const bytes = viewBytes(chunk);
+					if (bytes === null) return;
+					const s = dec.decode(bytes, { stream: true });
+					if (s) controller.enqueue(s);
 				},
-				close: () => {
-					try {
-						if (pending) this._rc.enqueue(enc.encode(pending)); // lone surrogate -> U+FFFD
-						this._rc.close();
-					} catch (e) { this._rc.error(e); throw e; }
+				flush(controller) {
+					// The final non-stream decode flushes any bytes held from an
+					// incomplete trailing sequence (emits U+FFFD, or throws in fatal
+					// mode), per the WHATWG flush-on-end contract.
+					const tail = dec.decode();
+					if (tail) controller.enqueue(tail);
 				},
-				// An abort on the writable side must error the readable side too, or a
-				// reader awaiting this.readable would hang forever.
-				abort: (reason) => this._rc.error(reason),
+			});
+			Object.defineProperties(this, {
+				_transform: { value: transform },
+				_decoder: { value: dec },
 			});
 		}
-	};
-	globalThis.TextDecoderStream = class TextDecoderStream {
-		constructor(label = "utf-8", options = {}) {
-			const dec = new TextDecoder(label, options);
-			this.encoding = dec.encoding;
-			// Cancelling the readable side must stop the writable so an upstream
-			// pipeTo (fetch body -> this stream) aborts and releases its source,
-			// instead of streaming forever into a cancelled readable.
-			this.readable = new ReadableStream({
-				start: (c) => (this._rc = c),
-				cancel: (reason) => { this._cancelled = true; this._cancelReason = reason; },
-			});
-			this.writable = new WritableStream({
-				write: (chunk) => {
-					if (this._cancelled) throw this._cancelReason ?? new DOMException("The readable side was cancelled", "AbortError");
-					// A fatal-mode decode throws on invalid input; error the readable
-					// side so a pending reader rejects instead of hanging.
-					try {
-						const s = dec.decode(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk), { stream: true });
-						if (s) this._rc.enqueue(s);
-					} catch (e) { this._rc.error(e); throw e; }
-				},
-				close: () => {
-					// Final non-stream decode flushes any bytes held from an
-					// incomplete trailing sequence (emits U+FFFD, or throws in
-					// fatal mode), per the WHATWG flush-on-end contract. A
-					// cancelled readable no longer accepts chunks — drop the tail
-					// so writer.close() still resolves (enqueue would TypeError).
-					try {
-						const tail = dec.decode();
-						if (this._cancelled) return;
-						if (tail) this._rc.enqueue(tail);
-						this._rc.close();
-					} catch (e) { this._rc.error(e); throw e; }
-				},
-				abort: (reason) => this._rc.error(reason),
-			});
+		get encoding() { return this._decoder.encoding; }
+		get fatal() { return this._decoder.fatal; }
+		get ignoreBOM() { return this._decoder.ignoreBOM; }
+		get readable() { return this._transform.readable; }
+		get writable() { return this._transform.writable; }
+	}
+	Object.defineProperty(TextDecoderStream.prototype, Symbol.toStringTag, {
+		value: "TextDecoderStream", configurable: true,
+	});
+	globalThis.TextDecoderStream = TextDecoderStream;
+
+	// viewBytes is the bytes a BufferSource holds, or null when its buffer has
+	// been transferred away — a detached view is empty, not broken.
+	function viewBytes(chunk) {
+		try {
+			if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+			return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+		} catch {
+			return null;
 		}
-	};
+	}
 
 	// CountQueuingStrategy / ByteLengthQueuingStrategy are defined in builtins.js.
 
