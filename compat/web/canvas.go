@@ -23,8 +23,8 @@ import (
 	"image"
 	"image/draw"
 	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
+	"image/jpeg"
+	"image/png"
 	"math"
 	"sort"
 
@@ -54,6 +54,24 @@ type paint struct {
 	solid    [4]float64 // r,g,b,a in 0..1, non-premultiplied
 	gradient *gradient
 	pattern  *pattern
+	// colorMatrix, when present, maps the source colour through a 5x4
+	// matrix in non-premultiplied space — the colorMatrix filter primitive.
+	colorMatrix []float64
+}
+
+func applyColorMatrix(m []float64, c [4]float64) [4]float64 {
+	var out [4]float64
+	for row := 0; row < 4; row++ {
+		v := m[row*5]*c[0] + m[row*5+1]*c[1] + m[row*5+2]*c[2] + m[row*5+3]*c[3] + m[row*5+4]
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		out[row] = v
+	}
+	return out
 }
 
 // pattern is an image tiled across the plane. inverse maps a device point back
@@ -361,6 +379,9 @@ func (s *surface) fillMask(mask []byte, p paint, alpha float64, op composite, cl
 				}
 				src = col
 			}
+			if p.colorMatrix != nil {
+				src = applyColorMatrix(p.colorMatrix, src)
+			}
 			src[3] *= alpha
 			o := i * 4
 			dst := [4]float64{
@@ -554,12 +575,18 @@ func intersectMasks(a, b []byte) []byte {
 type canvasAPI struct {
 	js       *spidermonkey.JS
 	surfaces map[int64]*surface
-	clips    map[int64][]byte
-	next     int64
+	// layers is each canvas's stack of open layer bitmaps: drawing lands on
+	// the top of the stack, and endLayer composites it onto what is below.
+	layers map[int64][]*surface
+	clips  map[int64][]byte
+	next   int64
 }
 
 func newCanvasAPI(js *spidermonkey.JS) *canvasAPI {
-	return &canvasAPI{js: js, surfaces: map[int64]*surface{}, clips: map[int64][]byte{}}
+	return &canvasAPI{
+		js: js, surfaces: map[int64]*surface{},
+		layers: map[int64][]*surface{}, clips: map[int64][]byte{},
+	}
 }
 
 func (a *canvasAPI) ops() map[string]spidermonkey.Func {
@@ -575,6 +602,9 @@ func (a *canvasAPI) ops() map[string]spidermonkey.Func {
 		"canvas_clip":           a.opClip,
 		"canvas_get_image_data": a.opGetImageData,
 		"canvas_put_image_data": a.opPutImageData,
+		"canvas_layer_begin":    a.opLayerBegin,
+		"canvas_layer_end":      a.opLayerEnd,
+		"canvas_encode":         a.opEncode,
 	}
 }
 
@@ -583,6 +613,9 @@ func (a *canvasAPI) surface(v spidermonkey.Value) (*surface, int64, error) {
 	s := a.surfaces[id]
 	if s == nil {
 		return nil, 0, fmt.Errorf("canvas: unknown surface")
+	}
+	if st := a.layers[id]; len(st) > 0 {
+		return st[len(st)-1], id, nil
 	}
 	return s, id, nil
 }
@@ -619,6 +652,7 @@ func clampCanvasSize(wf, hf float64) (int, int) {
 func (a *canvasAPI) opFree(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
 	id := int64(args[0].Float())
 	delete(a.surfaces, id)
+	delete(a.layers, id)
 	delete(a.clips, id)
 	return spidermonkey.Undefined(), nil
 }
@@ -633,7 +667,139 @@ func (a *canvasAPI) opResize(cfg spidermonkey.Config, args []spidermonkey.Value)
 	w, h := clampCanvasSize(args[1].Float(), args[2].Float())
 	_ = s
 	a.surfaces[id] = newSurface(w, h)
+	delete(a.layers, id)
 	delete(a.clips, id)
+	return spidermonkey.Undefined(), nil
+}
+
+// opLayerBegin(handle) opens a layer: a transparent bitmap the same size as
+// the canvas that captures every draw until the matching opLayerEnd.
+func (a *canvasAPI) opLayerBegin(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, id, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	a.layers[id] = append(a.layers[id], newSurface(s.w, s.h))
+	return spidermonkey.Undefined(), nil
+}
+
+// opLayerEnd(handle, spec) closes the top layer and composites it onto what
+// is below with the state saved when the layer was opened: its alpha, its
+// operator, and its shadow — which is the whole point of a layer: the group
+// is composited as ONE image.
+func (a *canvasAPI) opLayerEnd(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	id := int64(args[0].Float())
+	st := a.layers[id]
+	if len(st) == 0 {
+		return nil, fmt.Errorf("canvas_layer_end: no open layer")
+	}
+	layer := st[len(st)-1]
+	a.layers[id] = st[:len(st)-1]
+	if len(a.layers[id]) == 0 {
+		delete(a.layers, id)
+	}
+	dst, _, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	alpha, op := 1.0, compSourceOver
+	var spec *spidermonkey.Object
+	if len(args) > 1 {
+		spec = args[1].Object()
+	}
+	if spec != nil {
+		defer spec.Free()
+		alpha = objFloat(spec, "alpha", 1)
+		if c, ok := compositeByName[objString(spec, "composite", "source-over")]; ok {
+			op = c
+		}
+	}
+	clip := a.clips[id]
+	// A colorMatrix filter maps each of the layer's pixels through a 5x4
+	// matrix in non-premultiplied space before the group is composited.
+	if spec != nil {
+		if mv, err := spec.Get("colorMatrix"); err == nil && mv != nil {
+			if mo := mv.Object(); mo != nil {
+				b, berr := mo.Bytes()
+				mo.Free()
+				if berr == nil {
+					m := bytesToFloat64s(b)
+					if len(m) >= 20 {
+						for i := 0; i+3 < len(layer.pix); i += 4 {
+							r := float64(layer.pix[i]) / 255
+							g := float64(layer.pix[i+1]) / 255
+							bl := float64(layer.pix[i+2]) / 255
+							al := float64(layer.pix[i+3]) / 255
+							layer.pix[i] = clamp255(m[0]*r + m[1]*g + m[2]*bl + m[3]*al + m[4])
+							layer.pix[i+1] = clamp255(m[5]*r + m[6]*g + m[7]*bl + m[8]*al + m[9])
+							layer.pix[i+2] = clamp255(m[10]*r + m[11]*g + m[12]*bl + m[13]*al + m[14])
+							layer.pix[i+3] = clamp255(m[15]*r + m[16]*g + m[17]*bl + m[18]*al + m[19])
+						}
+					}
+				}
+			}
+		}
+		if sh, ok := readShadow(spec); ok {
+			pad := shadowPad(sh.blur)
+			bw, bh := dst.w+2*pad, dst.h+2*pad
+			ox, oy := int(math.Round(sh.dx)), int(math.Round(sh.dy))
+			mask := make([]byte, bw*bh)
+			for y := 0; y < bh; y++ {
+				sy := y - pad - oy
+				if sy < 0 || sy >= layer.h {
+					continue
+				}
+				for x := 0; x < bw; x++ {
+					sx := x - pad - ox
+					if sx < 0 || sx >= layer.w {
+						continue
+					}
+					mask[y*bw+x] = layer.pix[(sy*layer.w+sx)*4+3]
+				}
+			}
+			if r := blurRadius(sh.blur); r >= 1 {
+				for pass := 0; pass < 3; pass++ {
+					mask = boxBlur(mask, bw, bh, r)
+				}
+			}
+			dst.fillMask(cropPadded(mask, dst.w, dst.h, pad), paint{solid: sh.color}, alpha, op, clip)
+		}
+	}
+	whole := wholeSurfaceOp(op)
+	for y := 0; y < dst.h && y < layer.h; y++ {
+		for x := 0; x < dst.w && x < layer.w; x++ {
+			i := y*dst.w + x
+			li := (y*layer.w + x) * 4
+			src := [4]float64{
+				float64(layer.pix[li]) / 255, float64(layer.pix[li+1]) / 255,
+				float64(layer.pix[li+2]) / 255, float64(layer.pix[li+3]) / 255,
+			}
+			if src[3] == 0 && !whole {
+				continue
+			}
+			clipCov := 1.0
+			if clip != nil {
+				clipCov = float64(clip[i]) / 255
+				if clipCov == 0 {
+					continue
+				}
+			}
+			src[3] *= alpha
+			o := i * 4
+			d := [4]float64{
+				float64(dst.pix[o]) / 255, float64(dst.pix[o+1]) / 255,
+				float64(dst.pix[o+2]) / 255, float64(dst.pix[o+3]) / 255,
+			}
+			out := blend(op, src, d, 1)
+			if clipCov < 1 {
+				out = lerpPremul(d, out, clipCov)
+			}
+			dst.pix[o] = clamp255(out[0])
+			dst.pix[o+1] = clamp255(out[1])
+			dst.pix[o+2] = clamp255(out[2])
+			dst.pix[o+3] = clamp255(out[3])
+		}
+	}
 	return spidermonkey.Undefined(), nil
 }
 
@@ -937,6 +1103,57 @@ func (a *canvasAPI) opGetImageData(cfg spidermonkey.Config, args []spidermonkey.
 	return u8, nil
 }
 
+// opEncode(handle, type, quality) -> bytes: the surface as an encoded image.
+// PNG is the default and the fallback for any type the host cannot produce,
+// which is what the specification says about unsupported types.
+func (a *canvasAPI) opEncode(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, _, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	mime := "image/png"
+	if len(args) > 1 {
+		mime = args[1].String()
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, s.w, s.h))
+	copy(img.Pix, s.pix)
+	var buf bytes.Buffer
+	switch mime {
+	case "image/jpeg":
+		q := 92
+		if len(args) > 2 {
+			if f := args[2].Float(); f >= 0 && f <= 1 {
+				q = int(f * 100)
+			}
+		}
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: q}); err != nil {
+			return nil, err
+		}
+	default:
+		mime = "image/png"
+		if err := png.Encode(&buf, img); err != nil {
+			return nil, err
+		}
+	}
+	obj, err := a.js.NewObject()
+	if err != nil {
+		return nil, err
+	}
+	u8, err := a.js.NewBytes(buf.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	serr := obj.Set("bytes", u8)
+	u8.Free()
+	if serr != nil {
+		return nil, serr
+	}
+	if err := obj.Set("type", spidermonkey.ValueOf(mime)); err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
 // opPutImageData(handle, bytes, w, h, dx, dy, sx, sy, sw, sh) writes pixels
 // straight in: putImageData REPLACES, ignoring the transform, the clip, the
 // alpha and the composite operator.
@@ -1051,6 +1268,11 @@ func (a *canvasAPI) opDrawImage(cfg spidermonkey.Config, args []spidermonkey.Val
 	src, _, err := a.surface(args[1])
 	if err != nil {
 		return nil, err
+	}
+	// Drawing a canvas onto itself must read the picture as it was BEFORE the
+	// draw, not row by row as it is overwritten.
+	if src == dst {
+		src = &surface{w: dst.w, h: dst.h, pix: append([]byte(nil), dst.pix...)}
 	}
 	spec := args[2].Object()
 	if spec == nil {
@@ -1235,6 +1457,7 @@ func readMatrix(o *spidermonkey.Object, name string) ([6]float64, bool) {
 // closeAll drops every surface. Called from Web.Close.
 func (a *canvasAPI) closeAll() {
 	a.surfaces = map[int64]*surface{}
+	a.layers = map[int64][]*surface{}
 	a.clips = map[int64][]byte{}
 }
 
@@ -1291,6 +1514,17 @@ func readSubpaths(spec *spidermonkey.Object) ([][]point, error) {
 
 func (a *canvasAPI) readPaint(spec *spidermonkey.Object) (paint, error) {
 	var p paint
+	if mv, err := spec.Get("colorMatrix"); err == nil && mv != nil {
+		if mo := mv.Object(); mo != nil {
+			b, berr := mo.Bytes()
+			mo.Free()
+			if berr == nil {
+				if f := bytesToFloat64s(b); len(f) >= 20 {
+					p.colorMatrix = f[:20]
+				}
+			}
+		}
+	}
 	if pv, err := spec.Get("pattern"); err == nil && pv != nil {
 		if po := pv.Object(); po != nil {
 			pat, perr := a.readPattern(po)

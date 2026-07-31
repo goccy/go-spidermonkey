@@ -32,6 +32,9 @@
 	const canvasFromBytes = ops.canvas_from_bytes;
 	const canvasDecodeImage = ops.canvas_decode_image;
 	const canvasDrawImage = ops.canvas_draw_image;
+	const canvasLayerBegin = ops.canvas_layer_begin;
+	const canvasLayerEnd = ops.canvas_layer_end;
+	const canvasEncode = ops.canvas_encode;
 
 	// ------------------------------------------------------------- colours
 
@@ -759,30 +762,28 @@
 				if (inLen === 0 || outLen === 0) continue;
 				const u1x = inX / inLen, u1y = inY / inLen, u2x = outX / outLen, u2y = outY / outLen;
 				if (join === "round") { out.push(disc(vx, vy)); continue; }
-				// The bevel is a triangle on each side; the inner one is already
-				// inside the union and costs nothing.
-				const n1x = -u1y * hw, n1y = u1x * hw, n2x = -u2y * hw, n2y = u2x * hw;
-				out.push(ccw([vx, vy, vx + n1x, vy + n1y, vx + n2x, vy + n2y]));
-				out.push(ccw([vx, vy, vx - n1x, vy - n1y, vx - n2x, vy - n2y]));
+				const crossZ = u1x * u2y - u1y * u2x;
+				if (Math.abs(crossZ) < 1e-12) continue;
+				// The join fills the wedge on the OUTER side of the turn — the
+				// side the path turns away from. The inner side needs nothing:
+				// there the two quads overlap, and a triangle there would paint
+				// area a butt cap just beyond the corner excludes.
+				const sgn = crossZ > 0 ? 1 : -1;
+				const o1x = sgn * u1y * hw, o1y = -sgn * u1x * hw;
+				const o2x = sgn * u2y * hw, o2y = -sgn * u2x * hw;
+				out.push(ccw([vx, vy, vx + o1x, vy + o1y, vx + o2x, vy + o2y]));
 				if (join === "miter") {
 					const cosPhi = u1x * u2x + u1y * u2y;
 					// The miter ratio is 1/sin(θ/2) for interior angle θ, and
 					// sin(θ/2) = √((1+cos φ)/2) for turn angle φ.
 					const sinHalf = Math.sqrt(Math.max(0, (1 + cosPhi) / 2));
 					if (sinHalf > 0 && 1 / sinHalf <= miterLimit) {
-						const crossZ = u1x * u2y - u1y * u2x;
-						if (Math.abs(crossZ) > 1e-12) {
-							const sgn = crossZ > 0 ? 1 : -1;
-							// The outer side is the one the path turns away from.
-							const o1x = sgn * u1y * hw, o1y = -sgn * u1x * hw;
-							const o2x = sgn * u2y * hw, o2y = -sgn * u2x * hw;
-							const bx = o1x + o2x, by = o1y + o2y;
-							const bl = Math.hypot(bx, by);
-							if (bl > 0) {
-								const apexX = vx + (bx / bl) * (hw / sinHalf);
-								const apexY = vy + (by / bl) * (hw / sinHalf);
-								out.push(ccw([vx, vy, vx + o1x, vy + o1y, apexX, apexY, vx + o2x, vy + o2y]));
-							}
+						const bx = o1x + o2x, by = o1y + o2y;
+						const bl = Math.hypot(bx, by);
+						if (bl > 0) {
+							const apexX = vx + (bx / bl) * (hw / sinHalf);
+							const apexY = vy + (by / bl) * (hw / sinHalf);
+							out.push(ccw([vx, vy, vx + o1x, vy + o1y, apexX, apexY, vx + o2x, vy + o2y]));
 						}
 					}
 				}
@@ -1003,6 +1004,10 @@
 			return { handle: source._handle, width: source._width, height: source._height };
 		}
 		if (source instanceof OffscreenCanvas) {
+			// A canvas with unclosed layers has no well-defined pixels to read.
+			if (source._context && source._context._layers > 0) {
+				throw new DOMException("the source canvas has open layers", "InvalidStateError");
+			}
 			return { handle: source._handle, width: source.width, height: source.height };
 		}
 		if (source instanceof ImageData) {
@@ -1057,13 +1062,407 @@
 		lineWidth: 1, lineCap: "butt", lineJoin: "miter", miterLimit: 10,
 		lineDash: [], lineDashOffset: 0,
 		clip: null, // device-space polygons, or null for none
-		font: "10px sans-serif", textAlign: "start", textBaseline: "alphabetic",
+		font: "10px sans-serif", fontParsed: null, lang: "inherit",
+		textAlign: "start", textBaseline: "alphabetic",
 		shadowColor: [0, 0, 0, 0], shadowBlur: 0, shadowOffsetX: 0, shadowOffsetY: 0,
 		imageSmoothingEnabled: true, imageSmoothingQuality: "low",
-		filter: "none", direction: "inherit", letterSpacing: "0px", wordSpacing: "0px",
+		filter: "none", filterObject: null, direction: "inherit", letterSpacing: "0px", wordSpacing: "0px",
 		fontKerning: "auto", fontStretch: "normal", fontVariantCaps: "normal",
 		textRendering: "auto",
 	});
+
+	// CanvasFilter wraps a validated filter-primitive list; assigning one to
+	// ctx.filter (or passing the same structure to beginLayer) is the
+	// object-based spelling of the filter attribute.
+	class CanvasFilter {
+		constructor(init = undefined) {
+			validateLayerFilter(init);
+			Object.defineProperty(this, "_prims", { value: init });
+		}
+	}
+	Object.defineProperty(CanvasFilter.prototype, Symbol.toStringTag, {
+		value: "CanvasFilter", configurable: true,
+	});
+
+	// validCSSFilter decides whether a string is a <filter-value-list>: a
+	// whitespace-separated sequence of filter functions. Invalid strings —
+	// including the CSS-wide keywords and the empty string — leave the
+	// attribute untouched, so validation must be exact, not approximate.
+	const CSS_LENGTH = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?(?:px|em|rem|ex|ch|vw|vh|vmin|vmax|cm|mm|in|pt|pc|q)$/i;
+	const CSS_ANGLE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?(?:deg|grad|rad|turn)$/i;
+	const CSS_NUMBER_OR_PCT = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?%?$/;
+	const isZero = (t) => /^[+-]?0+(?:\.0+)?$/.test(t);
+	function validFilterFunction(name, args) {
+		const body = args.trim();
+		switch (name) {
+			case "blur":
+				return body === "" || CSS_LENGTH.test(body) || isZero(body);
+			case "hue-rotate":
+				return body === "" || CSS_ANGLE.test(body) || isZero(body);
+			case "brightness":
+			case "contrast":
+			case "grayscale":
+			case "invert":
+			case "opacity":
+			case "saturate":
+			case "sepia":
+				return body === "" || (CSS_NUMBER_OR_PCT.test(body) && parseFloat(body) >= 0);
+			case "drop-shadow": {
+				// color? && <length>{2,3} — the colour may itself be a function.
+				const parts = [];
+				let depth = 0, cur = "";
+				for (const ch of body) {
+					if (ch === "(") depth++;
+					if (ch === ")") depth--;
+					if (/\s/.test(ch) && depth === 0) {
+						if (cur) { parts.push(cur); cur = ""; }
+					} else {
+						cur += ch;
+					}
+				}
+				if (cur) parts.push(cur);
+				let lengths = 0, colors = 0;
+				for (const part of parts) {
+					if (CSS_LENGTH.test(part) || isZero(part)) lengths++;
+					else if (parseColor(part) !== null) colors++;
+					else return false;
+				}
+				return lengths >= 2 && lengths <= 3 && colors <= 1;
+			}
+			case "url":
+				return true;
+			default:
+				return false;
+		}
+	}
+	function validCSSFilter(str) {
+		const s2 = str.trim();
+		if (s2 === "none") return true;
+		if (s2 === "") return false;
+		let at = 0;
+		while (at < s2.length) {
+			while (at < s2.length && /\s/.test(s2[at])) at++;
+			if (at >= s2.length) break;
+			const m = /^([a-z-]+)\(/i.exec(s2.slice(at));
+			if (!m) return false;
+			let depth = 1;
+			let end = at + m[0].length;
+			while (end < s2.length && depth > 0) {
+				if (s2[end] === "(") depth++;
+				else if (s2[end] === ")") depth--;
+				end++;
+			}
+			if (depth !== 0) return false;
+			const args = s2.slice(at + m[0].length, end - 1);
+			if (!validFilterFunction(m[1].toLowerCase(), args)) return false;
+			at = end;
+		}
+		return true;
+	}
+
+	// -------------------------------------------------------- the font value
+	// parseFontShorthand is the CSS font shorthand: optional style, variant
+	// (small-caps only), weight and stretch in any order, then a size with an
+	// optional /line-height (parsed and dropped), then a font family list.
+	// Relative sizes resolve against the canvas default of 10px. The parsed
+	// form is kept alongside its canonical serialization, which is what the
+	// attribute answers with.
+
+	const FONT_STRETCH_KEYWORDS = [
+		"ultra-condensed", "extra-condensed", "condensed", "semi-condensed",
+		"semi-expanded", "expanded", "extra-expanded", "ultra-expanded",
+	];
+	const GENERIC_FAMILIES = new Set([
+		"serif", "sans-serif", "monospace", "cursive", "fantasy",
+		"system-ui", "math", "ui-serif", "ui-sans-serif", "ui-monospace", "ui-rounded",
+	]);
+	const CSS_WIDE_KEYWORDS = new Set(["inherit", "initial", "unset", "revert", "revert-layer", "default"]);
+	// Pixels per unit, for the units a font size accepts. Relative units
+	// resolve against the default font (10px) or the root default (16px).
+	const FONT_UNITS = {
+		px: 1, pt: 4 / 3, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6,
+		em: 10, rem: 16, ex: 5, ch: 5, "%": 0.1,
+	};
+	const FONT_SIZE_KEYWORDS = {
+		"xx-small": 16 * 3 / 5, "x-small": 16 * 3 / 4, small: 16 * 8 / 9, medium: 16,
+		large: 16 * 6 / 5, "x-large": 16 * 3 / 2, "xx-large": 16 * 2, "xxx-large": 16 * 3,
+		larger: 12, smaller: 10 * 5 / 6,
+	};
+
+	function parseFontLength(tok) {
+		const m = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(px|pt|pc|in|cm|mm|q|em|rem|ex|ch|%)$/i.exec(tok);
+		if (!m) return null;
+		const n = parseFloat(m[1]) * FONT_UNITS[m[2].toLowerCase()];
+		return Number.isFinite(n) && n >= 0 ? n : null;
+	}
+
+	function parseFontFamilies(raw) {
+		const families = [];
+		let at = 0;
+		const ws = () => { while (at < raw.length && /\s/.test(raw[at])) at++; };
+		for (;;) {
+			ws();
+			if (at >= raw.length) return null;
+			const ch = raw[at];
+			if (ch === '"' || ch === "'") {
+				at++;
+				let val = "";
+				for (;;) {
+					if (at >= raw.length) return null; // unterminated
+					const c = raw[at];
+					if (c === ch) { at++; break; }
+					if (c === "\\") {
+						at++;
+						if (at >= raw.length) return null;
+						val += raw[at]; at++;
+						continue;
+					}
+					val += c; at++;
+				}
+				families.push({ quoted: true, name: val });
+			} else {
+				const words = [];
+				for (;;) {
+					ws();
+					if (at >= raw.length || raw[at] === ",") break;
+					const m = /^-?[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff-]*/.exec(raw.slice(at));
+					if (!m) return null;
+					words.push(m[0]);
+					at += m[0].length;
+				}
+				if (words.length === 0) return null;
+				if (words.length === 1 && CSS_WIDE_KEYWORDS.has(words[0].toLowerCase())) return null;
+				const name = words.join(" ");
+				const generic = words.length === 1 && GENERIC_FAMILIES.has(words[0].toLowerCase());
+				families.push({ quoted: false, name: generic ? name.toLowerCase() : name, generic });
+			}
+			ws();
+			if (at >= raw.length) break;
+			if (raw[at] !== ",") return null;
+			at++;
+		}
+		return families.length ? families : null;
+	}
+
+	function serializeFontSize(px) {
+		// The shortest decimal that round-trips, the way CSS serializes numbers.
+		return String(Math.round(px * 1000) / 1000);
+	}
+
+	function serializeFontFamily(f) {
+		if (f.quoted) return '"' + f.name.replace(/[\\"]/g, (c) => "\\" + c) + '"';
+		return f.name;
+	}
+
+	// parseSpacing is letterSpacing/wordSpacing's value: a CSS <length>,
+	// serialized with its number and lowercased unit.
+	function parseSpacing(v) {
+		const m = /^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(px|pt|pc|in|cm|mm|q|em|rem|ex|ch)\s*$/i.exec(String(v));
+		if (!m) return null;
+		const n = parseFloat(m[1]);
+		if (!Number.isFinite(n)) return null;
+		return String(Math.round(n * 1000) / 1000) + m[2].toLowerCase();
+	}
+
+	function parseFontShorthand(input) {
+		const str = String(input).trim();
+		if (str === "" || CSS_WIDE_KEYWORDS.has(str.toLowerCase())) return null;
+		let style = "normal", variant = "normal", weight = "normal", stretch = "normal";
+		const seen = { style: false, variant: false, weight: false, stretch: false };
+		const re = /\S+/g;
+		let sizePx = null, familyStart = -1;
+		for (;;) {
+			const m = re.exec(str);
+			if (!m) return null;
+			const tok = m[0], low = tok.toLowerCase();
+			if (low === "normal") continue; // normal is valid for every slot
+			if (!seen.style && (low === "italic" || low === "oblique")) {
+				style = low; seen.style = true; continue;
+			}
+			if (!seen.variant && low === "small-caps") {
+				variant = low; seen.variant = true; continue;
+			}
+			if (!seen.weight && (low === "bold" || low === "bolder" || low === "lighter")) {
+				weight = low; seen.weight = true; continue;
+			}
+			if (!seen.weight && /^[1-9]00$/.test(low)) {
+				weight = low; seen.weight = true; continue;
+			}
+			if (!seen.stretch && FONT_STRETCH_KEYWORDS.includes(low)) {
+				stretch = low; seen.stretch = true; continue;
+			}
+			// This token must be the size (with an optional /line-height glued
+			// on); everything after it is the family list.
+			let sizeTok = tok, rest = str.slice(re.lastIndex);
+			const slash = sizeTok.indexOf("/");
+			let lh = null;
+			if (slash !== -1) {
+				lh = sizeTok.slice(slash + 1);
+				sizeTok = sizeTok.slice(0, slash);
+			} else if (/^\s*\//.test(rest)) {
+				rest = rest.replace(/^\s*\//, "");
+				lh = "";
+			}
+			if (lh !== null && lh === "") {
+				const lm = /^\s*(\S+)/.exec(rest);
+				if (!lm) return null;
+				lh = lm[1];
+				rest = rest.slice(rest.indexOf(lm[1]) + lm[1].length);
+			}
+			if (lh !== null && lh !== "normal" && parseFontLength(lh) === null
+				&& !/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(lh)) {
+				return null;
+			}
+			if (FONT_SIZE_KEYWORDS[sizeTok.toLowerCase()] !== undefined) {
+				sizePx = FONT_SIZE_KEYWORDS[sizeTok.toLowerCase()];
+			} else {
+				sizePx = parseFontLength(sizeTok);
+			}
+			if (sizePx === null) return null;
+			familyStart = str.length - rest.length;
+			break;
+		}
+		const families = parseFontFamilies(str.slice(familyStart));
+		if (!families) return null;
+		const parts = [];
+		if (style !== "normal") parts.push(style);
+		if (variant !== "normal") parts.push(variant);
+		if (weight !== "normal" && weight !== "400") parts.push(weight);
+		if (stretch !== "normal") parts.push(stretch);
+		parts.push(serializeFontSize(sizePx) + "px");
+		return {
+			style, variant, weight, stretch, sizePx, families,
+			serialized: parts.join(" ") + " " + families.map(serializeFontFamily).join(", "),
+		};
+	}
+
+	// ------------------------------------------------- layer filter checking
+	// validateLayerFilter is the parameter CONTRACT of beginLayer's filter,
+	// checked up front so a throwing beginLayer opens nothing. Each attribute
+	// converts the way the canvas-filters proposal says: a "number" is a
+	// restricted double (NaN and infinity are TypeErrors, so null is 0 and
+	// 'test' throws), a "number or list" accepts one level of iterable, and
+	// an enum accepts exactly its named strings.
+
+	function filterNum(v, what) {
+		const n = +v;
+		if (!Number.isFinite(n)) throw new TypeError(`beginLayer: ${what} must be a number`);
+		return n;
+	}
+	function filterNumList(v, what, maxLen) {
+		const out = (v !== null && typeof v === "object" && Symbol.iterator in v)
+			? [...v].map((e) => filterNum(e, what))
+			: [filterNum(v, what)];
+		if (out.length > maxLen) {
+			throw new TypeError(`beginLayer: ${what} takes at most ${maxLen} numbers`);
+		}
+		return out;
+	}
+	function filterSequence(v, what) {
+		if (v === null || typeof v !== "object" || !(Symbol.iterator in v)) {
+			throw new TypeError(`beginLayer: ${what} must be a list`);
+		}
+		return [...v];
+	}
+	// colorMatrixValues resolves a colorMatrix primitive to its 20 numbers:
+	// the saturate/hueRotate/luminanceToAlpha shorthands are the fixed
+	// matrices SVG defines for feColorMatrix.
+	function colorMatrixValues(prim) {
+		const type = prim.type === undefined ? "matrix" : String(prim.type);
+		if (type === "matrix") return [...prim.values].map((v) => +v);
+		const v = "values" in prim ? +prim.values : 0;
+		if (type === "saturate") {
+			return [
+				0.213 + 0.787 * v, 0.715 - 0.715 * v, 0.072 - 0.072 * v, 0, 0,
+				0.213 - 0.213 * v, 0.715 + 0.285 * v, 0.072 - 0.072 * v, 0, 0,
+				0.213 - 0.213 * v, 0.715 - 0.715 * v, 0.072 + 0.928 * v, 0, 0,
+				0, 0, 0, 1, 0,
+			];
+		}
+		if (type === "hueRotate") {
+			const c = Math.cos(v * Math.PI / 180), n = Math.sin(v * Math.PI / 180);
+			return [
+				0.213 + 0.787 * c - 0.213 * n, 0.715 - 0.715 * c - 0.715 * n, 0.072 - 0.072 * c + 0.928 * n, 0, 0,
+				0.213 - 0.213 * c + 0.143 * n, 0.715 + 0.285 * c + 0.140 * n, 0.072 - 0.072 * c - 0.283 * n, 0, 0,
+				0.213 - 0.213 * c - 0.787 * n, 0.715 - 0.715 * c + 0.715 * n, 0.072 + 0.928 * c + 0.072 * n, 0, 0,
+				0, 0, 0, 1, 0,
+			];
+		}
+		if (type === "luminanceToAlpha") {
+			return [
+				0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+				0.2125, 0.7154, 0.0721, 0, 0,
+			];
+		}
+		return null;
+	}
+
+	function validateLayerFilter(filter) {
+		if (filter === null || filter === undefined || typeof filter !== "object") return;
+		const list = Symbol.iterator in filter ? [...filter] : [filter];
+		for (const prim of list) {
+			if (prim === null || typeof prim !== "object") {
+				throw new TypeError("beginLayer: a filter primitive must be a dictionary");
+			}
+			switch (String(prim.name)) {
+				case "gaussianBlur":
+					if (!("stdDeviation" in prim)) {
+						throw new TypeError("beginLayer: gaussianBlur needs a stdDeviation");
+					}
+					filterNumList(prim.stdDeviation, "stdDeviation", 2);
+					break;
+				case "colorMatrix": {
+					const type = prim.type === undefined ? "matrix" : String(prim.type);
+					if (type === "matrix") {
+						const vals = filterSequence(prim.values, "values").map((e) => filterNum(e, "values"));
+						if (vals.length !== 20) {
+							throw new TypeError("beginLayer: colorMatrix takes 20 values");
+						}
+					} else if ((type === "saturate" || type === "hueRotate") && "values" in prim) {
+						filterNum(prim.values, "values");
+					}
+					break;
+				}
+				case "convolveMatrix": {
+					const rows = filterSequence(prim.kernelMatrix, "kernelMatrix")
+						.map((row) => filterSequence(row, "kernelMatrix").map((e) => filterNum(e, "kernelMatrix")));
+					if (rows.length === 0 || !rows.every((r) => r.length === rows[0].length)
+						|| (rows.length > 1 && rows[0].length === 0)) {
+						throw new TypeError("beginLayer: kernelMatrix must be a rectangular matrix");
+					}
+					break;
+				}
+				case "dropShadow":
+					if ("dx" in prim) filterNum(prim.dx, "dx");
+					if ("dy" in prim) filterNum(prim.dy, "dy");
+					if ("floodOpacity" in prim) filterNum(prim.floodOpacity, "floodOpacity");
+					if ("stdDeviation" in prim) filterNumList(prim.stdDeviation, "stdDeviation", 2);
+					if ("floodColor" in prim && parseColor(String(prim.floodColor)) === null) {
+						throw new TypeError("beginLayer: floodColor must be a colour");
+					}
+					break;
+				case "turbulence": {
+					if ("baseFrequency" in prim) {
+						const bf = filterNumList(prim.baseFrequency, "baseFrequency", 2);
+						if (bf.some((n) => n < 0)) {
+							throw new TypeError("beginLayer: baseFrequency must not be negative");
+						}
+					}
+					if ("numOctaves" in prim && filterNum(prim.numOctaves, "numOctaves") < 0) {
+						throw new TypeError("beginLayer: numOctaves must not be negative");
+					}
+					if ("seed" in prim) filterNum(prim.seed, "seed");
+					if ("stitchTiles" in prim && !["stitch", "noStitch"].includes(prim.stitchTiles)) {
+						throw new TypeError("beginLayer: stitchTiles must be stitch or noStitch");
+					}
+					if ("type" in prim && !["fractalNoise", "turbulence"].includes(prim.type)) {
+						throw new TypeError("beginLayer: type must be fractalNoise or turbulence");
+					}
+					break;
+				}
+			}
+		}
+	}
 
 	class OffscreenCanvasRenderingContext2D {
 		constructor(internal, canvas) {
@@ -1080,27 +1479,99 @@
 				_path: { value: new Path2D(), writable: true },
 				_dcur: { value: null, writable: true },
 				_dstart: { value: null, writable: true },
+				_layers: { value: 0, writable: true },
 			});
 		}
 
 		get canvas() { return this._canvas; }
 
 		// ----------------------------------------------------------- state
-		save() {
-			this._stack.push(JSON.parse(JSON.stringify({ ...this._state, clip: null })));
+		// _snapshot clones the state onto the stack; kind records whether
+		// save() or beginLayer() pushed it, because restore() may not cross a
+		// layer boundary and endLayer() may not cross a save().
+		_snapshot(kind) {
+			const entry = JSON.parse(JSON.stringify({ ...this._state, clip: null }));
 			// The clip is a device-space mask and is not JSON; it is carried by
 			// reference, which is safe because a clip is never mutated in place.
-			this._stack[this._stack.length - 1].clip = this._state.clip;
-			this._stack[this._stack.length - 1].fillGradient = this._state.fillGradient;
-			this._stack[this._stack.length - 1].strokeGradient = this._state.strokeGradient;
-			this._stack[this._stack.length - 1].fillPattern = this._state.fillPattern;
-			this._stack[this._stack.length - 1].strokePattern = this._state.strokePattern;
+			entry.clip = this._state.clip;
+			entry.fillGradient = this._state.fillGradient;
+			entry.strokeGradient = this._state.strokeGradient;
+			entry.fillPattern = this._state.fillPattern;
+			entry.strokePattern = this._state.strokePattern;
+			entry._kind = kind;
+			this._stack.push(entry);
+		}
+		save() {
+			this._snapshot("save");
 		}
 		restore() {
+			if (!this._stack.length) return;
+			if (this._stack[this._stack.length - 1]._kind === "layer") {
+				throw new DOMException("restore: the top of the stack is a layer", "InvalidStateError");
+			}
 			const s = this._stack.pop();
-			if (!s) return;
 			const hadClip = this._state.clip;
 			this._state = s;
+			if (hadClip !== s.clip) this._applyClip();
+		}
+		// beginLayer opens a group that renders onto its own bitmap; endLayer
+		// composites that bitmap as ONE image with the state saved here — the
+		// alpha, the operator and the shadow apply to the group, not to each
+		// draw inside it, which is what the layer-rendering attributes reset
+		// to their defaults inside the layer.
+		beginLayer(options = undefined) {
+			// A dictionary accepts undefined and null (both mean "empty") and
+			// any object; a primitive is a TypeError.
+			if (options !== undefined && options !== null && typeof options !== "object") {
+				throw new TypeError("beginLayer: the options must be a dictionary");
+			}
+			// The filter is validated NOW: a beginLayer that throws must
+			// leave no layer open.
+			if (options !== undefined && options !== null) validateLayerFilter(options.filter);
+			this._snapshot("layer");
+			const entry = this._stack[this._stack.length - 1];
+			entry._layerFilter = options !== undefined && options !== null ? options.filter : undefined;
+			canvasLayerBegin(this._canvas._handle);
+			this._layers++;
+			const st = this._state;
+			st.globalAlpha = 1;
+			st.composite = "source-over";
+			st.shadowColor = [0, 0, 0, 0];
+			st.shadowBlur = 0;
+			st.shadowOffsetX = 0;
+			st.shadowOffsetY = 0;
+			st.filter = "none";
+		}
+		endLayer() {
+			if (!this._stack.length || this._stack[this._stack.length - 1]._kind !== "layer") {
+				throw new DOMException("endLayer: no layer is open", "InvalidStateError");
+			}
+			const s = this._stack.pop();
+			const hadClip = this._state.clip;
+			this._state = s;
+			this._layers--;
+			// The group composites with the RESTORED state: its alpha, its
+			// operator and its shadow act on the layer as a whole.
+			const spec = { alpha: s.globalAlpha, composite: s.composite };
+			// A colorMatrix layer filter is rendered by the host; the other
+			// primitives are validated but not yet rendered.
+			if (s._layerFilter !== null && typeof s._layerFilter === "object") {
+				const prims = Symbol.iterator in s._layerFilter ? [...s._layerFilter] : [s._layerFilter];
+				if (prims.length === 1 && prims[0] && prims[0].name === "colorMatrix") {
+					const m = colorMatrixValues(prims[0]);
+					if (m) spec.colorMatrix = new Float64Array(m);
+				}
+			}
+			if (s.shadowColor[3] > 0 && (s.shadowOffsetX !== 0 || s.shadowOffsetY !== 0 || s.shadowBlur > 0)) {
+				spec.shadow = {
+					dx: s.shadowOffsetX, dy: s.shadowOffsetY, blur: s.shadowBlur,
+					color: new Float64Array([
+						s.shadowColor[0] / 255, s.shadowColor[1] / 255,
+						s.shadowColor[2] / 255, s.shadowColor[3],
+					]),
+				};
+			}
+			canvasLayerEnd(this._canvas._handle, spec);
 			if (hadClip !== s.clip) this._applyClip();
 		}
 		reset() {
@@ -1109,6 +1580,7 @@
 			this._path = new Path2D();
 			this._dcur = null;
 			this._dstart = null;
+			this._layers = 0;
 			canvasResize(this._canvas._handle, this._canvas.width, this._canvas.height);
 		}
 		isContextLost() { return false; }
@@ -1213,10 +1685,29 @@
 		set imageSmoothingQuality(v) {
 			if (["low", "medium", "high"].includes(String(v))) this._state.imageSmoothingQuality = String(v);
 		}
-		get filter() { return this._state.filter; }
-		set filter(v) { this._state.filter = String(v); }
+		get filter() { return this._state.filterObject ?? this._state.filter; }
+		set filter(v) {
+			if (v instanceof CanvasFilter) {
+				this._state.filterObject = v;
+				this._state.filter = "none";
+				return;
+			}
+			// A string is kept VERBATIM when it is a valid CSS filter value
+			// list, and ignored entirely when it is not — including the CSS-wide
+			// keywords, which are not values here.
+			const str = String(v);
+			if (validCSSFilter(str)) {
+				this._state.filter = str;
+				this._state.filterObject = null;
+			}
+		}
 		get font() { return this._state.font; }
-		set font(v) { this._state.font = String(v); }
+		set font(v) {
+			const f = parseFontShorthand(v);
+			if (f === null) return;
+			this._state.font = f.serialized;
+			this._state.fontParsed = f;
+		}
 		get textAlign() { return this._state.textAlign; }
 		set textAlign(v) {
 			if (["start", "end", "left", "right", "center"].includes(String(v))) this._state.textAlign = String(v);
@@ -1230,17 +1721,38 @@
 		get direction() { return this._state.direction; }
 		set direction(v) { if (["ltr", "rtl", "inherit"].includes(String(v))) this._state.direction = String(v); }
 		get letterSpacing() { return this._state.letterSpacing; }
-		set letterSpacing(v) { this._state.letterSpacing = String(v); }
+		set letterSpacing(v) {
+			const t = parseSpacing(v);
+			if (t !== null) this._state.letterSpacing = t;
+		}
 		get wordSpacing() { return this._state.wordSpacing; }
-		set wordSpacing(v) { this._state.wordSpacing = String(v); }
+		set wordSpacing(v) {
+			const t = parseSpacing(v);
+			if (t !== null) this._state.wordSpacing = t;
+		}
 		get fontKerning() { return this._state.fontKerning; }
 		set fontKerning(v) { if (["auto", "normal", "none"].includes(String(v))) this._state.fontKerning = String(v); }
 		get fontStretch() { return this._state.fontStretch; }
-		set fontStretch(v) { this._state.fontStretch = String(v); }
+		set fontStretch(v) {
+			// The enums below are CASE-SENSITIVE: an attribute set to a value
+			// that is not one of the names keeps its old value.
+			if (["normal", ...FONT_STRETCH_KEYWORDS].includes(v)) this._state.fontStretch = v;
+		}
 		get fontVariantCaps() { return this._state.fontVariantCaps; }
-		set fontVariantCaps(v) { this._state.fontVariantCaps = String(v); }
+		set fontVariantCaps(v) {
+			if (["normal", "small-caps", "all-small-caps", "petite-caps",
+				"all-petite-caps", "unicase", "titling-caps"].includes(v)) {
+				this._state.fontVariantCaps = v;
+			}
+		}
 		get textRendering() { return this._state.textRendering; }
-		set textRendering(v) { this._state.textRendering = String(v); }
+		set textRendering(v) {
+			if (["auto", "optimizeSpeed", "optimizeLegibility", "geometricPrecision"].includes(v)) {
+				this._state.textRendering = v;
+			}
+		}
+		get lang() { return this._state.lang; }
+		set lang(v) { this._state.lang = String(v); }
 
 		// --------------------------------------------------------- drawing
 		createLinearGradient(x0, y0, x1, y1) {
@@ -1461,6 +1973,11 @@
 
 		drawImage(source, ...rest) {
 			if (arguments.length < 3) throw new TypeError("drawImage requires at least 3 arguments");
+			// A zero-sized CANVAS has no bitmap to draw — that is an error; a
+			// zero-sized bitmap of any other kind simply draws nothing.
+			if (source instanceof OffscreenCanvas && (source.width === 0 || source.height === 0)) {
+				throw new DOMException("drawImage: the source canvas has no pixels", "InvalidStateError");
+			}
 			const info = sourceSurface(source);
 			if (!info) throw new TypeError("drawImage: the source is not an image");
 			if (info.width === 0 || info.height === 0) return;
@@ -1477,10 +1994,16 @@
 			}
 			if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite)) return;
 			if (sw === 0 || sh === 0 || dw === 0 || dh === 0) return;
+			// Negative dimensions name the same rectangle from its other side
+			// and do NOT mirror the image.
+			if (sw < 0) { sx += sw; sw = -sw; }
+			if (sh < 0) { sy += sh; sh = -sh; }
+			if (dw < 0) { dx += dw; dw = -dw; }
+			if (dh < 0) { dy += dh; dh = -dh; }
 			// The source rectangle must lie inside the image; one that does not is
 			// an IndexSizeError rather than a clamp, because the caller named a
 			// region that is not there.
-			if (rest.length === 8 && (sx < 0 || sy < 0 || sw < 0 || sh < 0
+			if (rest.length === 8 && (sx < 0 || sy < 0
 				|| sx + sw > info.width || sy + sh > info.height)) {
 				if (info.temporary) canvasFree(info.handle);
 				throw new DOMException("drawImage: the source rectangle is outside the image", "IndexSizeError");
@@ -1549,6 +2072,9 @@
 		}
 		getImageData(x, y, w, h, settings = undefined) {
 			if (arguments.length < 4) throw new TypeError("getImageData requires 4 arguments");
+			if (this._layers > 0) {
+				throw new DOMException("getImageData: the canvas has open layers", "InvalidStateError");
+			}
 			const sw = enforcedLong(w, "getImageData: the width");
 			const sh = enforcedLong(h, "getImageData: the height");
 			const sx = enforcedLong(x, "getImageData: x");
@@ -1571,6 +2097,9 @@
 		}
 		putImageData(data, dx, dy, sx = undefined, sy = undefined, sw = undefined, sh = undefined) {
 			if (!(data instanceof ImageData)) throw new TypeError("putImageData: an ImageData is required");
+			if (this._layers > 0) {
+				throw new DOMException("putImageData: the canvas has open layers", "InvalidStateError");
+			}
 			dx = enforcedLong(dx, "putImageData: dx");
 			dy = enforcedLong(dy, "putImageData: dy");
 			let dirtyX = sx === undefined ? 0 : enforcedLong(sx, "putImageData: dirtyX");
@@ -1617,6 +2146,17 @@
 				alpha: this._state.globalAlpha,
 				composite: this._state.composite,
 			};
+			// A colorMatrix filter set through a CanvasFilter object is applied
+			// by the host to the source colour of each drawn pixel.
+			const fo = this._state.filterObject;
+			if (fo !== null && fo !== undefined && typeof fo === "object" && fo._prims !== undefined) {
+				const prims = (fo._prims !== null && typeof fo._prims === "object" && Symbol.iterator in fo._prims)
+					? [...fo._prims] : [fo._prims];
+				if (prims.length === 1 && prims[0] && prims[0].name === "colorMatrix") {
+					const m = colorMatrixValues(prims[0]);
+					if (m) spec.colorMatrix = new Float64Array(m);
+				}
+			}
 			// A shadow needs a colour with some alpha and something to displace it:
 			// with no offset and no blur it would land exactly under the shape and
 			// never be seen.
@@ -1845,11 +2385,68 @@
 		}
 		getContext(type, options = undefined) {
 			if (arguments.length < 1) throw new TypeError("getContext requires 1 argument");
-			if (String(type) !== "2d") return null;
+			const id = String(type);
+			// OffscreenRenderingContextId is an ENUM: a name not in it is a
+			// TypeError, where a supported name we cannot serve returns null.
+			if (!["2d", "bitmaprenderer", "webgl", "webgl2"].includes(id)) {
+				throw new TypeError(`getContext: ${id} is not a context id`);
+			}
+			if (id !== "2d") return null;
 			if (!this._context) {
+				// The settings dictionary is converted ONCE, at creation, its
+				// members read in alphabetical order as Web IDL does.
+				if (options !== null && typeof options === "object") {
+					// Each member is read exactly ONCE, in alphabetical order.
+					void Boolean(options.alpha ?? true);
+					const csRaw = options.colorSpace;
+					const cs = csRaw === undefined ? "srgb" : String(csRaw);
+					if (cs !== "srgb" && cs !== "display-p3") {
+						throw new TypeError(`getContext: ${cs} is not a color space`);
+					}
+					void Boolean(options.desynchronized ?? false);
+					void Boolean(options.willReadFrequently ?? false);
+				}
 				this._context = new OffscreenCanvasRenderingContext2D(CONTEXT_INTERNAL, this);
 			}
 			return this._context;
+		}
+		// transferToImageBitmap MOVES the bitmap out: the canvas is left with a
+		// fresh transparent one of the same size.
+		transferToImageBitmap() {
+			if (!this._context) {
+				throw new DOMException("transferToImageBitmap: the canvas has no context", "InvalidStateError");
+			}
+			if (this._context._layers > 0) {
+				throw new DOMException("transferToImageBitmap: the canvas has open layers", "InvalidStateError");
+			}
+			const w = this._width, h = this._height;
+			const handle = w > 0 && h > 0
+				? canvasFromBytes(w, h, new Uint8Array(canvasGetImageData(this._handle, 0, 0, w, h)))
+				: canvasNew(w, h);
+			canvasResize(this._handle, w, h);
+			return new ImageBitmap(BITMAP_INTERNAL, handle, w, h);
+		}
+		convertToBlob(options = undefined) {
+			try {
+				if (this._context && this._context._layers > 0) {
+					throw new DOMException("convertToBlob: the canvas has open layers", "InvalidStateError");
+				}
+				if (this._width === 0 || this._height === 0) {
+					throw new DOMException("convertToBlob: the canvas has no pixels", "IndexSizeError");
+				}
+				let type = "image/png", quality = -1;
+				if (options !== null && typeof options === "object") {
+					if (options.type !== undefined) type = String(options.type);
+					if (options.quality !== undefined) {
+						const q = +options.quality;
+						if (Number.isFinite(q) && q >= 0 && q <= 1) quality = q;
+					}
+				}
+				const r = canvasEncode(this._handle, type, quality);
+				return Promise.resolve(new Blob([r.bytes], { type: r.type }));
+			} catch (e) {
+				return Promise.reject(e);
+			}
 		}
 	}
 	Object.defineProperty(OffscreenCanvas.prototype, Symbol.toStringTag, {
@@ -1902,6 +2499,7 @@
 	globalThis.DOMMatrixReadOnly ??= DOMMatrixReadOnly;
 	globalThis.DOMMatrix ??= DOMMatrix;
 
+	globalThis.CanvasFilter = CanvasFilter;
 	globalThis.ImageBitmap = ImageBitmap;
 	globalThis.CanvasPattern = CanvasPattern;
 	globalThis.OffscreenCanvas = OffscreenCanvas;

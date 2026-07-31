@@ -82,7 +82,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureURLPattern: {"URLPattern"},
 	FeatureCanvas: {
 		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
-		"Path2D", "ImageData", "CanvasPattern",
+		"Path2D", "ImageData", "CanvasPattern", "CanvasFilter",
 	},
 	// An ImageBitmap is what a canvas DRAWS, not part of the canvas: it is
 	// created from a blob or an ImageData and can be handed between agents.
