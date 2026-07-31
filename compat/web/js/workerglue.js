@@ -14,6 +14,8 @@
 //            postMessage/onmessage, location (parsed by the parent at spawn),
 //            navigator, Event/EventTarget/CustomEvent/MessageEvent/ErrorEvent,
 //            atob/btoa, TextEncoder/TextDecoder, structuredClone, timers,
+//            MessageChannel/MessagePort and BroadcastChannel (both same-realm:
+//            they reach the other ports in THIS worker, not the parent),
 //            console (forwarded to the parent), queueMicrotask, performance.now
 //
 //   NOT here: fetch, WebSocket, EventSource, crypto.subtle, URL, URLPattern,
@@ -227,6 +229,119 @@
 		};
 		return walk(value);
 	};
+
+	// ------------------------------------------------ MessageChannel / ports
+	// A channel between two ports in THIS realm. It needs no host and no other
+	// thread — both ends are here — which is why it can exist in an agent at all,
+	// where nothing implemented in Go is reachable. A worker that wants to talk to
+	// its parent uses postMessage; a worker that wants to fan messages around
+	// inside itself uses this.
+	class MessagePort extends EventTarget {
+		constructor() {
+			super();
+			this._peer = null;
+			this._started = false;
+			this._closed = false;
+			this._queue = [];
+			this._onmessage = null;
+		}
+		get onmessage() { return this._onmessage; }
+		// Assigning onmessage STARTS the port, which is the one side effect the
+		// standard gives it and the reason most code never calls start().
+		set onmessage(fn) {
+			this._onmessage = typeof fn === "function" ? fn : null;
+			this.start();
+		}
+		postMessage(value, options) {
+			if (arguments.length < 1) throw new TypeError("postMessage: a message is required");
+			const transfer = Array.isArray(options) ? options : options && options.transfer;
+			const ports = [];
+			for (const t of transfer || []) {
+				if (t instanceof MessagePort) {
+					if (t === this) throw new Error("A port cannot transfer itself");
+					ports.push(t);
+				}
+			}
+			const cloned = structuredClone(value);
+			if (this._closed) return;
+			const peer = this._peer;
+			if (!peer || peer._closed) return;
+			queueMicrotask(() => peer._deliver(cloned, ports));
+		}
+		_deliver(data, ports) {
+			if (this._closed) return;
+			if (!this._started) { this._queue.push({ data, ports }); return; }
+			const ev = new MessageEvent("message", { data, ports: ports || [] });
+			if (this._onmessage) this._onmessage.call(this, ev);
+			this.dispatchEvent(ev);
+		}
+		start() {
+			if (this._started || this._closed) return;
+			this._started = true;
+			const queued = this._queue;
+			this._queue = [];
+			for (const d of queued) this._deliver(d.data, d.ports);
+		}
+		close() {
+			this._closed = true;
+			this._queue.length = 0;
+			this._peer = null;
+		}
+	}
+	class MessageChannel {
+		constructor() {
+			this.port1 = new MessagePort();
+			this.port2 = new MessagePort();
+			this.port1._peer = this.port2;
+			this.port2._peer = this.port1;
+		}
+	}
+
+	// BroadcastChannel delivers to every OTHER channel of the same name — which,
+	// here, means every other one in this worker. It cannot reach the parent or a
+	// sibling agent: an agent has no host access, so there is no transport to
+	// route through, and nothing here pretends there is.
+	const broadcastChannels = new Map();
+	class BroadcastChannel extends EventTarget {
+		constructor(name) {
+			if (arguments.length < 1) throw new TypeError("BroadcastChannel: a name is required");
+			super();
+			this._name = String(name);
+			this._closed = false;
+			this._onmessage = null;
+			let list = broadcastChannels.get(this._name);
+			if (!list) broadcastChannels.set(this._name, list = []);
+			list.push(this);
+		}
+		get name() { return this._name; }
+		get onmessage() { return this._onmessage; }
+		set onmessage(fn) { this._onmessage = typeof fn === "function" ? fn : null; }
+		postMessage(message) {
+			if (this._closed) throw new Error("postMessage: the channel is closed");
+			const snapshot = structuredClone(message);
+			for (const target of (broadcastChannels.get(this._name) || []).filter((c) => c !== this && !c._closed)) {
+				queueMicrotask(() => {
+					if (target._closed) return;
+					const ev = new MessageEvent("message", { data: snapshot });
+					if (target._onmessage) target._onmessage.call(target, ev);
+					target.dispatchEvent(ev);
+				});
+			}
+		}
+		close() {
+			if (this._closed) return;
+			this._closed = true;
+			const list = broadcastChannels.get(this._name);
+			if (!list) return;
+			const i = list.indexOf(this);
+			if (i >= 0) list.splice(i, 1);
+			if (list.length === 0) broadcastChannels.delete(this._name);
+		}
+	}
+	for (const cls of [MessagePort, MessageChannel, BroadcastChannel]) {
+		Object.defineProperty(cls.prototype, Symbol.toStringTag, { value: cls.name, configurable: true });
+		globalThis[cls.name] = cls;
+	}
 
 	// ------------------------------------------------------------ timers
 	// A worker's timers run on the agent's own thread. The agent sleeps for the

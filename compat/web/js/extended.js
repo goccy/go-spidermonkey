@@ -642,16 +642,30 @@
 	// another thread. compat/nodejs still installs its own worker_threads
 	// version over these, which is what carries messages across an agent.
 
-	globalThis.MessageEvent ??= class MessageEvent extends Event {
+	// MessageEvent's members are IDL attributes, and `ports` is a FROZEN array:
+	// the ports that arrived are what arrived, and a receiver cannot add to them.
+	class MessageEvent extends Event {
 		constructor(type, init = {}) {
 			super(type, init);
-			this.data = init.data ?? null;
-			this.origin = init.origin ?? "";
-			this.lastEventId = init.lastEventId ?? "";
-			this.source = init.source ?? null;
-			this.ports = init.ports ? [...init.ports] : [];
+			const opts = init === null || init === undefined ? {} : init;
+			Object.defineProperties(this, {
+				_data: { value: opts.data ?? null },
+				_origin: { value: opts.origin === undefined ? "" : String(opts.origin) },
+				_lastEventId: { value: opts.lastEventId === undefined ? "" : String(opts.lastEventId) },
+				_source: { value: opts.source ?? null },
+				_ports: { value: Object.freeze(opts.ports ? [...opts.ports] : []) },
+			});
 		}
-	};
+		get data() { return this._data; }
+		get origin() { return this._origin; }
+		get lastEventId() { return this._lastEventId; }
+		get source() { return this._source; }
+		get ports() { return this._ports; }
+	}
+	Object.defineProperty(MessageEvent.prototype, Symbol.toStringTag, {
+		value: "MessageEvent", configurable: true,
+	});
+	globalThis.MessageEvent ??= MessageEvent;
 
 	globalThis.MessagePort ??= class MessagePort extends EventTarget {
 		constructor() {
@@ -666,24 +680,34 @@
 			this._onmessageerror = null;
 		}
 		postMessage(value, options) {
-			if (this._closed) return;
+			if (arguments.length < 1) throw new TypeError("postMessage: a message is required");
 			const transfer = Array.isArray(options) ? options : options && options.transfer;
-			let cloned;
-			try {
-				cloned = structuredClone(value, transfer ? { transfer } : undefined);
-			} catch (e) {
-				// A value that cannot be cloned is a DataCloneError on the CALLER,
-				// not a silent drop.
-				throw e;
+			// The transfer list is split: buffers are DETACHED by the clone, ports
+			// are MOVED to the other side and arrive as event.ports. Both are
+			// validated before anything is sent, and a port may not transfer itself.
+			const list = transfer ? [...transfer] : [];
+			const ports = [];
+			const buffers = [];
+			for (const t of list) {
+				if (t instanceof MessagePort) {
+					if (t === this) throw new DOMException("A port cannot transfer itself", "DataCloneError");
+					ports.push(t);
+					continue;
+				}
+				buffers.push(t);
 			}
+			// A value that cannot be cloned is a DataCloneError on the CALLER, not a
+			// silent drop — so the clone happens before the closed check.
+			const cloned = structuredClone(value, buffers.length ? { transfer: buffers } : undefined);
+			if (this._closed) return;
 			const peer = this._peer;
 			if (!peer || peer._closed) return;
-			queueMicrotask(() => peer._deliver(cloned));
+			queueMicrotask(() => peer._deliver(cloned, ports));
 		}
-		_deliver(data) {
+		_deliver(data, ports) {
 			if (this._closed) return;
-			if (!this._started) { this._queue.push(data); return; }
-			const ev = new MessageEvent("message", { data });
+			if (!this._started) { this._queue.push({ data, ports }); return; }
+			const ev = new MessageEvent("message", { data, ports: ports || [] });
 			if (this._onmessage) this._onmessage.call(this, ev);
 			this.dispatchEvent(ev);
 		}
@@ -692,7 +716,7 @@
 			this._started = true;
 			const queued = this._queue;
 			this._queue = [];
-			for (const d of queued) this._deliver(d);
+			for (const d of queued) this._deliver(d.data, d.ports);
 		}
 		close() {
 			if (this._closed) return;
