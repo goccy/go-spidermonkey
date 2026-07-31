@@ -1,0 +1,772 @@
+package web
+
+// canvas.go: the raster surface behind OffscreenCanvas's 2d context.
+//
+// The DRAWING is here, in Go, because it is an algorithm: flattening curves,
+// filling a path by a winding rule, stroking one into an outline, compositing
+// with an alpha. golang.org/x/image/vector rasterizes an anti-aliased coverage
+// mask for a polygon, which is the one piece that is genuinely hard to get
+// right, and everything else is built on it.
+//
+// What stays in JavaScript is the API surface and the drawing STATE — the
+// save/restore stack, the current transform, the styles — because that is what
+// the specification describes and because a state machine that lives on one
+// side of the bridge is one that cannot disagree with itself. Each call across
+// carries the state it needs, so this file holds pixels and nothing else.
+//
+// Colours are non-premultiplied RGBA bytes, in the order getImageData reports
+// them, and the surface stores them that way too: a premultiplied surface would
+// have to round twice on every read, and the tests compare exact bytes.
+
+import (
+	"fmt"
+	"image"
+	"math"
+
+	"golang.org/x/image/vector"
+
+	spidermonkey "github.com/goccy/go-spidermonkey"
+)
+
+// maxCanvasPixels bounds one surface. A canvas is allocated by the guest and
+// held until it is dropped, so a size it names must not be able to exhaust the
+// host on its own.
+const maxCanvasPixels = 64 << 20 // 64 Mpx = 256 MiB at 4 bytes each
+
+// surface is one canvas bitmap: width × height non-premultiplied RGBA.
+type surface struct {
+	w, h int
+	pix  []byte
+}
+
+func newSurface(w, h int) *surface {
+	return &surface{w: w, h: h, pix: make([]byte, w*h*4)}
+}
+
+// paint is how a shape is coloured. A solid colour is the common case; a
+// gradient answers per pixel.
+type paint struct {
+	solid    [4]float64 // r,g,b,a in 0..1, non-premultiplied
+	gradient *gradient
+}
+
+// gradient is a linear or radial colour ramp in USER space, with the transform
+// that maps user space to device space already applied by the caller.
+type gradient struct {
+	radial                bool
+	x0, y0, r0            float64
+	x1, y1, r1            float64
+	stops                 []gradientStop
+	inverse               [6]float64 // device -> user
+	hasInverse            bool
+	repeatNone            bool
+	degenerateTransparent bool
+}
+
+type gradientStop struct {
+	offset float64
+	color  [4]float64
+}
+
+// at returns the colour of a gradient at a device-space point.
+func (g *gradient) at(dx, dy float64) [4]float64 {
+	if g.degenerateTransparent || len(g.stops) == 0 {
+		return [4]float64{0, 0, 0, 0}
+	}
+	x, y := dx, dy
+	if g.hasInverse {
+		m := g.inverse
+		x = m[0]*dx + m[2]*dy + m[4]
+		y = m[1]*dx + m[3]*dy + m[5]
+	}
+	var t float64
+	if g.radial {
+		// The offset along a radial gradient is the solution of the pencil of
+		// circles; for the common concentric case it reduces to a ratio of
+		// distances, which is what this computes.
+		dxc, dyc := x-g.x1, y-g.y1
+		d := math.Hypot(dxc, dyc)
+		if g.r1 == g.r0 {
+			t = 0
+		} else {
+			t = (d - g.r0) / (g.r1 - g.r0)
+		}
+	} else {
+		vx, vy := g.x1-g.x0, g.y1-g.y0
+		den := vx*vx + vy*vy
+		if den == 0 {
+			return g.stops[len(g.stops)-1].color
+		}
+		t = ((x-g.x0)*vx + (y-g.y0)*vy) / den
+	}
+	return g.sample(t)
+}
+
+func (g *gradient) sample(t float64) [4]float64 {
+	if math.IsNaN(t) {
+		return [4]float64{0, 0, 0, 0}
+	}
+	if t <= g.stops[0].offset {
+		return g.stops[0].color
+	}
+	last := g.stops[len(g.stops)-1]
+	if t >= last.offset {
+		return last.color
+	}
+	for i := 1; i < len(g.stops); i++ {
+		a, b := g.stops[i-1], g.stops[i]
+		if t > b.offset {
+			continue
+		}
+		span := b.offset - a.offset
+		if span <= 0 {
+			return b.color
+		}
+		f := (t - a.offset) / span
+		var out [4]float64
+		for c := 0; c < 4; c++ {
+			out[c] = a.color[c] + (b.color[c]-a.color[c])*f
+		}
+		return out
+	}
+	return last.color
+}
+
+// composite names the Porter-Duff / blending operator a draw uses.
+type composite int
+
+const (
+	compSourceOver composite = iota
+	compSourceIn
+	compSourceOut
+	compSourceAtop
+	compDestinationOver
+	compDestinationIn
+	compDestinationOut
+	compDestinationAtop
+	compLighter
+	compCopy
+	compXOR
+)
+
+var compositeByName = map[string]composite{
+	"source-over":      compSourceOver,
+	"source-in":        compSourceIn,
+	"source-out":       compSourceOut,
+	"source-atop":      compSourceAtop,
+	"destination-over": compDestinationOver,
+	"destination-in":   compDestinationIn,
+	"destination-out":  compDestinationOut,
+	"destination-atop": compDestinationAtop,
+	"lighter":          compLighter,
+	"copy":             compCopy,
+	"xor":              compXOR,
+}
+
+// blend applies one operator to a single pixel. src and dst are
+// non-premultiplied RGBA in 0..1; cov is the source's coverage at this pixel.
+func blend(op composite, src, dst [4]float64, cov float64) [4]float64 {
+	// Premultiplied is the only form the operators are defined in.
+	sa := src[3] * cov
+	var s [4]float64
+	for i := 0; i < 3; i++ {
+		s[i] = src[i] * sa
+	}
+	s[3] = sa
+	da := dst[3]
+	var d [4]float64
+	for i := 0; i < 3; i++ {
+		d[i] = dst[i] * da
+	}
+	d[3] = da
+
+	var fs, fd float64
+	switch op {
+	case compSourceOver:
+		fs, fd = 1, 1-sa
+	case compSourceIn:
+		fs, fd = da, 0
+	case compSourceOut:
+		fs, fd = 1-da, 0
+	case compSourceAtop:
+		fs, fd = da, 1-sa
+	case compDestinationOver:
+		fs, fd = 1-da, 1
+	case compDestinationIn:
+		fs, fd = 0, sa
+	case compDestinationOut:
+		fs, fd = 0, 1-sa
+	case compDestinationAtop:
+		fs, fd = 1-da, sa
+	case compLighter:
+		fs, fd = 1, 1
+	case compCopy:
+		fs, fd = 1, 0
+	case compXOR:
+		fs, fd = 1-da, 1-sa
+	}
+	var out [4]float64
+	for i := 0; i < 4; i++ {
+		out[i] = s[i]*fs + d[i]*fd
+		if out[i] < 0 {
+			out[i] = 0
+		}
+		if out[i] > 1 {
+			out[i] = 1
+		}
+	}
+	// Back to non-premultiplied.
+	if out[3] <= 0 {
+		return [4]float64{0, 0, 0, 0}
+	}
+	for i := 0; i < 3; i++ {
+		out[i] /= out[3]
+		if out[i] > 1 {
+			out[i] = 1
+		}
+	}
+	return out
+}
+
+// fillMask composites a coverage mask onto the surface with one paint. mask is
+// width×height alpha in 0..255 and is the ONLY thing that says where the shape
+// is: every operator, including the destination-only ones, is applied over the
+// whole surface, because that is what "the source is transparent here" means.
+func (s *surface) fillMask(mask []byte, p paint, alpha float64, op composite, clip []byte) {
+	wholeSurface := op != compSourceOver && op != compDestinationOut && op != compLighter
+	for y := 0; y < s.h; y++ {
+		for x := 0; x < s.w; x++ {
+			i := (y*s.w + x)
+			cov := float64(mask[i]) / 255
+			if clip != nil {
+				cov *= float64(clip[i]) / 255
+			}
+			if cov == 0 && !wholeSurface {
+				continue
+			}
+			src := p.solid
+			if p.gradient != nil {
+				src = p.gradient.at(float64(x)+0.5, float64(y)+0.5)
+			}
+			src[3] *= alpha
+			o := i * 4
+			dst := [4]float64{
+				float64(s.pix[o]) / 255, float64(s.pix[o+1]) / 255,
+				float64(s.pix[o+2]) / 255, float64(s.pix[o+3]) / 255,
+			}
+			out := blend(op, src, dst, cov)
+			s.pix[o] = clamp255(out[0])
+			s.pix[o+1] = clamp255(out[1])
+			s.pix[o+2] = clamp255(out[2])
+			s.pix[o+3] = clamp255(out[3])
+		}
+	}
+}
+
+func clamp255(v float64) byte {
+	n := int(math.Round(v * 255))
+	if n < 0 {
+		return 0
+	}
+	if n > 255 {
+		return 255
+	}
+	return byte(n)
+}
+
+// rasterize turns a set of already-transformed device-space subpaths into a
+// coverage mask. x/image/vector fills by the NONZERO rule; even-odd is done by
+// rasterizing each subpath separately and combining, which is what the rule
+// means.
+func rasterize(w, h int, subpaths [][]point, evenOdd bool) []byte {
+	if !evenOdd {
+		r := vector.NewRasterizer(w, h)
+		for _, sp := range subpaths {
+			if len(sp) < 2 {
+				continue
+			}
+			r.MoveTo(float32(sp[0].x), float32(sp[0].y))
+			for _, pt := range sp[1:] {
+				r.LineTo(float32(pt.x), float32(pt.y))
+			}
+			r.ClosePath()
+		}
+		dst := image.NewAlpha(image.Rect(0, 0, w, h))
+		r.Draw(dst, dst.Bounds(), image.Opaque, image.Point{})
+		return dst.Pix
+	}
+	// Even-odd: a pixel is inside when an ODD number of subpaths contain it, so
+	// each is rasterized alone and the coverages are combined as a parity.
+	acc := make([]byte, w*h)
+	for _, sp := range subpaths {
+		if len(sp) < 2 {
+			continue
+		}
+		r := vector.NewRasterizer(w, h)
+		r.MoveTo(float32(sp[0].x), float32(sp[0].y))
+		for _, pt := range sp[1:] {
+			r.LineTo(float32(pt.x), float32(pt.y))
+		}
+		r.ClosePath()
+		dst := image.NewAlpha(image.Rect(0, 0, w, h))
+		r.Draw(dst, dst.Bounds(), image.Opaque, image.Point{})
+		for i, v := range dst.Pix {
+			a, b := int(acc[i]), int(v)
+			// a XOR b on coverage: a + b - 2ab, which is the parity rule for the
+			// fractional coverages anti-aliasing produces.
+			acc[i] = byte(a + b - 2*a*b/255)
+		}
+	}
+	return acc
+}
+
+type point struct{ x, y float64 }
+
+// intersectMasks is how nested clips combine: a pixel survives both.
+func intersectMasks(a, b []byte) []byte {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	out := make([]byte, len(a))
+	for i := range a {
+		out[i] = byte(int(a[i]) * int(b[i]) / 255)
+	}
+	return out
+}
+
+// ---------------------------------------------------------------- host ops
+
+type canvasAPI struct {
+	js       *spidermonkey.JS
+	surfaces map[int64]*surface
+	clips    map[int64][]byte
+	next     int64
+}
+
+func newCanvasAPI(js *spidermonkey.JS) *canvasAPI {
+	return &canvasAPI{js: js, surfaces: map[int64]*surface{}, clips: map[int64][]byte{}}
+}
+
+func (a *canvasAPI) ops() map[string]spidermonkey.Func {
+	return map[string]spidermonkey.Func{
+		"canvas_new":            a.opNew,
+		"canvas_free":           a.opFree,
+		"canvas_resize":         a.opResize,
+		"canvas_fill":           a.opFill,
+		"canvas_clear":          a.opClear,
+		"canvas_clip":           a.opClip,
+		"canvas_get_image_data": a.opGetImageData,
+		"canvas_put_image_data": a.opPutImageData,
+	}
+}
+
+func (a *canvasAPI) surface(v spidermonkey.Value) (*surface, int64, error) {
+	id := int64(v.Float())
+	s := a.surfaces[id]
+	if s == nil {
+		return nil, 0, fmt.Errorf("canvas: unknown surface")
+	}
+	return s, id, nil
+}
+
+// opNew(width, height) -> handle.
+func (a *canvasAPI) opNew(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 2 {
+		return nil, fmt.Errorf("canvas_new: (width, height) required")
+	}
+	w, h := int(args[0].Float()), int(args[1].Float())
+	if w < 0 || h < 0 || w*h > maxCanvasPixels {
+		return nil, fmt.Errorf("canvas_new: %dx%d is not an allocatable size", w, h)
+	}
+	a.next++
+	a.surfaces[a.next] = newSurface(w, h)
+	return spidermonkey.ValueOf(float64(a.next)), nil
+}
+
+func (a *canvasAPI) opFree(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	id := int64(args[0].Float())
+	delete(a.surfaces, id)
+	delete(a.clips, id)
+	return spidermonkey.Undefined(), nil
+}
+
+// opResize(handle, width, height): a resize CLEARS the canvas, which is what
+// assigning to width or height does.
+func (a *canvasAPI) opResize(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, id, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	w, h := int(args[1].Float()), int(args[2].Float())
+	if w < 0 || h < 0 || w*h > maxCanvasPixels {
+		return nil, fmt.Errorf("canvas_resize: %dx%d is not an allocatable size", w, h)
+	}
+	_ = s
+	a.surfaces[id] = newSurface(w, h)
+	delete(a.clips, id)
+	return spidermonkey.Undefined(), nil
+}
+
+// opFill(handle, spec) draws one shape. spec carries the flattened device-space
+// subpaths and everything about how they are painted, so the guest's state
+// never has to be mirrored here.
+func (a *canvasAPI) opFill(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, id, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(args) < 2 || args[1].Object() == nil {
+		return nil, fmt.Errorf("canvas_fill: a spec is required")
+	}
+	spec := args[1].Object()
+	defer spec.Free()
+	subpaths, err := readSubpaths(spec)
+	if err != nil {
+		return nil, err
+	}
+	if len(subpaths) == 0 {
+		return spidermonkey.Undefined(), nil
+	}
+	p, err := readPaint(spec)
+	if err != nil {
+		return nil, err
+	}
+	alpha := objFloat(spec, "alpha", 1)
+	op := compSourceOver
+	if name := objString(spec, "composite", "source-over"); name != "" {
+		if c, ok := compositeByName[name]; ok {
+			op = c
+		}
+	}
+	mask := rasterize(s.w, s.h, subpaths, objBool(spec, "evenOdd"))
+	s.fillMask(mask, p, alpha, op, a.clips[id])
+	return spidermonkey.Undefined(), nil
+}
+
+// opClear(handle, spec) is clearRect: the shape's pixels become transparent
+// black, ignoring every style. It is not a fill with a transparent colour —
+// that would be a no-op under source-over.
+func (a *canvasAPI) opClear(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, id, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	spec := args[1].Object()
+	defer spec.Free()
+	subpaths, err := readSubpaths(spec)
+	if err != nil {
+		return nil, err
+	}
+	mask := rasterize(s.w, s.h, subpaths, false)
+	clip := a.clips[id]
+	for i := range mask {
+		cov := float64(mask[i]) / 255
+		if clip != nil {
+			cov *= float64(clip[i]) / 255
+		}
+		if cov == 0 {
+			continue
+		}
+		o := i * 4
+		for c := 0; c < 4; c++ {
+			s.pix[o+c] = byte(float64(s.pix[o+c]) * (1 - cov))
+		}
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// opClip(handle, spec|null): null resets the clip, which is what restoring a
+// state that had none does.
+func (a *canvasAPI) opClip(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, id, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(args) < 2 || args[1].Object() == nil {
+		delete(a.clips, id)
+		return spidermonkey.Undefined(), nil
+	}
+	spec := args[1].Object()
+	defer spec.Free()
+	subpaths, err := readSubpaths(spec)
+	if err != nil {
+		return nil, err
+	}
+	mask := rasterize(s.w, s.h, subpaths, objBool(spec, "evenOdd"))
+	if objBool(spec, "replace") {
+		a.clips[id] = mask
+	} else {
+		a.clips[id] = intersectMasks(a.clips[id], mask)
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// opGetImageData(handle, x, y, w, h) -> bytes, in getImageData's order and
+// non-premultiplied, which is how the surface stores them.
+func (a *canvasAPI) opGetImageData(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, _, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	x, y := int(args[1].Float()), int(args[2].Float())
+	w, h := int(args[3].Float()), int(args[4].Float())
+	if w <= 0 || h <= 0 || w*h > maxCanvasPixels {
+		return nil, fmt.Errorf("canvas_get_image_data: %dx%d is not a readable size", w, h)
+	}
+	out := make([]byte, w*h*4)
+	for row := 0; row < h; row++ {
+		sy := y + row
+		if sy < 0 || sy >= s.h {
+			continue
+		}
+		for col := 0; col < w; col++ {
+			sx := x + col
+			if sx < 0 || sx >= s.w {
+				continue
+			}
+			copy(out[(row*w+col)*4:], s.pix[(sy*s.w+sx)*4:(sy*s.w+sx)*4+4])
+		}
+	}
+	u8, err := a.js.NewBytes(out)
+	if err != nil {
+		return nil, err
+	}
+	return u8, nil
+}
+
+// opPutImageData(handle, bytes, w, h, dx, dy, sx, sy, sw, sh) writes pixels
+// straight in: putImageData REPLACES, ignoring the transform, the clip, the
+// alpha and the composite operator.
+func (a *canvasAPI) opPutImageData(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	s, _, err := a.surface(args[0])
+	if err != nil {
+		return nil, err
+	}
+	data, err := argBytes(args[1])
+	if err != nil {
+		return nil, err
+	}
+	w, h := int(args[2].Float()), int(args[3].Float())
+	dx, dy := int(args[4].Float()), int(args[5].Float())
+	sx, sy := int(args[6].Float()), int(args[7].Float())
+	sw, sh := int(args[8].Float()), int(args[9].Float())
+	for row := 0; row < sh; row++ {
+		srcY := sy + row
+		dstY := dy + sy + row
+		if srcY < 0 || srcY >= h || dstY < 0 || dstY >= s.h {
+			continue
+		}
+		for col := 0; col < sw; col++ {
+			srcX := sx + col
+			dstX := dx + sx + col
+			if srcX < 0 || srcX >= w || dstX < 0 || dstX >= s.w {
+				continue
+			}
+			si := (srcY*w + srcX) * 4
+			di := (dstY*s.w + dstX) * 4
+			if si+4 > len(data) {
+				continue
+			}
+			copy(s.pix[di:di+4], data[si:si+4])
+		}
+	}
+	return spidermonkey.Undefined(), nil
+}
+
+// closeAll drops every surface. Called from Web.Close.
+func (a *canvasAPI) closeAll() {
+	a.surfaces = map[int64]*surface{}
+	a.clips = map[int64][]byte{}
+}
+
+// ------------------------------------------------------------- spec reading
+
+func readSubpaths(spec *spidermonkey.Object) ([][]point, error) {
+	v, err := spec.Get("subpaths")
+	if err != nil || v == nil {
+		return nil, nil
+	}
+	o := v.Object()
+	if o == nil {
+		return nil, nil
+	}
+	defer o.Free()
+	// The guest sends the flattened points as one flat Float64Array plus the
+	// length of each subpath, which is one crossing rather than one per point.
+	data, err := o.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	lensV, err := spec.Get("lengths")
+	if err != nil || lensV == nil {
+		return nil, nil
+	}
+	lo := lensV.Object()
+	if lo == nil {
+		return nil, nil
+	}
+	defer lo.Free()
+	lenBytes, err := lo.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	coords := bytesToFloat64s(data)
+	lengths := bytesToInt32s(lenBytes)
+	var out [][]point
+	at := 0
+	for _, n := range lengths {
+		count := int(n)
+		if count <= 0 || at+count*2 > len(coords) {
+			at += count * 2
+			continue
+		}
+		sp := make([]point, count)
+		for i := 0; i < count; i++ {
+			sp[i] = point{coords[at+i*2], coords[at+i*2+1]}
+		}
+		out = append(out, sp)
+		at += count * 2
+	}
+	return out, nil
+}
+
+func readPaint(spec *spidermonkey.Object) (paint, error) {
+	var p paint
+	if gv, err := spec.Get("gradient"); err == nil && gv != nil {
+		if go_ := gv.Object(); go_ != nil {
+			g, gerr := readGradient(go_)
+			go_.Free()
+			if gerr != nil {
+				return p, gerr
+			}
+			p.gradient = g
+			return p, nil
+		}
+	}
+	cv, err := spec.Get("color")
+	if err != nil || cv == nil {
+		return p, nil
+	}
+	co := cv.Object()
+	if co == nil {
+		return p, nil
+	}
+	defer co.Free()
+	b, err := co.Bytes()
+	if err != nil {
+		return p, err
+	}
+	f := bytesToFloat64s(b)
+	for i := 0; i < 4 && i < len(f); i++ {
+		p.solid[i] = f[i]
+	}
+	return p, nil
+}
+
+func readGradient(o *spidermonkey.Object) (*gradient, error) {
+	g := &gradient{}
+	g.radial = objBool(o, "radial")
+	g.x0, g.y0, g.r0 = objFloat(o, "x0", 0), objFloat(o, "y0", 0), objFloat(o, "r0", 0)
+	g.x1, g.y1, g.r1 = objFloat(o, "x1", 0), objFloat(o, "y1", 0), objFloat(o, "r1", 0)
+	g.degenerateTransparent = objBool(o, "degenerate")
+	if iv, err := o.Get("inverse"); err == nil && iv != nil {
+		if io := iv.Object(); io != nil {
+			b, berr := io.Bytes()
+			io.Free()
+			if berr == nil {
+				f := bytesToFloat64s(b)
+				if len(f) >= 6 {
+					copy(g.inverse[:], f[:6])
+					g.hasInverse = true
+				}
+			}
+		}
+	}
+	sv, err := o.Get("stops")
+	if err != nil || sv == nil {
+		return g, nil
+	}
+	so := sv.Object()
+	if so == nil {
+		return g, nil
+	}
+	defer so.Free()
+	b, err := so.Bytes()
+	if err != nil {
+		return g, err
+	}
+	f := bytesToFloat64s(b)
+	// Five doubles per stop: offset then r,g,b,a.
+	for i := 0; i+4 < len(f); i += 5 {
+		g.stops = append(g.stops, gradientStop{
+			offset: f[i],
+			color:  [4]float64{f[i+1], f[i+2], f[i+3], f[i+4]},
+		})
+	}
+	return g, nil
+}
+
+func objFloat(o *spidermonkey.Object, name string, def float64) float64 {
+	v, err := o.Get(name)
+	if err != nil || v == nil || v.IsUndefined() {
+		return def
+	}
+	if inner := v.Object(); inner != nil {
+		inner.Free()
+		return def
+	}
+	return v.Float()
+}
+
+func objBool(o *spidermonkey.Object, name string) bool {
+	v, err := o.Get(name)
+	if err != nil || v == nil {
+		return false
+	}
+	if inner := v.Object(); inner != nil {
+		inner.Free()
+		return false
+	}
+	return v.Bool()
+}
+
+func objString(o *spidermonkey.Object, name, def string) string {
+	v, err := o.Get(name)
+	if err != nil || v == nil || v.IsUndefined() {
+		return def
+	}
+	if inner := v.Object(); inner != nil {
+		inner.Free()
+		return def
+	}
+	return v.String()
+}
+
+// bytesToFloat64s reinterprets a Float64Array's bytes. The guest and the host
+// are the same machine, so the byte order is the same one on both sides.
+func bytesToFloat64s(b []byte) []float64 {
+	out := make([]float64, len(b)/8)
+	for i := range out {
+		var bits uint64
+		for j := 0; j < 8; j++ {
+			bits |= uint64(b[i*8+j]) << (8 * j)
+		}
+		out[i] = math.Float64frombits(bits)
+	}
+	return out
+}
+
+func bytesToInt32s(b []byte) []int32 {
+	out := make([]int32, len(b)/4)
+	for i := range out {
+		var bits uint32
+		for j := 0; j < 4; j++ {
+			bits |= uint32(b[i*4+j]) << (8 * j)
+		}
+		out[i] = int32(bits)
+	}
+	return out
+}

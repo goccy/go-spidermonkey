@@ -80,6 +80,9 @@ var cacheStorageJS string
 //go:embed js/observable.js
 var observableJS string
 
+//go:embed js/canvas.js
+var canvasJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -91,6 +94,7 @@ type Web struct {
 	worker *workerAPI
 	subtle *subtleAPI
 	codecs *codecAPI
+	canvas *canvasAPI
 	start  time.Time
 }
 
@@ -157,6 +161,11 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	for name, fn := range codecs.ops() {
 		opTable[name] = fn
 	}
+	canvas := newCanvasAPI(js)
+	w.canvas = canvas
+	for name, fn := range canvas.ops() {
+		opTable[name] = fn
+	}
 	subtle := newSubtleAPI()
 	w.subtle = subtle
 	for name, fn := range subtle.ops() {
@@ -174,7 +183,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS, canvasJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -335,6 +344,9 @@ func (w *Web) Close() error {
 	}
 	if w.codecs != nil {
 		w.codecs.closeAll()
+	}
+	if w.canvas != nil {
+		w.canvas.closeAll()
 	}
 	return nil
 }

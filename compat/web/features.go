@@ -47,6 +47,7 @@ const (
 	FeatureEventSource     Feature = "eventsource"
 	FeatureWebLocks        Feature = "web-locks"
 	FeatureWebAssembly     Feature = "webassembly"
+	FeatureCanvas          Feature = "canvas"
 	FeatureWorker          Feature = "worker"
 )
 
@@ -60,6 +61,10 @@ var featureGlobals = map[Feature][]string{
 	FeatureURLPattern: {"URLPattern"},
 	// Observable belongs with events: it is an event stream before it is
 	// anything else, and EventTarget.when is what produces one.
+	FeatureCanvas: {
+		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
+		"Path2D", "ImageData",
+	},
 	FeatureEvents: {
 		"Observable", "Subscriber",
 		"Event", "EventTarget", "CustomEvent", "ErrorEvent", "MessageEvent",
