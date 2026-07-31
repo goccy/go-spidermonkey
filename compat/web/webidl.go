@@ -77,6 +77,7 @@ func NormalizeIDLMembers(js *spidermonkey.JS, before string) error {
 		(function (beforeList) {
 			const before = new Set(beforeList.split(" "));
 			const IDL_CHECKED = Symbol.for("go-spidermonkey.idlChecked");
+			const seen = new WeakSet();
 			// %AsyncFunction.prototype%, by identity rather than by name: an
 			// operation written as an async function is one that returns a promise,
 			// and Web IDL says such an operation REPORTS a bad receiver as a
@@ -146,13 +147,10 @@ func NormalizeIDLMembers(js *spidermonkey.JS, before string) error {
 					if (changed) Object.defineProperty(target, key, d);
 				}
 			}
-			for (const name of Object.getOwnPropertyNames(globalThis)) {
-				// "__"-prefixed names are host plumbing, and anything that already
-				// existed is the engine's rather than ours to re-attribute.
-				if (before.has(name) || name.startsWith("__")) continue;
-				const d = Object.getOwnPropertyDescriptor(globalThis, name);
-				if (!d || typeof d.value !== "function") continue;
-				const proto = d.value.prototype;
+			// normalizeInterface applies the rules to one interface object and its
+			// prototype.
+			function normalizeInterface(fn) {
+				const proto = fn.prototype;
 				if (proto && (typeof proto === "object" || typeof proto === "function")) {
 					// An interface that already checks its own receiver keeps its own
 					// answer. The two are not interchangeable: an operation that
@@ -162,7 +160,36 @@ func NormalizeIDLMembers(js *spidermonkey.JS, before string) error {
 					if (!proto[IDL_CHECKED]) normalize(proto, new Set(["constructor"]), proto);
 					else normalize(proto, new Set(["constructor"]), null);
 				}
-				normalize(d.value, skipOnInterface, null);
+				normalize(fn, skipOnInterface, null);
+			}
+
+			for (const name of Object.getOwnPropertyNames(globalThis)) {
+				// "__"-prefixed names are host plumbing, and anything that already
+				// existed is the engine's rather than ours to re-attribute.
+				if (before.has(name) || name.startsWith("__")) continue;
+				const d = Object.getOwnPropertyDescriptor(globalThis, name);
+				if (!d) continue;
+				if (typeof d.value === "function") {
+					normalizeInterface(d.value);
+					continue;
+				}
+				// A NAMESPACE is an ordinary object whose members are operations and
+				// interfaces — WebAssembly is one. Its interfaces are reachable only
+				// through it, so a sweep that looked at function-valued globals alone
+				// left every one of them unattributed.
+				// self/window/globalThis name the global object itself; walking it as a
+				// namespace would walk every global a second time, and one of those is
+				// the global object again.
+				if (d.value === null || typeof d.value !== "object" || d.value === globalThis) continue;
+				if (seen.has(d.value)) continue;
+				seen.add(d.value);
+				normalize(d.value, new Set(), null);
+				for (const member of Object.getOwnPropertyNames(d.value)) {
+					if (member.startsWith("_")) continue;
+					const md = Object.getOwnPropertyDescriptor(d.value, member);
+					if (!md || typeof md.value !== "function" || !md.value.prototype) continue;
+					normalizeInterface(md.value);
+				}
 			}
 		})(` + jsLiteral(before) + `);
 	`

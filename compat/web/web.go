@@ -50,6 +50,9 @@ var xhrJS string
 //go:embed js/websocket.js
 var websocketJS string
 
+//go:embed js/websocketstream.js
+var websocketStreamJS string
+
 //go:embed js/eventsource.js
 var eventsourceJS string
 
@@ -168,7 +171,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)

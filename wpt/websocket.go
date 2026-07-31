@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,17 +118,40 @@ var wsEndpoints = map[string]wsEndpoint{
 		}
 	}},
 	// delayed-passive-close_wsh.py: answer the client's close frame only after a
-	// delay, so the closing state is observable.
+	// second, so a caller can see that its close does not complete until the
+	// handshake does. The delay is the fixture's whole point, and the test
+	// measures it: anything shorter passes a close that returned too early.
 	"delayed-passive-close": {serve: func(ctx context.Context, r *http.Request, c *websocket.Conn) {
 		_, _, err := c.Read(ctx)
 		var ce websocket.CloseError
 		if errors.As(err, &ce) {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(time.Second)
 		}
 	}},
+	// passive-close-abort_wsh.py: read the client's close frame and then drop the
+	// connection without answering it, so the closing handshake never completes
+	// and the client must report an abnormal closure.
+	"passive-close-abort": {serve: func(ctx context.Context, r *http.Request, c *websocket.Conn) {
+		_, _, _ = c.Read(ctx)
+		c.CloseNow()
+	}},
 	// remote-close_wsh.py: close from this end as soon as the connection is up.
+	// The query says HOW: `code` and `reason` name what the close frame carries,
+	// an absent code means an EMPTY frame (which the peer must report as 1005),
+	// and `abrupt` drops the connection without a close frame at all.
 	"remote-close": {serve: func(ctx context.Context, r *http.Request, c *websocket.Conn) {
-		_ = c.Close(websocket.StatusNormalClosure, "")
+		query := r.URL.Query()
+		if query.Get("abrupt") != "" {
+			c.CloseNow()
+			return
+		}
+		code := websocket.StatusNoStatusRcvd
+		if v := query.Get("code"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				code = websocket.StatusCode(n)
+			}
+		}
+		_ = c.Close(code, query.Get("reason"))
 	}},
 }
 

@@ -85,7 +85,7 @@ var featureGlobals = map[Feature][]string{
 	FeatureStructuredClone: {"structuredClone"},
 	FeatureMessaging:       {"MessageChannel", "MessagePort", "BroadcastChannel"},
 	FeatureXMLHttpRequest:  {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
-	FeatureWebSocket:       {"WebSocket", "CloseEvent"},
+	FeatureWebSocket:       {"WebSocket", "CloseEvent", "WebSocketStream", "WebSocketError"},
 	FeatureEventSource:     {"EventSource"},
 	FeatureWebLocks:        {"Lock", "LockManager"},
 	FeatureWebAssembly:     {"WebAssembly"},

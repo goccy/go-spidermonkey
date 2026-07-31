@@ -28,18 +28,69 @@
 		6668, 6669, 6679, 6697, 10080,
 	]);
 
-	globalThis.CloseEvent = class CloseEvent extends Event {
+	// CloseEvent's three members are IDL attributes: prototype accessors over
+	// slots, not own data properties, so the prototype has them and nothing can
+	// rewrite one on an event it received.
+	class CloseEvent extends Event {
 		constructor(type, init = {}) {
 			super(type, init);
-			this.wasClean = !!init.wasClean;
-			this.code = init.code === undefined ? 0 : Number(init.code);
-			this.reason = init.reason === undefined ? "" : String(init.reason);
+			const opts = init === null || init === undefined ? {} : init;
+			Object.defineProperties(this, {
+				_wasClean: { value: Boolean(opts.wasClean) },
+				_code: { value: opts.code === undefined ? 0 : Number(opts.code) },
+				_reason: { value: opts.reason === undefined ? "" : String(opts.reason) },
+			});
 		}
-	};
+		get wasClean() { return this._wasClean; }
+		get code() { return this._code; }
+		get reason() { return this._reason; }
+	}
+	Object.defineProperty(CloseEvent.prototype, Symbol.toStringTag, { value: "CloseEvent", configurable: true });
+	globalThis.CloseEvent = CloseEvent;
 
 	// Every live socket, by the handle the host addresses it with. The host calls
 	// __ws_dispatch with that handle; the socket itself is never passed across.
 	const sockets = new Map();
+
+	// The constructor's argument checks, separated from the connecting, because
+	// WebSocketStream has to make exactly the same ones and then NOT connect when
+	// its signal is already aborted. Registered under a symbol so the sibling
+	// file can reach it without adding a global.
+	function checkWebSocketArguments(url, protocols) {
+		let parsed;
+		try {
+			parsed = new URL(String(url), globalThis.location ? globalThis.location.href : undefined);
+		} catch {
+			throw new DOMException(`WebSocket: ${String(url)} is not a URL`, "SyntaxError");
+		}
+		// http/https are accepted and normalized: the two schemes address the same
+		// endpoints, and the url attribute reports the ws form.
+		if (parsed.protocol === "http:") parsed.protocol = "ws:";
+		else if (parsed.protocol === "https:") parsed.protocol = "wss:";
+		if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+			throw new DOMException(`WebSocket: ${parsed.protocol} is not a WebSocket scheme`, "SyntaxError");
+		}
+		if (parsed.hash !== "" || String(url).endsWith("#")) {
+			throw new DOMException("WebSocket: the URL must not have a fragment", "SyntaxError");
+		}
+		const list = typeof protocols === "string" ? [protocols]
+			: (protocols === undefined ? [] : Array.from(protocols, String));
+		const seen = new Set();
+		for (const p of list) {
+			if (!TOKEN.test(p)) {
+				throw new DOMException(`WebSocket: ${p} is not a valid subprotocol`, "SyntaxError");
+			}
+			const key = p.toLowerCase();
+			if (seen.has(key)) {
+				throw new DOMException(`WebSocket: subprotocol ${p} is repeated`, "SyntaxError");
+			}
+			seen.add(key);
+		}
+		return { parsed, list };
+	}
+	Object.defineProperty(globalThis, Symbol.for("go-spidermonkey.checkWebSocketArguments"), {
+		value: checkWebSocketArguments, configurable: true,
+	});
 
 	class WebSocket extends EventTarget {
 		constructor(url, protocols = []) {
@@ -47,35 +98,7 @@
 			if (arguments.length < 1) {
 				throw new TypeError("WebSocket: a URL is required");
 			}
-			let parsed;
-			try {
-				parsed = new URL(String(url), globalThis.location ? globalThis.location.href : undefined);
-			} catch {
-				throw new DOMException(`WebSocket: ${String(url)} is not a URL`, "SyntaxError");
-			}
-			// http/https are accepted and normalized: the two schemes address the same
-			// endpoints, and the url attribute reports the ws form.
-			if (parsed.protocol === "http:") parsed.protocol = "ws:";
-			else if (parsed.protocol === "https:") parsed.protocol = "wss:";
-			if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
-				throw new DOMException(`WebSocket: ${parsed.protocol} is not a WebSocket scheme`, "SyntaxError");
-			}
-			if (parsed.hash !== "" || String(url).endsWith("#")) {
-				throw new DOMException("WebSocket: the URL must not have a fragment", "SyntaxError");
-			}
-			const list = typeof protocols === "string" ? [protocols]
-				: (protocols === undefined ? [] : Array.from(protocols, String));
-			const seen = new Set();
-			for (const p of list) {
-				if (!TOKEN.test(p)) {
-					throw new DOMException(`WebSocket: ${p} is not a valid subprotocol`, "SyntaxError");
-				}
-				const key = p.toLowerCase();
-				if (seen.has(key)) {
-					throw new DOMException(`WebSocket: subprotocol ${p} is repeated`, "SyntaxError");
-				}
-				seen.add(key);
-			}
+			const { parsed, list } = checkWebSocketArguments(url, protocols);
 
 			this._url = parsed.href;
 			this._state = CONNECTING;
@@ -157,8 +180,9 @@
 
 		close(code, reason) {
 			// close(reason) with no code is an error, not a shorthand: an absent code
-			// is distinct from a bad one, and only the first argument may be absent.
-			if (code !== undefined && code !== null) {
+			// is distinct from a bad one, and only UNDEFINED is absent — null is a
+			// value, and it converts to 0, which is not a permitted close code.
+			if (code !== undefined) {
 				const n = Number(code);
 				if (!(n === 1000 || (n >= 3000 && n <= 4999))) {
 					throw new DOMException(`close: ${code} is not a permitted close code`, "InvalidAccessError");
