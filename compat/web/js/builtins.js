@@ -1657,11 +1657,13 @@
 	// toBodyChunk normalizes one ReadableStream body chunk to bytes. Strings are
 	// tolerated (UTF-8-encoded) because in-repo sources — and plenty of user code
 	// — enqueue text; anything else must be a BufferSource per spec.
+	// A stream body carries BYTES. A string chunk is not one — the stream had to
+	// be a byte stream to be a body at all, and a caller that enqueued a string
+	// has made a mistake that would otherwise be silently encoded for them.
 	function toBodyChunk(value) {
-		if (typeof value === "string") return utf8Encode(value);
 		if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
 		if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
-		throw new TypeError("ReadableStream body chunks must be strings or BufferSource");
+		throw new TypeError("a ReadableStream body may only contain BufferSource chunks");
 	}
 
 	// Shared body surface for Request and Response: buffered bytes in _body, or
@@ -1789,6 +1791,20 @@
 			};
 			// Workers' request.cf survives new Request(req) (workerd behavior).
 			if (from && from.cf !== undefined) this.cf = from.cf;
+			// A stream body means the request body is sent while the response may
+			// already be arriving, and the caller has to say so: `duplex: "half"`.
+			// Without it the constructor fails, which is how a caller learns that
+			// the stream they passed would never have been sent.
+			if (init.duplex !== undefined && String(init.duplex) !== "half") {
+				throw new TypeError(`Request: ${String(init.duplex)} is not a duplex mode`);
+			}
+			// Copying an existing Request carries its body across without the caller
+			// naming a duplex mode: they did not choose the stream, they are keeping
+			// the one the request already had.
+			if (init.body instanceof ReadableStream && !(init instanceof Request)
+				&& String(init.duplex ?? "") !== "half") {
+				throw new TypeError("Request: a ReadableStream body requires duplex: \"half\"");
+			}
 			this._bodyStream = null;
 			if (init.body !== undefined) setBody(this, init.body);
 			else {

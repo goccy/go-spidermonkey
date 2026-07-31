@@ -339,7 +339,9 @@ func TestResponseReadableStreamBody(t *testing.T) {
 	runAsync(t, js, `
 		(async () => {
 			const make = () => new ReadableStream({
-				start(c) { c.enqueue("hello "); c.enqueue(new TextEncoder().encode("world")); c.close(); },
+				// BufferSource chunks only: a body stream carries bytes, and a string
+				// chunk is a TypeError rather than something silently encoded.
+				start(c) { c.enqueue(new TextEncoder().encode("hello ")); c.enqueue(new TextEncoder().encode("world")); c.close(); },
 			});
 
 			const r1 = new Response(make());
@@ -355,7 +357,7 @@ func TestResponseReadableStreamBody(t *testing.T) {
 			__c.origText = await r2.text();
 
 			const r3 = new Response(new ReadableStream({
-				start(c) { c.enqueue(JSON.stringify({ n: 7 })); c.close(); },
+				start(c) { c.enqueue(new TextEncoder().encode(JSON.stringify({ n: 7 }))); c.close(); },
 			}));
 			__c.jsonN = (await r3.json()).n;
 
@@ -388,7 +390,9 @@ func TestRequestReadableStreamBody(t *testing.T) {
 		(async () => {
 			const req = new Request("http://example.test/upload", {
 				method: "POST",
-				body: new ReadableStream({ start(c) { c.enqueue("payload"); c.close(); } }),
+				// A stream body is half-duplex and the caller has to say so.
+				duplex: "half",
+				body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("payload")); c.close(); } }),
 			});
 			__c.bodyIsStream = req.body instanceof ReadableStream;
 			__c.text = await req.text();
