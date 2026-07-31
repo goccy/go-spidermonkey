@@ -2268,7 +2268,12 @@
 		}
 	}
 
-	function corsAllowsResponse(res, origin) {
+	function corsAllowsResponse(res, origin, withCredentials) {
+		if (withCredentials) {
+			const allowed = res.headers && res.headers.get("access-control-allow-origin");
+			return allowed === origin &&
+				String(res.headers.get("access-control-allow-credentials") || "").toLowerCase() === "true";
+		}
 		const allow = res.headers && res.headers.get("access-control-allow-origin");
 		if (!allow) return false;
 		if (allow === "*") {
@@ -2361,29 +2366,38 @@
 		return out;
 	}
 
-	async function runPreflight(url, need, origin) {
+	async function runPreflight(url, need, origin, referer, withCredentials) {
 		const h = { origin, "access-control-request-method": need.method };
 		if (need.headers.length) h["access-control-request-headers"] = need.headers.join(",");
 		// Browsers send Accept: */* on a preflight, and the suite's fixture
-		// rejects a preflight without it.
+		// rejects a preflight without it; the preflight also states the same
+		// referrer the real request would.
 		h.accept = "*/*";
+		if (referer) h.referer = referer;
 		// Through the same normalization the real response gets: the raw host
 		// object has no Headers to read the permissions out of.
 		const res = trackBodyUsed(await globalThis.__native_fetch(url, { method: "OPTIONS", headers: h, redirect: "error" }));
 		if (!(res.status >= 200 && res.status < 300)) {
 			throw corsError("preflight responded " + res.status);
 		}
+		// With credentials, every wildcard is a LITERAL: "*" grants nothing,
+		// the origin must be named, and Allow-Credentials must say true.
 		const allowOrigin = res.headers.get("access-control-allow-origin");
-		if (allowOrigin !== "*" && allowOrigin !== origin) {
+		if (allowOrigin !== origin && (withCredentials || allowOrigin !== "*")) {
 			throw corsError("preflight did not allow " + origin);
 		}
+		if (withCredentials &&
+			String(res.headers.get("access-control-allow-credentials") || "").toLowerCase() !== "true") {
+			throw corsError("preflight did not allow credentials");
+		}
 		const allowMethods = splitList(res.headers.get("access-control-allow-methods"));
-		if (!allowMethods.has("*") && !allowMethods.has(need.method.toLowerCase()) &&
+		const methodWildcard = allowMethods.has("*") && !withCredentials;
+		if (!methodWildcard && !allowMethods.has(need.method.toLowerCase()) &&
 			!(need.method === "GET" || need.method === "HEAD" || need.method === "POST")) {
 			throw corsError("preflight did not allow method " + need.method);
 		}
 		const allowHeaders = splitList(res.headers.get("access-control-allow-headers"));
-		const wildcard = allowHeaders.has("*");
+		const wildcard = allowHeaders.has("*") && !withCredentials;
 		for (const n of need.headers) {
 			if (allowHeaders.has(n)) continue;
 			// The wildcard covers every header EXCEPT Authorization, which must be
@@ -2438,7 +2452,7 @@
 		return res;
 	}
 
-	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode, signal) {
+	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode, signal, withCredentials) {
 		// The chain has AWAITS in it — a preflight, each hop — and an abort that
 		// lands during one of them must stop the next request from going out. The
 		// host-side cancel only reaches a request that has already started, so the
@@ -2512,13 +2526,13 @@
 				const hopNeed = needsPreflight(step.method, headers);
 				if (hopNeed) {
 					abortIfAborted();
-					await runPreflight(current, hopNeed, origin);
+					await runPreflight(current, hopNeed, origin, hdrObj.referer, withCredentials);
 				}
 			}
 			abortIfAborted();
 			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
 			const crossHop = target.origin !== envURL.origin;
-			if (crossHop && corsMode !== "no-cors" && !corsAllowsResponse(res, origin)) {
+			if (crossHop && corsMode !== "no-cors" && !corsAllowsResponse(res, origin, withCredentials)) {
 				throw corsError("no Access-Control-Allow-Origin for " + origin + " at " + target.origin);
 			}
 			// A no-cors response never negotiates; the server's only word is
@@ -2710,7 +2724,9 @@
 						try {
 							const u = new URL(String(explicit), envURL ? envURL.href : undefined);
 							u.username = ""; u.password = ""; u.hash = "";
-							ref = u.href;
+							// An explicit referrer is still SUBJECT to the policy: it
+							// replaces the document URL as the source, not the rules.
+							ref = parsed ? referrerHeaderFor(policy, u, parsed) : u.href;
 						} catch { ref = String(explicit); }
 					}
 				} else {
@@ -2751,7 +2767,7 @@
 						cleanup();
 						const tracked = trackBodyUsed(res);
 						if (crossOrigin && mode === "cors") {
-							if (!corsAllowsResponse(tracked, envURL.origin)) {
+							if (!corsAllowsResponse(tracked, envURL.origin, withCredentials)) {
 								throw corsError("no Access-Control-Allow-Origin for " + envURL.origin);
 							}
 							filterCORSResponseHeaders(tracked);
@@ -2777,6 +2793,12 @@
 			// by then — a body contributes a Content-Type, and that is one of the
 			// things the safelist is about.
 			const redirectMode = nInit.redirect || "follow";
+			// Only "include" makes a cross-origin exchange credentialed: there
+			// is no cookie jar here, but the CORS contract for a credentialed
+			// request is checkable — and checked — all the same.
+			const withCredentials =
+				String(init.credentials ?? (isReq ? input.credentials : "") ?? "") === "include";
+			nInit.credentials = String(init.credentials ?? (isReq ? input.credentials : "") ?? "") || "same-origin";
 			// The chain is driven in the guest whenever the environment has an
 			// origin to judge hops against — not only when the FIRST hop is
 			// already cross-origin. A same-origin request that redirects to
@@ -2793,7 +2815,7 @@
 				const go = chained
 					? () => {
 						if (signal && onAbort) signal.addEventListener("abort", onAbort);
-						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode, signal).then(
+						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode, signal, withCredentials).then(
 							(res) => { cleanup(); return res; },
 							(err) => {
 								cleanup();
@@ -2807,7 +2829,8 @@
 				// suite counts preflights.
 				const need = !chained && crossOrigin && mode === "cors"
 					? needsPreflight(method, headers) : null;
-				const started = !need ? go() : runPreflight(url, need, envURL.origin).then(go);
+				const started = !need ? go()
+					: runPreflight(url, need, envURL.origin, headers.get("referer"), withCredentials).then(go);
 				if (!signal) return started;
 				// An abort ENDS the fetch, whatever stage it is at. Cancelling the
 				// host request releases the connection, but the moment the promise
