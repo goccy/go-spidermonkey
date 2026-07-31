@@ -168,9 +168,25 @@
 			if (r < 0) throw new DOMException("arcTo: the radius must not be negative", "IndexSizeError");
 			this._cmds.push(["T", +x1, +y1, +x2, +y2, +r]);
 		}
+		// The radii are one to four corners, each a number or a DOMPointInit, and
+		// they fill in the same way a CSS shorthand does: one for all, two for the
+		// diagonals, three with the last pair mirrored, four in order from the
+		// top-left clockwise.
 		roundRect(x, y, w, h, radii = 0) {
-			const r = typeof radii === "number" ? radii : (Array.isArray(radii) ? Number(radii[0]) : 0);
-			this._cmds.push(["RR", +x, +y, +w, +h, Math.abs(r)]);
+			const list = Array.isArray(radii) ? radii : [radii];
+			if (list.length < 1 || list.length > 4) {
+				throw new RangeError("roundRect: between one and four radii are required");
+			}
+			const one = (v) => {
+				if (v !== null && typeof v === "object") return Math.abs(Number(v.x ?? 0));
+				return Math.abs(Number(v));
+			};
+			const r = list.map(one);
+			if (r.some((n) => !Number.isFinite(n))) return;
+			const corners = r.length === 1 ? [r[0], r[0], r[0], r[0]]
+				: r.length === 2 ? [r[0], r[1], r[0], r[1]]
+					: r.length === 3 ? [r[0], r[1], r[2], r[1]] : r;
+			this._cmds.push(["RR", +x, +y, +w, +h, corners[0], corners[1], corners[2], corners[3]]);
 		}
 		addPath(path) {
 			if (!(path instanceof Path2D)) throw new TypeError("addPath: a Path2D is required");
@@ -257,28 +273,29 @@
 					break;
 				}
 				case "RR": {
-					const [x, y, w, h, r0] = c.slice(1);
-					const r = Math.min(Math.abs(r0), Math.abs(w) / 2, Math.abs(h) / 2);
+					const [x, y, w, h] = c.slice(1, 5);
+					const cap = Math.min(Math.abs(w), Math.abs(h)) / 2;
+					const [tl, tr, br, bl] = c.slice(5).map((v) => Math.min(v, cap));
 					if (current && current.length >= 4) subpaths.push(current);
 					current = null;
-					const corner = (ax, ay, from) => {
+					const corner = (ax, ay, r, from) => {
 						for (let i = 0; i <= 16; i++) {
 							const t = from + (Math.PI / 2) * (i / 16);
 							push(ax + r * Math.cos(t), ay + r * Math.sin(t));
 						}
 					};
-					push(x + r, y);
-					push(x + w - r, y);
-					corner(x + w - r, y + r, -Math.PI / 2);
-					push(x + w, y + h - r);
-					corner(x + w - r, y + h - r, 0);
-					push(x + r, y + h);
-					corner(x + r, y + h - r, Math.PI / 2);
-					push(x, y + r);
-					corner(x + r, y + r, Math.PI);
+					push(x + tl, y);
+					push(x + w - tr, y);
+					corner(x + w - tr, y + tr, tr, -Math.PI / 2);
+					push(x + w, y + h - br);
+					corner(x + w - br, y + h - br, br, 0);
+					push(x + bl, y + h);
+					corner(x + bl, y + h - bl, bl, Math.PI / 2);
+					push(x, y + tl);
+					corner(x + tl, y + tl, tl, Math.PI);
 					if (current) subpaths.push(current);
 					current = null;
-					cx = startX = x + r; cy = startY = y;
+					cx = startX = x + tl; cy = startY = y;
 					break;
 				}
 				case "A": {
@@ -972,6 +989,40 @@
 		const n = Number(v);
 		if (!Number.isFinite(n) || n < 0) return 0;
 		return Math.floor(n) % 4294967296;
+	}
+
+	// DOMPointReadOnly/DOMPoint are the geometry interface roundRect's radii and
+	// getTransform's result are described in terms of. Only the 2d part is
+	// meaningful here, and z/w are the values the specification defaults them to.
+	class DOMPointReadOnly {
+		constructor(x = 0, y = 0, z = 0, w = 1) {
+			Object.defineProperties(this, {
+				_x: { value: Number(x) }, _y: { value: Number(y) },
+				_z: { value: Number(z) }, _w: { value: Number(w) },
+			});
+		}
+		get x() { return this._x; }
+		get y() { return this._y; }
+		get z() { return this._z; }
+		get w() { return this._w; }
+		toJSON() { return { x: this._x, y: this._y, z: this._z, w: this._w }; }
+		static fromPoint(init = {}) {
+			return new this(init.x ?? 0, init.y ?? 0, init.z ?? 0, init.w ?? 1);
+		}
+	}
+	class DOMPoint extends DOMPointReadOnly {
+		set x(v) { Object.defineProperty(this, "_x", { value: Number(v), configurable: true }); }
+		get x() { return this._x; }
+		set y(v) { Object.defineProperty(this, "_y", { value: Number(v), configurable: true }); }
+		get y() { return this._y; }
+		set z(v) { Object.defineProperty(this, "_z", { value: Number(v), configurable: true }); }
+		get z() { return this._z; }
+		set w(v) { Object.defineProperty(this, "_w", { value: Number(v), configurable: true }); }
+		get w() { return this._w; }
+	}
+	for (const cls of [DOMPointReadOnly, DOMPoint]) {
+		Object.defineProperty(cls.prototype, Symbol.toStringTag, { value: cls.name, configurable: true });
+		globalThis[cls.name] ??= cls;
 	}
 
 	globalThis.OffscreenCanvas = OffscreenCanvas;

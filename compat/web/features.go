@@ -63,7 +63,7 @@ var featureGlobals = map[Feature][]string{
 	// anything else, and EventTarget.when is what produces one.
 	FeatureCanvas: {
 		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
-		"Path2D", "ImageData",
+		"Path2D", "ImageData", "DOMPoint", "DOMPointReadOnly",
 	},
 	FeatureEvents: {
 		"Observable", "Subscriber",
