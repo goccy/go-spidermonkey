@@ -58,7 +58,10 @@ var featureGlobals = map[Feature][]string{
 	FeatureEncoding:   {"TextEncoder", "TextDecoder", "TextEncoderStream", "TextDecoderStream", "atob", "btoa"},
 	FeatureURL:        {"URL", "URLSearchParams"},
 	FeatureURLPattern: {"URLPattern"},
+	// Observable belongs with events: it is an event stream before it is
+	// anything else, and EventTarget.when is what produces one.
 	FeatureEvents: {
+		"Observable", "Subscriber",
 		"Event", "EventTarget", "CustomEvent", "ErrorEvent", "MessageEvent",
 		"PromiseRejectionEvent", "AbortController", "AbortSignal",
 		"addEventListener", "removeEventListener", "dispatchEvent", "reportError",

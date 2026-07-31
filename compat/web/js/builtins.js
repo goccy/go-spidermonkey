@@ -823,24 +823,45 @@
 		// long-lived source signal doesn't accumulate a listener per any() call.
 		static any(signals) {
 			const s = new AbortSignal();
-			const cleanups = [];
-			const settle = (reason) => {
-				while (cleanups.length) cleanups.pop()();
-				abortSignal(s, reason);
-			};
+			const settle = (reason) => abortSignal(s, reason);
 			for (const src of signals) {
 				if (src.aborted) { settle(src.reason); break; }
-				const h = () => settle(src.reason);
-				src.addEventListener("abort", h);
-				cleanups.push(() => src.removeEventListener("abort", h));
+				// An abort ALGORITHM, not a listener: a dependent signal is aborted
+				// as part of aborting its source, before either one's event fires.
+				addAbortAlgorithm(src, () => settle(src.reason));
 			}
 			return s;
 		}
 	}
+	// addAbortAlgorithm registers a runtime reaction to a signal's abort. It is
+	// internal: script has addEventListener, and the difference between the two
+	// is exactly when they run.
+	function addAbortAlgorithm(signal, fn) {
+		if (signal.aborted) { fn(signal.reason); return; }
+		if (!signal._abortAlgorithms) {
+			Object.defineProperty(signal, "_abortAlgorithms", { value: [], configurable: true });
+		}
+		signal._abortAlgorithms.push(fn);
+	}
+	Object.defineProperty(globalThis, Symbol.for("go-spidermonkey.addAbortAlgorithm"), {
+		value: addAbortAlgorithm, configurable: true,
+	});
+
 	function abortSignal(signal, reason) {
 		if (signal.aborted) return;
 		signal.aborted = true;
 		signal.reason = reason !== undefined ? reason : new DOMException("The operation was aborted", "AbortError");
+		// The signal's ABORT ALGORITHMS run before the event. They are the
+		// runtime's own reactions — a subscription closing, a dependent signal
+		// following — and they must complete before script sees the abort, so a
+		// listener finds the world already torn down. Registering them as
+		// listeners instead put them in the queue alongside script's, where the
+		// order depended on who subscribed first.
+		if (signal._abortAlgorithms) {
+			for (const fn of signal._abortAlgorithms.splice(0)) {
+				try { fn(signal.reason); } catch (e) { globalThis.reportError(e); }
+			}
+		}
 		const ev = new Event("abort");
 		if (typeof signal.onabort === "function") signal.onabort.call(signal, ev);
 		signal.dispatchEvent(ev);
@@ -2031,12 +2052,56 @@
 			if (!(emit && emit(e))) throw e;
 		}
 	};
-	// reportError(e): report to the global error channel without throwing (a stable
-	// global in browsers and Node >=17).
+	// reportError(e): report to the global error channel without throwing (a
+	// stable global in browsers and Node >=17).
+	//
+	// On the web that channel is an `error` event on the global, and it is the
+	// only way `self.onerror` can ever see an exception the runtime caught rather
+	// than one that unwound to the top. Logging to the console instead — which is
+	// what this did — left onerror silent, so any code that installs one to
+	// collect failures collected nothing. The console is the fallback for when
+	// nobody took the event, which is what a browser does too.
 	globalThis.reportError ??= (e) => {
 		const emit = globalThis.__emit_uncaught;
-		if (!(emit && emit(e))) { try { console.error(e); } catch { /* ignore */ } }
+		if (emit && emit(e)) return;
+		let handled = false;
+		if (typeof globalThis.ErrorEvent === "function") {
+			// Where it happened comes from the error itself when it IS an error: the
+			// engine records the position on every Error it makes. A value that is
+			// not an Error — code may report a string — carries no position, so the
+			// CALL SITE is used instead, read from a stack captured here.
+			const at = e instanceof Error
+				? { file: e.fileName, line: e.lineNumber, col: e.columnNumber }
+				: callSite();
+			const ev = new globalThis.ErrorEvent("error", {
+				cancelable: true,
+				message: e instanceof Error ? String(e.message) : String(e),
+				error: e,
+				filename: at.file === undefined ? "" : String(at.file),
+				lineno: at.line === undefined ? 0 : Number(at.line),
+				colno: at.col === undefined ? 0 : Number(at.col),
+			});
+			handled = !__dispatch_trusted(globalThis, ev);
+		}
+		if (!handled) { try { console.error(e); } catch { /* ignore */ } }
 	};
+	// callSite is where reportError was called from. The engine's stack is a
+	// foreign format — this runtime does not produce it and cannot change it — so
+	// reading a frame out of it is a parse, and the parse is TOTAL: anything that
+	// does not match gives an unknown position rather than a wrong one.
+	//
+	// A frame is `name@file:line:col`, and the first two belong to this function
+	// and to reportError itself.
+	const STACK_FRAME = /@(.*):(\d+):(\d+)$/;
+	function callSite() {
+		const frames = String(new Error().stack || "").split("\n");
+		for (const frame of frames.slice(2)) {
+			const m = STACK_FRAME.exec(frame.trim());
+			if (m) return { file: m[1], line: Number(m[2]), col: Number(m[3]) };
+		}
+		return {};
+	}
+
 	globalThis.setTimeout = function setTimeout(handler, delay, ...args) {
 		const fn = typeof handler === "function" ? handler : () => (0, eval)(String(handler));
 		let self;
