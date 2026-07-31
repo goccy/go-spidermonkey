@@ -2,6 +2,7 @@ package wpt
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"fmt"
 	"net"
@@ -121,6 +122,8 @@ func StartServer(root string) (*Server, error) {
 	// by the harness itself, through the same handler. See permissive.go.
 	answer := func(conn net.Conn, req *http.Request, head []byte) bool {
 		w := &permissiveWriter{header: http.Header{}}
+		// The raw head rides along for the handlers that echo it verbatim.
+		req = req.WithContext(context.WithValue(req.Context(), rawHeadKey{}, head))
 		handler.ServeHTTP(w, req)
 		defer conn.Close()
 		return w.writeTo(conn) == nil
@@ -129,6 +132,9 @@ func StartServer(root string) (*Server, error) {
 	go srv.alt.Serve(&permissiveListener{Listener: altLn, serve: answer})
 	return srv, nil
 }
+
+// rawHeadKey carries the raw request head to the handlers that need it.
+type rawHeadKey struct{}
 
 // BaseURL is the origin the tests see as their document/worker base.
 func (s *Server) BaseURL() string { return s.base }

@@ -1501,23 +1501,73 @@
 		return headers;
 	}
 
+	// The Headers iterator is a Web IDL "default iterator object": its
+	// prototype chains to %IteratorPrototype%, next is a plain data property,
+	// and it walks the LIVE sort-and-combine view — an entry removed while
+	// iterating is not visited, one appended is.
+	const ES_ITERATOR_PROTOTYPE = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+	const HeadersIteratorPrototype = Object.create(ES_ITERATOR_PROTOTYPE, {
+		next: {
+			value: function next() {
+				const list = this._headers._sorted();
+				if (this._index >= list.length) return { value: undefined, done: true };
+				const [k, v] = list[this._index++];
+				return {
+					value: this._kind === "key" ? k : this._kind === "value" ? v : [k, v],
+					done: false,
+				};
+			},
+			writable: true, enumerable: true, configurable: true,
+		},
+		[Symbol.toStringTag]: { value: "Headers Iterator", configurable: true },
+	});
+
 	class Headers {
-		constructor(init) {
+		constructor(init = undefined) {
 			this._map = new Map(); // lowercased name -> array of values
+			// The header list preserves the CASE a name was first written in;
+			// combining still keys on the lowercase form.
+			Object.defineProperty(this, "_case", { value: new Map() });
 			// The guard decides which headers this object will hold at all: see
 			// setHeadersGuard. "none" is a free-standing Headers, which filters
 			// nothing.
 			Object.defineProperty(this, "_guard", { value: "none", writable: true });
-			if (init instanceof Headers) {
-				// Copy raw values, preserving each Set-Cookie separately.
-				for (const [k, arr] of init._map) this._map.set(k, [...arr]);
-			} else if (Array.isArray(init)) {
+			if (init === undefined) return;
+			// The init is (sequence or record): a primitive — null included —
+			// is neither. Which one an OBJECT is, is decided by GETTING its
+			// Symbol.iterator, so a Headers subclass with its own iterator is
+			// read through that iterator, and a proxy sees exactly the trap
+			// order Web IDL prescribes.
+			if (init === null || (typeof init !== "object" && typeof init !== "function")) {
+				throw new TypeError("Headers: the init must be an object");
+			}
+			const iter = init[Symbol.iterator];
+			if (iter !== undefined && iter !== null) {
+				if (typeof iter !== "function") throw new TypeError("Headers: the init is not iterable");
 				for (const pair of init) {
-					if (!pair || pair.length !== 2) throw new TypeError("Headers: each init pair needs 2 items");
-					this.append(pair[0], pair[1]);
+					if (pair === null || (typeof pair !== "object" && typeof pair !== "function")) {
+						throw new TypeError("Headers: each init pair must be an object");
+					}
+					const items = [...pair];
+					if (items.length !== 2) throw new TypeError("Headers: each init pair needs 2 items");
+					this.append(items[0], items[1]);
 				}
-			} else if (init && typeof init === "object") {
-				for (const k of Object.keys(init)) this.set(k, init[k]);
+			} else {
+				// Web IDL's record conversion, trap for trap: [[OwnPropertyKeys]],
+				// then per key [[GetOwnProperty]] and — for an enumerable one —
+				// [[Get]], interleaved in that order, with the KEY converted to a
+				// ByteString before the value is read.
+				for (const key of Reflect.ownKeys(init)) {
+					if (typeof key !== "string") continue;
+					const desc = Reflect.getOwnPropertyDescriptor(init, key);
+					if (desc === undefined || !desc.enumerable) continue;
+					for (let i = 0; i < key.length; i++) {
+						if (key.charCodeAt(i) > 0xFF) {
+							throw new TypeError("Headers: a header name must be a ByteString");
+						}
+					}
+					this.append(key, init[key]);
+				}
 			}
 		}
 		// _blocked applies the guard. An immutable Headers throws; every other
@@ -1546,12 +1596,14 @@
 			if (this._blocked(k, combined, "append")) return;
 			if (existing) existing.push(v);
 			else this._map.set(k, [v]);
+			if (!this._case.has(k)) this._case.set(k, String(name));
 		}
 		set(name, value) {
 			const k = headerName(name, "set");
 			const v = headerValue(value, "set");
 			if (this._blocked(k, v, "set")) return;
 			this._map.set(k, [v]);
+			if (!this._case.has(k)) this._case.set(k, String(name));
 		}
 		// get combines multiple values with ", " per WHATWG (including Set-Cookie);
 		// getSetCookie is the only way to recover individual Set-Cookie values.
@@ -1562,20 +1614,37 @@
 			const k = headerName(name, "delete");
 			if (this._blocked(k, this.get(k) ?? "", "delete")) return;
 			this._map.delete(k);
+			this._case.delete(k);
 		}
 		forEach(cb, thisArg) { for (const [k, v] of this.entries()) cb.call(thisArg, v, k, this); }
-		*entries() {
+		// _sorted is the fetch "sort and combine" step, computed fresh for
+		// every iterator step so iteration observes mutations. Set-Cookie is
+		// its one special case: each cookie is its OWN entry, never joined (a
+		// comma inside an Expires date would make the joined value
+		// unparseable).
+		_sorted() {
+			const out = [];
 			for (const k of [...this._map.keys()].sort()) {
-				// Set-Cookie is special-cased by the Fetch "sort and combine" step:
-				// each cookie is its OWN entry, never comma-joined (a comma inside an
-				// Expires date would make the joined value unparseable).
-				if (k === "set-cookie") { for (const v of this._map.get(k)) yield [k, v]; }
-				else yield [k, this._map.get(k).join(", ")];
+				if (k === "set-cookie") { for (const v of this._map.get(k)) out.push([k, v]); }
+				else out.push([k, this._map.get(k).join(", ")]);
 			}
+			return out;
 		}
-		*keys() { for (const [k] of this.entries()) yield k; }
-		*values() { for (const [, v] of this.entries()) yield v; }
-		[Symbol.iterator]() { return this.entries(); }
+		_iterator(kind) {
+			const it = Object.create(HeadersIteratorPrototype);
+			Object.defineProperties(it, {
+				_headers: { value: this },
+				_index: { value: 0, writable: true },
+				_kind: { value: kind },
+			});
+			return it;
+		}
+		// _caseOf answers the name as it should travel on the wire.
+		_caseOf(k) { return this._case.get(k) ?? k; }
+		entries() { return this._iterator("entry"); }
+		keys() { return this._iterator("key"); }
+		values() { return this._iterator("value"); }
+		[Symbol.iterator]() { return this._iterator("entry"); }
 	}
 	globalThis.Headers = Headers;
 
@@ -2554,7 +2623,7 @@
 			// in by the single-shot dispatch path, and the Origin changes once a
 			// hop has left the origin.
 			const hdrObj = {};
-			for (const [k, v] of headers) hdrObj[k] = v;
+			for (const [k, v] of headers) hdrObj[headers._caseOf ? headers._caseOf(k) : k] = v;
 			const hopTarget = new URL(current);
 			// The request's origin can become OPAQUE part-way down a redirect chain:
 			// once a hop leaves the origin the request came from, the next request no
@@ -2695,7 +2764,10 @@
 			if (parsed) url = parsed.href;
 			const headers = setHeadersGuard(new Headers(isReq ? input.headers : undefined), "request");
 			if (init.headers !== undefined && init.headers !== null) {
-				for (const [k, v] of new Headers(init.headers)) headers.set(k, v);
+				// Through the intermediate Headers for validation and combining,
+				// but with the CASE the caller wrote, which is what travels.
+				const given = new Headers(init.headers);
+				for (const [k, v] of given) headers.set(given._caseOf(k), v);
 			}
 			// Past this point the user agent is speaking, not the caller, so its own
 			// headers are written straight into the map: Origin and Referer are
@@ -2837,7 +2909,7 @@
 			}
 			const dispatch = () => {
 				const hdrObj = {};
-				for (const [k, v] of headers) hdrObj[k] = v;
+				for (const [k, v] of headers) hdrObj[headers._caseOf ? headers._caseOf(k) : k] = v;
 				nInit.headers = hdrObj;
 				if (signal && onAbort) signal.addEventListener("abort", onAbort);
 				return globalThis.__native_fetch(url, nInit).then(

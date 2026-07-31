@@ -30,6 +30,13 @@ import (
 	"time"
 )
 
+// wantsRawHead names the fixtures whose ANSWER is the request head itself,
+// byte for byte: net/http canonicalizes header-name case on arrival, so a
+// handler that must echo "THIS-is-A-test" as sent needs the raw bytes.
+func wantsRawHead(path string) bool {
+	return strings.HasSuffix(path, "/echo-headers.py")
+}
+
 // permissiveListener wraps a listener so each connection is inspected before
 // net/http sees it.
 type permissiveListener struct {
@@ -98,7 +105,7 @@ func (c *peekConn) inspect() {
 		return
 	}
 	req, perr := parseHead(head)
-	if perr != nil || !headerNeedsPermissiveServer(req.Header) {
+	if perr != nil || (!headerNeedsPermissiveServer(req.Header) && !wantsRawHead(req.URL.Path)) {
 		c.prefix = bytes.NewReader(head)
 		return
 	}

@@ -16,10 +16,12 @@ package wpt
 // through to being served as a file, exactly as before.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -85,6 +87,8 @@ func handlerFor(rel string) wptHandler {
 		return commonRedirectHandler
 	case "xhr/resources/parse-headers.py":
 		return parseHeadersHandler
+	case "xhr/resources/echo-headers.py":
+		return echoHeadersHandler
 	case "fetch/api/resources/trickle.py":
 		return trickleHandler
 	case "fetch/api/resources/cache.py":
@@ -216,8 +220,10 @@ func inspectHeadersHandler(st *stash, w http.ResponseWriter, r *http.Request) bo
 	if v := r.URL.Query().Get("headers"); v != "" {
 		checked = strings.Split(v, "|")
 		for _, h := range checked {
-			if got := r.Header.Get(h); got != "" {
-				w.Header().Add("x-request-"+h, got)
+			// PRESENT is the question, not non-empty: a header whose value
+			// normalized to "" still travelled, and the test reads "" back.
+			if vals, ok := r.Header[textproto.CanonicalMIMEHeaderKey(h)]; ok && len(vals) > 0 {
+				w.Header().Add("x-request-"+h, strings.Join(vals, ", "))
 			}
 		}
 	}
@@ -488,6 +494,27 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 // against its two behaviours: it counts the hops it has served under a stash
 // token, and it carries the whole query string forward so the next hop behaves
 // the same way.
+// echoHeadersHandler is xhr/resources/echo-headers.py: the request's raw
+// header block, exactly as it was sent. The raw bytes come from the
+// permissive listener (net/http canonicalizes name case); when they are not
+// available the canonicalized view is the honest fallback.
+func echoHeadersHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if head, ok := r.Context().Value(rawHeadKey{}).([]byte); ok && len(head) > 0 {
+		if i := bytes.IndexByte(head, '\n'); i >= 0 {
+			w.Write(head[i+1:])
+			return true
+		}
+	}
+	for k, vals := range r.Header {
+		for _, v := range vals {
+			fmt.Fprintf(w, "%s: %s\r\n", k, v)
+		}
+	}
+	return true
+}
+
 // parseHeadersHandler is xhr/resources/parse-headers.py: it echoes the
 // my-custom-header query value back as a response header — including values
 // (a NUL byte, say) that a client must then refuse to accept.

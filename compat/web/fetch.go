@@ -327,6 +327,24 @@ func (a *fetchAPI) fetchAbort(cfg spidermonkey.Config, args []spidermonkey.Value
 // newHTTPClient builds the transport that enforces Config.Resolve (per
 // hostname) and Config.Dial (per resolved address, so a DNS answer cannot
 // smuggle a connection past the allow-list).
+// headerByFold reads a header whose stored key may not be canonical.
+func headerByFold(h http.Header, name string) string {
+	for k, vals := range h {
+		if strings.EqualFold(k, name) && len(vals) > 0 {
+			return vals[0]
+		}
+	}
+	return ""
+}
+
+func delHeaderFold(h http.Header, name string) {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			delete(h, k)
+		}
+	}
+}
+
 func (a *fetchAPI) cookieJar() http.CookieJar {
 	a.jarOnce.Do(func() {
 		jar, err := cookiejar.New(nil)
@@ -605,13 +623,16 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	if err := checkRequestPermission(cfg, req); err != nil {
 		return a.promise("reject", spidermonkey.ValueOf(err.Error()))
 	}
+	// Names go on the wire in the CASE the caller wrote them: Header.Set
+	// would canonicalize, and net/http writes map keys as they are.
 	for k, v := range headers {
-		req.Header.Set(k, v)
+		req.Header[k] = append(req.Header[k], v)
 	}
 	// Identify the runtime. Go's transport otherwise sends "Go-http-client/1.1",
 	// which names the transport rather than the platform, and a fetch with no
-	// User-Agent at all is something no user agent does.
-	if req.Header.Get("User-Agent") == "" {
+	// User-Agent at all is something no user agent does. The lookup folds case
+	// because the keys above no longer arrive canonicalized.
+	if headerByFold(req.Header, "User-Agent") == "" {
 		req.Header.Set("User-Agent", fetchUserAgent)
 	}
 	// A per-request client selects the redirect policy without disturbing the
@@ -639,8 +660,8 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 			// hostname alone, so it would leak Authorization/Cookie across ports on
 			// the same host — this closes that gap.
 			if n := len(via); n > 0 && !sameOrigin(via[n-1].URL, req.URL) {
-				req.Header.Del("Authorization")
-				req.Header.Del("Cookie")
+				delHeaderFold(req.Header, "Authorization")
+				delHeaderFold(req.Header, "Cookie")
 			}
 			return nil
 		}
