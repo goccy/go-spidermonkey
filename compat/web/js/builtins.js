@@ -530,25 +530,69 @@
 
 	// ------------------------------------------- EventTarget / AbortController
 
+	// Event's members are IDL ATTRIBUTES: prototype accessors over slots the
+	// constructor DEFINES rather than assigns. Both halves matter. As own data
+	// properties they were writable and absent from Event.prototype, which is
+	// where a caller looks for them; and a plain assignment walks the prototype
+	// chain, so a page that has put a getter named `type` on Object.prototype —
+	// which is exactly what the tests for safe object creation do — made
+	// constructing any event throw.
 	globalThis.Event ??= class Event {
 		constructor(type, init = {}) {
-			this.type = String(type);
-			this.target = null;
-			this.currentTarget = null;
-			this.defaultPrevented = false;
-			this.bubbles = !!init.bubbles;
-			this.cancelable = !!init.cancelable;
-			this._trusted = false;
+			if (arguments.length < 1) throw new TypeError("Event: a type is required");
+			const opts = init === null || init === undefined ? {} : init;
+			Object.defineProperties(this, {
+				_type: { value: String(type), writable: true },
+				_target: { value: null, writable: true },
+				_currentTarget: { value: null, writable: true },
+				_defaultPrevented: { value: false, writable: true },
+				_bubbles: { value: Boolean(opts.bubbles) },
+				_cancelable: { value: Boolean(opts.cancelable) },
+				_composed: { value: Boolean(opts.composed) },
+				_trusted: { value: false, writable: true },
+				_stopImmediate: { value: false, writable: true },
+				_stopped: { value: false, writable: true },
+				// The moment the event was created, on the same clock
+				// performance.now() reads — which is what timeStamp means.
+				_timeStamp: {
+					value: globalThis.performance && typeof globalThis.performance.now === "function"
+						? globalThis.performance.now() : 0,
+					writable: true,
+				},
+			});
 		}
+		get type() { return this._type; }
+		get target() { return this._target; }
+		get srcElement() { return this._target; }
+		get currentTarget() { return this._currentTarget; }
+		get eventPhase() { return this._currentTarget === null ? 0 : 2; }
+		get bubbles() { return this._bubbles; }
+		get cancelable() { return this._cancelable; }
+		get composed() { return this._composed; }
+		get defaultPrevented() { return this._defaultPrevented; }
+		get timeStamp() { return this._timeStamp; }
+		get returnValue() { return !this._defaultPrevented; }
+		set returnValue(value) { if (!value) this.preventDefault(); }
+		get cancelBubble() { return this._stopped; }
+		set cancelBubble(value) { if (value) this.stopPropagation(); }
 		// isTrusted distinguishes an event the RUNTIME fired (a message arriving,
 		// a timer's timeout) from one script fired through dispatchEvent. Script
 		// can never mint a trusted event: dispatchEvent clears the flag, and only
 		// the internal __dispatch_trusted helper below sets it.
 		get isTrusted() { return this._trusted; }
-		preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
-		stopPropagation() {}
-		stopImmediatePropagation() { this._stopImmediate = true; }
+		composedPath() { return this._currentTarget === null ? [] : [this._currentTarget]; }
+		preventDefault() { if (this._cancelable) this._defaultPrevented = true; }
+		stopPropagation() { this._stopped = true; }
+		stopImmediatePropagation() { this._stopped = true; this._stopImmediate = true; }
 	};
+	for (const [name, value] of [["NONE", 0], ["CAPTURING_PHASE", 1], ["AT_TARGET", 2], ["BUBBLING_PHASE", 3]]) {
+		for (const target of [globalThis.Event, globalThis.Event.prototype]) {
+			Object.defineProperty(target, name, { value, enumerable: true });
+		}
+	}
+	Object.defineProperty(globalThis.Event.prototype, Symbol.toStringTag, {
+		value: "Event", configurable: true,
+	});
 
 	// __dispatch_trusted(target, event): dispatch as the user agent, which is the
 	// one caller allowed to leave isTrusted true. Host-driven surfaces
@@ -563,53 +607,95 @@
 
 	globalThis.EventTarget ??= class EventTarget {
 		constructor() { this._listeners = new Map(); }
-		addEventListener(type, callback, options = {}) {
+		// A listener is identified by its callback AND its capture flag, and it is
+		// added only once for that pair. `passive` is accepted and recorded: there
+		// is no default action to suppress here, but a caller feature-detects it by
+		// whether the option is READ, so accepting it silently is the difference
+		// between "supported" and "ignored".
+		addEventListener(type, callback, options = undefined) {
+			if (arguments.length < 2) throw new TypeError("addEventListener requires 2 arguments");
 			if (callback === null || callback === undefined) return;
 			type = String(type);
-			const opts = options && typeof options === "object" ? options : {};
-			const signal = opts.signal;
+			const opts = normalizeListenerOptions(options, "addEventListener");
 			// WHATWG: an already-aborted signal means the listener is never added.
-			if (signal && signal.aborted) return;
+			if (opts.signal && opts.signal.aborted) return;
 			let list = this._listeners.get(type);
 			if (!list) this._listeners.set(type, list = []);
-			if (list.some((l) => l.callback === callback)) return;
-			const entry = { callback, once: !!opts.once, signalCleanup: null };
-			if (signal && typeof signal.addEventListener === "function") {
+			if (list.some((l) => l.callback === callback && l.capture === opts.capture)) return;
+			const entry = {
+				callback, capture: opts.capture, once: opts.once, passive: opts.passive,
+				removed: false, signalCleanup: null,
+			};
+			if (opts.signal && typeof opts.signal.addEventListener === "function") {
 				// Aborting the signal removes THIS listener; if the listener is
 				// removed normally (or fires with once), the abort hook is
 				// detached too so the signal doesn't accumulate dead closures.
-				const onAbort = () => this.removeEventListener(type, callback);
+				const signal = opts.signal;
+				const onAbort = () => this.removeEventListener(type, callback, { capture: opts.capture });
 				signal.addEventListener("abort", onAbort);
 				entry.signalCleanup = () => signal.removeEventListener("abort", onAbort);
 			}
 			list.push(entry);
 		}
-		removeEventListener(type, callback) {
+		removeEventListener(type, callback, options = undefined) {
+			if (arguments.length < 2) throw new TypeError("removeEventListener requires 2 arguments");
+			const opts = normalizeListenerOptions(options, "removeEventListener");
 			const list = this._listeners.get(String(type));
 			if (!list) return;
-			const i = list.findIndex((l) => l.callback === callback);
+			const i = list.findIndex((l) => l.callback === callback && l.capture === opts.capture);
 			if (i >= 0) {
 				const [entry] = list.splice(i, 1);
+				// Marked as well as spliced: a dispatch already walking a COPY of the
+				// list must not call a listener that has since been removed, which is
+				// the whole point of removing one from inside another.
+				entry.removed = true;
 				if (entry.signalCleanup) entry.signalCleanup();
 			}
 		}
 		dispatchEvent(event, opts) {
+			if (arguments.length < 1) throw new TypeError("dispatchEvent requires 1 argument");
+			if (!(event instanceof Event)) throw new TypeError("dispatchEvent: the argument must be an Event");
 			// A script-dispatched event is never trusted, however it was minted.
 			// The one exception is the internal trusted-dispatch helper.
 			if (!(opts && opts.__keepTrusted)) event._trusted = false;
-			event.target = event.currentTarget = this;
+			event._target = event._currentTarget = this;
+			event._stopped = false;
+			event._stopImmediate = false;
 			const list = this._listeners.get(event.type);
 			if (list) {
 				for (const l of [...list]) {
-					if (l.once) this.removeEventListener(event.type, l.callback);
+					if (l.removed) continue;
+					if (l.once) this.removeEventListener(event.type, l.callback, { capture: l.capture });
 					if (typeof l.callback === "function") l.callback.call(this, event);
 					else if (l.callback && typeof l.callback.handleEvent === "function") l.callback.handleEvent(event);
 					if (event._stopImmediate) break;
 				}
 			}
+			event._currentTarget = null;
 			return !event.defaultPrevented;
 		}
 	};
+
+	// An options argument is either a boolean (the capture flag) or a dictionary.
+	// `signal` is an AbortSignal and NOT nullable, so null is a TypeError rather
+	// than "no signal" — a caller that passes null has made a mistake.
+	function normalizeListenerOptions(options, who) {
+		if (typeof options === "boolean") return { capture: options, once: false, passive: false, signal: undefined };
+		if (options === null || options === undefined) return { capture: false, once: false, passive: false, signal: undefined };
+		if (typeof options !== "object" && typeof options !== "function") {
+			return { capture: Boolean(options), once: false, passive: false, signal: undefined };
+		}
+		const signal = options.signal;
+		if (signal !== undefined && !(typeof AbortSignal === "function" && signal instanceof AbortSignal)) {
+			throw new TypeError(`${who}: options.signal is not an AbortSignal`);
+		}
+		return {
+			capture: Boolean(options.capture),
+			once: Boolean(options.once),
+			passive: Boolean(options.passive),
+			signal,
+		};
+	}
 
 	// globalThis as an event target. The web dispatches host-originated events
 	// here rather than at an object the guest made — `unhandledrejection` below
@@ -1588,10 +1674,15 @@
 			// for good.
 			const chunk = new Uint8Array(this._body);
 			let delivered = false;
+			// A body is a BYTE stream — it carries bytes, and a caller may read it
+			// through a buffer of their own. Declared as an ordinary stream it
+			// refused every BYOB reader.
 			this._bodyStream = new ReadableStream({
+				type: "bytes",
 				pull(controller) {
-					if (delivered) controller.close();
-					else { delivered = true; controller.enqueue(chunk); }
+					if (delivered || chunk.length === 0) { controller.close(); return; }
+					delivered = true;
+					controller.enqueue(chunk);
 				},
 			});
 			return this._bodyStream;
@@ -1651,16 +1742,25 @@
 
 	class Request {
 		constructor(input, init = {}) {
+			if (arguments.length < 1) throw new TypeError("Request: an input is required");
 			const from = input instanceof Request ? input : null;
-			const url = from ? from.url : String(input);
-			// WHATWG/undici: constructing a Request from a URL that carries credentials
-			// throws a TypeError (they are NOT turned into an Authorization header).
+			// A request's url is ABSOLUTE. A relative one is resolved against the
+			// environment's base, and one that cannot be resolved is a TypeError —
+			// keeping the relative string meant everything downstream had to resolve
+			// it again, and a cache keyed on it matched nothing.
+			let url = from ? from.url : String(input);
 			if (!from) {
+				const base = environmentURL();
 				let parsed = null;
-				try { parsed = new URL(url); } catch { parsed = null; }
-				if (parsed && (parsed.username || parsed.password)) {
+				try { parsed = base ? new URL(url, base) : new URL(url); } catch { parsed = null; }
+				if (parsed === null) throw new TypeError(`Request: ${url} is not a URL`);
+				// WHATWG/undici: constructing a Request from a URL that carries
+				// credentials throws a TypeError (they are NOT turned into an
+				// Authorization header).
+				if (parsed.username || parsed.password) {
 					throw new TypeError("Request cannot be constructed from a URL that includes credentials");
 				}
+				url = parsed.href;
 			}
 			// A method must be a token, and CONNECT, TRACE and TRACK are forbidden
 			// to script outright — they let a page reach through a proxy or reflect
@@ -1809,11 +1909,41 @@
 	// by accident.
 	const nativeResponseProto = Object.create(Response.prototype, {
 		clone: {
+			// A response from fetch clones by TEEING its body, like any other: the
+			// two halves replay the same bytes. What is different is that this
+			// response's own consumers read the connection directly, and they cannot
+			// go on doing that once a tee owns it — so they are re-pointed at this
+			// side's branch here. Refusing to clone (which is what this used to do)
+			// left every caller that clones a fetch response with nothing.
 			value() {
-				// A body already read cannot be cloned, and a clone would have to tee
-				// the host's stream — which this layer cannot do. Reporting that is
-				// better than handing back a response whose body is silently empty.
-				throw new TypeError("clone: a response from fetch cannot be cloned by this runtime");
+				if (this.bodyUsed) throw new TypeError("clone: the body has already been used");
+				const source = this.body;
+				if (source && source.locked) throw new TypeError("clone: the body is locked");
+				// Built without a status in the init so the constructor's range guard
+				// is skipped: an opaque response's status is 0 and clones all the same.
+				const build = (stream) => {
+					const r = new Response(null, { statusText: this.statusText, headers: new Headers(this.headers) });
+					r.status = this.status;
+					r.ok = this.status >= 200 && this.status <= 299;
+					r.type = this.type;
+					r.url = this.url;
+					r.redirected = this.redirected === true;
+					r._body = null;
+					r._bodyStream = stream;
+					return r;
+				};
+				if (source === null || source === undefined) return build(null);
+				const [mine, theirs] = source.tee();
+				const self = build(mine);
+				Object.defineProperty(this, "body", { configurable: true, writable: true, value: mine });
+				for (const m of ["arrayBuffer", "bytes", "blob", "text", "json", "formData"]) {
+					Object.defineProperty(this, m, {
+						configurable: true, writable: true,
+						value: function (...a) { return self[m](...a); },
+					});
+				}
+				Object.defineProperty(this, "bodyUsed", { configurable: true, get: () => self.bodyUsed });
+				return build(theirs);
 			},
 			writable: true, configurable: true,
 		},
@@ -2165,7 +2295,16 @@
 		return res;
 	}
 
-	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode) {
+	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode, signal) {
+		// The chain has AWAITS in it — a preflight, each hop — and an abort that
+		// lands during one of them must stop the next request from going out. The
+		// host-side cancel only reaches a request that has already started, so the
+		// signal is re-read here before anything else is sent.
+		const abortIfAborted = () => {
+			if (signal && signal.aborted) {
+				throw (signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+			}
+		};
 		// "error" and "manual" never follow anything: the first redirect is either
 		// a network error or the end of the exchange.
 		const mode = String(nInit.__redirect ?? "follow");
@@ -2213,8 +2352,12 @@
 			// never consulted and the request went out regardless.
 			if (corsMode === "cors" && target.origin !== envURL.origin) {
 				const hopNeed = needsPreflight(step.method, headers);
-				if (hopNeed) await runPreflight(current, hopNeed, origin);
+				if (hopNeed) {
+					abortIfAborted();
+					await runPreflight(current, hopNeed, origin);
+				}
 			}
+			abortIfAborted();
 			const res = trackBodyUsed(await globalThis.__native_fetch(current, step));
 			const crossHop = target.origin !== envURL.origin;
 			if (crossHop && !corsAllowsResponse(res, origin)) {
@@ -2280,15 +2423,20 @@
 		try {
 			init = init || {};
 			const isReq = globalThis.Request && input instanceof globalThis.Request;
-			const url = isReq ? input.url : String(input);
+			// A relative URL is resolved against the environment's base HERE, so
+			// everything downstream — the redirect chain, the origin comparisons,
+			// the host — sees an absolute one. A Request has already done it.
+			let url = isReq ? input.url : String(input);
+			let parsed = null;
+			const fetchBase = environmentURL();
+			try { parsed = fetchBase ? new URL(url, fetchBase) : new URL(url); } catch { parsed = null; }
 			// WHATWG/undici: a URL that carries credentials is rejected (NOT converted
 			// to an Authorization header). Only throw when the URL actually parses with
 			// a username/password so relative inputs keep their current behavior.
-			let parsed = null;
-			try { parsed = new URL(url); } catch { parsed = null; }
 			if (parsed && (parsed.username || parsed.password)) {
 				throw new TypeError("Request cannot be constructed from a URL that includes credentials");
 			}
+			if (parsed) url = parsed.href;
 			const headers = setHeadersGuard(new Headers(isReq ? input.headers : undefined), "request");
 			if (init.headers !== undefined && init.headers !== null) {
 				for (const [k, v] of new Headers(init.headers)) headers.set(k, v);
@@ -2474,7 +2622,7 @@
 				const go = chained
 					? () => {
 						if (signal && onAbort) signal.addEventListener("abort", onAbort);
-						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode).then(
+						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode, signal).then(
 							(res) => { cleanup(); return res; },
 							(err) => {
 								cleanup();
@@ -2488,8 +2636,28 @@
 				// suite counts preflights.
 				const need = !chained && crossOrigin && mode === "cors"
 					? needsPreflight(method, headers) : null;
-				if (!need) return go();
-				return runPreflight(url, need, envURL.origin).then(go);
+				const started = !need ? go() : runPreflight(url, need, envURL.origin).then(go);
+				if (!signal) return started;
+				// An abort ENDS the fetch, whatever stage it is at. Cancelling the
+				// host request releases the connection, but the moment the promise
+				// rejects must not depend on how far the request had got — a signal
+				// that fires while the guest is between hops, or while the host is
+				// mid-round-trip, has to reject with the abort reason either way.
+				let fire = null;
+				const aborted = new Promise((_, reject) => {
+					fire = () => reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+					if (signal.aborted) fire();
+					else signal.addEventListener("abort", fire);
+				});
+				// The listener goes when the fetch is over, however it ended: a signal
+				// that outlives its fetch must not keep the rejection closure alive.
+				const drop = () => { if (fire) signal.removeEventListener("abort", fire); };
+				// Whichever loses the race is not an unhandled rejection: one of the
+				// two is always discarded.
+				started.then(drop, drop);
+				started.catch(() => {});
+				aborted.catch(() => {});
+				return Promise.race([started, aborted]);
 			};
 			// A ReadableStream request body is drained to bytes before dispatch (the
 			// native path sends a buffered body; no chunked uploads yet).

@@ -252,22 +252,11 @@ globalThis.GLOBAL = {
 		}
 		return `
 (function () {
-  // location itself is installed by compat/web (see Options.Location); what is
-  // needed here is only that relative URLs resolve against it.
-  const base = ` + jsString(href) + `;
-  const raw = globalThis.fetch;
-  globalThis.fetch = function fetch(input, init) {
-    if (typeof input === "string") input = new URL(input, base).href;
-    return raw.call(this, input, init);
-  };
-  const RawRequest = globalThis.Request;
-  if (RawRequest) {
-    globalThis.Request = class Request extends RawRequest {
-      constructor(input, init) {
-        super(typeof input === "string" ? new URL(input, base).href : input, init);
-      }
-    };
-  }
+  // A test file's URL is the base its relative URLs resolve against, and
+  // location carries it (see Options.Location). Nothing else is needed here:
+  // fetch and Request resolve against that base themselves, as they must —
+  // a shim that did it for them would be measuring the shim.
+  void ` + jsString(href) + `;
 })();
 `
 	}()

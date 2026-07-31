@@ -72,9 +72,11 @@ var featureGlobals = map[Feature][]string{
 		"ByteLengthQueuingStrategy", "CountQueuingStrategy",
 	},
 	FeatureCompression: {"CompressionStream", "DecompressionStream"},
-	FeatureFetch:       {"fetch", "Headers", "Request", "Response"},
-	FeatureFileAPI:     {"Blob", "File", "FileList", "FileReader", "FileReaderSync", "FormData"},
-	FeatureCrypto:      {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
+	// The Cache API is part of fetch's vocabulary, not a feature of its own:
+	// what it stores are Requests and Responses, and it fetches to fill itself.
+	FeatureFetch:   {"fetch", "Headers", "Request", "Response", "caches", "Cache", "CacheStorage"},
+	FeatureFileAPI: {"Blob", "File", "FileList", "FileReader", "FileReaderSync", "FormData"},
+	FeatureCrypto:  {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
 	FeaturePerformance: {
 		"performance", "Performance", "PerformanceEntry", "PerformanceMark",
 		"PerformanceMeasure", "PerformanceObserver", "PerformanceObserverEntryList",

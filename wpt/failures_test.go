@@ -75,8 +75,16 @@ func TestWPTFailureBuckets(t *testing.T) {
 			if os.Getenv("WPT_BUCKETS_NAMES") != "" {
 				line = s.Name + " :: " + line
 			}
-			if len(line) > 110 {
-				line = line[:110]
+			// WPT_BUCKETS_WIDTH widens the line when the tail of a message is
+			// where the cause is; the default keeps the report readable.
+			width := 110
+			if w := os.Getenv("WPT_BUCKETS_WIDTH"); w != "" {
+				if n, err := strconv.Atoi(w); err == nil && n > 0 {
+					width = n
+				}
+			}
+			if len(line) > width {
+				line = line[:width]
 			}
 			counts[digits.ReplaceAllString(line, "N")]++
 		}

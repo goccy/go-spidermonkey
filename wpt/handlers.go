@@ -136,8 +136,48 @@ func handlerFor(rel string) wptHandler {
 		return trickleHandler
 	case "xhr/resources/dump-authorization-header.py":
 		return dumpAuthorizationHandler
+	case "service-workers/cache-storage/resources/vary.py":
+		return cacheVaryHandler
+	case "service-workers/cache-storage/resources/fetch-status.py":
+		return cacheFetchStatusHandler
 	}
 	return nil
+}
+
+// cacheVaryHandler ports service-workers/cache-storage/resources/vary.py: a
+// response whose Vary header the caller chooses, which is how the Cache tests
+// produce two entries that share a URL and differ only by what they vary on.
+// The cookie override exists because two requests to the SAME url and query
+// cannot otherwise be told to vary differently.
+func cacheVaryHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	if has(r, "clear-vary-value-override-cookie") {
+		http.SetCookie(w, &http.Cookie{Name: "vary-value-override", Path: "/", MaxAge: -1})
+		_, _ = io.WriteString(w, "vary cookie cleared")
+		return true
+	}
+	if set := q(r, "set-vary-value-override-cookie", ""); set != "" {
+		http.SetCookie(w, &http.Cookie{Name: "vary-value-override", Value: set, Path: "/"})
+		_, _ = io.WriteString(w, "vary cookie set")
+		return true
+	}
+	if c, err := r.Cookie("vary-value-override"); err == nil && c.Value != "" {
+		w.Header().Set("Vary", c.Value)
+	} else if v := q(r, "vary", ""); v != "" {
+		w.Header().Set("Vary", v)
+	}
+	_, _ = io.WriteString(w, "vary response")
+	return true
+}
+
+// cacheFetchStatusHandler ports fetch-status.py: an empty response with the
+// status the query names.
+func cacheFetchStatusHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	code, err := strconv.Atoi(q(r, "status", "200"))
+	if err != nil || code < 100 || code > 599 {
+		code = http.StatusOK
+	}
+	w.WriteHeader(code)
+	return true
 }
 
 // q reads the first value of a query parameter, with a default.

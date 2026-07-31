@@ -725,10 +725,19 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 	if err := source.DefineFunc("cancel", st.cancel); err != nil {
 		return nil, err
 	}
+	// A response body is a BYTE stream: it carries bytes, and a caller may read
+	// it through a buffer of their own (getReader({mode:"byob"})). Declared as an
+	// ordinary stream it refused every BYOB reader.
+	if err := source.Set("type", spidermonkey.ValueOf("bytes")); err != nil {
+		source.Free()
+		return nil, err
+	}
 	// highWaterMark 0: nothing is read from the connection until a consumer
-	// asks. At the default of 1 the stream pulls as soon as it is constructed —
-	// which claims the body for the STREAM before the response has even been
-	// handed to the caller, so a later res.text() found it already consumed.
+	// asks. At the default the stream pulls as soon as it is constructed — which
+	// claims the body for the STREAM before the response has even been handed to
+	// the caller, so a later res.text() found it already consumed. (A byte
+	// stream's default is already 0; it is set anyway, because the default is
+	// not the reason.)
 	strategy, err := js.NewObject()
 	if err != nil {
 		source.Free()

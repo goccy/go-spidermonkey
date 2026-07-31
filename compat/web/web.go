@@ -71,6 +71,9 @@ var workerGlueJS string
 //go:embed js/broadcastchannel.js
 var broadcastChannelJS string
 
+//go:embed js/cachestorage.js
+var cacheStorageJS string
+
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -165,7 +168,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, `delete globalThis.__web_ops;`} {
+	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, `delete globalThis.__web_ops;`} {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
