@@ -160,7 +160,8 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	// are all absent from Node, and a Node runtime that answered to one of them
 	// would not be Node.
 	w, err := web.InstallWith(js, web.Options{
-		Features: append(web.MinimumCommonFeatures(), web.FeatureWebSocket, web.FeatureEventSource),
+		Features: append(web.MinimumCommonFeatures(),
+			web.FeatureWebSocket, web.FeatureEventSource, web.FeatureBroadcastChannel),
 	})
 	if err != nil {
 		return nil, err

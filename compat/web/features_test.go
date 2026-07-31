@@ -134,3 +134,43 @@ func TestFeatureSelectionRemovesTheRest(t *testing.T) {
 		}
 	}
 }
+
+// TestFeaturesAreSeparablyAskedFor is the property the fine-grained features
+// exist for: where a specification boundary runs through what looks like one
+// API, an embedding can take one side without the other.
+//
+// Each pair below is a boundary that was inside a single feature until it was
+// split, and each is checked in the direction that used to be impossible.
+func TestFeaturesAreSeparablyAskedFor(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		take    []web.Feature
+		present web.Feature
+		absent  web.Feature
+	}{
+		{"the File API without FormData", []web.Feature{web.FeatureFileAPI}, web.FeatureFileAPI, web.FeatureFormData},
+		{"encoding without its streams", []web.Feature{web.FeatureEncoding}, web.FeatureEncoding, web.FeatureEncodingStreams},
+		{"encoding without base64", []web.Feature{web.FeatureEncoding}, web.FeatureEncoding, web.FeatureBase64},
+		{"aborting without events", []web.Feature{web.FeatureAbort}, web.FeatureAbort, web.FeatureEvents},
+		{"messaging without a broadcast bus", []web.Feature{web.FeatureMessaging}, web.FeatureMessaging, web.FeatureBroadcastChannel},
+		{"a canvas without ImageBitmap", []web.Feature{web.FeatureCanvas}, web.FeatureCanvas, web.FeatureImageBitmap},
+		{"a canvas without the geometry types", []web.Feature{web.FeatureCanvas}, web.FeatureCanvas, web.FeatureGeometry},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// A worker scope, because some feature globals are [Exposed=Worker] —
+			// FileReaderSync among them — and this is a test about FEATURES, not
+			// about which scope exposes what.
+			got := installedGlobals(t, web.Options{Features: c.take, Scope: web.ScopeDedicatedWorker})
+			for _, g := range web.FeatureGlobals(c.present) {
+				if !got[g] {
+					t.Errorf("%q is missing although %s was selected", g, c.present)
+				}
+			}
+			for _, g := range web.FeatureGlobals(c.absent) {
+				if got[g] {
+					t.Errorf("%q is present although %s was not selected", g, c.absent)
+				}
+			}
+		})
+	}
+}

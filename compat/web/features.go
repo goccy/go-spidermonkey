@@ -50,33 +50,59 @@ const (
 	FeatureCanvas          Feature = "canvas"
 	FeatureObservable      Feature = "observable"
 	FeatureCache           Feature = "cache"
-	FeatureWorker          Feature = "worker"
+	// The features below exist because a SPEC boundary runs through what used to
+	// be one of the features above. Each is separately selectable because each
+	// is separately implementable, and an embedding that wants one without the
+	// other is asking a reasonable question: FormData is XHR's, not the File
+	// API's; atob/btoa are HTML's, not Encoding's; AbortController is DOM's and
+	// is what makes anything cancellable, fetch included.
+	FeatureAbort            Feature = "abort"
+	FeatureFormData         Feature = "formdata"
+	FeatureBase64           Feature = "base64"
+	FeatureEncodingStreams  Feature = "encoding-streams"
+	FeatureBroadcastChannel Feature = "broadcast-channel"
+	FeatureGeometry         Feature = "geometry"
+	FeatureImageBitmap      Feature = "imagebitmap"
+	FeatureWorker           Feature = "worker"
 )
 
 // featureGlobals maps each feature onto the globals it owns. Every global this
 // package installs belongs to exactly one feature, except the ones in
 // alwaysInstalled below.
 var featureGlobals = map[Feature][]string{
-	FeatureConsole:    {"console"},
-	FeatureEncoding:   {"TextEncoder", "TextDecoder", "TextEncoderStream", "TextDecoderStream", "atob", "btoa"},
+	FeatureConsole:  {"console"},
+	FeatureEncoding: {"TextEncoder", "TextDecoder"},
+	// The stream half of Encoding is separate because it needs streams, and an
+	// embedding without them can still have the encoder and the decoder.
+	FeatureEncodingStreams: {"TextEncoderStream", "TextDecoderStream"},
+	// atob/btoa are HTML's base64 utilities. They live next to Encoding in
+	// everyone's mental model and in no specification.
+	FeatureBase64:     {"atob", "btoa"},
 	FeatureURL:        {"URL", "URLSearchParams"},
 	FeatureURLPattern: {"URLPattern"},
-	// Observable belongs with events: it is an event stream before it is
-	// anything else, and EventTarget.when is what produces one.
 	FeatureCanvas: {
 		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
-		"Path2D", "ImageData", "DOMPoint", "DOMPointReadOnly",
-		"ImageBitmap", "CanvasPattern", "createImageBitmap",
+		"Path2D", "ImageData", "CanvasPattern",
 	},
+	// An ImageBitmap is what a canvas DRAWS, not part of the canvas: it is
+	// created from a blob or an ImageData and can be handed between agents.
+	FeatureImageBitmap: {"ImageBitmap", "createImageBitmap"},
+	// The geometry interfaces are their own specification, and a canvas is only
+	// one of the things that speaks in them.
+	FeatureGeometry: {"DOMPoint", "DOMPointReadOnly"},
 	// Observable is its own feature rather than part of events, even though it
 	// is an event stream: it is not in the Minimum Common API, and a profile
 	// that offers the standard's surface must be able to leave it out.
 	FeatureObservable: {"Observable", "Subscriber"},
 	FeatureEvents: {
 		"Event", "EventTarget", "CustomEvent", "ErrorEvent", "MessageEvent",
-		"PromiseRejectionEvent", "AbortController", "AbortSignal",
+		"PromiseRejectionEvent",
 		"addEventListener", "removeEventListener", "dispatchEvent", "reportError",
 	},
+	// Aborting is DOM's, and it is what makes anything cancellable — a fetch, a
+	// stream pipe, a subscription. It is separable from events because plenty of
+	// code wants a signal without ever dispatching one of its own.
+	FeatureAbort: {"AbortController", "AbortSignal"},
 	FeatureStreams: {
 		"ReadableStream", "WritableStream", "TransformStream",
 		"ReadableStreamBYOBReader", "ReadableStreamBYOBRequest",
@@ -91,21 +117,27 @@ var featureGlobals = map[Feature][]string{
 	// Common API does not require it, and the runtimes that have it have it as
 	// an addition.
 	FeatureCache:   {"caches", "Cache", "CacheStorage"},
-	FeatureFileAPI: {"Blob", "File", "FileList", "FileReader", "FileReaderSync", "FormData"},
-	FeatureCrypto:  {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
+	FeatureFileAPI: {"Blob", "File", "FileList", "FileReader", "FileReaderSync"},
+	// FormData is XMLHttpRequest's, not the File API's. It is here on its own
+	// because fetch needs it for a multipart body and XHR is not wanted.
+	FeatureFormData: {"FormData"},
+	FeatureCrypto:   {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
 	FeaturePerformance: {
 		"performance", "Performance", "PerformanceEntry", "PerformanceMark",
 		"PerformanceMeasure", "PerformanceObserver", "PerformanceObserverEntryList",
 	},
 	FeatureTimers:          {"setTimeout", "clearTimeout", "setInterval", "clearInterval", "queueMicrotask"},
 	FeatureStructuredClone: {"structuredClone"},
-	FeatureMessaging:       {"MessageChannel", "MessagePort", "BroadcastChannel"},
-	FeatureXMLHttpRequest:  {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
-	FeatureWebSocket:       {"WebSocket", "CloseEvent", "WebSocketStream", "WebSocketError"},
-	FeatureEventSource:     {"EventSource"},
-	FeatureWebLocks:        {"Lock", "LockManager"},
-	FeatureWebAssembly:     {"WebAssembly"},
-	FeatureWorker:          {"Worker"},
+	FeatureMessaging:       {"MessageChannel", "MessagePort"},
+	// A BroadcastChannel is not a channel between two ports but a bus by name,
+	// with its own reach and its own lifetime.
+	FeatureBroadcastChannel: {"BroadcastChannel"},
+	FeatureXMLHttpRequest:   {"XMLHttpRequest", "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "ProgressEvent"},
+	FeatureWebSocket:        {"WebSocket", "CloseEvent", "WebSocketStream", "WebSocketError"},
+	FeatureEventSource:      {"EventSource"},
+	FeatureWebLocks:         {"Lock", "LockManager"},
+	FeatureWebAssembly:      {"WebAssembly"},
+	FeatureWorker:           {"Worker"},
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs
@@ -180,6 +212,10 @@ const (
 var minimumCommonFeatures = []Feature{
 	FeatureConsole,
 	FeatureEncoding,
+	FeatureEncodingStreams,
+	FeatureBase64,
+	FeatureAbort,
+	FeatureFormData,
 	FeatureURL,
 	FeatureURLPattern,
 	FeatureEvents,
@@ -204,6 +240,8 @@ var serverRuntimeExtras = []Feature{
 	FeatureWebLocks,
 	FeatureWorker,
 	FeatureCache,
+	FeatureBroadcastChannel,
+	FeatureImageBitmap,
 }
 
 // MinimumCommonFeatures is the surface a non-browser runtime is expected to
