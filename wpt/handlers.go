@@ -421,14 +421,18 @@ func preflightHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 			w.Header().Set("Access-Control-Allow-Methods", v)
 		}
 		if token != "" {
-			// ABSENT is not the same as empty: the original stores None when the
-			// preflight carried no Access-Control-Request-Headers, and then omits
-			// the reporting header entirely — which is what the test reads as null.
-			// Storing "" for both made every no-unsafe-header preflight report an
-			// empty string instead.
-			control := "\x00absent"
-			if v, ok := r.Header["Access-Control-Request-Headers"]; ok && len(v) > 0 {
-				control = v[0]
+			// The header is REPORTED only when the test asked for it with the
+			// control_request_headers query parameter; the default it reports
+			// otherwise is the empty string. When it did ask and the preflight
+			// carried no Access-Control-Request-Headers, the original stores
+			// None and the reporting header is omitted entirely — which is
+			// what the test reads as null. Three states, all distinct.
+			control := ""
+			if query.Has("control_request_headers") {
+				control = "\x00absent"
+				if v, ok := r.Header["Access-Control-Request-Headers"]; ok && len(v) > 0 {
+					control = v[0]
+				}
 			}
 			st.put(token, strings.Join([]string{
 				control,

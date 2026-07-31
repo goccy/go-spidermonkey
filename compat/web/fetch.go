@@ -30,6 +30,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strconv"
 	"strings"
@@ -58,6 +59,11 @@ type fetchAPI struct {
 	roots      *x509.CertPool
 	clientOnce sync.Once
 	client     *http.Client
+	// jar is the cookie store a credentialed request reads and writes. The
+	// guest resolves the credentials mode per hop; the host only needs to
+	// know whether THIS request carries cookies.
+	jar     http.CookieJar
+	jarOnce sync.Once
 
 	mu     sync.Mutex
 	open   map[*fetchStream]struct{}
@@ -319,6 +325,16 @@ func (a *fetchAPI) fetchAbort(cfg spidermonkey.Config, args []spidermonkey.Value
 // newHTTPClient builds the transport that enforces Config.Resolve (per
 // hostname) and Config.Dial (per resolved address, so a DNS answer cannot
 // smuggle a connection past the allow-list).
+func (a *fetchAPI) cookieJar() http.CookieJar {
+	a.jarOnce.Do(func() {
+		jar, err := cookiejar.New(nil)
+		if err == nil {
+			a.jar = jar
+		}
+	})
+	return a.jar
+}
+
 func newHTTPClient(cfg spidermonkey.Config, roots *x509.CertPool) *http.Client {
 	dial := permissionDial(cfg)
 	// The transport is wrapped so that a request whose header values net/http
@@ -491,6 +507,7 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	method := "GET"
 	redirectMode := "follow"
 	cacheModeName := "default"
+	credentials := ""
 	abortID := ""
 	var reqBody io.Reader
 	headers := map[string]string{}
@@ -520,6 +537,9 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 		}
 		if v, ok := scalar("cache"); ok {
 			cacheModeName = v.String()
+		}
+		if v, ok := scalar("credentials"); ok {
+			credentials = v.String()
 		}
 		// The guest wraps init.signal as a string id (see the JS fetch wrapper) so
 		// its 'abort' listener can reach __native_fetch_abort. Pre-aborted signals
@@ -598,6 +618,9 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	// needs to count hops (for Response.redirected) and cap the chain.
 	hops := 0
 	reqClient := &http.Client{Transport: a.client.Transport}
+	if credentials == "include" {
+		reqClient.Jar = a.cookieJar()
+	}
 	switch redirectMode {
 	case "manual":
 		reqClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }

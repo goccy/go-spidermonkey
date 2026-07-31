@@ -326,9 +326,11 @@ func serveWPT(root string, srv *Server, w http.ResponseWriter, r *http.Request) 
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", contentType(rel))
 	}
-	// WPT's cross-origin tests need the suite's own server; permissive CORS
-	// here is what lets the same-origin majority run.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// No default Access-Control-Allow-Origin: wptserve adds none, and the
+	// cross-origin tests are ABOUT the difference — a resource that wants to
+	// be readable across origins declares it, with a .headers file or a
+	// ?pipe=header(...) stage, and one that does not is the "server forbid
+	// CORS" case the suite checks rejects.
 	// The pipes go LAST, so a test that asks for a particular Content-Type — or
 	// for none at all — overrides what was guessed from the file name.
 	if status := applyPipes(w, r); status != 0 {

@@ -2269,12 +2269,13 @@
 	}
 
 	function corsAllowsResponse(res, origin, withCredentials) {
+		// Optional whitespace around a header value is not part of it.
 		if (withCredentials) {
-			const allowed = res.headers && res.headers.get("access-control-allow-origin");
+			const allowed = String((res.headers && res.headers.get("access-control-allow-origin")) || "").trim();
 			return allowed === origin &&
-				String(res.headers.get("access-control-allow-credentials") || "").toLowerCase() === "true";
+				String(res.headers.get("access-control-allow-credentials") || "").trim().toLowerCase() === "true";
 		}
-		const allow = res.headers && res.headers.get("access-control-allow-origin");
+		const allow = String((res.headers && res.headers.get("access-control-allow-origin")) || "").trim();
 		if (!allow) return false;
 		if (allow === "*") {
 			// A wildcard cannot authorize a credentialed request.
@@ -2366,7 +2367,46 @@
 		return out;
 	}
 
+	// splitTokenList is splitList with the grammar enforced: every entry must
+	// be an HTTP token (or the wildcard). A preflight that answers with a
+	// malformed Access-Control-Allow-* value has not allowed anything.
+	const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+	function splitTokenList(value, what) {
+		const out = new Set();
+		for (const part of String(value || "").split(",")) {
+			const t = part.trim().toLowerCase();
+			if (!t) continue;
+			if (!HTTP_TOKEN.test(t)) throw corsError(`preflight ${what} value "${t}" is not a token`);
+			out.add(t);
+		}
+		return out;
+	}
+
+	// The preflight cache: a server's permission holds for Max-Age seconds
+	// (5 by default), so a second request within it goes out unasked. Keyed
+	// by origin, url and credentials mode, as the specification keys it.
+	const preflightCache = new Map();
+	function preflightCacheCovers(url, need, origin, withCredentials) {
+		const key = origin + "\x00" + url + "\x00" + (withCredentials ? "c" : "");
+		const entry = preflightCache.get(key);
+		if (!entry || entry.expires < Date.now()) {
+			preflightCache.delete(key);
+			return false;
+		}
+		const m = need.method.toLowerCase();
+		const simple = m === "get" || m === "head" || m === "post";
+		if (!simple && !entry.methods.has(m) && !(entry.methods.has("*") && !withCredentials)) return false;
+		const headerWildcard = entry.headers.has("*") && !withCredentials;
+		for (const n of need.headers) {
+			if (entry.headers.has(n)) continue;
+			if (headerWildcard && n !== "authorization") continue;
+			return false;
+		}
+		return true;
+	}
+
 	async function runPreflight(url, need, origin, referer, withCredentials) {
+		if (preflightCacheCovers(url, need, origin, withCredentials)) return;
 		const h = { origin, "access-control-request-method": need.method };
 		if (need.headers.length) h["access-control-request-headers"] = need.headers.join(",");
 		// Browsers send Accept: */* on a preflight, and the suite's fixture
@@ -2382,7 +2422,7 @@
 		}
 		// With credentials, every wildcard is a LITERAL: "*" grants nothing,
 		// the origin must be named, and Allow-Credentials must say true.
-		const allowOrigin = res.headers.get("access-control-allow-origin");
+		const allowOrigin = String(res.headers.get("access-control-allow-origin") || "").trim();
 		if (allowOrigin !== origin && (withCredentials || allowOrigin !== "*")) {
 			throw corsError("preflight did not allow " + origin);
 		}
@@ -2390,13 +2430,13 @@
 			String(res.headers.get("access-control-allow-credentials") || "").toLowerCase() !== "true") {
 			throw corsError("preflight did not allow credentials");
 		}
-		const allowMethods = splitList(res.headers.get("access-control-allow-methods"));
+		const allowMethods = splitTokenList(res.headers.get("access-control-allow-methods"), "Access-Control-Allow-Methods");
 		const methodWildcard = allowMethods.has("*") && !withCredentials;
 		if (!methodWildcard && !allowMethods.has(need.method.toLowerCase()) &&
 			!(need.method === "GET" || need.method === "HEAD" || need.method === "POST")) {
 			throw corsError("preflight did not allow method " + need.method);
 		}
-		const allowHeaders = splitList(res.headers.get("access-control-allow-headers"));
+		const allowHeaders = splitTokenList(res.headers.get("access-control-allow-headers"), "Access-Control-Allow-Headers");
 		const wildcard = allowHeaders.has("*") && !withCredentials;
 		for (const n of need.headers) {
 			if (allowHeaders.has(n)) continue;
@@ -2406,16 +2446,33 @@
 			if (wildcard && n !== "authorization") continue;
 			throw corsError("preflight did not allow header " + n);
 		}
+		let maxAge = 5;
+		const rawAge = res.headers.get("access-control-max-age");
+		if (rawAge !== null && /^-?\d+$/.test(String(rawAge).trim())) {
+			maxAge = parseInt(rawAge, 10);
+		}
+		if (maxAge > 0) {
+			preflightCache.set(origin + "\x00" + url + "\x00" + (withCredentials ? "c" : ""), {
+				expires: Date.now() + Math.min(maxAge, 60) * 1000,
+				methods: allowMethods,
+				headers: allowHeaders,
+			});
+		}
 	}
 
 	// filterCORSResponseHeaders removes what a cors response may not expose: a
 	// page sees the safelist plus whatever Access-Control-Expose-Headers names.
-	function filterCORSResponseHeaders(res) {
+	function filterCORSResponseHeaders(res, withCredentials) {
 		const exposed = splitList(res.headers.get("access-control-expose-headers"));
+		// With credentials the wildcard is a LITERAL header name; and
+		// Set-Cookie is never exposed to a cross-origin caller at all, not
+		// even by naming it.
+		const wildcard = exposed.has("*") && !withCredentials;
 		const remove = [];
 		for (const [k] of res.headers) {
 			const n = String(k).toLowerCase();
-			if (CORS_SAFELISTED_RESPONSE_HEADERS.has(n) || exposed.has("*") || exposed.has(n)) continue;
+			if (n === "set-cookie" || n === "set-cookie2") { remove.push(k); continue; }
+			if (CORS_SAFELISTED_RESPONSE_HEADERS.has(n) || wildcard || exposed.has(n)) continue;
 			remove.push(k);
 		}
 		for (const k of remove) {
@@ -2452,7 +2509,8 @@
 		return res;
 	}
 
-	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode, signal, withCredentials) {
+	async function followCORSRedirects(url, nInit, headers, envURL, referrerPolicy, explicitReferrer, corsMode, signal, credentialsMode) {
+		const withCredentials = credentialsMode === "include";
 		// The chain has AWAITS in it — a preflight, each hop — and an abort that
 		// lands during one of them must stop the next request from going out. The
 		// host-side cancel only reaches a request that has already started, so the
@@ -2517,6 +2575,12 @@
 			}
 			const step = { ...nInit, redirect: "manual", headers: hdrObj };
 			const target = hopTarget;
+			// The credentials MODE is the request's; whether cookies actually
+			// travel is decided per hop: "same-origin" carries them only on a
+			// hop that stayed home.
+			step.credentials = credentialsMode === "include"
+				|| (credentialsMode !== "omit" && target.origin === envURL.origin)
+				? "include" : "omit";
 			// A preflight is required for EVERY cross-origin hop that needs one, not
 			// only for the first: a redirect to a URL whose headers are not
 			// safelisted must ask that server's permission before it is sent
@@ -2540,7 +2604,7 @@
 			if (crossHop && corsMode === "no-cors") corpCheck(res, envURL, target);
 			if (!REDIRECT_STATUSES.has(res.status)) {
 				if (corsMode === "no-cors" && tainted) return opaqueResponse(res);
-				if (crossHop) filterCORSResponseHeaders(res);
+				if (crossHop) filterCORSResponseHeaders(res, withCredentials);
 				try { Object.defineProperty(res, "redirected", { configurable: true, value: hops > 0 }); } catch { /* ignore */ }
 				if (crossHop) {
 					try { Object.defineProperty(res, "type", { configurable: true, value: "cors" }); } catch { /* ignore */ }
@@ -2770,7 +2834,7 @@
 							if (!corsAllowsResponse(tracked, envURL.origin, withCredentials)) {
 								throw corsError("no Access-Control-Allow-Origin for " + envURL.origin);
 							}
-							filterCORSResponseHeaders(tracked);
+							filterCORSResponseHeaders(tracked, withCredentials);
 						}
 						if (crossOrigin && mode === "no-cors") return opaqueResponse(tracked);
 						if (crossOrigin) {
@@ -2793,12 +2857,12 @@
 			// by then — a body contributes a Content-Type, and that is one of the
 			// things the safelist is about.
 			const redirectMode = nInit.redirect || "follow";
-			// Only "include" makes a cross-origin exchange credentialed: there
-			// is no cookie jar here, but the CORS contract for a credentialed
-			// request is checkable — and checked — all the same.
-			const withCredentials =
-				String(init.credentials ?? (isReq ? input.credentials : "") ?? "") === "include";
-			nInit.credentials = String(init.credentials ?? (isReq ? input.credentials : "") ?? "") || "same-origin";
+			// The credentials mode decides both the cookie jar and the CORS
+			// contract: with "include", every wildcard becomes a literal.
+			const credentialsMode = String(init.credentials ?? (isReq ? input.credentials : "") ?? "") || "same-origin";
+			const withCredentials = credentialsMode === "include";
+			nInit.credentials = credentialsMode === "omit" ? "omit"
+				: (withCredentials || !crossOrigin) ? "include" : "omit";
 			// The chain is driven in the guest whenever the environment has an
 			// origin to judge hops against — not only when the FIRST hop is
 			// already cross-origin. A same-origin request that redirects to
@@ -2815,7 +2879,7 @@
 				const go = chained
 					? () => {
 						if (signal && onAbort) signal.addEventListener("abort", onAbort);
-						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode, signal, withCredentials).then(
+						return followCORSRedirects(url, nInit, headers, envURL, chainPolicy, chainExplicitReferrer, mode, signal, credentialsMode).then(
 							(res) => { cleanup(); return res; },
 							(err) => {
 								cleanup();
