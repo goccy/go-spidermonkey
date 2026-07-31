@@ -1522,6 +1522,13 @@
 		[Symbol.toStringTag]: { value: "Headers Iterator", configurable: true },
 	});
 
+	// teeForClone is fetch's tee: the second branch receives cloned buffers
+	// (ReadableStreamTee with cloneForBranch2), shared from streams.js.
+	const teeForClone = (stream) => {
+		const flagged = globalThis[Symbol.for("go-spidermonkey.streamTeeClone")];
+		return flagged ? flagged(stream) : stream.tee();
+	};
+
 	class Headers {
 		constructor(init = undefined) {
 			this._map = new Map(); // lowercased name -> array of values
@@ -1741,6 +1748,11 @@
 	// explicitly, apply it (spec behavior).
 	function setBody(target, init) {
 		if (init instanceof ReadableStream) {
+			// A stream that is already locked or has been read from cannot
+			// become a body: there is nothing left to transmit.
+			if (init.locked || init._disturbed === true) {
+				throw new TypeError("the body stream is locked or disturbed");
+			}
 			target._body = null;
 			target._bodyStream = init;
 			return;
@@ -1978,9 +1990,11 @@
 			r.type = this.type;
 			if (this._bodyStream) {
 				// tee() the stream body (WHATWG): both responses replay every chunk.
-				// A used/locked body cannot be cloned.
+				// A used/locked body cannot be cloned. The CLONE's branch carries
+				// cloned buffers — fetch tees with cloneForBranch2 — so writing
+				// into one response's chunk cannot corrupt the other's.
 				if (this.bodyUsed || this._bodyStream.locked) throw new TypeError("Cannot clone a Response whose body is used or locked");
-				const [b1, b2] = this._bodyStream.tee();
+				const [b1, b2] = teeForClone(this._bodyStream);
 				this._bodyStream = b1;
 				r._bodyStream = b2;
 				r._body = null;

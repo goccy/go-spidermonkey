@@ -1296,7 +1296,7 @@
 		return readableStreamDefaultTee(stream, cloneForBranch2);
 	}
 
-	function readableStreamDefaultTee(stream) {
+	function readableStreamDefaultTee(stream, cloneForBranch2) {
 		const reader = new ReadableStreamDefaultReader(stream);
 		let reading = false, readAgain = false, canceled1 = false, canceled2 = false;
 		let reason1, reason2, branch1, branch2;
@@ -1311,8 +1311,21 @@
 					// triggered by the enqueue, cannot re-enter this read synchronously.
 					queueMicrotask(() => {
 						readAgain = false;
+						// With cloneForBranch2 (fetch's clone path), the second
+						// branch gets its OWN copy of each BufferSource chunk.
+						let chunk2 = chunk;
+						if (cloneForBranch2) {
+							// Structured clone semantics: the copy keeps its VIEW
+							// type — a Float32Array clones as a Float32Array.
+							if (ArrayBuffer.isView(chunk)) {
+								const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+								chunk2 = new chunk.constructor(buf);
+							} else if (chunk instanceof ArrayBuffer) {
+								chunk2 = chunk.slice(0);
+							}
+						}
 						if (!canceled1) readableStreamDefaultControllerEnqueue(branch1._controller, chunk);
-						if (!canceled2) readableStreamDefaultControllerEnqueue(branch2._controller, chunk);
+						if (!canceled2) readableStreamDefaultControllerEnqueue(branch2._controller, chunk2);
 						reading = false;
 						if (readAgain) pullAlgorithm();
 					});
@@ -2645,6 +2658,9 @@
 	}
 
 	globalThis.ReadableStream = ReadableStream;
+	// fetch's clone path tees with cloneForBranch2; the flagged form is not
+	// reachable through the public tee(), so it is shared by symbol.
+	globalThis[Symbol.for("go-spidermonkey.streamTeeClone")] = (stream) => readableStreamTee(stream, true);
 	globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
 	globalThis.ReadableStreamBYOBReader = ReadableStreamBYOBReader;
 	globalThis.ReadableStreamDefaultController = ReadableStreamDefaultController;
