@@ -2102,12 +2102,16 @@
 		} catch { return null; }
 	}
 
-	// Origin travels with a CORS request and with any method outside the
-	// safelist — a POST states its origin even in no-cors mode.
-	function originHeaderFor(mode, method, envURL) {
+	// Origin travels with a request whose response is CORS-tainted — a
+	// cross-origin request in cors mode — and with any method outside the
+	// safelist, where a POST states its origin even in no-cors mode. A
+	// SAME-ORIGIN GET states nothing: there is nobody to state it to, and a
+	// server that sees one has been told something the standard does not send.
+	function originHeaderFor(mode, method, envURL, crossOrigin) {
 		if (!envURL) return null;
 		const m = String(method || "GET").toUpperCase();
-		if (mode === "cors" || (m !== "GET" && m !== "HEAD")) return envURL.origin;
+		if (crossOrigin && mode === "cors") return envURL.origin;
+		if (m !== "GET" && m !== "HEAD") return envURL.origin;
 		return null;
 	}
 
@@ -2184,14 +2188,44 @@
 		"expires", "last-modified", "pragma",
 	]);
 
+	// A CORS-unsafe request-header byte. The set is the standard's, and it is
+	// what makes `accept: */*` safelisted and `accept: "` not: the value has to
+	// be one a server cannot be surprised by, not merely a header with the right
+	// name.
+	// Everything below 0x20 except TAB, plus the punctuation the standard names.
+	// Note what is NOT here: 0x3B (;), which a content-type needs for its
+	// parameters — including it refused "text/plain;charset=utf-8", which is the
+	// safelisted value a form POST sends.
+	const CORS_UNSAFE_BYTE = /[\x00-\x08\x0a-\x1f\x22\x28\x29\x3a\x3c\x3e\x3f\x40\x5b\x5c\x5d\x7b\x7d\x7f]/;
+	// accept-language and content-language may hold only these.
+	const LANGUAGE_VALUE = /^[\x30-\x39\x41-\x5a\x61-\x7a *,\-.;=]*$/;
+	// The safelist stops at 128 bytes per value: a longer one is unsafe however
+	// it is spelled.
+	const CORS_SAFELIST_VALUE_MAX = 128;
+
 	function isSafelistedRequestHeader(name, value) {
 		const n = String(name).toLowerCase();
 		if (!CORS_SAFELISTED_REQUEST_HEADERS.has(n)) return false;
-		if (n === "content-type") {
-			const mime = String(value).split(";")[0].trim().toLowerCase();
-			return CORS_SAFELISTED_CONTENT_TYPES.has(mime);
+		const v = String(value);
+		if (utf8Length(v) > CORS_SAFELIST_VALUE_MAX) return false;
+		switch (n) {
+			case "accept":
+				return !CORS_UNSAFE_BYTE.test(v);
+			case "accept-language":
+			case "content-language":
+				return LANGUAGE_VALUE.test(v);
+			case "content-type": {
+				if (CORS_UNSAFE_BYTE.test(v)) return false;
+				const mime = v.split(";")[0].trim().toLowerCase();
+				return CORS_SAFELISTED_CONTENT_TYPES.has(mime);
+			}
 		}
 		return true;
+	}
+
+	// The byte length of a header value, which is what the limit is measured in.
+	function utf8Length(v) {
+		return new TextEncoder().encode(v).length;
 	}
 
 	// needsPreflight reports whether the request escapes the safelist, and names
@@ -2322,19 +2356,34 @@
 		// still has only that origin to send. Recomputing from the document URL
 		// each time handed the full URL back after it had already been withheld.
 		let refSource = envURL;
+		// Response tainting: "cors" once any hop has been cross-origin, and never
+		// back again.
+		let tainted = false;
 		for (;;) {
 			// The headers are materialized per hop: nInit.headers is only filled
 			// in by the single-shot dispatch path, and the Origin changes once a
 			// hop has left the origin.
 			const hdrObj = {};
 			for (const [k, v] of headers) hdrObj[k] = v;
+			const hopTarget = new URL(current);
 			// The request's origin can become OPAQUE part-way down a redirect chain:
 			// once a hop leaves the origin the request came from, the next request no
 			// longer speaks for that origin and says so with the literal "null".
 			// Fetch's rule keys on the CURRENT url, not on the destination — a hop
 			// from the request's own origin to another one still carries the real
 			// origin, and only a hop that starts somewhere else loses it.
-			hdrObj.origin = origin;
+			//
+			// WHETHER to send one is decided per hop, and the taint is STICKY: once
+			// a hop has left the origin the response is CORS-tainted for the rest of
+			// the chain, so a redirect back to where it started still states its
+			// origin — as the literal "null" by then. Deciding hop by hop instead
+			// made the last request look like a plain same-origin one.
+			if (hopTarget.origin !== envURL.origin) tainted = true;
+			if (originHeaderFor(corsMode, nInit.method, envURL, tainted)) {
+				hdrObj.origin = origin;
+			} else {
+				delete hdrObj.origin;
+			}
 			// The referrer is decided per HOP, not once: a policy that gives the
 			// full URL to a same-origin peer gives only the origin to the next
 			// one. Computing it once sent the first hop's referrer all the way
@@ -2346,7 +2395,7 @@
 				try { refSource = ref ? new URL(ref) : null; } catch { refSource = null; }
 			}
 			const step = { ...nInit, redirect: "manual", headers: hdrObj };
-			const target = new URL(current);
+			const target = hopTarget;
 			// A preflight is required for EVERY cross-origin hop that needs one, not
 			// only for the first: a redirect to a URL whose headers are not
 			// safelisted must ask that server's permission before it is sent
@@ -2455,7 +2504,11 @@
 			const envURL = environmentURL();
 			const mode = String(init.mode ?? (isReq ? input.mode : undefined) ?? "cors");
 			if (!headers.has("origin")) {
-				const origin = originHeaderFor(mode, method, envURL);
+				// Whether the target is somewhere else decides this, so it is asked
+				// here rather than taken from the later cross-origin check — which is
+				// about the redirect chain and comes after the headers are final.
+				const toElsewhere = !!(envURL && parsed && envURL.origin !== parsed.origin);
+				const origin = originHeaderFor(mode, method, envURL, toElsewhere);
 				if (origin) uaSet("origin", origin);
 			}
 			// A blob: URL is served from memory, not the network.

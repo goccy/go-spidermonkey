@@ -671,6 +671,46 @@ func (a *fetchAPI) fetchFunc(cfg spidermonkey.Config, args []spidermonkey.Value)
 	})
 }
 
+// defineEmptyConsumers gives a body-less response the same consumer surface as
+// any other: each answers with nothing rather than being absent, so a caller
+// that reads a 204 gets "" instead of a TypeError about a missing method.
+func (a *fetchAPI) defineEmptyConsumers(r *spidermonkey.Object) error {
+	empty := map[string]spidermonkey.Func{
+		"bytes": func(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+			u8, err := a.js.NewBytes(nil)
+			if err != nil {
+				return nil, err
+			}
+			return a.promise("resolve", u8)
+		},
+		"arrayBuffer": func(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+			u8, err := a.js.NewBytes(nil)
+			if err != nil {
+				return nil, err
+			}
+			buf, err := u8.Get("buffer")
+			if err != nil {
+				return nil, err
+			}
+			return a.promise("resolve", buf)
+		},
+		"text": func(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+			return a.promise("resolve", spidermonkey.ValueOf(""))
+		},
+		"json": func(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+			// An empty body is not JSON, and saying so is the same answer a body
+			// that failed to parse gets.
+			return a.promise("reject", a.typeError("Unexpected end of JSON input"))
+		},
+	}
+	for name, fn := range empty {
+		if err := r.DefineFunc(name, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // newResponse builds the Response as a guest object composed entirely from
 // Go: data fields via Set, behavior via Go closures over the http.Response,
 // and the body via `new ReadableStream(source)` where source.pull/cancel are
@@ -707,6 +747,22 @@ func (a *fetchAPI) newResponse(resp *http.Response, redirected bool, cancel cont
 	}
 	if err := r.Set("__headerEntries", spidermonkey.ValueOf(pairs)); err != nil {
 		return nil, err
+	}
+
+	// A null-body status HAS no body: 204, 205 and 304 are defined to carry
+	// none, so `response.body` is null rather than a stream that closes at once.
+	// The connection is still released.
+	switch resp.StatusCode {
+	case 204, 205, 304:
+		resp.Body.Close()
+		if err := r.Set("body", spidermonkey.Null()); err != nil {
+			return nil, err
+		}
+		if err := a.defineEmptyConsumers(r); err != nil {
+			return nil, err
+		}
+		cancel()
+		return r, nil
 	}
 
 	// body: new ReadableStream({ pull, cancel }) with Go closures.
