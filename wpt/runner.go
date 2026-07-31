@@ -294,6 +294,13 @@ const collector = `
 (function () {
   const H = ` + harnessStatusNamesJSFrag + `;
   const S = ` + subtestStatusNamesJSFrag + `;
+  // Completion is EXPLICIT in every scope. Without a document, testharness
+  // detects a shell environment, whose harness completes the moment no test
+  // is pending — which, while a file's synchronous tests are still being
+  // declared one statement apart, is after the FIRST of them. Every test
+  // declared after that vanished without failing anything. The runner
+  // appends the done() call for the scopes whose wrapper would have it.
+  setup({ explicit_done: true });
   add_completion_callback(function (tests, status) {
     globalThis.__wpt_result = JSON.stringify({
       harness: H[status.status] || "ERROR",
@@ -477,11 +484,10 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 		steps = append(steps, struct{ name, src string }{p, string(substituteWPT(p, b, opts.SubVars))})
 	}
 	steps = append(steps, struct{ name, src string }{rel, string(src)})
-	if c.Scope != "" && c.Scope != "window" && !strings.HasSuffix(rel, ".worker.js") {
-		// ...and the wrapper ends with done(). In a worker scope testharness
-		// waits for an explicit finish (WorkerTestEnvironment sets
-		// wait_for_finish), so without this every worker-scope file that does not
-		// call done() itself times out instead of reporting.
+	if !strings.HasSuffix(rel, ".worker.js") {
+		// ...and the wrapper ends with done(), in EVERY scope: the collector
+		// forces explicit completion (see its comment), and a browser's
+		// generated .any.js wrappers end with done() the same way.
 		steps = append(steps, struct{ name, src string }{"<done>", "done();"})
 	}
 
