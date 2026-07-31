@@ -183,3 +183,67 @@ func TestECMA429GapsAreReal(t *testing.T) {
 		}
 	}
 }
+
+// TestProfilesAreLevelsOfTheStandard checks the property an embedding chooses a
+// profile FOR: the minimum-common level has everything ECMA-429 requires and
+// nothing this package adds beyond what a server-side runtime exposes.
+//
+// It is the standard's own list that is checked, not a list of features, so a
+// feature that grows a new global cannot quietly widen the profile.
+func TestProfilesAreLevelsOfTheStandard(t *testing.T) {
+	for _, profile := range []web.Profile{web.ProfileMinimumCommon, web.ProfileServerRuntime, web.ProfileFull} {
+		t.Run(string(profile), func(t *testing.T) {
+			js, err := spidermonkey.New(spidermonkey.Config{})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer js.Close()
+			w, err := web.InstallWith(js, web.Options{Profile: profile})
+			if err != nil {
+				t.Fatalf("InstallWith: %v", err)
+			}
+			defer w.Close()
+			// Every profile is at least the standard: a level BELOW the Minimum
+			// Common API is not a level anyone can target.
+			for area, names := range ecma429Interfaces {
+				for _, name := range names {
+					if !definedIn(t, js, name) {
+						t.Errorf("%s: %s is missing although every profile includes ECMA-429", area, name)
+					}
+				}
+			}
+			for area, names := range ecma429Globals {
+				for _, name := range names {
+					if !definedIn(t, js, name) {
+						t.Errorf("%s: %s is missing although every profile includes ECMA-429", area, name)
+					}
+				}
+			}
+			// And the levels differ where they are meant to: the parts of the
+			// platform no server-side runtime has are only in the full one.
+			beyond := map[string]web.Profile{
+				"XMLHttpRequest":  web.ProfileFull,
+				"OffscreenCanvas": web.ProfileFull,
+				"Observable":      web.ProfileFull,
+				"caches":          web.ProfileServerRuntime,
+				"WebSocket":       web.ProfileServerRuntime,
+			}
+			for name, firstIn := range beyond {
+				want := profile == web.ProfileFull ||
+					(firstIn == web.ProfileServerRuntime && profile == web.ProfileServerRuntime)
+				if got := definedIn(t, js, name); got != want {
+					t.Errorf("%s present=%v under profile %s, want %v", name, got, profile, want)
+				}
+			}
+		})
+	}
+}
+
+func definedIn(t *testing.T, js *spidermonkey.JS, name string) bool {
+	t.Helper()
+	r, err := js.Eval(context.Background(), fmt.Sprintf("typeof globalThis[%q] !== \"undefined\"", name))
+	if err != nil || r.Error != nil {
+		t.Fatalf("checking %s: %v %v", name, err, r.Error)
+	}
+	return r.Value.Bool()
+}

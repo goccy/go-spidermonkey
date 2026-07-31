@@ -153,7 +153,15 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	// of it is not Node's: a runtime that answers to XMLHttpRequest is not the one
 	// this package claims to be. compat/web names the surface at feature
 	// granularity precisely so this line can say which part is Node's.
-	w, err := web.InstallWith(js, web.Options{Features: web.MinimumCommonFeatures()})
+	// The Minimum Common API plus the two things Node has beyond it. Named
+	// explicitly rather than taken from a profile: what Node exposes is a fact
+	// about Node, and it is not the same list as what Deno or Workers expose.
+	// XMLHttpRequest, the Cache API, Web Locks, the web Worker and the canvas
+	// are all absent from Node, and a Node runtime that answered to one of them
+	// would not be Node.
+	w, err := web.InstallWith(js, web.Options{
+		Features: append(web.MinimumCommonFeatures(), web.FeatureWebSocket, web.FeatureEventSource),
+	})
 	if err != nil {
 		return nil, err
 	}

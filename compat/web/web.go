@@ -213,7 +213,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	if err != nil {
 		return nil, fmt.Errorf("web: installing Worker: %w", err)
 	}
-	if err := removeUnselected(js, opts.Features); err != nil {
+	if err := removeUnselected(js, opts.Features, opts.Profile); err != nil {
 		return nil, err
 	}
 	// The global-scope interfaces go last: they decorate what everything above

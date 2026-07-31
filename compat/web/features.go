@@ -48,6 +48,8 @@ const (
 	FeatureWebLocks        Feature = "web-locks"
 	FeatureWebAssembly     Feature = "webassembly"
 	FeatureCanvas          Feature = "canvas"
+	FeatureObservable      Feature = "observable"
+	FeatureCache           Feature = "cache"
 	FeatureWorker          Feature = "worker"
 )
 
@@ -66,8 +68,11 @@ var featureGlobals = map[Feature][]string{
 		"Path2D", "ImageData", "DOMPoint", "DOMPointReadOnly",
 		"ImageBitmap", "CanvasPattern", "createImageBitmap",
 	},
+	// Observable is its own feature rather than part of events, even though it
+	// is an event stream: it is not in the Minimum Common API, and a profile
+	// that offers the standard's surface must be able to leave it out.
+	FeatureObservable: {"Observable", "Subscriber"},
 	FeatureEvents: {
-		"Observable", "Subscriber",
 		"Event", "EventTarget", "CustomEvent", "ErrorEvent", "MessageEvent",
 		"PromiseRejectionEvent", "AbortController", "AbortSignal",
 		"addEventListener", "removeEventListener", "dispatchEvent", "reportError",
@@ -81,9 +86,11 @@ var featureGlobals = map[Feature][]string{
 		"ByteLengthQueuingStrategy", "CountQueuingStrategy",
 	},
 	FeatureCompression: {"CompressionStream", "DecompressionStream"},
-	// The Cache API is part of fetch's vocabulary, not a feature of its own:
-	// what it stores are Requests and Responses, and it fetches to fill itself.
-	FeatureFetch:   {"fetch", "Headers", "Request", "Response", "caches", "Cache", "CacheStorage"},
+	FeatureFetch:       {"fetch", "Headers", "Request", "Response"},
+	// The Cache API speaks fetch's vocabulary but is not part of it: the Minimum
+	// Common API does not require it, and the runtimes that have it have it as
+	// an addition.
+	FeatureCache:   {"caches", "Cache", "CacheStorage"},
 	FeatureFileAPI: {"Blob", "File", "FileList", "FileReader", "FileReaderSync", "FormData"},
 	FeatureCrypto:  {"crypto", "Crypto", "CryptoKey", "SubtleCrypto"},
 	FeaturePerformance: {
@@ -140,27 +147,95 @@ func AllFeatures() []Feature {
 	return out
 }
 
+// Profile is a named level of the platform, for an embedding that wants "the
+// surface Deno and Bun have" without having to know which features add up to
+// it — and, just as importantly, without silently gaining the ones that do not.
+//
+// The gap is real and it grows: this package implements a good deal that no
+// server-side runtime exposes (a canvas, Observable, XMLHttpRequest, a Cache),
+// and an embedding that took everything would be claiming a surface its users
+// cannot rely on being there anywhere else.
+type Profile string
+
+const (
+	// ProfileMinimumCommon is ECMA-429, the Minimum Common API: exactly what a
+	// non-browser runtime is REQUIRED to have, and nothing else. This is the
+	// level to ask for when the goal is parity with Deno, Bun or Workers.
+	ProfileMinimumCommon Profile = "minimum-common"
+	// ProfileServerRuntime is the Minimum Common API plus what those runtimes
+	// have all converged on beyond it and application code genuinely expects:
+	// WebSocket, EventSource, Web Locks and the Cache API travel with fetch.
+	ProfileServerRuntime Profile = "server-runtime"
+	// ProfileFull is everything this package implements, including the parts of
+	// the platform no server-side runtime exposes. It is the default, because an
+	// embedding that names nothing is asking for what is here.
+	ProfileFull Profile = "full"
+)
+
+// minimumCommonFeatures are the features ECMA-429 requires, named rather than
+// derived: the standard is a list of interfaces, and which of this package's
+// features carry them is a fact about the standard, not about what happens to
+// be implemented here. compat/web/ecma429_test.go holds this to the interface
+// list it is drawn from.
+var minimumCommonFeatures = []Feature{
+	FeatureConsole,
+	FeatureEncoding,
+	FeatureURL,
+	FeatureURLPattern,
+	FeatureEvents,
+	FeatureStreams,
+	FeatureCompression,
+	FeatureFetch,
+	FeatureFileAPI,
+	FeatureCrypto,
+	FeaturePerformance,
+	FeatureTimers,
+	FeatureStructuredClone,
+	FeatureMessaging,
+	FeatureWebAssembly,
+}
+
+// serverRuntimeExtras are what the runtimes add on top of the standard. Each is
+// here because all of Deno, Bun and Workers have it, not because it is
+// specified as required.
+var serverRuntimeExtras = []Feature{
+	FeatureWebSocket,
+	FeatureEventSource,
+	FeatureWebLocks,
+	FeatureWorker,
+	FeatureCache,
+}
+
 // MinimumCommonFeatures is the surface a non-browser runtime is expected to
 // have — the "minimum common API" that Node, Deno, Bun and Cloudflare Workers
-// converged on. It is every feature except the browser-only ones, and it is
-// what compat/nodejs asks for.
+// converged on, and what compat/nodejs asks for.
 func MinimumCommonFeatures() []Feature {
-	var out []Feature
-	for _, f := range AllFeatures() {
-		if f == FeatureXMLHttpRequest {
-			continue
-		}
-		out = append(out, f)
+	return append([]Feature(nil), minimumCommonFeatures...)
+}
+
+// FeaturesFor resolves a profile into the features it names. An unknown profile
+// resolves to the full surface, which is what naming nothing does.
+func FeaturesFor(p Profile) []Feature {
+	switch p {
+	case ProfileMinimumCommon:
+		return MinimumCommonFeatures()
+	case ProfileServerRuntime:
+		return append(MinimumCommonFeatures(), serverRuntimeExtras...)
+	default:
+		return AllFeatures()
 	}
-	return out
 }
 
 // Options configures an installation.
 type Options struct {
-	// Features selects the surface to expose. A nil slice means the whole web
-	// platform; naming features that depend on one another is the caller's
-	// responsibility (fetch needs streams for a body, for instance).
+	// Features selects the surface to expose. A nil slice defers to Profile;
+	// naming features that depend on one another is the caller's responsibility
+	// (fetch needs streams for a body, for instance).
 	Features []Feature
+	// Profile names a LEVEL of the platform when Features is nil — the surface a
+	// server-side runtime is expected to have, rather than a list the caller has
+	// to keep in step with this package. Empty means ProfileFull.
+	Profile Profile
 	// RootCAs, when set, are certificate authorities the guest's TLS connections
 	// trust IN ADDITION to the system pool — for an origin behind a private CA, or
 	// a test server that mints its own certificate. Nil means the system pool
@@ -193,9 +268,9 @@ const (
 )
 
 // featureSet turns a selection into a lookup, treating nil as everything.
-func featureSet(features []Feature) map[Feature]bool {
+func featureSet(features []Feature, profile Profile) map[Feature]bool {
 	if features == nil {
-		features = AllFeatures()
+		features = FeaturesFor(profile)
 	}
 	set := make(map[Feature]bool, len(features))
 	for _, f := range features {
@@ -209,9 +284,9 @@ func featureSet(features []Feature) map[Feature]bool {
 // keeps the feature table the single statement of what belongs to what: the JS
 // is one surface, and splitting it per feature would put the same list in two
 // places and let them drift.
-func removeUnselected(js *spidermonkey.JS, features []Feature) error {
+func removeUnselected(js *spidermonkey.JS, features []Feature, profile Profile) error {
 	var drop []string
-	set := featureSet(features)
+	set := featureSet(features, profile)
 	for f, globals := range featureGlobals {
 		if set[f] {
 			continue
