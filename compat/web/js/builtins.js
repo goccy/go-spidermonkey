@@ -1606,8 +1606,20 @@
 	// requires) and is essential for FormData, whose multipart boundary must match
 	// the header. Returning the raw bytes (not String(init)) is what stops a Blob
 	// or FormData body from being serialized to "[object Blob]".
+	// A SHARED buffer is not a BufferSource: the IDL is BufferSource, not
+	// [AllowShared] BufferSource, and it could not be one — another agent may
+	// rewrite it while it is being sent.
+	function isSharedBufferSource(v) {
+		if (typeof SharedArrayBuffer !== "function") return false;
+		if (v instanceof SharedArrayBuffer) return true;
+		return ArrayBuffer.isView(v) && v.buffer instanceof SharedArrayBuffer;
+	}
+
 	function normalizeBody(init) {
 		if (init === null || init === undefined) return { bytes: null, contentType: null };
+		if (isSharedBufferSource(init)) {
+			throw new TypeError("a body may not be backed by a SharedArrayBuffer");
+		}
 		if (typeof init === "string") return { bytes: utf8Encode(init), contentType: "text/plain;charset=UTF-8" };
 		if (init instanceof URLSearchParams) return { bytes: utf8Encode(init.toString()), contentType: "application/x-www-form-urlencoded;charset=UTF-8" };
 		if (init instanceof ArrayBuffer) return { bytes: new Uint8Array(init.slice(0)), contentType: null };

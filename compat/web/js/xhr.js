@@ -226,6 +226,13 @@
 			if (this._state !== OPENED || this._sent) {
 				throw new DOMException("send: the request is not open", "InvalidStateError");
 			}
+			if (body !== null && body !== undefined && typeof SharedArrayBuffer === "function"
+				&& (body instanceof SharedArrayBuffer
+					|| (ArrayBuffer.isView(body) && body.buffer instanceof SharedArrayBuffer))) {
+				// A shared buffer is not a BufferSource: another agent may rewrite it
+				// while it is on the wire.
+				throw new TypeError("send: a body may not be backed by a SharedArrayBuffer");
+			}
 			this._sent = true;
 			if (!this._async) return this._sendSync(body);
 			this._controller = new AbortController();

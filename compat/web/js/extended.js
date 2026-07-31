@@ -336,7 +336,15 @@
 	// ------------------------------------------------------------- FormData
 
 	class FormData {
-		constructor() { this._entries = []; }
+		// The one argument is an HTMLFormElement, and there are no elements here —
+		// but null is not one either, and passing it is a mistake rather than "no
+		// form", which is what leaving the argument out means.
+		constructor(form = undefined) {
+			if (form !== undefined) {
+				throw new TypeError("FormData: this runtime has no form elements to build one from");
+			}
+			this._entries = [];
+		}
 		append(name, value, filename) { this._entries.push([String(name), toFormValue(value, filename)]); }
 		set(name, value, filename) {
 			name = String(name);

@@ -1801,8 +1801,6 @@
  "xhr/event-upload-progress-crossorigin.any.js [dedicatedworker]": "2/4 subtests fail (e5d5a743b1ba)",
  "xhr/event-upload-progress.any.js": "2/4 subtests fail (e5d5a743b1ba)",
  "xhr/event-upload-progress.any.js [dedicatedworker]": "2/4 subtests fail (e5d5a743b1ba)",
- "xhr/formdata/constructor.any.js": "1/1 subtests fail (4f3eda96a7cd)",
- "xhr/formdata/constructor.any.js [dedicatedworker]": "1/1 subtests fail (4f3eda96a7cd)",
  "xhr/formdata/iteration.any.js": "1/1 subtests fail (1e2a04da67b0)",
  "xhr/formdata/iteration.any.js [dedicatedworker]": "3/3 subtests fail (1b355e97fd91)",
  "xhr/formdata/set-blob.any.js": "1/1 subtests fail (c358cdf64ed8)",
@@ -1823,8 +1821,6 @@
  "xhr/send-data-es-object.any.js [dedicatedworker]": "TIMEOUT: no completion callback fired",
  "xhr/send-data-formdata.any.js": "1/1 subtests fail (f1c520d2c1fe)",
  "xhr/send-data-formdata.any.js [dedicatedworker]": "1/1 subtests fail (f1c520d2c1fe)",
- "xhr/send-data-sharedarraybuffer.any.js": "1/1 subtests fail (89be9d7e3091)",
- "xhr/send-data-sharedarraybuffer.any.js [dedicatedworker]": "14/14 subtests fail (0d2ca3f16e32)",
  "xhr/xhr-timeout-longtask.any.js": "1/1 subtests fail (df4ec274d6c1)",
  "xhr/xhr-timeout-longtask.any.js [dedicatedworker]": "1/1 subtests fail (df4ec274d6c1)"
 }
