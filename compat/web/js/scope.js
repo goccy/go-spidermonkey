@@ -106,7 +106,15 @@
 	delete globalThis.__web_concurrency;
 
 	// ------------------------------------------------------------ the scope
+	// A few interfaces are [Exposed=Worker] and must NOT be reachable from a
+	// document's global. They are removed rather than never installed because
+	// the installation does not know its scope — this file is the one place that
+	// does.
+	const WORKER_ONLY = ["FileReaderSync", "WorkerGlobalScope", "WorkerNavigator",
+		"DedicatedWorkerGlobalScope", "SharedWorkerGlobalScope", "ServiceWorkerGlobalScope",
+		"WorkerLocation", "importScripts"];
 	if (!isWorker) {
+		for (const name of WORKER_ONLY) delete globalThis[name];
 		globalScopeClass("Window");
 		return;
 	}

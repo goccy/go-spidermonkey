@@ -11,12 +11,28 @@
 	// is what lowercases it, normalizes parameter whitespace and yields "" for
 	// one that does not parse. Captured here because __web_ops is deleted once
 	// the builtins have run.
+	// A media type is reported PARSED and SERIALIZED BACK, never as given: that
+	// is what lowercases it, normalizes parameter whitespace and yields "" for
+	// one that does not parse. Captured here because __web_ops is deleted once
+	// the builtins have run.
 	const mimeType = __web_ops.mime_type;
 
+	// slice() does NOT parse: its steps say only that a type outside
+	// U+0020..U+007E becomes the empty string and that what is left is
+	// lowercased. The two rules are genuinely different, and a slice given
+	// "te<xt/plain" keeps it where the constructor would not.
+	const sliceType = (t) => (/^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : "");
+
 	const encodePart = (part) => {
-		if (part instanceof Uint8Array) return part.slice();
-		if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
-		if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+		// A DETACHED buffer holds nothing: its bytes went elsewhere, and a Blob
+		// built from it is empty rather than a failure.
+		try {
+			if (part instanceof Uint8Array) return part.slice();
+			if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
+			if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+		} catch {
+			return new Uint8Array(0);
+		}
 		if (part && typeof part._blobParts === "object") return concatBytes(part._blobParts);
 		return new TextEncoder().encode(String(part));
 	};
@@ -58,7 +74,8 @@
 		slice(start = 0, end = this._bytes.length, contentType = "") {
 			const s = start < 0 ? Math.max(this._bytes.length + start, 0) : Math.min(start, this._bytes.length);
 			const e = end < 0 ? Math.max(this._bytes.length + end, 0) : Math.min(end, this._bytes.length);
-			const b = new Blob([], { type: contentType });
+			const b = new Blob([]);
+			b._type = sliceType(String(contentType));
 			b._bytes = this._bytes.slice(s, Math.max(s, e));
 			b._blobParts = [b._bytes];
 			return b;
@@ -100,7 +117,9 @@
 	// which is what `self` is asked for and what a caller feature-detects.
 	class FileList {
 		constructor() {
-			if (!new.target) throw new TypeError("Illegal constructor");
+			// Nothing here produces one, and script may not either: a FileList comes
+			// from a file picker, and there is none.
+			throw new TypeError("Illegal constructor");
 			Object.defineProperty(this, "_items", { value: [] });
 		}
 		get length() { return this._items.length; }
@@ -153,30 +172,26 @@
 	// The event-based way to read a Blob. Blob's own promise methods cover the
 	// same ground, but FileReader is what the platform's own tests — and any
 	// code written against a browser — actually use, and it was absent.
+	// FileReader's state, result and error are ATTRIBUTES and its three ready
+	// states are CONSTANTS: the first belong on the prototype and the second are
+	// unwritable. Written as own properties of each instance, the prototype had
+	// none of them and the constants could be reassigned.
+	const READER_EVENTS = ["loadstart", "progress", "load", "abort", "error", "loadend"];
+
 	class FileReader extends EventTarget {
 		constructor() {
 			super();
-			this.readyState = 0; // EMPTY
-			this.result = null;
-			this.error = null;
-			this._aborted = false;
-			// An onX property IS a listener, registered where it is assigned —
-			// so a handler added with addEventListener beforehand runs first.
-			for (const name of ["loadstart", "progress", "load", "abort", "error", "loadend"]) {
-				let current = null;
-				Object.defineProperty(this, "on" + name, {
-					enumerable: true,
-					configurable: true,
-					get: () => current,
-					set: (fn) => {
-						if (current) this.removeEventListener(name, current);
-						current = typeof fn === "function" ? fn : null;
-						if (current) this.addEventListener(name, current);
-					},
-				});
-			}
+			Object.defineProperties(this, {
+				_readyState: { value: 0, writable: true }, // EMPTY
+				_result: { value: null, writable: true },
+				_error: { value: null, writable: true },
+				_aborted: { value: false, writable: true },
+				_on: { value: {} },
+			});
 		}
-		get [Symbol.toStringTag]() { return "FileReader"; }
+		get readyState() { return this._readyState; }
+		get result() { return this._result; }
+		get error() { return this._error; }
 
 		_fire(type, loaded = 0, total = 0) {
 			const ev = new Event(type);
@@ -211,15 +226,15 @@
 		// _read runs the common state machine: one read at a time, LOADING while
 		// it runs, then result-or-error and always loadend.
 		_read(blob, convert) {
-			if (this.readyState === 1) {
+			if (this._readyState === 1) {
 				throw new DOMException("The object is in an invalid state.", "InvalidStateError");
 			}
 			if (!(blob instanceof Blob)) {
 				throw new TypeError("FileReader expects a Blob");
 			}
-			this.readyState = 1; // LOADING
-			this.result = null;
-			this.error = null;
+			this._readyState = 1; // LOADING
+			this._result = null;
+			this._error = null;
 			this._aborted = false;
 			blob.arrayBuffer().then(
 				(buf) => {
@@ -232,12 +247,12 @@
 						steps.push(() => this._fire("progress", bytes.length, bytes.length));
 					}
 					steps.push(() => {
-						this.readyState = 2; // DONE
+						this._readyState = 2; // DONE
 						try {
-							this.result = convert(bytes, blob);
+							this._result = convert(bytes, blob);
 						} catch (e) {
-							this.result = null;
-							this.error = e instanceof DOMException ? e
+							this._result = null;
+							this._error = e instanceof DOMException ? e
 								: new DOMException(String(e && e.message || e), "EncodingError");
 							this._fire("error", bytes.length, bytes.length);
 							return;
@@ -252,9 +267,9 @@
 					this._steps([
 						() => this._fire("loadstart"),
 						() => {
-							this.readyState = 2;
-							this.result = null;
-							this.error = e instanceof DOMException ? e
+							this._readyState = 2;
+							this._result = null;
+							this._error = e instanceof DOMException ? e
 								: new DOMException(String(e && e.message || e), "NotReadableError");
 							this._fire("error");
 						},
@@ -265,7 +280,7 @@
 		}
 
 		readAsArrayBuffer(blob) { this._read(blob, (bytes) => bytes.buffer.slice(0)); }
-		readAsText(blob, encoding) {
+		readAsText(blob, encoding = undefined) {
 			this._read(blob, (bytes) => new TextDecoder(encoding || "utf-8", { ignoreBOM: false }).decode(bytes));
 		}
 		readAsBinaryString(blob) {
@@ -279,23 +294,41 @@
 			});
 		}
 		abort() {
-			if (this.readyState === 2 || this.readyState === 0) {
-				this.readyState = 2;
-				this.result = null;
+			if (this._readyState === 2 || this._readyState === 0) {
+				this._readyState = 2;
+				this._result = null;
 				return;
 			}
 			this._aborted = true;
-			this.readyState = 2;
-			this.result = null;
-			this.error = new DOMException("The user aborted a request.", "AbortError");
+			this._readyState = 2;
+			this._result = null;
+			this._error = new DOMException("The user aborted a request.", "AbortError");
 			this._fire("abort");
 			this._fire("loadend");
 		}
 	}
-	FileReader.EMPTY = 0;
-	FileReader.LOADING = 1;
-	FileReader.DONE = 2;
+	// An onX property IS a listener, registered where it is assigned — so a
+	// handler added with addEventListener beforehand runs first. On the
+	// PROTOTYPE, because that is where an event-handler attribute lives.
+	for (const name of READER_EVENTS) {
+		Object.defineProperty(FileReader.prototype, "on" + name, {
+			enumerable: true, configurable: true,
+			get() { return this._on[name] ?? null; },
+			set(fn) {
+				const prev = this._on[name];
+				if (prev) this.removeEventListener(name, prev);
+				this._on[name] = typeof fn === "function" ? fn : null;
+				if (this._on[name]) this.addEventListener(name, this._on[name]);
+			},
+		});
+	}
+	Object.defineProperty(FileReader.prototype, Symbol.toStringTag, {
+		value: "FileReader", configurable: true,
+	});
+	// A constant is not writable and not configurable, on the interface object
+	// and on its prototype alike.
 	for (const [k, v] of [["EMPTY", 0], ["LOADING", 1], ["DONE", 2]]) {
+		Object.defineProperty(FileReader, k, { value: v, enumerable: true });
 		Object.defineProperty(FileReader.prototype, k, { value: v, enumerable: true });
 	}
 	globalThis.FileReader = FileReader;

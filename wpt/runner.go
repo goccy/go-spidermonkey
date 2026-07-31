@@ -126,7 +126,15 @@ func Expand(root string, paths []string) ([]Case, error) {
 		if len(variants) == 0 {
 			variants = []string{""}
 		}
-		for _, scope := range scopesFor(m) {
+		scopes := scopesFor(m)
+		// A .worker.js file IS a worker script — that is what the suffix means —
+		// so it runs in one scope, not in the window as well. Running it as a
+		// document's script asked it to use interfaces that are exposed only to
+		// workers, and reported their absence as a failure of the file.
+		if strings.HasSuffix(p, ".worker.js") {
+			scopes = []string{"dedicatedworker"}
+		}
+		for _, scope := range scopes {
 			for _, v := range variants {
 				out = append(out, Case{Path: p, Scope: scope, Variant: v})
 			}

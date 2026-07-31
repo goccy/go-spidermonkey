@@ -808,11 +808,13 @@
 		}
 		static timeout(ms) {
 			const s = new AbortSignal();
-			// The timer must NOT keep the loop alive on its own (Node unref's it):
-			// otherwise a completed handler still holding an AbortSignal.timeout(30s)
-			// delays the whole loop/response until the timeout fires.
-			const t = setTimeout(() => abortSignal(s, new DOMException("The operation timed out", "TimeoutError")), ms);
-			if (t && typeof t.unref === "function") t.unref();
+			// The timer KEEPS THE LOOP ALIVE, like any other. It used to be unref'd
+			// so that a handler holding a long timeout could not delay a response —
+			// but an abort that may or may not happen depending on whether the loop
+			// had other work is worse than a late one, and it is not what the signal
+			// promises. It showed as a test that hung: the loop went idle before the
+			// 5 ms timeout could fire, so the abort never arrived.
+			setTimeout(() => abortSignal(s, new DOMException("The operation timed out", "TimeoutError")), ms);
 			return s;
 		}
 		// AbortSignal.any([...]) — aborts as soon as ANY source signal aborts (the
