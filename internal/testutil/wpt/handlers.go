@@ -117,6 +117,8 @@ func handlerFor(rel string) wptHandler {
 		return esCORSHandler
 	case "fetch/cross-origin-resource-policy/resources/hello.py":
 		return corpHelloHandler
+	case "fetch/cross-origin-resource-policy/resources/redirect.py":
+		return corpRedirectHandler
 	case "fetch/metadata/resources/echo-as-json.py":
 		return secFetchEchoHandler
 	case "xhr/resources/delay.py":
@@ -365,6 +367,19 @@ func redirectAndStashHandler(st *stash, w http.ResponseWriter, r *http.Request) 
 	} else {
 		io.WriteString(w, "<meta charset=utf-8>\n<body><script>parent.postMessage('loaded','*')</script></body>")
 	}
+	return true
+}
+
+// corpRedirectHandler ports the CORP suite's redirect.py: a 302 to
+// ?redirectTo, optionally carrying Cross-Origin-Resource-Policy — the header
+// the suite expects to be enforced on the REDIRECT response itself.
+func corpRedirectHandler(_ *stash, w http.ResponseWriter, r *http.Request) bool {
+	q := r.URL.Query()
+	if corp := q.Get("corp"); corp != "" {
+		w.Header().Set("Cross-Origin-Resource-Policy", corp)
+	}
+	w.Header().Set("Location", q.Get("redirectTo"))
+	w.WriteHeader(http.StatusFound)
 	return true
 }
 
