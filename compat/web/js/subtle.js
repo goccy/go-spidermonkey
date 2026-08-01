@@ -1232,6 +1232,209 @@
 		return subtle.importKey("raw", raw, alg, extractable, usages);
 	}
 
+	// ------------------------------------------------------------ supports
+	// SubtleCrypto.supports (https://wicg.github.io/webcrypto-modern-algos/):
+	// a synchronous, never-throwing answer to "would this (operation,
+	// algorithm) pair get past normalization". True must mean the operation
+	// would actually be attempted here — so the table below lists what THIS
+	// implementation does, and the parameter checks mirror the ones the real
+	// operations make.
+	const SUPPORTS_OPS = (() => {
+		const SIGNING = ["generateKey", "importKey", "exportKey", "sign", "verify", "getPublicKey"];
+		const DERIVING = ["generateKey", "importKey", "exportKey", "deriveKey", "deriveBits", "getPublicKey"];
+		const AEAD = ["generateKey", "importKey", "exportKey", "encrypt", "decrypt", "wrapKey", "unwrapKey"];
+		const KEM = ["generateKey", "importKey", "exportKey", "getPublicKey",
+			"encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits"];
+		const table = {
+			"RSASSA-PKCS1-V1_5": SIGNING,
+			"RSA-PSS": SIGNING,
+			"RSA-OAEP": ["generateKey", "importKey", "exportKey", "encrypt", "decrypt",
+				"wrapKey", "unwrapKey", "getPublicKey"],
+			ECDSA: SIGNING,
+			ECDH: DERIVING,
+			ED25519: SIGNING,
+			ED448: SIGNING,
+			X25519: DERIVING,
+			X448: DERIVING,
+			"AES-CBC": AEAD,
+			"AES-CTR": AEAD,
+			"AES-GCM": AEAD,
+			"AES-OCB": AEAD,
+			"AES-KW": ["generateKey", "importKey", "exportKey", "wrapKey", "unwrapKey"],
+			[CHACHA]: AEAD,
+			HMAC: ["generateKey", "importKey", "exportKey", "sign", "verify"],
+			KMAC128: ["generateKey", "importKey", "exportKey", "sign", "verify"],
+			KMAC256: ["generateKey", "importKey", "exportKey", "sign", "verify"],
+			HKDF: ["importKey", "deriveKey", "deriveBits"],
+			PBKDF2: ["importKey", "deriveKey", "deriveBits"],
+			ARGON2I: ["importKey", "deriveKey", "deriveBits"],
+			ARGON2D: ["importKey", "deriveKey", "deriveBits"],
+			ARGON2ID: ["importKey", "deriveKey", "deriveBits"],
+			"ML-DSA-44": SIGNING, "ML-DSA-65": SIGNING, "ML-DSA-87": SIGNING,
+			"ML-KEM-512": KEM, "ML-KEM-768": KEM, "ML-KEM-1024": KEM,
+		};
+		for (const h of ["SHA-1", "SHA-256", "SHA-384", "SHA-512",
+			"SHA3-256", "SHA3-384", "SHA3-512", "CSHAKE128", "CSHAKE256",
+			"TURBOSHAKE128", "TURBOSHAKE256", "KT128", "KT256"]) {
+			table[h] = ["digest"];
+		}
+		return table;
+	})();
+
+	// derivedKeyLength is WebCrypto's "get key length" for the algorithms a
+	// derived key can have: the bit length the KDF must produce, null when the
+	// target takes whatever it is given, false when it cannot be a derived key.
+	function derivedKeyLength(alg) {
+		if (alg === null || alg === undefined) return false;
+		const name = String(typeof alg === "object" ? alg.name : alg).toUpperCase();
+		const a = typeof alg === "object" ? alg : {};
+		if (name === "AES-CBC" || name === "AES-CTR" || name === "AES-GCM" ||
+			name === "AES-KW" || name === "AES-OCB") {
+			const len = Number(a.length);
+			return [128, 192, 256].includes(len) ? len : false;
+		}
+		if (name === "HMAC") {
+			const h = a.hash;
+			const hName = h === null || h === undefined ? undefined
+				: String(typeof h === "object" ? h.name : h).toUpperCase();
+			if (hName === undefined || !KNOWN_HASHES.has(hName)) return false;
+			if (a.length !== undefined) {
+				const len = Number(a.length);
+				return Number.isInteger(len) && len > 0 ? len : false;
+			}
+			// No stated length: the hash's block size.
+			return hName === "SHA-384" || hName === "SHA-512" ? 1024 : 512;
+		}
+		if (name === "HKDF" || name === "PBKDF2") return null;
+		if (name === CHACHA) return 256;
+		return false;
+	}
+
+	function supportsParams(op, name, alg, extra) {
+		const isBytes = (v) => v instanceof ArrayBuffer || ArrayBuffer.isView(v);
+		const bytes = (v) => isBytes(v) ? (ArrayBuffer.isView(v) ? v.byteLength : v.byteLength) : -1;
+		const hashOK = (h) => {
+			const n = h === null || h === undefined ? undefined
+				: String(typeof h === "object" ? h.name : h).toUpperCase();
+			return n !== undefined && KNOWN_HASHES.has(n);
+		};
+		// A string algorithm carries no members; required members are missing.
+		const a = typeof alg === "object" && alg !== null ? alg : {};
+		const rsa = name.startsWith("RSA");
+		const ec = name === "ECDSA" || name === "ECDH";
+		switch (op) {
+			case "generateKey":
+				if (rsa) {
+					checkRSAParams(a, op); // throws, caught by supports
+					return hashOK(a.hash);
+				}
+				if (ec) return EC_CURVES.has(String(a.namedCurve));
+				if (AES_NAMES.includes(name) || name === "AES-KW" || name === "AES-OCB") {
+					return [128, 192, 256].includes(Number(a.length));
+				}
+				if (name === "HMAC") {
+					if (!hashOK(a.hash)) return false;
+					return a.length === undefined ||
+						(Number.isInteger(Number(a.length)) && Number(a.length) > 0);
+				}
+				return true;
+			case "importKey":
+				if (rsa || name === "HMAC") return hashOK(a.hash);
+				if (ec) return a.namedCurve === undefined || EC_CURVES.has(String(a.namedCurve));
+				return true;
+			case "sign":
+			case "verify":
+				if (name === "ECDSA") return hashOK(a.hash);
+				if (name === "RSA-PSS") {
+					return a.saltLength === undefined ||
+						(Number.isInteger(Number(a.saltLength)) && Number(a.saltLength) >= 0);
+				}
+				return true;
+			case "encrypt":
+			case "decrypt":
+				if (name === "AES-CBC") return bytes(a.iv) === 16;
+				if (name === "AES-CTR") {
+					const len = Number(a.length);
+					return bytes(a.counter) === 16 && Number.isInteger(len) && len >= 1 && len <= 128;
+				}
+				if (name === "AES-GCM") {
+					if (bytes(a.iv) < 1) return false;
+					return a.tagLength === undefined ||
+						[32, 64, 96, 104, 112, 120, 128].includes(Number(a.tagLength));
+				}
+				if (name === CHACHA) {
+					if (bytes(a.nonce ?? a.iv) !== 12) return false;
+					return a.tagLength === undefined || Number(a.tagLength) === 128;
+				}
+				return true;
+			case "deriveBits":
+			case "deriveKey": {
+				// How many bits the deriving side can produce: a key-agreement
+				// algorithm's output is the size of its curve, a KDF's is unbounded.
+				let cap = Infinity;
+				if (name === "ECDH" || name === "X25519" || name === "X448") {
+					if (!(a.public instanceof globalThis.CryptoKey)) return false;
+					if (name === "X25519") cap = 256;
+					else if (name === "X448") cap = 448;
+					else {
+						cap = { "P-256": 256, "P-384": 384, "P-521": 528 }[
+							a.public.algorithm && a.public.algorithm.namedCurve] ?? Infinity;
+					}
+				} else if (name === "HKDF" || name === "PBKDF2") {
+					if (!hashOK(a.hash) || !isBytes(a.salt)) return false;
+					if (name === "HKDF" && !isBytes(a.info)) return false;
+					if (name === "PBKDF2" &&
+						!(Number.isInteger(Number(a.iterations)) && Number(a.iterations) > 0)) return false;
+					if (op === "deriveBits") {
+						// A null length is an OperationError for these two, and a
+						// length that is not a whole number of bytes cannot be cut.
+						const len = Number(extra);
+						return extra !== undefined && extra !== null &&
+							Number.isInteger(len) && len > 0 && len % 8 === 0;
+					}
+				}
+				if (op === "deriveBits") return true;
+				// deriveKey: the extra argument is the derived key's algorithm.
+				// Its "get key length" has to be answerable and to fit the cap —
+				// X25519 cannot fill the 512 bits HMAC-SHA-256 defaults to.
+				const len = derivedKeyLength(extra);
+				if (len === false) return false;
+				return len === null || len <= cap;
+			}
+			case "encapsulateKey":
+			case "decapsulateKey": {
+				// The extra argument names the algorithm of the key to be made
+				// from the shared secret; it has to be a makeable secret key.
+				const extraName = extra === null || extra === undefined ? undefined
+					: String(typeof extra === "object" ? extra.name : extra).toUpperCase();
+				if (extraName === undefined) return false;
+				const ops2 = SUPPORTS_OPS[extraName];
+				return ops2 !== undefined && (ops2.includes("encrypt") || extraName === "HKDF" || extraName === "PBKDF2" || extraName === "HMAC");
+			}
+			default:
+				return true;
+		}
+	}
+
+	Object.defineProperty(globalThis.SubtleCrypto, "supports", {
+		value: function supports(operation, algorithm, lengthOrAdditionalAlgorithm) {
+			if (arguments.length < 2) {
+				throw new TypeError("SubtleCrypto.supports: an operation and an algorithm are required");
+			}
+			try {
+				const name = typeof algorithm === "string"
+					? algorithm.toUpperCase()
+					: String(normalizeAlgorithm(algorithm, "supports")).toUpperCase();
+				const ops2 = SUPPORTS_OPS[name];
+				if (!ops2 || !ops2.includes(String(operation))) return false;
+				return supportsParams(String(operation), name, algorithm, lengthOrAdditionalAlgorithm);
+			} catch {
+				return false;
+			}
+		},
+		writable: true, enumerable: true, configurable: true,
+	});
+
 	// The operations go onto SubtleCrypto.prototype rather than onto the instance:
 	// crypto.subtle is a SubtleCrypto (declared in builtins.js, which ECMA-429
 	// requires to be exposed), and an interface's operations belong to its
