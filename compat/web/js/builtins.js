@@ -567,7 +567,9 @@
 		get target() { return this._target; }
 		get srcElement() { return this._target; }
 		get currentTarget() { return this._currentTarget; }
-		get eventPhase() { return this._currentTarget === null ? 0 : 2; }
+		// _phase is set by a tree-aware dispatcher (the DOM module) while the
+		// event travels; without one there are only two states to report.
+		get eventPhase() { return this._phase ?? (this._currentTarget === null ? 0 : 2); }
 		get bubbles() { return this._bubbles; }
 		get cancelable() { return this._cancelable; }
 		get composed() { return this._composed; }

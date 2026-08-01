@@ -196,8 +196,16 @@
 	}
 
 	// And the reverse: interfaces that are [Exposed=Window] only. A worker has
-	// no localStorage — storage reaches a worker through other APIs.
-	for (const name of ["Storage", "localStorage", "sessionStorage", "StorageEvent", "fetchLater"]) {
+	// no localStorage — storage reaches a worker through other APIs — and no
+	// document, so the whole DOM module surface (installed before this file
+	// runs, scope-blind) goes too.
+	for (const name of ["Storage", "localStorage", "sessionStorage", "StorageEvent", "fetchLater",
+		"document", "Node", "CharacterData", "Text", "Comment", "ProcessingInstruction",
+		"DocumentType", "Attr", "NamedNodeMap", "DOMTokenList", "Element", "HTMLElement",
+		"HTMLUnknownElement", "HTMLHtmlElement", "HTMLHeadElement", "HTMLBodyElement",
+		"HTMLDivElement", "HTMLSpanElement", "HTMLTitleElement", "HTMLScriptElement",
+		"HTMLAnchorElement", "NodeList", "HTMLCollection", "DocumentFragment",
+		"DOMImplementation", "Document", "DOMParser"]) {
 		delete globalThis[name];
 	}
 

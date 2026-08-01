@@ -28,12 +28,16 @@ import (
 type Feature string
 
 const (
-	FeatureConsole         Feature = "console"
-	FeatureEncoding        Feature = "encoding"
-	FeatureURL             Feature = "url"
-	FeatureURLPattern      Feature = "urlpattern"
-	FeatureOrigin          Feature = "origin"
-	FeatureFetchLater      Feature = "fetch-later"
+	FeatureConsole    Feature = "console"
+	FeatureEncoding   Feature = "encoding"
+	FeatureURL        Feature = "url"
+	FeatureURLPattern Feature = "urlpattern"
+	FeatureOrigin     Feature = "origin"
+	FeatureFetchLater Feature = "fetch-later"
+	// FeatureDOM and FeatureDOMParsing are provided by the compat/web/dom
+	// MODULE; their globals live in its Module().Features.
+	FeatureDOM             Feature = "dom"
+	FeatureDOMParsing      Feature = "dom-parsing"
 	FeatureEvents          Feature = "events"
 	FeatureStreams         Feature = "streams"
 	FeatureCompression     Feature = "compression"

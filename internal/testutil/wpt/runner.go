@@ -26,6 +26,7 @@ import (
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/web"
 	"github.com/goccy/go-spidermonkey/compat/web/canvas"
+	"github.com/goccy/go-spidermonkey/compat/web/dom"
 )
 
 // Status mirrors testharness.js's status codes.
@@ -307,8 +308,16 @@ const collector = `
   // declared one statement apart, is after the FIRST of them. Every test
   // declared after that vanished without failing anything. The runner
   // appends the done() call for the scopes whose wrapper would have it.
-  setup({ explicit_done: true });
+  // output: false — with the DOM module installed, testharness sees a real
+  // window environment and would render its results into the document; this
+  // runner reads them through the completion callback instead.
+  // explicit_timeout: the window environment also arms its own watchdog
+  // (10s, before any META: timeout=long is knowable from here), which a
+  // 12-second synchronous test tripped. The HOST enforces the per-file
+  // timeout; testharness must not race it.
+  setup({ explicit_done: true, output: false, explicit_timeout: true });
   add_completion_callback(function (tests, status) {
+    try {
     globalThis.__wpt_result = JSON.stringify({
       harness: H[status.status] || "ERROR",
       message: status.message || "",
@@ -318,6 +327,11 @@ const collector = `
         message: t.message || "",
       })),
     });
+    } catch (e) {
+      globalThis.__wpt_result = JSON.stringify({
+        harness: "ERROR", message: "collector: " + e, subtests: [],
+      });
+    }
     // Tell the host the verdicts are in. Waiting for the loop to go IDLE instead
     // would mean waiting out every handle the test left open — an unclosed
     // WebSocket keeps the loop alive on purpose, and the file would cost the
@@ -359,13 +373,19 @@ func importScriptsShimFor(loaded []string) string {
 // ran, because that IS its outcome.
 func Run(ctx context.Context, opts Options, c Case) FileResult {
 	res := runOnce(ctx, opts, c)
-	if res.Harness == string(StatusTimeout) && ctx.Err() == nil {
+	// Retry only the ABSENCE of a result — the deadline hit before the
+	// harness said anything. A TIMEOUT the harness itself reported (the
+	// guest watchdog completing a file whose async tests hang) is an
+	// outcome, and rerunning it just doubles the cost of every hung file.
+	if res.Harness == string(StatusTimeout) && res.Message == noCompletionMessage && ctx.Err() == nil {
 		if again := runOnce(ctx, opts, c); again.Harness != string(StatusTimeout) {
 			return again
 		}
 	}
 	return res
 }
+
+const noCompletionMessage = "no completion callback fired"
 
 func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	rel := c.Path
@@ -425,7 +445,7 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	w, err := web.InstallWith(js, web.Options{
 		// Every opt-in module is installed: the harness measures the whole
 		// surface this repository can offer, not a particular embedding's cut.
-		Modules:  []web.Module{canvas.Module()},
+		Modules:  []web.Module{canvas.Module(), dom.Module()},
 		RootCAs:  opts.RootCAs,
 		Scope:    scopeFor(c.Scope),
 		Location: base + rel + c.Variant,
@@ -494,12 +514,33 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 		steps = append(steps, struct{ name, src string }{p, string(substituteWPT(p, b, opts.SubVars))})
 	}
 	steps = append(steps, struct{ name, src string }{rel, string(src)})
+	if c.Scope == "window" {
+		// A window test environment completes only after the window's load
+		// event; there is no loader here, so the runner IS the loader and
+		// says so once the file's synchronous code has run.
+		steps = append(steps, struct{ name, src string }{"<load>",
+			`globalThis.dispatchEvent(new Event("load"));`})
+	}
 	if !strings.HasSuffix(rel, ".worker.js") {
 		// ...and the wrapper ends with done(), in EVERY scope: the collector
 		// forces explicit completion (see its comment), and a browser's
 		// generated .any.js wrappers end with done() the same way.
 		steps = append(steps, struct{ name, src string }{"<done>", "done();"})
 	}
+	// The guest-side watchdog. explicit_timeout disarmed testharness's own
+	// (it fires at 10s regardless of META: timeout=long), so a file whose
+	// async tests never finish — an iframe load that cannot happen yet, a
+	// message that never arrives — must still complete with honest TIMEOUT
+	// statuses instead of costing the whole host timeout. Armed after the
+	// file's synchronous code, so a long-blocking sync test never races it.
+	// 15s and 60s are the browser contract (wptrunner's normal and long
+	// timeouts, with headroom on the normal one for a loaded machine).
+	watchdogMS := 15000
+	if m.long {
+		watchdogMS = 60000
+	}
+	steps = append(steps, struct{ name, src string }{"<watchdog>",
+		fmt.Sprintf("setTimeout(() => timeout(), %d);", watchdogMS)})
 
 	for _, st := range steps {
 		r, err := js.Eval(ctx, st.src)
@@ -531,7 +572,7 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 		}
 	}
 	res.Harness = string(StatusTimeout)
-	res.Message = "no completion callback fired"
+	res.Message = noCompletionMessage
 	if waitErr != nil {
 		res.Harness = string(StatusError)
 		res.Message = waitErr.Error()
