@@ -6,8 +6,10 @@
 //	WPT=1 go test ./wpt/ -run TestWPTSuite -v -timeout 1h
 //
 // Knobs: WPT_DIRS (comma-separated suite directories, default DefaultDirs),
-// WPT_FILTER (substring), WPT_WORKERS, WPT_TIMEOUT (per file), WPT_UPDATE=1
-// (regenerate expectations.json), WPT_REPORT=path.
+// WPT_FILTER (substring), WPT_WORKERS, WPT_TIMEOUT (per file), WPT_SHARD=i/n
+// (every n-th case, for the sequential shards `make wpt` runs), WPT_UPDATE=1
+// (regenerate expectations.json — whole file, so only from an UNSHARDED run;
+// shards use WPT_UPDATE=merge), WPT_REPORT=path.
 //
 // Only the .any.js / .worker.js forms are runnable without a browser. Which
 // DIRECTORIES are in the default set is a separate question, and the answer is
@@ -138,6 +140,26 @@ func TestWPTSuite(t *testing.T) {
 		cases = keep
 	}
 	sort.Slice(cases, func(i, j int) bool { return cases[i].Key() < cases[j].Key() })
+	// WPT_SHARD=i/n keeps every n-th case, so the suite can run as separate
+	// SEQUENTIAL processes (make wpt): each shard's peak memory is returned to
+	// the OS at process exit, and a stall (docs/engine-followups.md) costs one
+	// shard, not the run. Pair with WPT_UPDATE=merge, never =1: a whole-file
+	// rewrite from one shard deletes every other shard's expectations.
+	if sh := os.Getenv("WPT_SHARD"); sh != "" {
+		i, n, ok := strings.Cut(sh, "/")
+		idx, err1 := strconv.Atoi(i)
+		total, err2 := strconv.Atoi(n)
+		if !ok || err1 != nil || err2 != nil || total <= 0 || idx < 0 || idx >= total {
+			t.Fatalf("WPT_SHARD=%q: want i/n with 0 <= i < n", sh)
+		}
+		var keep []wpt.Case
+		for j, c := range cases {
+			if j%total == idx {
+				keep = append(keep, c)
+			}
+		}
+		cases = keep
+	}
 	if len(cases) == 0 {
 		t.Fatalf("no tests selected (dirs=%v filter=%q)", dirs, filter)
 	}
@@ -318,9 +340,26 @@ func TestWPTSuite(t *testing.T) {
 		// material for asking "which missing piece costs the most".
 		writeJSON(t, report, failureDetail)
 	}
-	if os.Getenv("WPT_UPDATE") != "" {
-		writeJSON(t, expectationsFile, failures)
-		t.Logf("wrote %d expected failures to %s", len(failures), expectationsFile)
+	if mode := os.Getenv("WPT_UPDATE"); mode != "" {
+		out := failures
+		if mode == "merge" {
+			// A SHARD's results, merged into the existing file: this run
+			// re-decides only the cases it ran, and keeps the rest.
+			out = map[string]string{}
+			if b, err := os.ReadFile(expectationsFile); err == nil {
+				if err := json.Unmarshal(b, &out); err != nil {
+					t.Fatalf("parse %s: %v", expectationsFile, err)
+				}
+			}
+			for _, c := range cases {
+				delete(out, c.Key())
+			}
+			for k, detail := range failures {
+				out[k] = detail
+			}
+		}
+		writeJSON(t, expectationsFile, out)
+		t.Logf("wrote %d expected failures to %s", len(out), expectationsFile)
 		return
 	}
 

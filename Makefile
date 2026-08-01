@@ -122,8 +122,22 @@ wpt-fetch:
 	git -C testdata/wpt/suite sparse-checkout set $(WPT_SUITE_DIRS)
 
 ## wpt: run the Web Platform Tests against compat/web. Judged per subtest.
+##
+## Run in SEQUENTIAL shards for the same reasons nodetest is: each interpreter
+## pre-allocates its full linear-memory ceiling and a test abandoned mid host
+## call keeps its interpreter alive, so one long process accumulates both;
+## a shard's peak goes back to the OS at process exit. NEVER run this
+## concurrently with another suite. To refresh expectations across shards use
+## WPT_UPDATE=merge (WPT_UPDATE=1 from one shard deletes the other shards'
+## entries).
+WPT_SHARDS ?= 4
 wpt: wpt-fetch
-	WPT=1 go test ./internal/testutil/wpt/ -run TestWPTSuite -v -timeout 2h
+	@set -e; fail=0; i=0; while [ $$i -lt $(WPT_SHARDS) ]; do \
+		echo "==> wpt shard $$i/$(WPT_SHARDS)"; \
+		WPT=1 WPT_SHARD=$$i/$(WPT_SHARDS) \
+			go test ./internal/testutil/wpt/ -run TestWPTSuite -v -timeout 1h || fail=1; \
+		i=$$((i + 1)); \
+	done; exit $$fail
 
 ## babeltest-fetch: check out Babel's fixture corpus and install the matching
 ## @babel/* packages the fixtures are run through.
