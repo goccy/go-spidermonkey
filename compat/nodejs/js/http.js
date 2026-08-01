@@ -583,6 +583,55 @@
 				o = { ...options };
 				if (o.headers) o.headers = { ...o.headers };
 			}
+			const received = (v) => {
+				if (v === null || v === undefined) return ` Received ${v}`;
+				if (typeof v === "function") return ` Received function ${v.name}`;
+				if (typeof v === "object") {
+					const n = v.constructor && v.constructor.name;
+					return n ? ` Received an instance of ${n}` : ` Received ${String(v)}`;
+				}
+				let sv = typeof v === "string" ? `'${v}'` : String(v);
+				if (sv.length > 28) sv = sv.slice(0, 25) + "...";
+				return ` Received type ${typeof v} (${sv})`;
+			};
+			// Node's request-option validation, in its shapes and its order:
+			// the protocol must be the module's own, the hostname a string (or
+			// absent), the method a valid HTTP token, and the path free of
+			// unescaped characters — control bytes, spaces, and non-ASCII.
+			if (o.protocol && o.protocol !== "http:" && o.protocol !== "https:") {
+				throw Object.assign(
+					new TypeError(`Protocol "${o.protocol}" not supported. Expected "http:"`),
+					{ code: "ERR_INVALID_PROTOCOL" });
+			}
+			if (o.hostname !== undefined && o.hostname !== null && typeof o.hostname !== "string") {
+				throw Object.assign(
+					new TypeError(`The "options.hostname" property must be of type string or one of undefined or null.${received(o.hostname)}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (o.host !== undefined && o.host !== null && typeof o.host !== "string") {
+				throw Object.assign(
+					new TypeError(`The "options.host" property must be of type string or one of undefined or null.${received(o.host)}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (o.method !== undefined) {
+				if (typeof o.method !== "string") {
+					throw Object.assign(new TypeError('The "method" argument must be of type string.'),
+						{ code: "ERR_INVALID_ARG_TYPE" });
+				}
+				if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(o.method)) {
+					throw Object.assign(new TypeError(`Method must be a valid HTTP token ["${o.method}"]`),
+						{ code: "ERR_INVALID_HTTP_TOKEN" });
+				}
+			}
+			if (o.path !== undefined && o.path !== null) {
+				const pathStr = String(o.path);
+				// The characters a request line cannot carry raw (RFC 9110's
+				// grammar): controls, space, and anything past ASCII.
+				if (/[\u0000-\u0020\u007f-\uffff]/.test(pathStr)) {
+					throw Object.assign(new TypeError("Request path contains unescaped characters"),
+						{ code: "ERR_UNESCAPED_CHARACTERS" });
+				}
+			}
 			this.method = (o.method || "GET").toUpperCase();
 			this._headers = {};
 			for (const [k, v] of Object.entries(o.headers || {})) this._headers[k] = v;

@@ -868,25 +868,23 @@ func TestHTTPClientDestroyStopsIdlePump(t *testing.T) {
 // via onError, since the JS shim ignores the op's return value.
 func TestHTTPClientBadMethodEmitsError(t *testing.T) {
 	js, rt := newRuntime(t, spidermonkey.Config{})
+	// Node THROWS synchronously for a method that is not an HTTP token —
+	// ERR_INVALID_HTTP_TOKEN from the constructor, not an 'error' event.
 	script := `
 		globalThis.r = {};
 		const http = require("http");
-		const req = http.request({ host: "127.0.0.1", port: 1, method: "BAD METHOD" }, () => { r.got = "response"; });
-		req.on("error", (e) => { r.error = e.code || e.message || "error"; });
-		req.end();
-	`
-	done := make(chan error, 1)
-	go func() { _, e := rt.RunScript(context.Background(), script); done <- e }()
-	select {
-	case e := <-done:
-		if e != nil {
-			t.Fatalf("RunScript: %v", e)
+		try {
+			http.request({ host: "127.0.0.1", port: 1, method: "BAD METHOD" });
+			r.error = "";
+		} catch (e) {
+			r.error = e.code || e.message;
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("RunScript hung — invalid method did not emit 'error' (client request never settled)")
+	`
+	if _, err := rt.RunScript(context.Background(), script); err != nil {
+		t.Fatalf("RunScript: %v", err)
 	}
-	if got := evalStr(t, js, `String(r.error ?? "")`); got == "" {
-		t.Errorf("no 'error' emitted for invalid method (got r.got=%q)", evalStr(t, js, `String(r.got ?? "")`))
+	if got := evalStr(t, js, `String(r.error ?? "")`); got != "ERR_INVALID_HTTP_TOKEN" {
+		t.Errorf("invalid method: got %q, want a synchronous ERR_INVALID_HTTP_TOKEN", got)
 	}
 }
 
