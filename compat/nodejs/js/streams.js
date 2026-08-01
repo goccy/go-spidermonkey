@@ -954,37 +954,102 @@
 		for await (const chunk of rs) yield chunk;
 	};
 	const fromAsyncGen = (gen, options) => Readable.from(gen, { objectMode: true, ...options });
+	// The iterator helpers validate like Node's: the function synchronously
+	// (ERR_INVALID_ARG_TYPE), the concurrency option as a positive number.
+	const helperFn = (fn, name) => {
+		if (typeof fn !== "function") {
+			const recv = fn === null || fn === undefined ? `Received ${fn}`
+				: typeof fn === "object" ? `Received an instance of ${fn.constructor ? fn.constructor.name : "Object"}`
+				: `Received type ${typeof fn} (${String(fn)})`;
+			throw Object.assign(new TypeError(`The "fn" argument must be of type function. ${recv}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+	};
+	const helperOptions = (options) => {
+		if (options === undefined || options === null) return;
+		if (typeof options !== "object") {
+			throw Object.assign(new TypeError('The "options" argument must be of type object.'),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		if (options.concurrency !== undefined && !(Number(options.concurrency) >= 1)) {
+			throw Object.assign(new RangeError(`The value of "concurrency" is out of range. It must be >= 1. Received ${options.concurrency}`),
+				{ code: "ERR_OUT_OF_RANGE" });
+		}
+		if (options.signal !== undefined && (options.signal === null || typeof options.signal !== "object" || typeof options.signal.aborted !== "boolean")) {
+			throw Object.assign(new TypeError('The "options.signal" property must be an instance of AbortSignal.'),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+	};
+	// drop/take size: a number, coerced per NumberIsNaN rules.
+	// drop/take size: the iterator-helpers coercion ("the spec made me do
+	// this" — Node's own comment): ToIntegerOrInfinity, NaN becomes 0, and
+	// only a NEGATIVE result is an error.
+	const helperCount = (n, name) => {
+		let v = Number(n);
+		if (Number.isNaN(v)) v = 0;
+		if (v < 0) {
+			throw Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 0. Received ${n}`),
+				{ code: "ERR_OUT_OF_RANGE" });
+		}
+		return Math.trunc(v);
+	};
+	const helperAbort = (options) => {
+		const sig = options && options.signal;
+		return () => {
+			if (sig && sig.aborted) {
+				throw Object.assign(new Error("The operation was aborted"), { name: "AbortError", code: "ABORT_ERR" });
+			}
+		};
+	};
 	Object.assign(Readable.prototype, {
 		map(fn, options) {
+			helperFn(fn, "fn");
+			helperOptions(options);
 			const self = this;
+			const check = helperAbort(options);
 			return fromAsyncGen((async function* () {
+				check();
 				let i = 0;
-				for await (const c of helperSource(self)) yield await fn(c, i++);
+				for await (const c of helperSource(self)) { check(); yield await fn(c, i++); }
 			})(), options);
 		},
 		filter(fn, options) {
+			helperFn(fn, "fn");
+			helperOptions(options);
 			const self = this;
+			const check = helperAbort(options);
 			return fromAsyncGen((async function* () {
+				check();
 				let i = 0;
-				for await (const c of helperSource(self)) if (await fn(c, i++)) yield c;
+				for await (const c of helperSource(self)) { check(); if (await fn(c, i++)) yield c; }
 			})(), options);
 		},
 		take(n, options) {
+			const count = helperCount(n, "number");
+			helperOptions(options);
+			const check = helperAbort(options);
 			const self = this;
 			return fromAsyncGen((async function* () {
-				if (n <= 0) return;
-				let left = n;
-				for await (const c of helperSource(self)) { yield c; if (--left <= 0) return; }
+				check();
+				if (count <= 0) return;
+				let left = count;
+				for await (const c of helperSource(self)) { check(); yield c; if (--left <= 0) return; }
 			})(), options);
 		},
 		drop(n, options) {
+			const count = helperCount(n, "number");
+			helperOptions(options);
+			const check = helperAbort(options);
 			const self = this;
 			return fromAsyncGen((async function* () {
-				let left = n;
-				for await (const c of helperSource(self)) { if (left-- > 0) continue; yield c; }
+				check();
+				let left = count;
+				for await (const c of helperSource(self)) { check(); if (left-- > 0) continue; yield c; }
 			})(), options);
 		},
 		flatMap(fn, options) {
+			helperFn(fn, "fn");
+			helperOptions(options);
 			const self = this;
 			return fromAsyncGen((async function* () {
 				let i = 0;

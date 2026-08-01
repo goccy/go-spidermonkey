@@ -895,6 +895,17 @@
 	Object.setPrototypeOf(Socket.prototype, core.stream.Duplex.prototype);
 	Object.setPrototypeOf(Socket, core.stream.Duplex);
 	Socket.prototype.connect = function connect(port, host, connectListener) {
+		if (port === undefined && host === undefined && connectListener === undefined) {
+			throw Object.assign(new TypeError('The "options" or "port" or "path" argument must be specified'),
+				{ code: "ERR_MISSING_ARGS" });
+		}
+		if (typeof port === "object" && port !== null) {
+			const o = port;
+			if (o.port === undefined && o.path === undefined) {
+				throw Object.assign(new TypeError('The "options" or "port" or "path" argument must be specified'),
+					{ code: "ERR_MISSING_ARGS" });
+			}
+		}
 		if (typeof port === "object") { const o = port; connectListener = host; host = o.host; port = o.port; if (o.allowHalfOpen !== undefined) this.allowHalfOpen = !!o.allowHalfOpen; }
 		if (typeof host === "function") { connectListener = host; host = undefined; }
 		// A string port is a path on a real Node (a unix socket); here only a
@@ -1026,6 +1037,10 @@
 		// valid. Dropping the listener when options is present would silently
 		// discard every connection handler.
 		if (typeof options === "function") { connectionListener = options; options = undefined; }
+		if (options !== undefined && options !== null && typeof options !== "object") {
+			throw Object.assign(new TypeError(`The "options" argument must be of type object. Received type ${typeof options} ('${options}')`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
 		this._id = null;
 		this.listening = false;
 		this._connections = new Set();
