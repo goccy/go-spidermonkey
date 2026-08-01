@@ -1452,9 +1452,10 @@
 		if (METHOD_OVERRIDE_HEADERS.has(name)) {
 			return value.split(",").some((m) => FORBIDDEN_METHODS.has(m.trim().toUpperCase()));
 		}
-		// A Range header is forbidden except in the one shape a media element
-		// would send.
-		if (name === "range") return !/^bytes=[0-9]+-[0-9]*$/.test(value);
+		// Range is deliberately NOT here: the standard keeps it settable, and a
+		// blob: fetch answers an invalid one with a network error — dropping the
+		// header at set time turned every one of those into a silent whole-blob
+		// 200.
 		return false;
 	}
 
@@ -2277,29 +2278,40 @@
 	// outcome. The rules are exact rather than lenient because the whole point of
 	// the tests is the ones a permissive parser would wave through.
 	function parseSingleByteRange(value, size) {
+		// The standard's "simple range header value", with whitespace allowed:
+		// "bytes" OWS "=" OWS digits* OWS "-" OWS digits*, nothing after — one
+		// range, no list, and at least one of the two positions stated.
 		const raw = String(value);
-		const prefix = "bytes=";
-		if (!raw.toLowerCase().startsWith(prefix)) return null;
-		const spec = raw.slice(prefix.length);
-		if (spec.includes(",")) return null; // one range only
-		const hyphen = spec.indexOf("-");
-		if (hyphen < 0) return null;
-		const first = spec.slice(0, hyphen);
-		const last = spec.slice(hyphen + 1);
-		const digitsOnly = (s) => s.length > 0 && /^[0-9]+$/.test(s);
+		let i = 0;
+		if (!raw.startsWith("bytes")) return null;
+		i = 5;
+		const ows = () => { while (raw[i] === " " || raw[i] === "\t") i++; };
+		const digits = () => {
+			const from = i;
+			while (raw[i] >= "0" && raw[i] <= "9") i++;
+			return raw.slice(from, i);
+		};
+		ows();
+		if (raw[i] !== "=") return null;
+		i++;
+		ows();
+		const first = digits();
+		ows();
+		if (raw[i] !== "-") return null;
+		i++;
+		ows();
+		const last = digits();
+		if (i !== raw.length) return null;
+		if (first === "" && last === "") return null;
 		if (first === "") {
 			// A suffix range: the LAST n bytes. Zero of them satisfies nothing.
-			if (!digitsOnly(last)) return null;
 			const n = Number(last);
 			if (n === 0) return null;
-			const start = Math.max(0, size - n);
-			return { start, end: size - 1 };
+			return { start: Math.max(0, size - n), end: size - 1 };
 		}
-		if (!digitsOnly(first)) return null;
 		const start = Number(first);
 		if (start >= size) return null; // unsatisfiable
 		if (last === "") return { start, end: size - 1 };
-		if (!digitsOnly(last)) return null;
 		const end = Math.min(Number(last), size - 1);
 		if (end < start) return null;
 		return { start, end };
