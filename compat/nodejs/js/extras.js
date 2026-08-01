@@ -57,13 +57,35 @@
 
 	// -------------------------------------------------------------- crypto
 
-	const toBuf = (d, enc) => (typeof d === "string" ? Buffer.from(d, enc || "utf8") : Buffer.from(d.buffer ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : d));
+	const toBuf = (d, enc) => {
+		if (typeof d === "string") return Buffer.from(d, enc || "utf8");
+		if (ArrayBuffer.isView(d)) return Buffer.from(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
+		// ArrayBuffer and SharedArrayBuffer both copy through a view; Buffer.from
+		// takes neither shared memory nor a raw SAB.
+		if (typeof SharedArrayBuffer !== "undefined" && d instanceof SharedArrayBuffer) {
+			return Buffer.from(new Uint8Array(new Uint8Array(d)));
+		}
+		return Buffer.from(d);
+	};
 
 	// The names every crypto entry point uses for a bad argument. Reaching the
 	// host with a non-string algorithm produced whatever the Go side made of
 	// "null" — a message about an unknown digest, not about the argument.
+	// The received-suffix in Node's exact shapes: "Received null",
+	// "Received type string ('20')", "Received an instance of Object".
+	function cryptoReceived(v) {
+		if (v === null || v === undefined) return `Received ${v}`;
+		if (typeof v === "function") return `Received function ${v.name}`;
+		if (typeof v === "object") {
+			const n = v.constructor && v.constructor.name;
+			return n ? `Received an instance of ${n}` : `Received ${String(v)}`;
+		}
+		let sv = typeof v === "string" ? `'${v}'` : String(v);
+		if (sv.length > 28) sv = sv.slice(0, 25) + "...";
+		return `Received type ${typeof v} (${sv})`;
+	}
 	const cryptoArgType = (name, expected, v) => Object.assign(
-		new TypeError(`The "${name}" argument must be ${expected}. Received ${v === null ? "null" : typeof v}`),
+		new TypeError(`The "${name}" argument must be ${expected}. ${cryptoReceived(v)}`),
 		{ code: "ERR_INVALID_ARG_TYPE" });
 	const cryptoRange = (name, range, v) => Object.assign(
 		new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${v}`),
@@ -71,6 +93,16 @@
 	function requireAlgorithm(algorithm, name = "algorithm") {
 		if (typeof algorithm !== "string") throw cryptoArgType(name, "of type string", algorithm);
 		return algorithm.toLowerCase();
+	}
+	// The digests the host implements; a name outside this set is Node's
+	// synchronous ERR_CRYPTO_INVALID_DIGEST, never an async host error.
+	const SUPPORTED_DIGESTS = new Set(["md5", "sha1", "sha224", "sha256", "sha384", "sha512"]);
+	function requireDigest(digest, name = "digest") {
+		const d = requireAlgorithm(digest, name);
+		if (!SUPPORTED_DIGESTS.has(d)) {
+			throw Object.assign(new TypeError(`Invalid digest: ${digest}`), { code: "ERR_CRYPTO_INVALID_DIGEST" });
+		}
+		return d;
 	}
 	// A count that must be a positive integer: iterations, key lengths, sizes.
 	function requireCount(v, name, min = 0, max = Number.MAX_SAFE_INTEGER) {
@@ -80,7 +112,8 @@
 		return v;
 	}
 	const requireBufferLike = (v, name) => {
-		if (typeof v !== "string" && !ArrayBuffer.isView(v) && !(v instanceof ArrayBuffer)) {
+		if (typeof v !== "string" && !ArrayBuffer.isView(v) && !(v instanceof ArrayBuffer) &&
+			!(typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer)) {
 			throw cryptoArgType(name, "of type string or an instance of Buffer, TypedArray, or DataView", v);
 		}
 		return v;
@@ -105,7 +138,10 @@
 				? ops.crypto_hmac(this._alg, this._key, data)
 				: ops.crypto_hash(this._alg, data);
 			const out = Buffer.from(raw);
-			return encoding ? out.toString(encoding) : out;
+			// Node: an encoding the Buffer does not know ("buffer" included)
+			// returns the raw Buffer rather than throwing.
+			if (!encoding || encoding === "buffer") return out;
+			try { return out.toString(encoding); } catch { return out; }
 		}
 	}
 
@@ -173,11 +209,43 @@
 			setAutoPadding(autoPadding) { this._autoPad = autoPadding === undefined ? true : !!autoPadding; return this; }
 			update(data, inputEnc, outputEnc) {
 				if (this._done) throw new Error("Trying to add data in unsupported state");
+				// Node pins the DECODER once a string update chose one; a later
+				// update may not switch it mid-stream.
+				if (typeof data === "string") {
+					const enc = (inputEnc || "utf8").toLowerCase().replace("utf-8", "utf8");
+					if (!Buffer.isEncoding(enc)) {
+						throw Object.assign(new TypeError(`Unknown encoding: ${inputEnc}`), { code: "ERR_UNKNOWN_ENCODING" });
+					}
+					if (this._inputEnc !== undefined && this._inputEnc !== enc) {
+						throw Object.assign(new Error("Cannot change encoding"), { code: "ERR_CRYPTO_INVALID_STATE" });
+					}
+					this._inputEnc = enc;
+				}
+				// The OUTPUT encoding pins the same way.
+				if (outputEnc) {
+					const oe = String(outputEnc).toLowerCase().replace("utf-8", "utf8");
+					if (oe !== "buffer" && !Buffer.isEncoding(oe)) {
+						throw Object.assign(new TypeError(`Unknown encoding: ${outputEnc}`), { code: "ERR_UNKNOWN_ENCODING" });
+					}
+					if (this._outputEnc !== undefined && this._outputEnc !== oe) {
+						throw Object.assign(new Error("Cannot change encoding"), { code: "ERR_CRYPTO_INVALID_STATE" });
+					}
+					this._outputEnc = oe;
+				}
 				this._chunks.push(toBuf(data, inputEnc));
 				return outputEnc ? "" : Buffer.alloc(0);
 			}
 			final(outputEnc) {
 				if (this._done) throw new Error("Unsupported state or unable to authenticate data");
+				if (outputEnc) {
+					const oe = String(outputEnc).toLowerCase().replace("utf-8", "utf8");
+					if (oe !== "buffer" && !Buffer.isEncoding(oe)) {
+						throw Object.assign(new TypeError(`Unknown encoding: ${outputEnc}`), { code: "ERR_UNKNOWN_ENCODING" });
+					}
+					if (this._outputEnc !== undefined && this._outputEnc !== oe) {
+						throw Object.assign(new Error("Cannot change encoding"), { code: "ERR_CRYPTO_INVALID_STATE" });
+					}
+				}
 				this._done = true;
 				const data = Buffer.concat(this._chunks);
 				const r = ops.crypto_cipher(this._algo, this._key, this._iv, encrypt, data, this._aad, this._authTag, this._autoPad);
@@ -344,9 +412,10 @@
 	function pbkdf2Sync(password, salt, iterations, keylen, digest) {
 		requireBufferLike(password, "password");
 		requireBufferLike(salt, "salt");
-		requireCount(iterations, "iterations", 1);
-		requireCount(keylen, "keylen", 0);
-		requireAlgorithm(digest, "digest");
+		// int32 bounds: the host op takes C ints, and Node ranges them here.
+		requireCount(iterations, "iterations", 1, 2147483647);
+		requireCount(keylen, "keylen", 0, 2147483647);
+		requireDigest(digest);
 		const r = ops.crypto_pbkdf2(toBuf(password), toBuf(salt), iterations, keylen, String(digest).toLowerCase());
 		ops.release_pending();
 		if (isErr(r)) cryptoThrow(r);
@@ -361,18 +430,68 @@
 		if (isErr(r)) cryptoThrow(r);
 		return Buffer.from(r);
 	}
+	const HKDF_HASH_LEN = { md5: 16, sha1: 20, sha224: 28, sha256: 32, sha384: 48, sha512: 64 };
 	function hkdfSync(digest, ikm, salt, info, keylen) {
+		// Node's order: types first, then the info size, then the length,
+		// and only THEN whether the digest exists — the suite pairs an
+		// unknown digest with an oversized info to check exactly this.
 		requireAlgorithm(digest, "digest");
+		if (ikm instanceof KeyObject) ikm = keyMaterial(ikm);
 		requireBufferLike(ikm, "ikm");
-		requireCount(keylen, "keylen", 0);
+		requireBufferLike(salt, "salt");
+		requireBufferLike(info, "info");
+		const infoLen = typeof info === "string" ? Buffer.byteLength(info) : info.byteLength;
+		if (infoLen > 1024) {
+			throw Object.assign(
+				new RangeError(`The value of "info" is out of range. It must be <= 1024. Received ${infoLen}`),
+				{ code: "ERR_OUT_OF_RANGE" });
+		}
+		// Node names hkdf's fifth argument "length".
+		requireCount(keylen, "length", 0, 2147483647);
+		requireDigest(digest);
+		const hashLen = HKDF_HASH_LEN[String(digest).toLowerCase()];
+		if (hashLen && keylen > 255 * hashLen) {
+			throw Object.assign(new RangeError(`Invalid key length: ${keylen}`), { code: "ERR_CRYPTO_INVALID_KEYLEN" });
+		}
 		const r = ops.crypto_hkdf(String(digest).toLowerCase(), toBuf(ikm), toBuf(salt), toBuf(info), keylen);
 		ops.release_pending();
 		if (isErr(r)) cryptoThrow(r);
 		return Buffer.from(r).buffer;
 	}
+	// Node's async crypto shape: argument VALIDATION throws synchronously,
+	// the operation's own failures arrive through the callback. Everything
+	// here is one thread either way, so computing eagerly and delivering on a
+	// microtask is observably Node's ordering.
+	const VALIDATION_CODES = new Set(["ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE",
+		"ERR_INVALID_ARG_VALUE", "ERR_CRYPTO_INVALID_DIGEST", "ERR_CRYPTO_INVALID_KEYLEN"]);
 	const asyncify = (fn) => (...args) => {
-		const cb = args.pop();
-		queueMicrotask(() => { try { cb(null, fn(...args)); } catch (e) { cb(e); } });
+		// The callback is the argument PAST the operation's own: popping the
+		// last argument unconditionally turned hkdf(d, ikm, salt, info, -1)
+		// into a four-argument call and misnamed every later validation.
+		let cb;
+		if (args.length > fn.length || typeof args[args.length - 1] === "function") {
+			cb = args.pop();
+		}
+		if (typeof cb !== "function") {
+			// Node validates the ARGUMENTS before it validates the callback:
+			// hkdf() with nothing at all names the digest, not the callback.
+			try {
+				fn(...args);
+			} catch (e) {
+				if (e && VALIDATION_CODES.has(e.code)) throw e;
+			}
+			throw Object.assign(new TypeError(`The "callback" argument must be of type function. ${cryptoReceived(cb)}`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		let result;
+		try {
+			result = fn(...args);
+		} catch (e) {
+			if (e && VALIDATION_CODES.has(e.code)) throw e;
+			queueMicrotask(() => cb(e));
+			return;
+		}
+		queueMicrotask(() => cb(null, result));
 	};
 
 	// generateKeyPairSync honors publicKeyEncoding/privateKeyEncoding: PEM
@@ -565,6 +684,13 @@
 			if (typeof data !== "string" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
 				throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.'), { code: "ERR_INVALID_ARG_TYPE" });
 			}
+			if (typeof outputEncoding !== "string") {
+				throw Object.assign(new TypeError('The "outputEncoding" argument must be of type string.'), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			const known = ["hex", "base64", "base64url", "latin1", "binary", "buffer", "utf8", "utf-8", "ascii", "ucs2", "utf16le"];
+			if (!known.includes(outputEncoding.toLowerCase())) {
+				throw Object.assign(new TypeError(`The argument 'outputEncoding' is invalid. Received '${outputEncoding}'`), { code: "ERR_INVALID_ARG_VALUE" });
+			}
 			const h = new Hash(algorithm);
 			h.update(data);
 			return outputEncoding === "buffer" ? h.digest() : h.digest(outputEncoding);
@@ -612,9 +738,7 @@
 			queueMicrotask(() => { try { cb(null, scryptSync(pw, salt, keylen, opts)); } catch (e) { cb(e); } });
 		},
 		hkdfSync,
-		hkdf: (digest, ikm, salt, info, keylen, cb) => {
-			queueMicrotask(() => { try { cb(null, hkdfSync(digest, ikm, salt, info, keylen)); } catch (e) { cb(e); } });
-		},
+		hkdf: asyncify((digest, ikm, salt, info, keylen) => hkdfSync(digest, ikm, salt, info, keylen)),
 		generateKeyPairSync,
 		generateKeyPair: (type, options, cb) => {
 			queueMicrotask(() => { try { const kp = generateKeyPairSync(type, options); cb(null, kp.publicKey, kp.privateKey); } catch (e) { cb(e); } });
@@ -639,7 +763,15 @@
 			return min + (n % range);
 		},
 		pseudoRandomBytes: randomBytes,
-		randomUUID: () => globalThis.crypto.randomUUID(),
+		randomUUID: (options) => {
+			if (options !== undefined && (options === null || typeof options !== "object")) {
+				throw Object.assign(new TypeError('The "options" argument must be of type object.'), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (options && options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== "boolean") {
+				throw Object.assign(new TypeError('The "options.disableEntropyCache" property must be of type boolean.'), { code: "ERR_INVALID_ARG_TYPE" });
+			}
+			return globalThis.crypto.randomUUID();
+		},
 		randomFillSync: (buf, offset, size) => randomFillInto(buf, offset, size),
 		randomFill: (buf, offset, size, cb) => {
 			// Node overloads: randomFill(buf, cb) / (buf, offset, cb) /
