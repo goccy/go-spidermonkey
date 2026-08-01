@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	suiteDir         = "testdata/suite"
+	suiteDir         = "../../../testdata/node/suite"
 	expectationsFile = "expectations.json"
 	quarantineFile   = "quarantine.txt"
 )

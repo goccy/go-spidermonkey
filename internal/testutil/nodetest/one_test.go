@@ -26,6 +26,6 @@ func TestNodeOne(t *testing.T) {
 			timeout = d
 		}
 	}
-	r := nodetest.Run(context.Background(), nodetest.Options{Root: "testdata/suite", Timeout: timeout}, rel)
+	r := nodetest.Run(context.Background(), nodetest.Options{Root: "../../../testdata/node/suite", Timeout: timeout}, rel)
 	t.Logf("status=%v reason=%s\n--- output ---\n%s", r.Status, r.Reason, r.Output)
 }

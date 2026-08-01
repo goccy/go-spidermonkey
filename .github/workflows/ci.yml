@@ -77,11 +77,11 @@ jobs:
           go-version-file: go.mod
       - name: Resolve the WPT submodule pin
         id: wpt-pin
-        run: echo "sha=$(git ls-tree HEAD internal/testutil/wpt/testdata/suite --object-only)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git ls-tree HEAD testdata/wpt/suite --object-only)" >> "$GITHUB_OUTPUT"
       - name: Cache the pinned WPT checkout
         uses: actions/cache@v4
         with:
-          path: internal/testutil/wpt/testdata/suite
+          path: testdata/wpt/suite
           key: wpt-${{ steps.wpt-pin.outputs.sha }}-${{ hashFiles('Makefile') }}
       - run: make wpt
 
@@ -96,11 +96,11 @@ jobs:
           go-version-file: go.mod
       - name: Resolve the Node submodule pin
         id: node-pin
-        run: echo "sha=$(git ls-tree HEAD internal/testutil/nodetest/testdata/suite --object-only)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git ls-tree HEAD testdata/node/suite --object-only)" >> "$GITHUB_OUTPUT"
       - name: Cache the pinned Node checkout
         uses: actions/cache@v4
         with:
-          path: internal/testutil/nodetest/testdata/suite
+          path: testdata/node/suite
           key: nodetest-${{ steps.node-pin.outputs.sha }}-${{ hashFiles('Makefile') }}
       - run: make nodetest
 
@@ -118,12 +118,12 @@ jobs:
           node-version: 22
       - name: Resolve the Babel submodule pin
         id: babel-pin
-        run: echo "sha=$(git ls-tree HEAD internal/testutil/babeltest/testdata/suite --object-only)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git ls-tree HEAD testdata/babel/suite --object-only)" >> "$GITHUB_OUTPUT"
       - name: Cache the pinned Babel checkout and its packages
         uses: actions/cache@v4
         with:
           path: |
-            internal/testutil/babeltest/testdata/suite
-            internal/testutil/babeltest/node_modules
+            testdata/babel/suite
+            testdata/babel/node_modules
           key: babeltest-${{ steps.babel-pin.outputs.sha }}-${{ hashFiles('Makefile', 'scripts/babel-suite-deps.sh') }}
       - run: make babeltest

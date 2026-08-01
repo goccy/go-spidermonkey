@@ -22,11 +22,11 @@ ATTESTATION_API   = https://api.github.com/repos/$(SPIDERMONKEY_WASM_REPO)/attes
 # Babel's fixture corpus as a whole-toolchain workload. Each is pinned to an
 # exact upstream revision and fetched on demand (blobless sparse clone) — none
 # of them belongs in this repository.
-# The node suite is the internal/testutil/nodetest/testdata/suite submodule
+# The node suite is the testdata/node/suite submodule
 # (pinned by gitlink, v26.5.0); only the test trees below are checked out.
 NODE_SUITE_DIRS := test/common test/parallel test/es-module test/fixtures
 
-# The wpt suite is the internal/testutil/wpt/testdata/suite submodule; its
+# The wpt suite is the testdata/wpt/suite submodule; its
 # PIN is the gitlink, not a variable here. The union of what Bun and Deno support, which is the first milestone: every
 # directory either of them covers is covered here, whether or not this runtime
 # implements the API yet. A directory left out because the API is missing is a
@@ -43,7 +43,7 @@ WPT_SUITE_DIRS := resources common interfaces images media fonts \
                   css eventsource schema service-workers wasm web-locks \
                   webidl webstorage websockets workers xhr
 
-# The babel suite is the internal/testutil/babeltest/testdata/suite submodule
+# The babel suite is the testdata/babel/suite submodule
 # (pinned by gitlink, v8.0.4); only its packages/ tree is checked out.
 BABEL_SUITE_DIRS := packages
 
@@ -93,8 +93,8 @@ test262:
 ## nodetest-fetch: materialize the nodejs/node submodule (shallow, blobless,
 ## sparse to NODE_SUITE_DIRS).
 nodetest-fetch:
-	git submodule update --init --depth 1 --filter=blob:none internal/testutil/nodetest/testdata/suite
-	git -C internal/testutil/nodetest/testdata/suite sparse-checkout set $(NODE_SUITE_DIRS)
+	git submodule update --init --depth 1 --filter=blob:none testdata/node/suite
+	git -C testdata/node/suite sparse-checkout set $(NODE_SUITE_DIRS)
 
 ## nodetest: run the Node.js project's own test suite against compat/nodejs.
 ## Takes about a minute. Tests addressed to the node binary itself (private
@@ -118,8 +118,8 @@ nodetest: nodetest-fetch
 ## wpt-fetch: materialize the web-platform-tests submodule (shallow, blobless,
 ## sparse to WPT_SUITE_DIRS).
 wpt-fetch:
-	git submodule update --init --depth 1 --filter=blob:none internal/testutil/wpt/testdata/suite
-	git -C internal/testutil/wpt/testdata/suite sparse-checkout set $(WPT_SUITE_DIRS)
+	git submodule update --init --depth 1 --filter=blob:none testdata/wpt/suite
+	git -C testdata/wpt/suite sparse-checkout set $(WPT_SUITE_DIRS)
 
 ## wpt: run the Web Platform Tests against compat/web. Judged per subtest.
 wpt: wpt-fetch
@@ -128,10 +128,10 @@ wpt: wpt-fetch
 ## babeltest-fetch: check out Babel's fixture corpus and install the matching
 ## @babel/* packages the fixtures are run through.
 babeltest-fetch:
-	git submodule update --init --depth 1 --filter=blob:none internal/testutil/babeltest/testdata/suite
-	git -C internal/testutil/babeltest/testdata/suite sparse-checkout set $(BABEL_SUITE_DIRS)
-	./scripts/babel-suite-deps.sh internal/testutil/babeltest/testdata/suite internal/testutil/babeltest/package.json
-	cd internal/testutil/babeltest && npm install --no-audit --no-fund
+	git submodule update --init --depth 1 --filter=blob:none testdata/babel/suite
+	git -C testdata/babel/suite sparse-checkout set $(BABEL_SUITE_DIRS)
+	./scripts/babel-suite-deps.sh testdata/babel/suite testdata/babel/package.json
+	cd testdata/babel && npm install --no-audit --no-fund
 
 ## babeltest: run Babel's fixture corpus through @babel/core on this runtime.
 babeltest: babeltest-fetch

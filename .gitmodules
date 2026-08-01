@@ -3,14 +3,14 @@
 	url = https://github.com/tc39/test262.git
 	shallow = true
 [submodule "internal/testutil/wpt/testdata/suite"]
-	path = internal/testutil/wpt/testdata/suite
+	path = testdata/wpt/suite
 	url = https://github.com/web-platform-tests/wpt.git
 	shallow = true
 [submodule "internal/testutil/babeltest/testdata/suite"]
-	path = internal/testutil/babeltest/testdata/suite
+	path = testdata/babel/suite
 	url = https://github.com/babel/babel.git
 	shallow = true
 [submodule "internal/testutil/nodetest/testdata/suite"]
-	path = internal/testutil/nodetest/testdata/suite
+	path = testdata/node/suite
 	url = https://github.com/nodejs/node.git
 	shallow = true

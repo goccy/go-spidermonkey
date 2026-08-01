@@ -1,5 +1,5 @@
 // Package wpt runs the Web Platform Tests (web-platform-tests/wpt, checked out
-// under ./testdata/suite by `make wpt-fetch`) against the compat/web vocabulary.
+// under testdata/wpt/suite by `make wpt-fetch`) against the compat/web vocabulary.
 //
 // WPT tests are judged per SUBTEST, not per file: a .any.js file typically
 // declares dozens of independent assertions, and a single unimplemented corner

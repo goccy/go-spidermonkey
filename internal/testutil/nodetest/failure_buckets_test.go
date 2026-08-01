@@ -42,7 +42,7 @@ func TestNodeFailureBuckets(t *testing.T) {
 		}
 	case "all":
 		for _, dir := range []string{"test/parallel", "test/es-module"} {
-			p, err := nodetest.List("testdata/suite", dir)
+			p, err := nodetest.List("../../../testdata/node/suite", dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -64,7 +64,7 @@ func TestNodeFailureBuckets(t *testing.T) {
 	example := map[string]string{}
 	hung := 0
 	for _, rel := range paths {
-		r := nodetest.Run(context.Background(), nodetest.Options{Root: "testdata/suite", Timeout: timeout}, rel)
+		r := nodetest.Run(context.Background(), nodetest.Options{Root: "../../../testdata/node/suite", Timeout: timeout}, rel)
 		if r.Status == nodetest.StatusPass {
 			continue
 		}

@@ -35,7 +35,7 @@ func TestBabelSuite(t *testing.T) {
 	}
 	root := os.Getenv("BABELTEST_ROOT")
 	if root == "" {
-		root = "."
+		root = "../../../testdata/babel"
 	}
 	if _, err := os.Stat(root + "/node_modules/@babel/core/package.json"); err != nil {
 		t.Fatalf("no @babel packages under %s: run `make babeltest-fetch` (%v)", root, err)

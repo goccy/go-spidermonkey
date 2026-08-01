@@ -1,5 +1,5 @@
 // Package babeltest runs Babel's own fixture corpus (babel/babel, checked out
-// under ./testdata/suite by `make babeltest-fetch`) through @babel/core ON THIS RUNTIME.
+// under testdata/babel/suite by `make babeltest-fetch`) through @babel/core ON THIS RUNTIME.
 //
 // Where test262 measures the engine and the Node/WPT suites measure one API
 // surface at a time, this measures the whole stack under a real workload:
@@ -54,7 +54,7 @@ type Result struct {
 
 // Options configures a run.
 type Options struct {
-	// Root is the babeltest directory: it must contain suite/ (the pinned
+	// Root is the data directory (testdata/babel): it must contain suite/ (the pinned
 	// checkout) and node_modules/ (the matching @babel/* packages).
 	Root string
 	// Timeout bounds one shard — one Babel package's whole fixture corpus.
@@ -76,7 +76,7 @@ const (
 // test/fixtures directory, relative to Root. Sharding per package is what keeps
 // one interpreter's working set bounded and isolates a crash to one package.
 func Shards(root string) ([]string, error) {
-	pkgs, err := os.ReadDir(filepath.Join(root, "testdata", "suite", "packages"))
+	pkgs, err := os.ReadDir(filepath.Join(root, "suite", "packages"))
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +85,7 @@ func Shards(root string) ([]string, error) {
 		if !p.IsDir() {
 			continue
 		}
-		rel := path.Join("testdata", "suite", "packages", p.Name(), "test", "fixtures")
+		rel := path.Join("suite", "packages", p.Name(), "test", "fixtures")
 		if fi, err := os.Stat(filepath.Join(root, rel)); err == nil && fi.IsDir() {
 			out = append(out, rel)
 		}
