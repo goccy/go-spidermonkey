@@ -498,6 +498,12 @@
 			return out;
 		}
 
+		// A MessagePort is transferable, never serializable: one that reaches
+		// here was not in the transfer list (a transferred one is pre-seeded
+		// into `seen` by transferClone below).
+		if (globalThis.MessagePort && value instanceof globalThis.MessagePort) {
+			throw new DOMException("A MessagePort can only be transferred, not cloned", "DataCloneError");
+		}
 		// A platform object the spec marks [[Serializable]] carries its own
 		// cloner. The plain-object path below copies own enumerable properties,
 		// which is not enough for one whose state lives elsewhere: a CryptoKey
@@ -522,26 +528,65 @@
 		}
 		return out;
 	}
+	// transferClone is StructuredSerializeWithTransfer + deserialize in one
+	// realm: validate the transfer list, mint each transferred object's
+	// replacement, clone the graph with the replacements pre-seeded (so a
+	// transferred port inside the value maps to its new self), and only then
+	// detach the originals. Returns the clone AND the replacements in transfer-
+	// list order, which is what event.ports is made of.
+	function transferClone(value, transfer) {
+		const list = transfer === undefined || transfer === null ? [] : [...transfer];
+		const set = new Set();
+		for (const t of list) {
+			if (set.has(t)) throw new DOMException("Duplicate value in transfer list", "DataCloneError");
+			set.add(t);
+			if (t instanceof ArrayBuffer) {
+				if (t.detached === true || (t.byteLength === 0 && isDetached(t))) {
+					throw new DOMException("Cannot transfer a detached ArrayBuffer", "DataCloneError");
+				}
+				continue;
+			}
+			if (globalThis.MessagePort && t instanceof globalThis.MessagePort) {
+				if (t._detached === true) {
+					throw new DOMException("Cannot transfer a detached MessagePort", "DataCloneError");
+				}
+				continue;
+			}
+			throw new DOMException("Value is not transferable", "DataCloneError");
+		}
+		// Mint replacements, and seed them into the clone map so any reference
+		// to a transferred port inside the value becomes the NEW port.
+		const seen = new Map();
+		const ports = [];
+		const detachPorts = [];
+		for (const t of list) {
+			if (globalThis.MessagePort && t instanceof globalThis.MessagePort) {
+				const replacement = t._transferOut();
+				seen.set(t, replacement);
+				ports.push(replacement);
+				detachPorts.push(t);
+			}
+		}
+		const out = fullClone(value, seen);
+		// Detach last: the serialize step reads the source data. Buffers go
+		// through ArrayBuffer.prototype.transfer — the engine's real detach, so
+		// any view over the source throws afterwards.
+		for (const t of list) {
+			if (t instanceof ArrayBuffer) t.transfer();
+		}
+		for (const t of detachPorts) t._detach();
+		return { data: out, ports };
+	}
+	// The registry symbol lets the scope layer (window.postMessage) reuse this
+	// without a global function the suite would enumerate.
+	Object.defineProperty(globalThis, Symbol.for("go-spidermonkey.transferClone"), {
+		value: transferClone, configurable: true,
+	});
+
 	globalThis.structuredClone = (value, options) => {
 		const transfer = options && options.transfer;
 		if (transfer === undefined || transfer === null) return fullClone(value, new Map());
-		// Transfer list: ArrayBuffers only (the transferable types this runtime
-		// has). Validate the whole list up front — DataCloneError on a non-
-		// transferable, a duplicate, or an already-detached buffer.
-		const list = [...transfer];
-		const set = new Set();
-		for (const t of list) {
-			if (!(t instanceof ArrayBuffer)) throw new DOMException("Value is not transferable", "DataCloneError");
-			if (set.has(t)) throw new DOMException("Duplicate value in transfer list", "DataCloneError");
-			if (t.detached === true || (t.byteLength === 0 && isDetached(t))) throw new DOMException("Cannot transfer a detached ArrayBuffer", "DataCloneError");
-			set.add(t);
-		}
-		// Clone first (the serialize step reads the source data), then detach the
-		// transferred buffers via ArrayBuffer.prototype.transfer — the engine's
-		// real detach, so any view over the source throws afterwards.
-		const out = fullClone(value, new Map());
-		for (const t of list) t.transfer();
-		return out;
+		return transferClone(value, transfer).data;
 	};
 	// isDetached distinguishes a genuinely detached zero-length buffer from a
 	// normal new ArrayBuffer(0): constructing a view over a detached buffer
@@ -693,29 +738,23 @@
 		postMessage(value, options) {
 			if (arguments.length < 1) throw new TypeError("postMessage: a message is required");
 			const transfer = Array.isArray(options) ? options : options && options.transfer;
-			// The transfer list is split: buffers are DETACHED by the clone, ports
-			// are MOVED to the other side and arrive as event.ports. Both are
-			// validated before anything is sent, and a port may not transfer itself.
 			const list = transfer ? [...transfer] : [];
-			const ports = [];
-			const buffers = [];
 			for (const t of list) {
-				if (t instanceof MessagePort) {
-					if (t === this) throw new DOMException("A port cannot transfer itself", "DataCloneError");
-					ports.push(t);
-					continue;
-				}
-				buffers.push(t);
+				if (t === this) throw new DOMException("A port cannot transfer itself", "DataCloneError");
 			}
-			// A value that cannot be cloned is a DataCloneError on the CALLER, not a
-			// silent drop — so the clone happens before the closed check.
-			const cloned = structuredClone(value, buffers.length ? { transfer: buffers } : undefined);
+			// A value that cannot be cloned is a DataCloneError on the CALLER, not
+			// a silent drop — so the clone (which also re-mints transferred ports
+			// and detaches the originals) happens before the closed check.
+			const { data, ports } = transferClone(value, list);
 			if (this._closed) return;
 			const peer = this._peer;
 			if (!peer || peer._closed) return;
-			queueMicrotask(() => peer._deliver(cloned, ports));
+			queueMicrotask(() => peer._deliver(data, ports));
 		}
 		_deliver(data, ports) {
+			// A message can be in flight toward a port that gets transferred
+			// before the delivery task runs: it belongs to the replacement.
+			if (this._replacedBy) { this._replacedBy._deliver(data, ports); return; }
 			if (this._closed) return;
 			if (!this._started) { this._queue.push({ data, ports }); return; }
 			const ev = new MessageEvent("message", { data, ports: ports || [] });
@@ -733,6 +772,24 @@
 			if (this._closed) return;
 			this._closed = true;
 			this._queue.length = 0;
+		}
+		// _transferOut mints this port's replacement: the new port takes over
+		// the entanglement and the undelivered queue. Detaching the original is
+		// a separate step (_detach), run only after the whole clone succeeds.
+		_transferOut() {
+			const np = new MessagePort();
+			np._peer = this._peer;
+			if (this._peer) this._peer._peer = np;
+			np._queue = this._queue;
+			this._queue = [];
+			this._replacedBy = np;
+			return np;
+		}
+		_detach() {
+			this._detached = true;
+			this._closed = true;
+			this._peer = null;
+			this._queue = [];
 		}
 		get onmessage() { return this._onmessage; }
 		set onmessage(fn) {

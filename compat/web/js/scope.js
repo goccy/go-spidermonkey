@@ -163,11 +163,12 @@
 						}
 						deliver = here !== undefined && parsed.origin === here.origin;
 					}
-					const data = globalThis.structuredClone(message, { transfer });
+					const clone = globalThis[Symbol.for("go-spidermonkey.transferClone")];
+					const { data, ports } = clone(message, transfer);
 					if (!deliver) return;
 					globalThis.setTimeout(() => {
 						const ev = new MessageEvent("message", {
-							data, origin: here === undefined ? "" : here.origin, source: globalThis,
+							data, ports, origin: here === undefined ? "" : here.origin, source: globalThis,
 						});
 						globalThis.__dispatch_trusted(globalThis, ev);
 					}, 0);
