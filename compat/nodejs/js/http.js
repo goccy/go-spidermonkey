@@ -684,8 +684,25 @@
 			this._timeoutMs = 0;
 			this._timeoutTimer = null;
 			// Node: options.timeout arms the idle timeout at request creation.
-			if (o.timeout) this.setTimeout(o.timeout);
 			if (cb) this.once("response", cb);
+			// The client socket: announced on the next tick (listeners attach
+			// after the constructor returns), connected the tick after —
+			// loopback connects are effectively immediate here, but the two
+			// states must still be observable in order.
+			const sock = makeSocket();
+			sock.connecting = true;
+			sock.on("timeout", () => this.emit("timeout"));
+			process.nextTick(() => {
+				if (this.destroyed) return;
+				this.socket = this.connection = sock;
+				if (o.timeout) sock.setTimeout(o.timeout);
+				this.emit("socket", sock);
+				process.nextTick(() => {
+					if (this.destroyed) return;
+					sock.connecting = false;
+					sock.emit("connect");
+				});
+			});
 		}
 		setHeader(name, value) { this._headers[name] = value; return this; }
 		getHeader(name) { return this._headers[name]; }
@@ -807,7 +824,23 @@
 			}
 			cb(err);
 		}
-		setTimeout(ms, cb) { return idleSetTimeout(this, ms, cb); }
+		setTimeout(ms, cb) {
+			// The timeout lives on the SOCKET (socket.timeout, its 'timeout'
+			// listener count), and the request re-emits through the one
+			// persistent forwarder installed at socket creation. An explicit
+			// setTimeout on a still-connecting socket waits for 'connect' —
+			// which is why the option timeout is visible at 'socket' and this
+			// one only afterwards.
+			if (cb) this.once("timeout", cb);
+			const arm = (socket) => {
+				if (!socket || typeof socket.setTimeout !== "function") return;
+				if (socket.connecting) socket.once("connect", () => socket.setTimeout(ms));
+				else socket.setTimeout(ms);
+			};
+			if (this.socket) arm(this.socket);
+			else this.once("socket", arm);
+			return this;
+		}
 	}
 
 	function parseRequestURL(url) {
