@@ -685,24 +685,11 @@
 			this._timeoutTimer = null;
 			// Node: options.timeout arms the idle timeout at request creation.
 			if (cb) this.once("response", cb);
-			// The client socket: announced on the next tick (listeners attach
-			// after the constructor returns), connected the tick after —
-			// loopback connects are effectively immediate here, but the two
-			// states must still be observable in order.
-			const sock = makeSocket();
-			sock.connecting = true;
-			sock.on("timeout", () => this.emit("timeout"));
-			process.nextTick(() => {
-				if (this.destroyed) return;
-				this.socket = this.connection = sock;
-				if (o.timeout) sock.setTimeout(o.timeout);
-				this.emit("socket", sock);
-				process.nextTick(() => {
-					if (this.destroyed) return;
-					sock.connecting = false;
-					sock.emit("connect");
-				});
-			});
+			// The client socket exists once the request is actually SENT: a
+			// request that is destroyed (or never ends) must not leave a
+			// socket and its idle timer behind — two hundred abandoned
+			// requests did exactly that and exhausted the heap.
+			this._timeoutOption = o.timeout;
 		}
 		setHeader(name, value) { this._headers[name] = value; return this; }
 		getHeader(name) { return this._headers[name]; }
@@ -759,6 +746,7 @@
 		_ensureStarted() {
 			if (this._started) return;
 			this._started = true;
+			assignClientSocket(this);
 			const { onResponse, onError } = this._sendHandlers();
 			this._reqId = ops.http_client_req_stream(this.method, this._url, JSON.stringify(this._headers), this._agentConfig(), onResponse, onError);
 		}
@@ -800,6 +788,7 @@
 			// The op returns the request/body id so abort()/destroy() can cancel the
 			// round-trip (otherwise an aborted or unconsumed response leaves the host
 			// body pump parked and the event loop never idles).
+			assignClientSocket(this);
 			this._reqId = ops.http_client_req(this.method, this._url, JSON.stringify(this._headers), body, this._agentConfig(), onResponse, onError);
 			callback();
 		}
@@ -841,6 +830,27 @@
 			else this.once("socket", arm);
 			return this;
 		}
+	}
+
+	// assignSocket gives a client request its socket and walks the two states
+	// Node makes observable: 'socket' on the tick the socket is assigned,
+	// 'connect' the tick after. The timeout OPTION arms at assignment; an
+	// explicit setTimeout() during connect waits for it (see setTimeout).
+	function assignClientSocket(req) {
+		if (req.socket || req.destroyed) return;
+		const sock = makeSocket();
+		sock.connecting = true;
+		sock.on("timeout", () => req.emit("timeout"));
+		req.socket = req.connection = sock;
+		if (req._timeoutOption) sock.setTimeout(req._timeoutOption);
+		for (const pending of req._pendingSocketTimeouts || []) pending(sock);
+		req._pendingSocketTimeouts = null;
+		req.emit("socket", sock);
+		process.nextTick(() => {
+			if (req.destroyed) return;
+			sock.connecting = false;
+			sock.emit("connect");
+		});
 	}
 
 	function parseRequestURL(url) {
