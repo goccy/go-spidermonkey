@@ -1228,10 +1228,32 @@
 			let thrown;
 			try { fn(); } catch (e) { thrown = e; }
 			if (thrown === undefined) {
-				throw new AssertionError({ message: m || "Missing expected exception", operator: "throws" });
+				// Name the function that failed to throw — with hundreds of
+				// validation asserts per file, "missing" alone says nothing.
+				const src = String(fn).replace(/\s+/g, " ").slice(0, 100);
+				throw new AssertionError({ message: (m || "Missing expected exception") + ` [${src}]`, operator: "throws" });
 			}
 			if (!matchError(thrown, matcher)) {
-				throw new AssertionError({ actual: thrown, expected: matcher, operator: "throws", message: m || "thrown error did not match" });
+				// Say WHAT did not match: the campaign against the Node suite
+				// lives and dies by this diagnostic. The first differing key of
+				// an object matcher is the failure, so name it.
+				let detail = "";
+				if (matcher && typeof matcher === "object" && !(matcher instanceof RegExp)) {
+					for (const k of Object.keys(matcher)) {
+						const want = matcher[k];
+						const got = thrown ? thrown[k] : undefined;
+						const ok = want instanceof RegExp && typeof got === "string"
+							? want.test(got) : deepEqual(got, want);
+						if (!ok) {
+							detail = ` (${k}: got ${JSON.stringify(got)}, want ${
+								want instanceof RegExp ? String(want) : JSON.stringify(want)})`;
+							break;
+						}
+					}
+				} else {
+					detail = ` (got ${String(thrown)})`;
+				}
+				throw new AssertionError({ actual: thrown, expected: matcher, operator: "throws", message: (m || "thrown error did not match") + detail });
 			}
 		},
 		doesNotThrow: (fn, matcher, m) => {
@@ -1465,6 +1487,11 @@
 		if (v < min || v > max) throw errRange(name, `>= ${min} && <= ${max}`, v);
 	}
 	const validateFd = (fd) => validateInteger(fd, "fd", 0, 0x7fffffff);
+	function validateData(d) {
+		if (typeof d === "string" || ArrayBuffer.isView(d)) return;
+		if (d !== null && typeof d === "object" && (Symbol.iterator in d || Symbol.asyncIterator in d)) return;
+		throw errArgType("data", "of type string or an instance of Buffer, TypedArray, or DataView", d);
+	}
 	function validateBuffer(v, name) {
 		if (!ArrayBuffer.isView(v)) throw errArgType(name, "an instance of Buffer, TypedArray, or DataView", v);
 	}
@@ -1496,20 +1523,33 @@
 	// the same inputs at the same moment. Keyed by the callback-flavour name.
 	const fsCheck = {
 		readFile: (p, o) => { validatePath(p); validateEncodingOpt(o); },
-		writeFile: (p, d, o) => { validatePath(p); validateEncodingOpt(o); },
-		appendFile: (p, d, o) => { validatePath(p); validateEncodingOpt(o); },
+		writeFile: (p, d, o) => { validatePath(p); validateData(d); validateEncodingOpt(o); },
+		appendFile: (p, d, o) => { validatePath(p); validateData(d); validateEncodingOpt(o); },
 		readdir: (p, o) => { validatePath(p); validateEncodingOpt(o); },
 		readlink: (p, o) => { validatePath(p); validateEncodingOpt(o); },
 		realpath: (p, o) => { validatePath(p); validateEncodingOpt(o); },
 		mkdtemp: (p, o) => { validatePath(p); validateEncodingOpt(o); },
 		stat: validatePath, lstat: validatePath, unlink: validatePath,
 		rmdir: validatePath, rm: validatePath, mkdir: validatePath,
-		access: validatePath, truncate: validatePath, open: validatePath,
+		access: validatePath, truncate: validatePath,
+		open: (p, flags, mode) => {
+			validatePath(p);
+			if (mode !== undefined && typeof mode !== "function") validateMode(mode, 0o666);
+		},
 		rename: (a, b) => { validatePath(a); validatePath(b); },
 		link: (a, b) => { validatePath(a); validatePath(b); },
 		copyFile: (a, b) => { validatePath(a); validatePath(b); },
 		cp: (a, b, o) => { validatePath(a); validatePath(b); validateCpOptions(o); },
-		symlink: (t, p) => { validatePath(t); validatePath(p); },
+		symlink: (t, p, type) => {
+			if (typeof t !== "string" && !(t instanceof URL) && !ArrayBuffer.isView(t)) {
+				throw errArgType("target", "of type string or an instance of Buffer or URL", t);
+			}
+			validatePath(p);
+			if (type !== undefined && type !== null && typeof type !== "function" &&
+				type !== "dir" && type !== "file" && type !== "junction") {
+				throw errArgValue("type", type, "must be one of 'dir', 'file', or 'junction'");
+			}
+		},
 		chmod: (p, m) => { validatePath(p); validateMode(m); },
 		lchmod: (p, m) => { validatePath(p); validateMode(m); },
 		chown: (p, u, g) => { validatePath(p); validateUidGid(u, g); },
@@ -1519,13 +1559,17 @@
 		ftruncate: (fd) => validateFd(fd),
 	};
 	// An octal string ("755") is as good as a number; anything else is not a mode.
-	function validateMode(m) {
-		if (m === undefined || m === null) return;
+	// Node's parseFileMode: a nullish mode takes the caller's default WHEN one
+	// exists (mkdir), and is a type error where none does (chmod); a string is
+	// octal or an ERR_INVALID_ARG_VALUE; a number is a uint32 — the full
+	// 32-bit range, not just the permission bits.
+	function validateMode(m, def) {
+		if ((m === undefined || m === null) && def !== undefined) return;
 		if (typeof m === "string") {
 			if (!/^[0-7]+$/.test(m)) throw errArgValue("mode", m, "must be a 32-bit unsigned integer or an octal string");
 			return;
 		}
-		validateInteger(m, "mode", 0, 0o777);
+		validateInteger(m, "mode", 0, 0xffffffff);
 	}
 	// -1 is Node's "leave it alone" sentinel, so the range starts below zero.
 	function validateUidGid(uid, gid) {
@@ -1554,7 +1598,9 @@
 		if (flags & O_APPEND) base = rw ? "a+" : "a";
 		else if (flags & O_TRUNC || flags & O_CREAT) base = rw ? "w+" : (flags & O_WRONLY ? "w" : "r+");
 		else base = rw ? "r+" : "r";
-		if (!(flags & O_CREAT) && !(flags & O_TRUNC) && !(flags & O_APPEND)) base = rw ? "r+" : (flags & O_WRONLY ? "w" : "r");
+		// Bare O_WRONLY does NOT create or truncate — "w" would do both. The
+		// closest string flag that means "existing file, writable" is "r+".
+		if (!(flags & O_CREAT) && !(flags & O_TRUNC) && !(flags & O_APPEND)) base = rw || (flags & O_WRONLY) ? "r+" : "r";
 		return (flags & O_EXCL) ? base + "x" : base;
 	}
 	const OPEN_FLAGS = {
@@ -1837,7 +1883,7 @@
 			if (opts && opts.recursive !== undefined && typeof opts.recursive !== "boolean") {
 				throw errArgType("options.recursive", "of type boolean", opts.recursive);
 			}
-			if (opts && opts.mode !== undefined) validateMode(opts.mode);
+			if (opts && opts.mode !== undefined) validateMode(opts.mode, 0o777);
 			const r = ops.fs_mkdir(fsResolve(p), !!(opts && opts.recursive));
 			if (isErr(r)) throw fsError(r, "mkdir", p);
 		},
@@ -1871,6 +1917,23 @@
 			if (typeof options === "function") { listener = options; options = {}; }
 			validatePath(p);
 			validateEncodingOpt(options);
+			if (options && typeof options === "object" && options.ignored !== undefined) {
+				const ig = options.ignored;
+				if (typeof ig !== "string" && !(ig instanceof RegExp) && typeof ig !== "function" && !Array.isArray(ig)) {
+					throw errArgType("options.ignored", "of type string, RegExp, or function", ig);
+				}
+			}
+			if (options && typeof options === "object" && options.ignore !== undefined) {
+				const ig = options.ignore;
+				const one = (v) => {
+					if (typeof v !== "string" && !(v instanceof RegExp) && typeof v !== "function") {
+						throw errArgType("options.ignore", "of type string, RegExp, or function", v);
+					}
+					if (v === "") throw errArgValue("options.ignore", v, "must not be empty");
+				};
+				if (Array.isArray(ig)) ig.forEach(one);
+				else one(ig);
+			}
 			if (listener !== undefined && listener !== null) validateFunction(listener, "listener");
 			const watcher = new FSWatcher();
 			const id = ops.fs_watch(fsResolve(p), (eventType, filename) => {
@@ -1936,7 +1999,8 @@
 			const { from, to, opts } = cpPrepare(src, dest, options);
 			copyEntry(from, to, opts);
 		},
-		openSync(p, flags = "r") {
+		openSync(p, flags = "r", mode) {
+			if (mode !== undefined) validateMode(mode, 0o666);
 			const f = flagsToString(flags);
 			// Exclusive ('x') fails on an existing file; the host op then gets the
 			// base flag ('x' and the sync 's' modifier stripped: "wx" -> "w").
@@ -1953,7 +2017,19 @@
 		readSync(fd, buffer, offset = 0, length = buffer.length, position = null) {
 			validateFd(fd);
 			validateBuffer(buffer, "buffer");
+			// The options form: readSync(fd, buffer[, {offset, length, position}]),
+			// where a null member means its default, exactly like Node.
+			if (offset !== null && typeof offset === "object") {
+				({ offset, length, position } = {
+					offset: offset.offset ?? 0,
+					length: offset.length ?? buffer.byteLength - (offset.offset ?? 0),
+					position: offset.position ?? null,
+				});
+			}
+			offset ??= 0;
+			length ??= buffer.byteLength - offset;
 			validateInteger(offset, "offset", 0, buffer.byteLength);
+			if (position === -1) position = null;
 			if (position !== null && position !== undefined && typeof position !== "bigint") {
 				validateInteger(position, "position", 0, Number.MAX_SAFE_INTEGER);
 			}
@@ -1967,6 +2043,23 @@
 		writeSync(fd, buffer, offset, length, position) {
 			validateFd(fd);
 			if (typeof buffer !== "string") validateBuffer(buffer, "buffer");
+			// The options form: writeSync(fd, buffer[, {offset, length, position}]),
+			// with the bounds checked against the buffer the way Node checks them.
+			if (offset !== null && typeof offset === "object") {
+				({ offset, length, position } = { offset: offset.offset, length: offset.length, position: offset.position });
+			}
+			if (typeof buffer !== "string") {
+				const size = buffer.byteLength;
+				const off = offset ?? 0;
+				validateInteger(off, "offset", 0, size);
+				const len = length ?? size - off;
+				validateInteger(len, "length", 0, 0x7fffffff);
+				if (len > size - off) {
+					throw errRange("length", `<= ${size - off}`, len);
+				}
+				offset = off;
+				length = len;
+			}
 			let data, pos;
 			if (typeof buffer === "string") {
 				// writeSync(fd, string[, position[, encoding]])
@@ -1975,7 +2068,7 @@
 			} else {
 				// writeSync(fd, buffer[, offset[, length[, position]]])
 				data = Buffer.from(buffer.buffer ? new Uint8Array(buffer.buffer, buffer.byteOffset + (offset || 0), length ?? buffer.length) : buffer);
-				pos = typeof position === "number" ? position : null;
+				pos = typeof position === "number" && position !== -1 ? position : null;
 			}
 			const r = ops.fs_write_fd(fd, data, pos);
 			if (isErr(r)) throw fsError(r, "write", fd);
@@ -2033,7 +2126,17 @@
 			if (isErr(r)) throw fsError(r, "utime", p);
 		},
 		lutimesSync(p, atime, mtime) { return fsSync.utimesSync(p, atime, mtime); },
-		symlinkSync(target, linkPath) {
+		symlinkSync(target, linkPath, type) {
+			// The target is a path too: false/1/{} are type errors, and the
+			// message names "target" the way the suite's /target|path/ expects.
+			if (typeof target !== "string" && !(target instanceof URL) && !ArrayBuffer.isView(target)) {
+				throw errArgType("target", "of type string or an instance of Buffer or URL", target);
+			}
+			validatePath(linkPath);
+			if (type !== undefined && type !== null &&
+				type !== "dir" && type !== "file" && type !== "junction") {
+				throw errArgValue("type", type, "must be one of 'dir', 'file', or 'junction'");
+			}
 			const abs = fsResolveNoFollow(linkPath);
 			if (symlinks.has(abs)) throw fsError({ code: "EEXIST", message: "file already exists" }, "symlink", linkPath);
 			symlinks.set(abs, typeof target === "string" ? target : String(target));
@@ -2060,7 +2163,15 @@
 	function callbackify1(syncFn, check) {
 		return (...args) => {
 			const cb = args.pop();
-			validateFunction(cb, "cb");
+			// Node validates the call's ARGUMENTS before it validates the
+			// callback: fs.fchmod(1, "123x") with no callback reports the bad
+			// mode, not the missing function. The check may not see the popped
+			// non-function as an argument, so it runs against the full list
+			// when the tail is not callable.
+			if (typeof cb !== "function") {
+				if (check) check(...args, cb);
+				validateFunction(cb, "cb");
+			}
 			if (check) check(...args);
 			queueMicrotask(() => {
 				try { cb(null, syncFn(...args)); } catch (e) { cb(e); }
@@ -2137,10 +2248,13 @@
 		// much npm tooling — monkey-patches and calls these): open/close/read/write/
 		// fstat over the existing *Sync fd ops.
 		open: (p, flags, mode, cb) => {
-			if (typeof flags === "function") { cb = flags; flags = "r"; }
-			else if (typeof mode === "function") { cb = mode; }
-			validateFunction(cb, "cb");
+			if (typeof flags === "function") { cb = flags; flags = "r"; mode = undefined; }
+			else if (typeof mode === "function") { cb = mode; mode = undefined; }
+			// Node parses the mode BEFORE it demands the callback: an octal
+			// string is fine, "boom" is an ERR_INVALID_ARG_VALUE.
 			validatePath(p);
+			if (mode !== undefined) validateMode(mode, 0o666);
+			validateFunction(cb, "cb");
 			queueMicrotask(() => { try { cb(null, fsSync.openSync(p, flags)); } catch (e) { cb(e); } });
 		},
 		close: (fd, cb) => {
@@ -2375,7 +2489,7 @@
 		} catch (e) { return Promise.reject(e); }
 	};
 	promisified.access = (p) => (ops.fs_exists(fsResolve(p)) ? Promise.resolve() : Promise.reject(fsError({ code: "ENOENT", message: "no such file or directory" }, "access", p)));
-	promisified.open = (p, flags) => { try { return Promise.resolve(makeFileHandle(fsSync.openSync(p, flags))); } catch (e) { return Promise.reject(e); } };
+	promisified.open = (p, flags, mode) => { try { return Promise.resolve(makeFileHandle(fsSync.openSync(p, flags, mode))); } catch (e) { return Promise.reject(e); } };
 	core["fs/promises"] = promisified;
 	fsMod.promises = promisified;
 
