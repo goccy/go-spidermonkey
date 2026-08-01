@@ -247,6 +247,25 @@ func parseIPv4Number(input string) (uint64, error) {
 	if input == "" {
 		return 0, nil
 	}
+	// Every character must be a digit of the radix BEFORE the value is read:
+	// strconv.ParseUint reports ErrRange the moment the value overflows,
+	// without looking at the rest, so "111…1b" — sixty ones and a letter —
+	// came back as a range error and was mistaken for a number below.
+	for i := 0; i < len(input); i++ {
+		c := input[i]
+		var ok bool
+		switch radix {
+		case 16:
+			ok = c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+		case 8:
+			ok = c >= '0' && c <= '7'
+		default:
+			ok = c >= '0' && c <= '9'
+		}
+		if !ok {
+			return 0, fmt.Errorf("bad IPv4 part: %q is not a digit", c)
+		}
+	}
 	n, err := strconv.ParseUint(input, radix, 64)
 	if err == nil {
 		return n, nil

@@ -936,7 +936,7 @@
  "streams/writable-streams/aborting.any.js [dedicatedworker]": "1/65 subtests fail (f27dc483f9bf)",
  "streams/writable-streams/start.any.js": "1/8 subtests fail (4970ff27aa16)",
  "streams/writable-streams/start.any.js [dedicatedworker]": "1/8 subtests fail (4970ff27aa16)",
- "url/IdnaTestV2.any.js": "122/2671 subtests fail (3a2cf50c322d)",
+ "url/IdnaTestV2.any.js": "74/2671 subtests fail (e4af31348bc4)",
  "url/historical.any.js": "4/8 subtests fail (d2ee1a1bf06d)",
  "url/historical.any.js [dedicatedworker]": "3/7 subtests fail (1b4f06697ebf)",
  "url/idlharness.any.js": "10/77 subtests fail (a42f7615f740)",
