@@ -158,7 +158,6 @@
 			encoding: options.encoding || null,
 		};
 		this.readable = true;
-		this.readableEnded = false;
 		if (typeof options.read === "function") this._read = options.read;
 		if (typeof options.destroy === "function") this._destroy = options.destroy;
 		if (options.encoding) this.setEncoding(options.encoding);
@@ -172,7 +171,45 @@
 
 	// Getters must be defined with defineProperties, not Object.assign (which
 	// would invoke them during the copy).
+	// The public state accessors Node exposes on every stream: destroyed,
+	// closed and errored read whichever side(s) the stream has. They live on
+	// the PROTOTYPES — an instance property set at destroy time answered true
+	// after the fact but undefined before it, and the suite asserts the
+	// `false`s as strictly as the `true`s.
+	const streamStateGetters = {
+		destroyed: {
+			get() {
+				return !!((this._rs && this._rs.destroyed) || (this._ws && this._ws.destroyed));
+			},
+			set(v) {
+				if (this._rs) this._rs.destroyed = !!v;
+				if (this._ws) this._ws.destroyed = !!v;
+			},
+			configurable: true,
+		},
+		closed: {
+			get() {
+				return this._closeEmitted === true ||
+					!!((this._rs && this._rs.closed) || (this._ws && this._ws.closed));
+			},
+			configurable: true,
+		},
+		errored: {
+			get() {
+				return (this._rs && this._rs.errored) || (this._ws && this._ws.errored) ||
+					this._errored || null;
+			},
+			configurable: true,
+		},
+	};
+
 	Object.defineProperties(Readable.prototype, {
+		...streamStateGetters,
+		readableEnded: { get() { return !!this._rs.endEmitted; }, configurable: true },
+		readableAborted: {
+			get() { return !!(this._rs.destroyed && !this._rs.endEmitted); },
+			configurable: true,
+		},
 		// Node calls this state object _readableState, and reaches into it from
 		// its own libraries as well as its suite — `stream._readableState.pipes`
 		// is how you ask what a stream is piped to. Keeping it under a private
@@ -322,7 +359,6 @@
 			if (st.ended && st.buffer.length === 0 && !st.endEmitted && (st.flowing === true || st.consumed)) {
 				st.endEmitted = true;
 				this.readable = false;
-				this.readableEnded = true;
 				if (st.decoder) {
 					const rest = st.decoder.end();
 					if (rest) this.emit("data", rest);
@@ -380,9 +416,9 @@
 			const st = this._rs;
 			if (st.destroyed) return this;
 			st.destroyed = true;
+			st.closed = true;
 			this.readable = false;
-			this.destroyed = true;
-			if (err) this._errored = err; // so a later finished() reports the error
+			if (err) { st.errored = err; this._errored = err; } // so a later finished() reports the error
 			const done = (e) => {
 				if (e) this.emit("error", e);
 				emitClose(this);
@@ -531,18 +567,21 @@
 			objectMode: !!(options.objectMode || options.writableObjectMode),
 		};
 		self.writable = true;
-		self.writableEnded = false;
-		self.writableFinished = false;
 		if (typeof options.write === "function") self._write = options.write;
 		if (typeof options.final === "function") self._final = options.final;
 		if (typeof options.destroy === "function" && !self._destroy) self._destroy = options.destroy;
 	}
 
 	const writableGetters = {
+		...streamStateGetters,
 		_writableState: { get() { return this._ws; }, configurable: true },
 		writableHighWaterMark: { get() { return this._ws.highWaterMark; }, configurable: true },
 		writableLength: { get() { return this._ws.buffered; }, configurable: true },
 		writableObjectMode: { get() { return this._ws.objectMode; }, configurable: true },
+		writableNeedDrain: { get() { return !!this._ws.needDrain; }, configurable: true },
+		writableCorked: { get() { return this._ws.corked; }, configurable: true },
+		writableEnded: { get() { return !!this._ws.ending; }, configurable: true },
+		writableFinished: { get() { return !!this._ws.finishEmitted; }, configurable: true },
 	};
 
 	const writableMethods = {
@@ -622,7 +661,6 @@
 			if (chunk !== null && chunk !== undefined) this.write(chunk, encoding);
 			const st = this._ws;
 			st.ending = true;
-			this.writableEnded = true;
 			if (callback) this.once("finish", callback);
 			this._maybeFinish();
 			return this;
@@ -636,7 +674,6 @@
 			const done = () => process.nextTick(() => {
 				this.finished = true;
 				this.writable = false;
-				this.writableFinished = true;
 				st.finishEmitted = true;
 				this.emit("finish");
 				emitClose(this);
@@ -648,9 +685,9 @@
 			const st = this._ws;
 			if (st.destroyed) return this;
 			st.destroyed = true;
+			st.closed = true;
 			this.writable = false;
-			this.destroyed = true;
-			if (err) this._errored = err; // so a later finished() reports the error
+			if (err) { st.errored = err; this._errored = err; } // so a later finished() reports the error
 			// Invoke the callbacks of any still-queued writes with an error
 			// rather than stranding them.
 			this._failWriteQueue(err || new Error("stream destroyed"));
@@ -696,12 +733,15 @@
 		const rs = this._rs;
 		const ws = this._ws;
 		if ((rs && rs.destroyed) || (ws && ws.destroyed)) return this;
-		if (rs) rs.destroyed = true;
-		if (ws) ws.destroyed = true;
+		if (rs) { rs.destroyed = true; rs.closed = true; }
+		if (ws) { ws.destroyed = true; ws.closed = true; }
 		this.readable = false;
 		this.writable = false;
-		this.destroyed = true;
-		if (err) this._errored = err; // so a later finished() reports the error
+		if (err) {
+			if (rs) rs.errored = err;
+			if (ws) ws.errored = err;
+			this._errored = err; // so a later finished() reports the error
+		}
 		if (this._failWriteQueue) this._failWriteQueue(err || new Error("stream destroyed"));
 		const done = (e) => {
 			if (e) this.emit("error", e);

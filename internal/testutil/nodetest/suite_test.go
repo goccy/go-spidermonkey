@@ -28,10 +28,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,6 +211,18 @@ func TestNodeSuite(t *testing.T) {
 	inFlight := map[string]time.Time{}
 	jobs := make(chan string)
 	results := make(chan nodetest.Result, workers)
+	// An abandoned call's goroutine keeps SPINNING inside translated wasm code
+	// the scheduler cannot preempt, so each abandonment can pin one P for the
+	// rest of the process. Granting the scheduler a replacement P keeps the
+	// other workers running; the cap bounds a pathological shard. The real fix
+	// is engine-side (docs/engine-followups.md: the stack-quota check the
+	// interrupt relies on is a no-op under translation).
+	var extraProcs atomic.Int32
+	grantProc := func() {
+		if extraProcs.Add(1) <= 16 {
+			runtime.GOMAXPROCS(runtime.GOMAXPROCS(0) + 1)
+		}
+	}
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
@@ -230,6 +244,12 @@ func TestNodeSuite(t *testing.T) {
 					flightMu.Lock()
 					delete(inFlight, p)
 					flightMu.Unlock()
+					if strings.Contains(r.Reason, "deadline exceeded") {
+						// The interrupt did not stop it; the goroutine was
+						// abandoned mid-flight (see nodetest.Run) and may be
+						// pinning a P.
+						grantProc()
+					}
 					results <- r
 				case <-time.After(timeout + 30*time.Second):
 					flightMu.Lock()
@@ -239,6 +259,7 @@ func TestNodeSuite(t *testing.T) {
 					// one worth looking at, and waiting for the summary hides it
 					// behind however long the rest of the run takes.
 					t.Logf("hard timeout, abandoned: %s", p)
+					grantProc()
 					results <- nodetest.Result{Path: p, Status: nodetest.StatusFail,
 						Reason: "hard timeout: uninterruptible block; abandoned"}
 				}
