@@ -25,6 +25,7 @@ import (
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/web"
+	"github.com/goccy/go-spidermonkey/compat/web/canvas"
 )
 
 // Status mirrors testharness.js's status codes.
@@ -416,6 +417,9 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	// classes for idlharness; both were the runner standing in for a layer that
 	// should have had them.
 	w, err := web.InstallWith(js, web.Options{
+		// Every opt-in module is installed: the harness measures the whole
+		// surface this repository can offer, not a particular embedding's cut.
+		Modules:  []web.Module{canvas.Module()},
 		RootCAs:  opts.RootCAs,
 		Scope:    scopeFor(c.Scope),
 		Location: base + rel + c.Variant,

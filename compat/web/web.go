@@ -80,8 +80,6 @@ var cacheStorageJS string
 //go:embed js/observable.js
 var observableJS string
 
-//go:embed js/canvas.js
-var canvasJS string
 
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
@@ -94,7 +92,8 @@ type Web struct {
 	worker *workerAPI
 	subtle *subtleAPI
 	codecs *codecAPI
-	canvas *canvasAPI
+	// moduleClosers are the opt-in modules' close hooks, run at Close.
+	moduleClosers []func()
 	start  time.Time
 }
 
@@ -161,11 +160,6 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	for name, fn := range codecs.ops() {
 		opTable[name] = fn
 	}
-	canvas := newCanvasAPI(js)
-	w.canvas = canvas
-	for name, fn := range canvas.ops() {
-		opTable[name] = fn
-	}
 	subtle := newSubtleAPI()
 	w.subtle = subtle
 	for name, fn := range subtle.ops() {
@@ -173,6 +167,26 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	}
 	for name, fn := range subtle.ops2() {
 		opTable[name] = fn
+	}
+	// Opt-in modules contribute their host ops to the same table; their close
+	// hooks run at Web.Close.
+	var moduleScripts []string
+	for _, m := range opts.Modules {
+		if m.Ops != nil {
+			mops, mclose, merr := m.Ops(js)
+			if merr != nil {
+				return nil, fmt.Errorf("web: installing module: %w", merr)
+			}
+			for name, fn := range mops {
+				opTable[name] = fn
+			}
+			if mclose != nil {
+				w.moduleClosers = append(w.moduleClosers, mclose)
+			}
+		}
+		if m.Script != "" {
+			moduleScripts = append(moduleScripts, m.Script)
+		}
 	}
 	for name, fn := range opTable {
 		if err := ops.DefineFunc(name, fn); err != nil {
@@ -183,7 +197,10 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	for _, src := range []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS, canvasJS, `delete globalThis.__web_ops;`} {
+	sources := []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS}
+	sources = append(sources, moduleScripts...)
+	sources = append(sources, `delete globalThis.__web_ops;`)
+	for _, src := range sources {
 		r, err := js.Eval(context.Background(), src)
 		if err != nil {
 			return nil, fmt.Errorf("web: evaluating builtins: %w", err)
@@ -213,7 +230,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 	if err != nil {
 		return nil, fmt.Errorf("web: installing Worker: %w", err)
 	}
-	if err := removeUnselected(js, opts.Features, opts.Profile); err != nil {
+	if err := removeUnselected(js, opts.Features, opts.Profile, opts.Modules); err != nil {
 		return nil, err
 	}
 	// The global-scope interfaces go last: they decorate what everything above
@@ -345,8 +362,8 @@ func (w *Web) Close() error {
 	if w.codecs != nil {
 		w.codecs.closeAll()
 	}
-	if w.canvas != nil {
-		w.canvas.closeAll()
+	for _, closeModule := range w.moduleClosers {
+		closeModule()
 	}
 	return nil
 }

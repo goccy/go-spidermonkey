@@ -28,6 +28,7 @@ import (
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/web"
+	"github.com/goccy/go-spidermonkey/compat/web/canvas"
 )
 
 // ecma429Interfaces are the interfaces the standard requires on globalThis.
@@ -103,7 +104,7 @@ func TestECMA429Surface(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer js.Close()
-	w, err := web.Install(js)
+	w, err := web.InstallWith(js, web.Options{Modules: []web.Module{canvas.Module()}})
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestECMA429GapsAreReal(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer js.Close()
-	w, err := web.Install(js)
+	w, err := web.InstallWith(js, web.Options{Modules: []web.Module{canvas.Module()}})
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -198,7 +199,7 @@ func TestProfilesAreLevelsOfTheStandard(t *testing.T) {
 				t.Fatalf("New: %v", err)
 			}
 			defer js.Close()
-			w, err := web.InstallWith(js, web.Options{Profile: profile})
+			w, err := web.InstallWith(js, web.Options{Profile: profile, Modules: []web.Module{canvas.Module()}})
 			if err != nil {
 				t.Fatalf("InstallWith: %v", err)
 			}

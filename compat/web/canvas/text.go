@@ -1,4 +1,4 @@
-package web
+package canvas
 
 // canvastext.go: text shaping for the 2d context.
 //

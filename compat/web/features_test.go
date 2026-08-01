@@ -13,6 +13,7 @@ import (
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/web"
+	"github.com/goccy/go-spidermonkey/compat/web/canvas"
 )
 
 // globalNames returns every own property of globalThis, which is what a caller
@@ -48,6 +49,7 @@ func installedGlobals(t *testing.T, opts web.Options) map[string]bool {
 		t.Fatalf("New: %v", err)
 	}
 	defer js.Close()
+	opts.Modules = []web.Module{canvas.Module()}
 	w, err := web.InstallWith(js, opts)
 	if err != nil {
 		t.Fatalf("InstallWith: %v", err)
@@ -69,6 +71,16 @@ func TestEveryGlobalIsClassified(t *testing.T) {
 	classified := map[string]web.Feature{}
 	for _, f := range web.AllFeatures() {
 		for _, g := range web.FeatureGlobals(f) {
+			if other, dup := classified[g]; dup {
+				t.Errorf("%s is claimed by both %s and %s", g, other, f)
+			}
+			classified[g] = f
+		}
+	}
+	// Module-provided features classify through the module's own table —
+	// that is where their globals are declared.
+	for f, globals := range canvas.Module().Features {
+		for _, g := range globals {
 			if other, dup := classified[g]; dup {
 				t.Errorf("%s is claimed by both %s and %s", g, other, f)
 			}

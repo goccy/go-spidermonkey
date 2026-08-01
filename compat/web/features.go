@@ -65,8 +65,8 @@ const (
 	FeatureImageBitmap      Feature = "imagebitmap"
 	// Font loading (CSS Font Loading Module) is its own specification: a
 	// runtime can render canvas text without letting pages register fonts.
-	FeatureFonts Feature = "fonts"
-	FeatureWorker           Feature = "worker"
+	FeatureFonts  Feature = "fonts"
+	FeatureWorker Feature = "worker"
 )
 
 // featureGlobals maps each feature onto the globals it owns. Every global this
@@ -83,17 +83,9 @@ var featureGlobals = map[Feature][]string{
 	FeatureBase64:     {"atob", "btoa"},
 	FeatureURL:        {"URL", "URLSearchParams"},
 	FeatureURLPattern: {"URLPattern"},
-	FeatureCanvas: {
-		"OffscreenCanvas", "OffscreenCanvasRenderingContext2D", "CanvasGradient",
-		"Path2D", "ImageData", "CanvasPattern", "CanvasFilter", "TextMetrics",
-	},
-	// An ImageBitmap is what a canvas DRAWS, not part of the canvas: it is
-	// created from a blob or an ImageData and can be handed between agents.
-	FeatureImageBitmap: {"ImageBitmap", "createImageBitmap"},
-	// The geometry interfaces are their own specification, and a canvas is only
-	// one of the things that speaks in them.
-	FeatureGeometry: {"DOMPoint", "DOMPointReadOnly", "DOMMatrix", "DOMMatrixReadOnly"},
-	FeatureFonts:    {"FontFace", "FontFaceSet", "fonts"},
+	// FeatureCanvas, FeatureImageBitmap, FeatureGeometry and FeatureFonts are
+	// provided by the compat/web/canvas MODULE; their globals live in its
+	// Module().Features, and exist only when an embedding imports it.
 	// Observable is its own feature rather than part of events, even though it
 	// is an event stream: it is not in the Minimum Common API, and a profile
 	// that offers the standard's surface must be able to leave it out.
@@ -269,11 +261,32 @@ func FeaturesFor(p Profile) []Feature {
 }
 
 // Options configures an installation.
+// Module is an opt-in slice of the platform that lives in its own package
+// under compat/web/ and is COMPILED IN only when that package is imported —
+// which is the point: canvas alone carries image codecs and embedded fonts,
+// and an embedding that never draws should not link them. A module's features
+// join the selection machinery exactly like the built-in ones.
+type Module struct {
+	// Features maps each feature the module provides onto the globals it
+	// installs, merged into the feature table for Options.Features/Profile
+	// selection and for the classification tests.
+	Features map[Feature][]string
+	// Ops registers the module's host functions (by __web_ops name) and
+	// returns an optional close hook, run at Web.Close.
+	Ops func(js *spidermonkey.JS) (map[string]spidermonkey.Func, func(), error)
+	// Script is the module's guest source, evaluated with __web_ops in scope
+	// after the built-ins.
+	Script string
+}
+
 type Options struct {
 	// Features selects the surface to expose. A nil slice defers to Profile;
 	// naming features that depend on one another is the caller's responsibility
 	// (fetch needs streams for a body, for instance).
 	Features []Feature
+	// Modules are the opt-in platform slices to install; see Module. Their
+	// features are selectable through Features/Profile like any other.
+	Modules []Module
 	// Profile names a LEVEL of the platform when Features is nil — the surface a
 	// server-side runtime is expected to have, rather than a list the caller has
 	// to keep in step with this package. Empty means ProfileFull.
@@ -326,10 +339,29 @@ func featureSet(features []Feature, profile Profile) map[Feature]bool {
 // keeps the feature table the single statement of what belongs to what: the JS
 // is one surface, and splitting it per feature would put the same list in two
 // places and let them drift.
-func removeUnselected(js *spidermonkey.JS, features []Feature, profile Profile) error {
-	var drop []string
+func removeUnselected(js *spidermonkey.JS, features []Feature, profile Profile, modules []Module) error {
+	table := featureGlobals
+	if len(modules) > 0 {
+		table = map[Feature][]string{}
+		for f, g := range featureGlobals {
+			table[f] = g
+		}
+		for _, m := range modules {
+			for f, g := range m.Features {
+				table[f] = g
+			}
+		}
+	}
+	// The selection resolves against the MERGED table: "full" means
+	// everything installed, module features included.
 	set := featureSet(features, profile)
-	for f, globals := range featureGlobals {
+	if features == nil && (profile == "" || profile == ProfileFull) {
+		for f := range table {
+			set[f] = true
+		}
+	}
+	var drop []string
+	for f, globals := range table {
 		if set[f] {
 			continue
 		}

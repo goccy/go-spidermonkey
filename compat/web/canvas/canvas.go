@@ -1,4 +1,4 @@
-package web
+package canvas
 
 // canvas.go: the raster surface behind OffscreenCanvas's 2d context.
 //
@@ -32,6 +32,16 @@ import (
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 )
+
+// argBytes reads a BufferSource argument through the bytes bridge.
+func argBytes(v spidermonkey.Value) ([]byte, error) {
+	o := v.Object()
+	if o == nil {
+		return nil, fmt.Errorf("expected a byte buffer argument")
+	}
+	defer o.Free()
+	return o.Bytes()
+}
 
 // maxCanvasPixels bounds one surface. A canvas is allocated by the guest and
 // held until it is dropped, so a size it names must not be able to exhaust the

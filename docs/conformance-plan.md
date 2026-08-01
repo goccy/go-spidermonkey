@@ -5,6 +5,30 @@ the Node.js test suite and the Web Platform Tests, so those are the bar. Beyond
 that bar the target is all of WPT; Bun and Deno are the first milestone, not the
 destination.
 
+## Milestones
+
+1. **Beat Deno, like for like.** Deno's published expectations compute to
+   62.2% clean `.any.*` files on the directories it tracks; the comparison
+   below is maintained per directory.
+2. **Grow whole-suite coverage, milestone by milestone.** The honest number
+   is the one `TestWPTCoverage` prints (Servo's framing, servo.org/wpt: the
+   denominator is ALL of WPT at the pinned revision and anything not run
+   counts as failed). Nothing in the suite is out of scope — the areas that
+   need a DOM, layout or rendering (css, svg, editing, shadow-dom, …) are
+   TODO, not exclusions: the eventual ambition includes serving as a
+   rendering engine. Each milestone claims the next tractable slice —
+   `.window.js` execution, DOM core, then upward.
+
+## How the surface grows: opt-in modules
+
+Every new slice of the platform lands as a SUB-PACKAGE of compat/web that an
+embedding opts into by importing it and passing its `Module()` to
+`web.InstallWith` (see `compat/web/canvas`, the first). Go links only what a
+build imports, so the heavy machinery behind a feature — image codecs and
+embedded fonts for canvas today; layout, style and text stacks later — costs
+nothing in build time or binary size for an embedding that does not ask for
+it. The core `compat/web` package stays the Minimum Common surface.
+
 ## What the suite is for
 
 The suite defines what to support. It is not a report on what already works.

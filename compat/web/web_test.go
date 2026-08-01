@@ -15,6 +15,7 @@ import (
 
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/web"
+	"github.com/goccy/go-spidermonkey/compat/web/canvas"
 )
 
 func newWeb(t *testing.T, cfg spidermonkey.Config) (*spidermonkey.JS, *web.Web) {
@@ -33,7 +34,10 @@ func newWeb(t *testing.T, cfg spidermonkey.Config) (*spidermonkey.JS, *web.Web) 
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { js.Close() })
-	w, err := web.Install(js)
+	// The tests exercise the FULL surface, canvas module included — the
+	// module split is about what an embedding links, not about what this
+	// package supports.
+	w, err := web.InstallWith(js, web.Options{Modules: []web.Module{canvas.Module()}})
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
