@@ -38,6 +38,9 @@ var builtinsJS string
 //go:embed js/subtle.js
 var subtleJS string
 
+//go:embed js/origin.js
+var originJS string
+
 //go:embed js/urlpattern.js
 var urlpatternJS string
 
@@ -147,6 +150,8 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		"url_domain_to_ascii":   w.opDomainToASCII,
 		"url_domain_to_unicode": w.opDomainToUnicode,
 
+		"origin_registrable_domain": w.opRegistrableDomain,
+
 		"pattern_compile":      w.opPatternCompile,
 		"pattern_from_string":  w.opPatternFromString,
 		"pattern_compare":      w.opPatternCompare,
@@ -199,7 +204,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	sources := []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, webstorageJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS}
+	sources := []string{streamsJS, builtinsJS, subtleJS, extendedJS, originJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, webstorageJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS}
 	sources = append(sources, moduleScripts...)
 	sources = append(sources, `delete globalThis.__web_ops;`)
 	for _, src := range sources {

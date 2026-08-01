@@ -32,6 +32,7 @@ const (
 	FeatureEncoding        Feature = "encoding"
 	FeatureURL             Feature = "url"
 	FeatureURLPattern      Feature = "urlpattern"
+	FeatureOrigin          Feature = "origin"
 	FeatureEvents          Feature = "events"
 	FeatureStreams         Feature = "streams"
 	FeatureCompression     Feature = "compression"
@@ -84,6 +85,9 @@ var featureGlobals = map[Feature][]string{
 	FeatureBase64:     {"atob", "btoa"},
 	FeatureURL:        {"URL", "URLSearchParams"},
 	FeatureURLPattern: {"URLPattern"},
+	// The Origin interface is HTML's, exposed everywhere: an origin is a
+	// value, not a capability, and a worker can compare origins too.
+	FeatureOrigin: {"Origin"},
 	// FeatureCanvas, FeatureImageBitmap, FeatureGeometry and FeatureFonts are
 	// provided by the compat/web/canvas MODULE; their globals live in its
 	// Module().Features, and exist only when an embedding imports it.
