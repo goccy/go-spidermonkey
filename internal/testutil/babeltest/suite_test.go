@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goccy/go-spidermonkey/babeltest"
+	"github.com/goccy/go-spidermonkey/internal/testutil/babeltest"
 )
 
 const expectationsFile = "expectations.json"

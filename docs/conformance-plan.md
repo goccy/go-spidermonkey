@@ -218,7 +218,7 @@ exposed:
 
 ## The hangs
 
-`nodetest/quarantine.txt` went from 477 to 235. Diagnosing them was hopeless
+`internal/testutil/nodetest/quarantine.txt` went from 477 to 235. Diagnosing them was hopeless
 while the only evidence was `3 pending host op(s)`, so `Loop.Alive()` names the
 KIND of handle held — `net.conn`, `net.server`, `http`, `tls`, `dgram`,
 `worker`, `stdio`, `http.client`. That turned the list into a histogram, and

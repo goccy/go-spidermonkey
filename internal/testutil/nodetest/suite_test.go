@@ -35,11 +35,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goccy/go-spidermonkey/nodetest"
+	"github.com/goccy/go-spidermonkey/internal/testutil/nodetest"
 )
 
 const (
-	suiteDir         = "suite"
+	suiteDir         = "testdata/suite"
 	expectationsFile = "expectations.json"
 	quarantineFile   = "quarantine.txt"
 )

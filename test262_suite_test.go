@@ -1,10 +1,10 @@
 // This file runs the official ECMAScript conformance suite
 // (https://github.com/tc39/test262, vendored as the git submodule
-// ./test262/suite) against go-spidermonkey's PUBLIC API.
+// ./testdata/test262/suite) against go-spidermonkey's PUBLIC API.
 //
 // The run is opt-in because it takes minutes, not seconds:
 //
-//	git submodule update --init --depth 1 test262/suite
+//	git submodule update --init --depth 1 testdata/test262/suite
 //	TEST262=1 go test . -run TestTest262 -v -timeout 2h
 //
 // Every test runs in a fresh interpreter (its own realm), in both sloppy and
@@ -21,7 +21,7 @@
 //     the test-only InstallTest262Hooks seam (export_test.go).
 //
 // Tests this embedding cannot host are skipped, not failed, and the skip is
-// accounted per reason. The checked-in test262/expectations.json lists the
+// accounted per reason. The checked-in testdata/test262/expectations.json lists the
 // tests known to fail; the suite FAILS on any regression (an unexpected
 // failure) and on any stale expectation (an expected failure that now
 // passes). Regenerate it with TEST262_UPDATE=1.
@@ -45,8 +45,8 @@ import (
 )
 
 const (
-	suiteDir         = "test262/suite"
-	expectationsFile = "test262/expectations.json"
+	suiteDir         = "testdata/test262/suite"
+	expectationsFile = "testdata/test262/expectations.json"
 )
 
 // featureProbes maps a test262 feature tag to a JS expression that is true when
@@ -558,7 +558,7 @@ func TestTest262(t *testing.T) {
 		t.Skip("set TEST262=1 to run the conformance suite (takes minutes); see the file comment")
 	}
 	if _, err := os.Stat(filepath.Join(suiteDir, "test")); err != nil {
-		t.Skip("test262 suite not present: git submodule update --init --depth 1 test262/suite")
+		t.Skip("test262 suite not present: git submodule update --init --depth 1 testdata/test262/suite")
 	}
 	timeout := 120 * time.Second
 	if v := os.Getenv("TEST262_TIMEOUT"); v != "" {

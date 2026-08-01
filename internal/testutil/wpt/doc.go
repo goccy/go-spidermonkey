@@ -6,8 +6,9 @@
 //
 //   - A loopback server (server.go, handlers.go, permissive.go, tls.go) that
 //     stands in for wptserve: it serves the pinned upstream checkout in
-//     ./suite (fetched by `make wpt-fetch`), re-implements the suite's Python
-//     fixture handlers (*.py) in Go, and speaks wptserve's conventions —
+//     ./testdata/suite (a git submodule, materialized by `make wpt-fetch`),
+//     re-implements the suite's Python fixture handlers (*.py) in Go, and
+//     speaks wptserve's conventions —
 //     `.headers` files, `.asis` raw responses, `?pipe=` stages and `.sub.`
 //     template substitution.
 //

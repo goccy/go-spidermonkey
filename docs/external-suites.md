@@ -7,9 +7,9 @@ than tests written here:
 
 | suite | what it measures | run it |
 |---|---|---|
-| [nodetest](../nodetest) | `compat/nodejs`, against the Node.js project's own test suite | `make nodetest` |
+| [nodetest](../internal/testutil/nodetest) | `compat/nodejs`, against the Node.js project's own test suite | `make nodetest` |
 | [wpt](../internal/testutil/wpt) | `compat/web`, against the Web Platform Tests | `make wpt` |
-| [babeltest](../babeltest) | the whole stack, against Babel's fixture corpus | `make babeltest` |
+| [babeltest](../internal/testutil/babeltest) | the whole stack, against Babel's fixture corpus | `make babeltest` |
 | [test262](../test262) | the engine (ECMA-262) | `make test262` |
 
 `make suites` runs all four.
@@ -28,7 +28,7 @@ moves: every one of the 19 remaining failures ALSO fails under real Node.js
 running the same published `@babel/*` packages — they are fixtures that moved
 ahead of the released packages, or that depend on the Babel monorepo's own
 layout. On that corpus this runtime is behaviourally identical to Node. To
-redo it, run `babeltest/js/fixtures.js` under `node` with `__babeltest_root`
+redo it, run `internal/testutil/babeltest/js/fixtures.js` under `node` with `__babeltest_root`
 set to a fixtures directory and diff its failures against `expectations.json`.
 
 WPT by directory, and the one split that the total hides:
@@ -73,7 +73,7 @@ their repositories (2026-07-28):
 |---|---|---|
 | Deno (`tests/node_compat/config.jsonc`) | 3,786 | **3,411** (375 disabled, each with a reason) |
 | Bun (`test/js/node/test/parallel`, vendored) | 3,505 (+67 sequential) | ~all of them |
-| here | 4,883 (the whole upstream corpus) | see `nodetest/expectations.json` |
+| here | 4,883 (the whole upstream corpus) | see `internal/testutil/nodetest/expectations.json` |
 
 Deno's disabled reasons read almost identically to ours — Node internals, CLI
 flags, the inspector, its own permission model. The difference in what RUNS is
@@ -99,7 +99,7 @@ run does not, and why:
 ## How they are wired
 
 Each suite is **pinned to an exact upstream revision** in the Makefile and
-fetched on demand by `scripts/fetch-suite.sh` (a blobless, sparse, depth-1
+materialized from pinned git submodules under each harness’s `testdata/` (a blobless, sparse, depth-1
 clone). None of them is vendored: nodejs/node's test tree alone is ~80 MB and
 web-platform-tests is gigabytes. The checkouts land in `<suite>/suite/` and are
 gitignored.
@@ -123,7 +123,7 @@ without touching the checkout, and tests cannot interfere with each other), and
 the file is required as the entry module, so `require('../common')` resolves and
 the `common.mustCall` assertions registered on `'exit'` are what judge the run.
 
-`nodetest/policy.go` holds the one judgement call: whether a test is addressed
+`internal/testutil/nodetest/policy.go` holds the one judgement call: whether a test is addressed
 to a public API this layer implements, or to something only the `node` binary
 can answer. Skipped, with the reason recorded:
 
@@ -148,9 +148,9 @@ as the suite moves.
 separate PROCESSES:
 
 ```sh
-go test -c -o /tmp/nodetest.bin ./nodetest        # build ONCE
+go test -c -o /tmp/nodetest.bin ./internal/testutil/nodetest   # build ONCE
 for i in $(seq 0 7); do
-  ( cd nodetest && NODETEST=1 NODETEST_SHARD=$i/8 NODETEST_REPORT=/tmp/shard-$i.json \
+  ( cd internal/testutil/nodetest && NODETEST=1 NODETEST_SHARD=$i/8 NODETEST_REPORT=/tmp/shard-$i.json \
       /tmp/nodetest.bin -test.run TestNodeSuite -test.v -test.timeout 15m ) > /tmp/shard-$i.txt 2>&1
 done
 ```
@@ -172,7 +172,7 @@ on an Apple Silicon machine running an amd64 Go toolchain under Rosetta:
   the binary unreaped and the shard apparently hung at 0% CPU. Every thread
   sits in `findRunnable`/`stopm`; SIGQUIT clears it. Keeping the go command out
   of the loop avoids it entirely (and skips eight rebuilds).
-- **`cd nodetest` first.** `go test` runs a test binary with the package
+- **`cd internal/testutil/nodetest` first.** `go test` runs a test binary with the package
   directory as its working directory; a prebuilt binary does not, and the suite
   resolves its checkout relative to it.
 
@@ -211,7 +211,7 @@ as the pinned checkout** (`scripts/babel-suite-deps.sh` generates the dependency
 list from the checkout, so the two cannot drift). That keeps the run hermetic
 and reproducible while testing exactly the code Babel ships.
 
-`babeltest/js/fixtures.js` reimplements Babel's fixture protocol against the
+`internal/testutil/babeltest/js/fixtures.js` reimplements Babel's fixture protocol against the
 same rules its own helpers use — the options merge (root → suite → task), the
 `throws` expectation, `BABEL_8_BREAKING`, the external-helpers plugin and its
 load-bearing `helperVersion`, and babel-generator's separate parse-and-print

@@ -22,13 +22,12 @@ ATTESTATION_API   = https://api.github.com/repos/$(SPIDERMONKEY_WASM_REPO)/attes
 # Babel's fixture corpus as a whole-toolchain workload. Each is pinned to an
 # exact upstream revision and fetched on demand (blobless sparse clone) — none
 # of them belongs in this repository.
-NODE_SUITE_REPO ?= https://github.com/nodejs/node.git
-NODE_SUITE_REV  ?= 1e320ec51f092604ac90d05c0d9942fc80de8c5b   # v26.5.0
+# The node suite is the internal/testutil/nodetest/testdata/suite submodule
+# (pinned by gitlink, v26.5.0); only the test trees below are checked out.
 NODE_SUITE_DIRS := test/common test/parallel test/es-module test/fixtures
 
-WPT_SUITE_REPO ?= https://github.com/web-platform-tests/wpt.git
-WPT_SUITE_REV  ?= f4b24b414258bfdca10fbb0f8d646b97fc6657ec
-# The union of what Bun and Deno support, which is the first milestone: every
+# The wpt suite is the internal/testutil/wpt/testdata/suite submodule; its
+# PIN is the gitlink, not a variable here. The union of what Bun and Deno support, which is the first milestone: every
 # directory either of them covers is covered here, whether or not this runtime
 # implements the API yet. A directory left out because the API is missing is a
 # gap that stops being visible, which is exactly backwards — the suite is the
@@ -44,8 +43,8 @@ WPT_SUITE_DIRS := resources common interfaces images media fonts \
                   css eventsource schema service-workers wasm web-locks \
                   webidl webstorage websockets workers xhr
 
-BABEL_SUITE_REPO ?= https://github.com/babel/babel.git
-BABEL_SUITE_REV  ?= 6d0dbd2a92aefe03cf1f7d49ebb39acd56e11c72   # v8.0.4
+# The babel suite is the internal/testutil/babeltest/testdata/suite submodule
+# (pinned by gitlink, v8.0.4); only its packages/ tree is checked out.
 BABEL_SUITE_DIRS := packages
 
 .PHONY: spidermonkey download verify test test262 \
@@ -85,15 +84,17 @@ test:
 	go test ./...
 
 ## test262: run the official ECMAScript conformance suite (tc39/test262,
-## vendored as the test262/suite submodule) against this embedding. Takes
+## vendored as the testdata/test262/suite submodule) against this embedding. Takes
 ## about 45 minutes; see test262_suite_test.go for the skip policy and knobs.
 test262:
-	git submodule update --init --depth 1 test262/suite
+	git submodule update --init --depth 1 testdata/test262/suite
 	TEST262=1 go test -run TestTest262 -v -timeout 3h .
 
-## nodetest-fetch: check out the pinned nodejs/node test tree into nodetest/suite.
+## nodetest-fetch: materialize the nodejs/node submodule (shallow, blobless,
+## sparse to NODE_SUITE_DIRS).
 nodetest-fetch:
-	./scripts/fetch-suite.sh $(NODE_SUITE_REPO) $(NODE_SUITE_REV) nodetest/suite $(NODE_SUITE_DIRS)
+	git submodule update --init --depth 1 --filter=blob:none internal/testutil/nodetest/testdata/suite
+	git -C internal/testutil/nodetest/testdata/suite sparse-checkout set $(NODE_SUITE_DIRS)
 
 ## nodetest: run the Node.js project's own test suite against compat/nodejs.
 ## Takes about a minute. Tests addressed to the node binary itself (private
@@ -110,13 +111,15 @@ nodetest: nodetest-fetch
 	@set -e; fail=0; i=0; while [ $$i -lt $(NODETEST_SHARDS) ]; do \
 		echo "==> nodetest shard $$i/$(NODETEST_SHARDS)"; \
 		NODETEST=1 NODETEST_SHARD=$$i/$(NODETEST_SHARDS) \
-			go test ./nodetest/ -run TestNodeSuite -v -timeout 20m || fail=1; \
+			go test ./internal/testutil/nodetest/ -run TestNodeSuite -v -timeout 20m || fail=1; \
 		i=$$((i + 1)); \
 	done; exit $$fail
 
-## wpt-fetch: check out the pinned web-platform-tests tree into internal/testutil/wpt/suite.
+## wpt-fetch: materialize the web-platform-tests submodule (shallow, blobless,
+## sparse to WPT_SUITE_DIRS).
 wpt-fetch:
-	./scripts/fetch-suite.sh $(WPT_SUITE_REPO) $(WPT_SUITE_REV) internal/testutil/wpt/suite $(WPT_SUITE_DIRS)
+	git submodule update --init --depth 1 --filter=blob:none internal/testutil/wpt/testdata/suite
+	git -C internal/testutil/wpt/testdata/suite sparse-checkout set $(WPT_SUITE_DIRS)
 
 ## wpt: run the Web Platform Tests against compat/web. Judged per subtest.
 wpt: wpt-fetch
@@ -125,13 +128,14 @@ wpt: wpt-fetch
 ## babeltest-fetch: check out Babel's fixture corpus and install the matching
 ## @babel/* packages the fixtures are run through.
 babeltest-fetch:
-	./scripts/fetch-suite.sh $(BABEL_SUITE_REPO) $(BABEL_SUITE_REV) babeltest/suite $(BABEL_SUITE_DIRS)
-	./scripts/babel-suite-deps.sh babeltest/suite babeltest/package.json
-	cd babeltest && npm install --no-audit --no-fund
+	git submodule update --init --depth 1 --filter=blob:none internal/testutil/babeltest/testdata/suite
+	git -C internal/testutil/babeltest/testdata/suite sparse-checkout set $(BABEL_SUITE_DIRS)
+	./scripts/babel-suite-deps.sh internal/testutil/babeltest/testdata/suite internal/testutil/babeltest/package.json
+	cd internal/testutil/babeltest && npm install --no-audit --no-fund
 
 ## babeltest: run Babel's fixture corpus through @babel/core on this runtime.
 babeltest: babeltest-fetch
-	BABELTEST=1 go test ./babeltest/ -run TestBabelSuite -v -timeout 2h
+	BABELTEST=1 go test ./internal/testutil/babeltest/ -run TestBabelSuite -v -timeout 2h
 
 ## suites: every external conformance suite, in ascending runtime.
 suites: wpt nodetest babeltest test262

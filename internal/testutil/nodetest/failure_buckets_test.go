@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goccy/go-spidermonkey/nodetest"
+	"github.com/goccy/go-spidermonkey/internal/testutil/nodetest"
 )
 
 // TestNodeFailureBuckets groups tests by the FIRST line their run printed, so a
@@ -42,7 +42,7 @@ func TestNodeFailureBuckets(t *testing.T) {
 		}
 	case "all":
 		for _, dir := range []string{"test/parallel", "test/es-module"} {
-			p, err := nodetest.List("suite", dir)
+			p, err := nodetest.List("testdata/suite", dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -64,7 +64,7 @@ func TestNodeFailureBuckets(t *testing.T) {
 	example := map[string]string{}
 	hung := 0
 	for _, rel := range paths {
-		r := nodetest.Run(context.Background(), nodetest.Options{Root: "suite", Timeout: timeout}, rel)
+		r := nodetest.Run(context.Background(), nodetest.Options{Root: "testdata/suite", Timeout: timeout}, rel)
 		if r.Status == nodetest.StatusPass {
 			continue
 		}

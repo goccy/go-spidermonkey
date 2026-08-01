@@ -38,11 +38,8 @@ bench/testdata/octane/
 # `make wpt-fetch` and `make babeltest-fetch` (see the pins in the Makefile).
 # The checkouts themselves (the trailing slash does not cover a symlink, which
 # is how a local checkout is often wired in).
-nodetest/suite
-internal/testutil/wpt/suite
-babeltest/suite
-# babeltest/package.json is GENERATED from the pinned checkout by
+# internal/testutil/babeltest/package.json is GENERATED from the pinned checkout by
 # scripts/babel-suite-deps.sh; `make babeltest-fetch` writes it.
-babeltest/node_modules/
-babeltest/package.json
-babeltest/package-lock.json
+internal/testutil/babeltest/node_modules/
+internal/testutil/babeltest/package.json
+internal/testutil/babeltest/package-lock.json

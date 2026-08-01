@@ -51,7 +51,7 @@ import (
 )
 
 const (
-	suiteDir         = "suite"
+	suiteDir         = "testdata/suite"
 	expectationsFile = "expectations.json"
 )
 

@@ -1,4 +1,16 @@
 [submodule "test262/suite"]
-	path = test262/suite
+	path = testdata/test262/suite
 	url = https://github.com/tc39/test262.git
+	shallow = true
+[submodule "internal/testutil/wpt/testdata/suite"]
+	path = internal/testutil/wpt/testdata/suite
+	url = https://github.com/web-platform-tests/wpt.git
+	shallow = true
+[submodule "internal/testutil/babeltest/testdata/suite"]
+	path = internal/testutil/babeltest/testdata/suite
+	url = https://github.com/babel/babel.git
+	shallow = true
+[submodule "internal/testutil/nodetest/testdata/suite"]
+	path = internal/testutil/nodetest/testdata/suite
+	url = https://github.com/nodejs/node.git
 	shallow = true
