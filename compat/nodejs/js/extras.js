@@ -2468,17 +2468,116 @@
 	// TLS options decide whether a connection is SECURE, so a malformed one is
 	// worth naming rather than ignoring: a `ciphers: 1` that is silently dropped
 	// leaves the caller believing they restricted the suite when they did not.
+	// The TLS 1.2 cipher-suite names Go's crypto/tls can actually negotiate
+	// (their OpenSSL spellings), plus the TLS 1.3 suites and list directives.
+	// A ciphers option whose legacy portion matches none of them is the
+	// handshake failure Node reports at CONTEXT time: no cipher match.
+	const KNOWN_TLS_CIPHERS = new Set([
+		"ECDHE-ECDSA-AES128-GCM-SHA256", "ECDHE-RSA-AES128-GCM-SHA256",
+		"ECDHE-ECDSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-GCM-SHA384",
+		"ECDHE-ECDSA-CHACHA20-POLY1305", "ECDHE-RSA-CHACHA20-POLY1305",
+		"ECDHE-ECDSA-AES128-SHA", "ECDHE-RSA-AES128-SHA",
+		"ECDHE-ECDSA-AES256-SHA", "ECDHE-RSA-AES256-SHA",
+		"AES128-GCM-SHA256", "AES256-GCM-SHA384", "AES128-SHA", "AES256-SHA",
+		"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256",
+	]);
+	function validateCipherList(ciphers) {
+		// TLS 1.3 names (TLS_*) configure their own list; directives and
+		// keywords pass through. What must NOT pass silently is a legacy list
+		// that names no cipher this runtime has.
+		let sawLegacy = false;
+		let matchedLegacy = false;
+		for (const tok of String(ciphers).split(":")) {
+			if (tok === "" || tok.startsWith("!") || tok.startsWith("-") || tok.startsWith("+")) continue;
+			if (/^TLS_/.test(tok)) {
+				if (KNOWN_TLS_CIPHERS.has(tok)) matchedLegacy = true;
+				else sawLegacy = true;
+				continue;
+			}
+			if (["ALL", "DEFAULT", "HIGH", "MEDIUM", "COMPLEMENTOFDEFAULT", "@STRENGTH"].includes(tok) || tok.startsWith("@SECLEVEL")) {
+				matchedLegacy = true;
+				continue;
+			}
+			sawLegacy = true;
+			// OpenSSL cipher names are case-sensitive: "aes256-sha" matches
+			// nothing even though "AES256-SHA" exists.
+			if (KNOWN_TLS_CIPHERS.has(tok)) matchedLegacy = true;
+		}
+		if (sawLegacy && !matchedLegacy) {
+			throw Object.assign(new Error("SSL_CTX_set_cipher_list error: no cipher match"),
+				{ code: "ERR_SSL_NO_CIPHER_MATCH", library: "SSL routines", reason: "no cipher match" });
+		}
+	}
 	function validateTLSOptions(options, name = "options") {
 		if (options === undefined || options === null) return {};
 		if (typeof options !== "object") {
 			throw Object.assign(new TypeError(`The "${name}" argument must be of type object. Received ${typeof options}`),
 				{ code: "ERR_INVALID_ARG_TYPE" });
 		}
-		for (const key of ["ciphers", "servername", "clientCertEngine", "privateKeyEngine", "privateKeyIdentifier", "sigalgs"]) {
-			if (options[key] !== undefined && options[key] !== null && typeof options[key] !== "string") {
-				throw Object.assign(new TypeError(`The "options.${key}" property must be of type string. Received ${typeof options[key]}`),
+		// Custom OpenSSL engines were dropped upstream; naming one is the
+		// error modern Node reports (its suite skips on exactly this code).
+		if (options.clientCertEngine !== undefined && options.clientCertEngine !== null) {
+			if (typeof options.clientCertEngine !== "string") {
+				throw Object.assign(new TypeError(`The "options.clientCertEngine" property must be of type string. ${cryptoReceived(options.clientCertEngine)}`),
 					{ code: "ERR_INVALID_ARG_TYPE" });
 			}
+			throw Object.assign(new Error("Custom engines not supported by this OpenSSL"),
+				{ code: "ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED" });
+		}
+		if (options.ciphers !== undefined && options.ciphers !== null && typeof options.ciphers === "string") {
+			validateCipherList(options.ciphers);
+		}
+		if (options.secureProtocol !== undefined && options.secureProtocol !== null) {
+			const sp = String(options.secureProtocol);
+			// SSLv23_method is the historical "negotiate anything" ALIAS and
+			// is legal; only the SSLv2_/SSLv3_ families are disabled.
+			if (/^SSLv2_/.test(sp)) {
+				throw Object.assign(new Error("SSLv2 methods disabled"), { code: "ERR_TLS_INVALID_PROTOCOL_METHOD" });
+			}
+			if (/^SSLv3_/.test(sp)) {
+				throw Object.assign(new Error("SSLv3 methods disabled"), { code: "ERR_TLS_INVALID_PROTOCOL_METHOD" });
+			}
+			const known = new Set(["TLS_method", "TLS_client_method", "TLS_server_method",
+				"TLSv1_method", "TLSv1_client_method", "TLSv1_server_method",
+				"TLSv1_1_method", "TLSv1_1_client_method", "TLSv1_1_server_method",
+				"TLSv1_2_method", "TLSv1_2_client_method", "TLSv1_2_server_method",
+				"SSLv23_method", "SSLv23_client_method", "SSLv23_server_method"]);
+			if (!known.has(sp)) {
+				throw Object.assign(new Error(`Unknown method: ${sp}`), { code: "ERR_TLS_INVALID_PROTOCOL_METHOD" });
+			}
+		}
+		for (const key of ["ciphers", "servername", "clientCertEngine", "privateKeyEngine", "privateKeyIdentifier", "sigalgs"]) {
+			if (options[key] !== undefined && options[key] !== null && typeof options[key] !== "string") {
+				throw Object.assign(new TypeError(`The "options.${key}" property must be of type string.${cryptoReceived === undefined ? "" : " " + cryptoReceived(options[key])}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+		}
+		// key/cert/ca: string, view, or an ARRAY of those; false/undefined/null
+		// mean absent. Anything else is the exact TypeError the suite spells.
+		// Node's configSecureContext order: ca, then cert, then key — the
+		// suite pairs a bad key with a bad cert to check exactly this.
+		for (const key of ["ca", "cert", "key"]) {
+			const v = options[key];
+			// Node's configSecureContext guards with `if (ca)` etc.: EVERY
+			// falsy value means absent, 0 and "" included.
+			if (!v) continue;
+			const one = (x) => typeof x === "string" || ArrayBuffer.isView(x);
+			const bad = (x) => {
+				throw Object.assign(new TypeError(
+					`The "options.${key}" property must be of type string or an instance of Buffer, TypedArray, or DataView. ${cryptoReceived(x)}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			};
+			if (Array.isArray(v)) {
+				// Element-wise, and the error names the ELEMENT — Node walks
+				// the array and reports the first offender, not the array.
+				for (const x of v) {
+					if (one(x)) continue;
+					if (key === "key" && x !== null && typeof x === "object" && one(x.pem)) continue;
+					bad(x);
+				}
+				continue;
+			}
+			if (!one(v)) bad(v);
 		}
 		for (const key of ["sessionTimeout", "handshakeTimeout", "minVersion", "maxVersion"]) {
 			const v = options[key];
