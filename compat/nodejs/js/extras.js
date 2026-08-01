@@ -1790,7 +1790,28 @@
 	// the pattern APM/tracing libraries use). Bare await interleaving without
 	// AsyncResource still cannot be tracked without engine async-context hooks.
 	class AsyncResource {
-		constructor(type) { this.type = type; this._snap = snapshotStores(); }
+		constructor(type, opts) {
+			// The second argument is a triggerAsyncId (or carries one); an id
+			// below -1 can never have existed.
+			const trigger = typeof opts === "number" ? opts
+				: opts && typeof opts === "object" ? opts.triggerAsyncId : undefined;
+			if (trigger !== undefined && (typeof trigger !== "number" || !Number.isInteger(trigger) || trigger < -1)) {
+				throw Object.assign(new RangeError(`Invalid triggerAsyncId value: ${trigger}`),
+					{ code: "ERR_INVALID_ASYNC_ID" });
+			}
+			if (typeof type !== "string") {
+				const recv = type === null || type === undefined ? `Received ${type}`
+					: `Received type ${typeof type} (${String(type)})`;
+				throw Object.assign(new TypeError(`The "type" argument must be of type string. ${recv}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (type === "") {
+				throw Object.assign(new TypeError("Invalid name for async \"type\": "),
+					{ code: "ERR_ASYNC_TYPE" });
+			}
+			this.type = type;
+			this._snap = snapshotStores();
+		}
 		runInAsyncScope(fn, thisArg, ...args) { return withSnapshot(this._snap, fn, thisArg, args); }
 		emitDestroy() { return this; }
 		bind(fn) { const snap = this._snap; return (...a) => withSnapshot(snap, fn, this, a); }
@@ -2071,6 +2092,28 @@
 				if (options[key] !== undefined && options[key] !== null && !Array.isArray(options[key])) {
 					throw Object.assign(new TypeError(`The "options.${key}" property must be an instance of ${kind}. Received ${typeof options[key]}`),
 						{ code: "ERR_INVALID_ARG_TYPE" });
+				}
+			}
+			if (Array.isArray(options.execArgv)) {
+				// The worker's execArgv is parsed like a node command line; an
+				// option node does not know is the same error it gives.
+				const knownExec = new Set(["--no-warnings", "--no-deprecation", "--trace-warnings",
+					"--trace-deprecation", "--experimental-vm-modules", "--expose-internals"]);
+				for (const a of options.execArgv) {
+					const flag = String(a).split("=")[0];
+					if (!knownExec.has(flag)) {
+						throw Object.assign(new Error(`Initiated Worker with invalid execArgv flags: ${a}`),
+							{ code: "ERR_WORKER_INVALID_EXEC_ARGV" });
+					}
+				}
+			}
+			if (options.env && typeof options.env === "object" && typeof options.env.NODE_OPTIONS === "string") {
+				const knownOpt = new Set(["--no-warnings", "--no-deprecation", "--trace-warnings", "--trace-deprecation"]);
+				for (const a of options.env.NODE_OPTIONS.trim().split(/\s+/).filter(Boolean)) {
+					if (!knownOpt.has(a.split("=")[0])) {
+						throw Object.assign(new Error(`Initiated Worker with invalid NODE_OPTIONS env variable: ${a}`),
+							{ code: "ERR_WORKER_INVALID_EXEC_ARGV" });
+					}
 				}
 			}
 			// SHARE_ENV is a sentinel, not an object of variables.

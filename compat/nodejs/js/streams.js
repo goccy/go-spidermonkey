@@ -762,7 +762,16 @@
 	Object.assign(Transform.prototype, {
 		_transform(chunk, encoding, callback) { callback(null, chunk); },
 		_write(chunk, encoding, callback) {
+			// The transform callback may be called ONCE; a second call is the
+			// error Node emits (not throws) on the stream.
+			let called = false;
 			this._transform(chunk, encoding, (err, out) => {
+				if (called) {
+					this.emit("error", Object.assign(new Error("Callback called multiple times"),
+						{ code: "ERR_MULTIPLE_CALLBACK" }));
+					return;
+				}
+				called = true;
 				if (err) return callback(err);
 				if (out !== null && out !== undefined) this.push(out);
 				callback();

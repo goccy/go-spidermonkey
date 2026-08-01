@@ -205,7 +205,7 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Engine fix needed:** pass the import attributes through to the host module
   loader.
 
-## 5. `require()` of an ES module
+## 5. `require()` of an ES module (require(esm) — synchronous module evaluation)
 
 - **Symptom:** `require()` of an ESM-only package throws "import declarations
   may only appear at top level of a module". Node >= 22 supports requiring a
