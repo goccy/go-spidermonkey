@@ -313,6 +313,11 @@ func TestWPTSuite(t *testing.T) {
 	if report := os.Getenv("WPT_REPORT_ALL"); report != "" {
 		writeJSON(t, report, allOutcomes)
 	}
+	if report := os.Getenv("WPT_DETAIL"); report != "" {
+		// Every failing subtest's status, name and message, per case — the raw
+		// material for asking "which missing piece costs the most".
+		writeJSON(t, report, failureDetail)
+	}
 	if os.Getenv("WPT_UPDATE") != "" {
 		writeJSON(t, expectationsFile, failures)
 		t.Logf("wrote %d expected failures to %s", len(failures), expectationsFile)

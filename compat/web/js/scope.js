@@ -129,6 +129,12 @@
 		return;
 	}
 
+	// And the reverse: interfaces that are [Exposed=Window] only. A worker has
+	// no localStorage — storage reaches a worker through other APIs.
+	for (const name of ["Storage", "localStorage", "sessionStorage", "StorageEvent"]) {
+		delete globalThis[name];
+	}
+
 	const WorkerGlobalScope = globalScopeClass("WorkerGlobalScope");
 	switch (scope) {
 		case "sharedworker":

@@ -49,6 +49,7 @@ const (
 	FeatureWebAssembly     Feature = "webassembly"
 	FeatureCanvas          Feature = "canvas"
 	FeatureObservable      Feature = "observable"
+	FeatureWebStorage      Feature = "webstorage"
 	FeatureCache           Feature = "cache"
 	// The features below exist because a SPEC boundary runs through what used to
 	// be one of the features above. Each is separately selectable because each
@@ -134,6 +135,9 @@ var featureGlobals = map[Feature][]string{
 	FeatureWebLocks:         {"Lock", "LockManager"},
 	FeatureWebAssembly:      {"WebAssembly"},
 	FeatureWorker:           {"Worker"},
+	// Web Storage is HTML's, and window-only: a worker reaches storage through
+	// other APIs, and scope.js removes these from every worker scope.
+	FeatureWebStorage: {"Storage", "localStorage", "sessionStorage", "StorageEvent"},
 }
 
 // alwaysInstalled are the globals no feature owns because everything needs

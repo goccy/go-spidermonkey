@@ -546,8 +546,10 @@
 				_target: { value: null, writable: true },
 				_currentTarget: { value: null, writable: true },
 				_defaultPrevented: { value: false, writable: true },
-				_bubbles: { value: Boolean(opts.bubbles) },
-				_cancelable: { value: Boolean(opts.cancelable) },
+				// Writable because the legacy init*Event() methods (initEvent,
+				// initStorageEvent) re-initialize an already-constructed event.
+				_bubbles: { value: Boolean(opts.bubbles), writable: true },
+				_cancelable: { value: Boolean(opts.cancelable), writable: true },
 				_composed: { value: Boolean(opts.composed) },
 				_trusted: { value: false, writable: true },
 				_stopImmediate: { value: false, writable: true },

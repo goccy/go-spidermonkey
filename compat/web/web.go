@@ -59,6 +59,9 @@ var eventsourceJS string
 //go:embed js/weblocks.js
 var weblocksJS string
 
+//go:embed js/webstorage.js
+var webstorageJS string
+
 //go:embed js/wasm.js
 var wasmJS string
 
@@ -80,7 +83,6 @@ var cacheStorageJS string
 //go:embed js/observable.js
 var observableJS string
 
-
 // Web is one installation of the web vocabulary on one interpreter.
 type Web struct {
 	js     *spidermonkey.JS
@@ -94,7 +96,7 @@ type Web struct {
 	codecs *codecAPI
 	// moduleClosers are the opt-in modules' close hooks, run at Close.
 	moduleClosers []func()
-	start  time.Time
+	start         time.Time
 }
 
 // Install defines the whole web platform surface on js and returns the handle
@@ -197,7 +199,7 @@ func InstallWith(js *spidermonkey.JS, opts Options) (*Web, error) {
 		return nil, err
 	}
 
-	sources := []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS}
+	sources := []string{streamsJS, builtinsJS, subtleJS, extendedJS, urlpatternJS, xhrJS, websocketJS, websocketStreamJS, eventsourceJS, weblocksJS, webstorageJS, wasmJS, workerJS, broadcastChannelJS, cacheStorageJS, observableJS}
 	sources = append(sources, moduleScripts...)
 	sources = append(sources, `delete globalThis.__web_ops;`)
 	for _, src := range sources {
