@@ -208,6 +208,14 @@ func TestWPTSuite(t *testing.T) {
 	// turns its next occurrence into a cause.
 	failureDetail := map[string][]string{}
 	harnessReasons := map[string]int{}
+	// WPT_REPORT_ALL captures EVERY case, passing ones included — the input
+	// the coverage report (coverage_test.go) is computed from.
+	type caseOutcome struct {
+		Harness  string `json:"harness"`
+		Subtests int    `json:"subtests"`
+		Failed   int    `json:"failed"`
+	}
+	allOutcomes := map[string]caseOutcome{}
 	done, start := 0, time.Now()
 	for r := range results {
 		if done++; done%100 == 0 {
@@ -229,7 +237,11 @@ func TestWPTSuite(t *testing.T) {
 			s.broken++
 			harnessReasons[r.Harness+": "+bucket(stable(r.Message))]++
 			failures[r.Path] = r.Harness + ": " + bucket(stable(r.Message))
+			allOutcomes[r.Path] = caseOutcome{Harness: r.Harness, Subtests: len(r.Subtests)}
 			continue
+		}
+		if r.Harness == "SKIP" {
+			allOutcomes[r.Path] = caseOutcome{Harness: r.Harness}
 		}
 		var failed []string
 		for _, sub := range r.Subtests {
@@ -241,6 +253,9 @@ func TestWPTSuite(t *testing.T) {
 			failed = append(failed, string(sub.Status)+" "+stable(sub.Name))
 			failureDetail[r.Path] = append(failureDetail[r.Path],
 				string(sub.Status)+" "+stable(sub.Name)+": "+bucket(stable(sub.Message)))
+		}
+		if r.Harness == "OK" {
+			allOutcomes[r.Path] = caseOutcome{Harness: r.Harness, Subtests: len(r.Subtests), Failed: len(failed)}
 		}
 		if len(failed) == 0 {
 			s.clean++
@@ -294,6 +309,9 @@ func TestWPTSuite(t *testing.T) {
 
 	if report := os.Getenv("WPT_REPORT"); report != "" {
 		writeJSON(t, report, failures)
+	}
+	if report := os.Getenv("WPT_REPORT_ALL"); report != "" {
+		writeJSON(t, report, allOutcomes)
 	}
 	if os.Getenv("WPT_UPDATE") != "" {
 		writeJSON(t, expectationsFile, failures)
@@ -426,7 +444,7 @@ func bucket(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func writeJSON(t *testing.T, p string, v map[string]string) {
+func writeJSON(t *testing.T, p string, v any) {
 	t.Helper()
 	b, err := json.MarshalIndent(v, "", " ")
 	if err != nil {
