@@ -1422,6 +1422,22 @@
 			if (p.protocol !== "file:") {
 				throw Object.assign(new TypeError(`The URL must be of scheme file`), { code: "ERR_INVALID_URL_SCHEME" });
 			}
+			if (p.hostname !== "" && p.hostname !== "localhost") {
+				throw Object.assign(new TypeError('File URL host must be "localhost" or empty on this platform'),
+					{ code: "ERR_INVALID_FILE_URL_HOST" });
+			}
+			// An encoded separator would silently change the directory
+			// structure once decoded; Node rejects both slashes.
+			if (/%2f|%5c/i.test(p.pathname)) {
+				throw Object.assign(new TypeError("File URL path must not include encoded / or \\ characters"),
+					{ code: "ERR_INVALID_FILE_URL_PATH" });
+			}
+			if (/%00/i.test(p.pathname)) {
+				// An encoded NUL decodes to the byte no path may carry — the
+				// same ERR_INVALID_ARG_VALUE a raw NUL in a string path gets.
+				throw Object.assign(new TypeError("The argument 'path' must be a string, Uint8Array, or URL without null bytes."),
+					{ code: "ERR_INVALID_ARG_VALUE" });
+			}
 			// A URL pathname is percent-ENCODED. Handing it to the filesystem raw
 			// makes a directory literally named "copy_%251" out of "copy_%1", so
 			// every pathToFileURL round-trip missed its own target.

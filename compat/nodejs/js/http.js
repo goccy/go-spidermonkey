@@ -522,7 +522,22 @@
 	// keepAlive:false (Node), but http.globalAgent is keepAlive:true (Node v19+).
 	let __nextAgentId = 0;
 	class Agent {
+		static _validate(options) {
+			if (!options || typeof options !== "object") return;
+			if (options.maxTotalSockets !== undefined && options.maxTotalSockets !== null) {
+				const v = options.maxTotalSockets;
+				if (typeof v !== "number") {
+					throw Object.assign(new TypeError(`The "maxTotalSockets" argument must be of type number. Received type ${typeof v} (${typeof v === "string" ? `'${v}'` : String(v)})`),
+						{ code: "ERR_INVALID_ARG_TYPE" });
+				}
+				if (Number.isNaN(v) || v <= 0) {
+					throw Object.assign(new RangeError(`The value of "maxTotalSockets" is out of range. It must be > 0. Received ${v}`),
+						{ code: "ERR_OUT_OF_RANGE" });
+				}
+			}
+		}
 		constructor(options = {}) {
+			Agent._validate(options);
 			this.options = { ...options };
 			this.keepAlive = options.keepAlive ?? false;
 			this.keepAliveMsecs = options.keepAliveMsecs ?? 1000;
@@ -622,6 +637,12 @@
 					throw Object.assign(new TypeError(`Method must be a valid HTTP token ["${o.method}"]`),
 						{ code: "ERR_INVALID_HTTP_TOKEN" });
 				}
+			}
+			if (o.timeout !== undefined && typeof o.timeout !== "number") {
+				const recv = o.timeout === null ? " Received null"
+					: ` Received type ${typeof o.timeout} (${String(o.timeout)})`;
+				throw Object.assign(new TypeError(`The "timeout" argument must be of type number.${recv}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
 			}
 			if (o.path !== undefined && o.path !== null) {
 				const pathStr = String(o.path);
