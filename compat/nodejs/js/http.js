@@ -146,7 +146,9 @@
 		constructor(init = {}) {
 			super();
 			this._reqId = init.reqId;
-			this.socket = this.connection = init.socket || makeSocket();
+			// The server always hands a socket in; a bare new OutgoingMessage()
+			// has NONE until its 'socket' event, and setTimeout queues on it.
+			this.socket = this.connection = init.socket ?? null;
 			this.req = init.req;
 			this.statusCode = 200;
 			this.statusMessage = undefined;
@@ -232,8 +234,17 @@
 		flushHeaders() { this._ensureHead(); }
 		writeContinue() {}
 		setTimeout(ms, cb) {
-			// Node delegates to the underlying socket (response.socket.setTimeout).
-			if (this.socket && typeof this.socket.setTimeout === "function") this.socket.setTimeout(ms, cb);
+			// Node delegates to the socket — the one it has, or the one its
+			// 'socket' event will deliver — and the message re-emits the
+			// socket's timeout as its own.
+			if (cb) this.once("timeout", cb);
+			const arm = (socket) => {
+				if (socket && typeof socket.setTimeout === "function") {
+					socket.setTimeout(ms, () => this.emit("timeout"));
+				}
+			};
+			if (this.socket) arm(this.socket);
+			else this.once("socket", arm);
 			return this;
 		}
 		_ensureHead() {
