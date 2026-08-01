@@ -92,6 +92,11 @@
 				},
 			});
 		}
+		// The stream of strings form of text(): UTF-8 always, whatever the
+		// type parameter claims.
+		textStream() {
+			return this.stream().pipeThrough(new TextDecoderStream());
+		}
 		get [Symbol.toStringTag]() { return "Blob"; }
 	}
 	globalThis.Blob = Blob;

@@ -1813,8 +1813,9 @@
 		// response.text() does, and a consumer that only tracked its own calls
 		// reported false there.
 		get bodyUsed() {
+			if (this._bodyConsumed === true) return true;
 			if (this._bodyStream) return this._bodyStream._disturbed === true;
-			return this._bodyConsumed === true;
+			return false;
 		},
 		// A guest-constructed Request/Response body may be read only once (WHATWG);
 		// a second read throws a TypeError, and bodyUsed reflects that.
@@ -1832,6 +1833,26 @@
 			return this._body === null ? new Uint8Array(0) : new Uint8Array(this._body);
 		},
 		async text() { const b = await this._bodyBytes(); return b.length === 0 ? "" : utf8Decode(b, false); },
+		// textStream(): the body as a stream of strings, UTF-8 always — the
+		// Content-Type charset is deliberately ignored, like text(). Calling it
+		// consumes the body immediately, like every other consumer.
+		textStream() {
+			// A null body has nothing to consume: the stream is empty and
+			// bodyUsed stays false, however many times this is called.
+			const nullBody = !this._bodyStream && this._body === null;
+			if (!nullBody) this._useBody();
+			let src = this._bodyStream;
+			if (src === undefined || src === null) {
+				const bytes = nullBody ? new Uint8Array(0) : new Uint8Array(this._body);
+				src = new ReadableStream({
+					pull(controller) {
+						if (bytes.length) controller.enqueue(bytes);
+						controller.close();
+					},
+				});
+			}
+			return src.pipeThrough(new TextDecoderStream());
+		},
 		async json() {
 			// A leading BOM is not part of the JSON text; the UTF-8 decode that
 			// produced the string already dropped an encoded one, and a LITERAL
