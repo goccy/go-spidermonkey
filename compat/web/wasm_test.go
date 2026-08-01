@@ -1,7 +1,7 @@
 package web
 
 // White-box on purpose: the tests assemble real wasm binaries with the same
-// section/LEB helpers wasmbin.go emits its synthetic modules with, which keeps
+// section/LEB helpers wasm.go emits its synthetic modules with, which keeps
 // the encodings honest from both directions — a bug in the helpers breaks the
 // fixtures too, visibly.
 

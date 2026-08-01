@@ -6,6 +6,8 @@ import (
 	spidermonkey "github.com/goccy/go-spidermonkey"
 	"github.com/goccy/go-spidermonkey/compat/nodejs"
 	"github.com/goccy/go-spidermonkey/fs"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -118,3 +120,6 @@ func TestProcessSignal(t *testing.T) {
 		t.Fatalf("SIGUSR1 handler did not fire; got %q", got)
 	}
 }
+
+func osFindProcess() (*os.Process, error) { return os.FindProcess(os.Getpid()) }
+func sigUSR1() os.Signal                  { return syscall.SIGUSR1 }

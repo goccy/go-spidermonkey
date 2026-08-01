@@ -1,5 +1,33 @@
 package web
 
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"compress/zlib"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/andybalholm/brotli"
+	spidermonkey "github.com/goccy/go-spidermonkey"
+	"github.com/goccy/go-spidermonkey/compat/internal/eventloop"
+	"github.com/klauspost/compress/zstd"
+	"io"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
 // fetch: everything lives on the Go side, wired into the guest through the
 // public object API (the shape proven by the repo's fetch feasibility test).
 // fetch itself is a Go closure assigned to globalThis.fetch; the Response is
@@ -18,28 +46,6 @@ package web
 // tied to the in-flight request's context: an abort cancels it mid-flight and
 // rejects with a DOMException AbortError. Response headers are shipped as data
 // and rebuilt into a real Headers instance on the JS side.
-
-import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/http/cookiejar"
-	"net/url"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-
-	spidermonkey "github.com/goccy/go-spidermonkey"
-	"github.com/goccy/go-spidermonkey/compat/internal/eventloop"
-)
 
 // fetchAPI owns the Go side of fetch: the permission-enforcing HTTP client
 // (built lazily from the Config the first call carries), the guest builtins
@@ -296,7 +302,8 @@ func installFetch(js *spidermonkey.JS, loop *eventloop.Loop, roots *x509.CertPoo
 	// __native_fetch_abort(id): the JS fetch wrapper's AbortSignal listener calls
 	// this to cancel the Go request context of an in-flight fetch.
 	// __native_fetch_sync(url, init): the blocking round-trip synchronous
-	// XMLHttpRequest is defined in terms of. See fetchsync.go for what it costs.
+	// XMLHttpRequest is defined in terms of. See the synchronous-fetch section
+	// below for what it costs.
 	if err := js.Global().DefineFunc("__native_fetch_sync", a.fetchSync); err != nil {
 		return nil, err
 	}
@@ -359,13 +366,13 @@ func newHTTPClient(cfg spidermonkey.Config, roots *x509.CertPool) *http.Client {
 	dial := permissionDial(cfg)
 	// The transport is wrapped so that a request whose header values net/http
 	// refuses to write is still sent — over the same permission-checked dial.
-	// See fetchraw.go.
+	// See the raw-fetch section below.
 	std := &http.Transport{DialContext: dial, TLSClientConfig: tlsConfig(roots)}
 	// The cache wraps the transport rather than the client, so it also sees the
 	// hops of a redirect chain — each of which is a request of its own.
 	inner := &permissiveTransport{std: std, dial: dial}
 	// Decoding sits ABOVE the cache, so a cache hit is decoded too and the cache
-	// stores the bytes the origin actually sent. See fetchdecode.go.
+	// stores the bytes the origin actually sent. See the decode section below.
 	return &http.Client{Transport: &decodingTransport{
 		next: &cachingTransport{next: inner, cache: newResponseCache()},
 	}}
@@ -1120,4 +1127,1413 @@ func (a *fetchAPI) closeAll() {
 			*o = nil
 		}
 	}
+}
+
+// ------------------------- decoding a response's Content-Encoding.
+//
+// fetch decodes the content codings a response declares before the body reaches
+// the caller — `res.text()` on a gzipped resource gives the text, not the gzip.
+// net/http does this for gzip only, and only when IT chose to ask for gzip; a
+// server that compresses without being asked, or that uses br or zstd, hands
+// back bytes nothing unwraps. So the decoding is here, as a RoundTripper above
+// the cache: a cache hit is decoded too, and what the cache stores stays the
+// bytes the origin actually sent.
+//
+// A corrupt body must FAIL rather than truncate. Every reader below reports its
+// own error, and because the decode is streaming that error arrives at the read
+// that hits the damage — which is what the caller's body promise rejects with.
+
+// decodingTransport unwraps the content codings of every response it passes on.
+type decodingTransport struct{ next http.RoundTripper }
+
+func (t *decodingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Announce what can be decoded. Without this a server has no reason to
+	// compress at all, and net/http's own transparent gzip only happens when it
+	// added the header itself — which it will not, now that one is present.
+	out := req.Clone(req.Context())
+	if out.Header.Get("Accept-Encoding") == "" {
+		out.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	}
+	resp, err := t.next.RoundTrip(out)
+	if err != nil {
+		return nil, err
+	}
+	return decodeBody(resp), nil
+}
+
+// decodeBody replaces the body with a decoded one when the response declares a
+// coding this runtime understands. A coding it does not understand is left
+// alone: the bytes are then what the caller asked for, and pretending otherwise
+// would be worse than handing them over.
+func decodeBody(resp *http.Response) *http.Response {
+	coding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	if coding == "" || coding == "identity" {
+		return resp
+	}
+	// A list of codings is applied in order, so it is undone in reverse.
+	parts := strings.Split(coding, ",")
+	body := resp.Body
+	decoded := false
+	for i := len(parts) - 1; i >= 0; i-- {
+		next, ok := decodeReader(strings.TrimSpace(parts[i]), body)
+		if !ok {
+			// An unknown coding stops the unwrapping: anything further out was
+			// applied on top of it and cannot be reached through it either.
+			break
+		}
+		body = next
+		decoded = true
+	}
+	if !decoded {
+		return resp
+	}
+	resp.Body = body
+	// The declared length described the ENCODED bytes and no longer describes
+	// anything the caller can see, so it goes — as does the coding itself, which
+	// has been undone.
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	resp.Uncompressed = true
+	return resp
+}
+
+// decodeReader wraps r in the decoder for one coding, reporting whether the
+// coding is one this runtime knows.
+//
+// The decoders are all LAZY about their headers: a gzip.Reader validates its
+// header on construction, which would mean a corrupt body failed at
+// RoundTrip time rather than at the read — and a body error has to reach the
+// caller as a rejected body promise, not as a failed fetch. So construction is
+// deferred to the first Read.
+func decodeReader(coding string, r io.ReadCloser) (io.ReadCloser, bool) {
+	switch coding {
+	case "gzip", "x-gzip":
+		return &lazyDecoder{src: r, open: func(in io.Reader) (io.Reader, error) { return gzip.NewReader(in) }}, true
+	case "deflate":
+		return &lazyDecoder{src: r, open: func(in io.Reader) (io.Reader, error) { return zlib.NewReader(in) }}, true
+	case "br":
+		return &lazyDecoder{src: r, open: func(in io.Reader) (io.Reader, error) { return brotli.NewReader(in), nil }}, true
+	case "zstd":
+		return &lazyDecoder{src: r, open: func(in io.Reader) (io.Reader, error) {
+			// Window sizes above the default are refused rather than allocated:
+			// a response can otherwise name a window that costs the host hundreds
+			// of megabytes per body. The suite checks exactly that refusal.
+			d, err := zstd.NewReader(in, zstd.WithDecoderMaxWindow(1<<23), zstd.WithDecoderConcurrency(1))
+			if err != nil {
+				return nil, err
+			}
+			return d.IOReadCloser(), nil
+		}}, true
+	}
+	return nil, false
+}
+
+// lazyDecoder defers building its decoder until the first Read, so a malformed
+// stream is reported to whoever reads the body rather than to whoever made the
+// request.
+type lazyDecoder struct {
+	src  io.ReadCloser
+	open func(io.Reader) (io.Reader, error)
+	r    io.Reader
+	err  error
+}
+
+func (d *lazyDecoder) Read(p []byte) (int, error) {
+	if d.err != nil {
+		return 0, d.err
+	}
+	if d.r == nil {
+		r, err := d.open(d.src)
+		if err != nil {
+			d.err = err
+			return 0, err
+		}
+		d.r = r
+	}
+	n, err := d.r.Read(p)
+	if err != nil && err != io.EOF {
+		d.err = err
+	}
+	return n, err
+}
+
+func (d *lazyDecoder) Close() error {
+	if c, ok := d.r.(io.Closer); ok {
+		_ = c.Close()
+	}
+	return d.src.Close()
+}
+
+// ------------------------- sending a request whose headers net/http's
+// Transport refuses.
+//
+// A header value may hold any byte but NUL, LF and CR as far as fetch is
+// concerned. net/http is stricter: Transport.roundTrip runs validateHeaders,
+// which rejects every control character except HTAB, and the request never
+// leaves. That is RFC 9110's field-vchar rule, and enforcing it on send is a
+// deliberate choice — but it is enforced by the TRANSPORT, not by the code that
+// writes the request, and Go's own server does not enforce it on receive at all
+// (net/textproto trims a field value and keeps whatever is left). So a Go
+// client cannot send what a Go server will happily accept.
+//
+// The way around it is not a hand-written HTTP implementation. Request.Write is
+// public, documented as writing "an HTTP/1.1 request, which is the header and
+// body, in wire format", and validates only the field NAME; ReadResponse parses
+// the reply. Between them the whole exchange is standard-library code, and this
+// file is the dozen lines that connect them.
+//
+// The raw path is taken ONLY for a request the standard path would refuse, so
+// nothing in ordinary use loses connection pooling or HTTP/2 — and HTTP/2 could
+// not carry such a value anyway, since its own header check is the same one.
+
+// isCTLNotLWS mirrors the rule httpguts.ValidHeaderFieldValue applies: a
+// control character other than HTAB or space is what makes the Transport refuse.
+func isCTLNotLWS(b byte) bool {
+	return (b < 0x20 || b == 0x7f) && b != '\t' && b != ' '
+}
+
+// needsRawWrite reports whether net/http would refuse to send these headers.
+func needsRawWrite(h http.Header) bool {
+	for _, vv := range h {
+		for _, v := range vv {
+			for i := 0; i < len(v); i++ {
+				if isCTLNotLWS(v[i]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// permissiveTransport delegates to the standard Transport, and falls back to
+// writing the request over a connection of its own for the requests the standard
+// Transport will not send.
+type permissiveTransport struct {
+	std  *http.Transport
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+func (t *permissiveTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !needsRawWrite(req.Header) {
+		return t.std.RoundTrip(req)
+	}
+	return t.roundTripRaw(req)
+}
+
+// closingBody ties the response body's lifetime to the connection's, since this
+// path has no pool to return it to.
+type closingBody struct {
+	*bufio.Reader
+	conn net.Conn
+	body interface{ Close() error }
+}
+
+func (b *closingBody) Read(p []byte) (int, error) { return b.Reader.Read(p) }
+
+func (b *closingBody) Close() error {
+	if b.body != nil {
+		_ = b.body.Close()
+	}
+	return b.conn.Close()
+}
+
+func (t *permissiveTransport) roundTripRaw(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	host := req.URL.Hostname()
+	port := req.URL.Port()
+	if port == "" {
+		if req.URL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	conn, err := t.dial(ctx, "tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		return nil, err
+	}
+	if req.URL.Scheme == "https" {
+		tc := tls.Client(conn, &tls.Config{ServerName: host})
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		conn = tc
+	}
+	// The context has no transport to cancel through here, so it cancels by
+	// closing the connection — which is what makes an aborted fetch return
+	// promptly rather than waiting on the peer.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	if err := req.Write(conn); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+	br := bufio.NewReader(conn)
+	resp, err := readResponsePermissive(br, req)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	resp.Body = &closingBody{Reader: bufio.NewReader(resp.Body), conn: conn, body: resp.Body}
+	return resp, nil
+}
+
+// readResponsePermissive parses a response the way http.ReadResponse would,
+// except that it does not validate header values. ReadResponse goes through
+// net/textproto, whose ReadMIMEHeader rejects a control character in a value —
+// so a server that echoes back the header this path exists to SEND could not be
+// read. The framing is still the standard library's: a chunked body is decoded by
+// httputil, and a counted one by io.LimitReader.
+func readResponsePermissive(br *bufio.Reader, req *http.Request) (*http.Response, error) {
+	statusLine, err := readCRLFLine(br)
+	if err != nil {
+		return nil, err
+	}
+	proto, rest, ok := strings.Cut(statusLine, " ")
+	if !ok {
+		return nil, fmt.Errorf("bad status line %q", statusLine)
+	}
+	codeText, reason, _ := strings.Cut(rest, " ")
+	code, err := strconv.Atoi(codeText)
+	if err != nil {
+		return nil, fmt.Errorf("bad status code %q", codeText)
+	}
+	header := http.Header{}
+	for {
+		line, err := readCRLFLine(br)
+		if err != nil {
+			return nil, err
+		}
+		if line == "" {
+			break
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, fmt.Errorf("bad header line %q", line)
+		}
+		// Only the optional whitespace around the value is removed. Whatever else
+		// the value holds is the value — that is the whole point of this path.
+		header.Add(strings.TrimSpace(name), strings.Trim(value, " \t"))
+	}
+	resp := &http.Response{
+		Status:     codeText + " " + reason,
+		StatusCode: code,
+		Proto:      proto,
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+		Request:    req,
+	}
+	switch {
+	case strings.EqualFold(header.Get("Transfer-Encoding"), "chunked"):
+		resp.ContentLength = -1
+		resp.TransferEncoding = []string{"chunked"}
+		resp.Body = io.NopCloser(httputil.NewChunkedReader(br))
+	case header.Get("Content-Length") != "":
+		n, cerr := strconv.ParseInt(header.Get("Content-Length"), 10, 64)
+		if cerr != nil {
+			return nil, fmt.Errorf("bad Content-Length %q", header.Get("Content-Length"))
+		}
+		resp.ContentLength = n
+		resp.Body = io.NopCloser(io.LimitReader(br, n))
+	default:
+		// No framing: the body runs to end of connection, which is why this path
+		// does not reuse the connection.
+		resp.ContentLength = -1
+		resp.Body = io.NopCloser(br)
+	}
+	return resp, nil
+}
+
+// readCRLFLine reads one header line and returns it without its terminator.
+func readCRLFLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// ------------------------- the blocking round-trip behind synchronous
+// XMLHttpRequest.
+//
+// A synchronous send() must not return until the response has arrived. There is
+// one loop goroutine, so "not return" means it is occupied for the whole
+// round-trip: no timer fires, no promise settles, no other host call runs. That
+// is not an implementation shortcoming — it is what the caller asked for, and it
+// is why the specification itself deprecates the mode. What it costs is stated
+// here rather than in a comment somewhere the caller will not read: a request to
+// a server this same instance is serving CANNOT complete, because the request
+// that would answer it can never be dispatched.
+//
+// It is a separate entry point from fetch rather than a flag on it because the
+// two differ in the only thing that matters about fetch's shape: fetch hands the
+// body back as a stream and settles a promise, and neither exists here. What
+// they DO share — the client, the permission hooks, the redirect policy — is
+// shared by construction, so a URL denied to one is denied to the other.
+
+// maxSyncBody bounds a synchronous response, which is buffered whole: there is
+// no reader to apply backpressure and nothing to stream it into.
+const maxSyncBody = 100 << 20
+
+// fetchSync(url, init) -> { status, statusText, url, headers, body } or
+// { error }. init carries method, headers, body and timeoutMs; there is no
+// signal, because nothing can abort a call that owns the only thread.
+func (a *fetchAPI) fetchSync(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	a.clientOnce.Do(func() { a.client = newHTTPClient(cfg, a.roots) })
+	if len(args) < 1 {
+		return nil, fmt.Errorf("fetch_sync: an input URL is required")
+	}
+	url := args[0].String()
+	method := "GET"
+	headers := map[string]string{}
+	var body io.Reader
+	timeout := time.Duration(0)
+
+	if len(args) > 1 && args[1].IsObject() {
+		init := args[1].Object()
+		defer init.Free()
+		if v, err := init.Get("method"); err == nil && v != nil && !v.IsUndefined() {
+			if o := v.Object(); o != nil {
+				o.Free()
+			} else {
+				method = strings.ToUpper(v.String())
+			}
+		}
+		if v, err := init.Get("timeoutMs"); err == nil && v != nil && !v.IsUndefined() {
+			if o := v.Object(); o != nil {
+				o.Free()
+			} else if ms := v.Float(); ms > 0 {
+				timeout = time.Duration(ms) * time.Millisecond
+			}
+		}
+		if v, err := init.Get("body"); err == nil {
+			if o := v.Object(); o != nil {
+				data, berr := o.Bytes()
+				o.Free()
+				if berr != nil {
+					return nil, berr
+				}
+				body = strings.NewReader(string(data))
+			} else if v.Export() != nil {
+				body = strings.NewReader(v.String())
+			}
+		}
+		if v, err := init.Get("headers"); err == nil {
+			if o := v.Object(); o != nil {
+				s, serr := a.jsonObj.CallMethod("stringify", o)
+				o.Free()
+				if serr != nil {
+					return nil, serr
+				}
+				if err := json.Unmarshal([]byte(s.String()), &headers); err != nil {
+					return nil, fmt.Errorf("fetch_sync: bad headers: %w", err)
+				}
+			}
+		}
+	}
+
+	if strings.HasPrefix(strings.ToLower(url), "data:") {
+		resp, derr := dataResponse(url, method)
+		if derr != nil {
+			return a.syncError(derr.Error())
+		}
+		return a.syncResponse(resp, url)
+	}
+
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return a.syncError(err.Error())
+	}
+	if err := checkRequestPermission(cfg, req); err != nil {
+		return a.syncError(err.Error())
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", fetchUserAgent)
+	}
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	client := &http.Client{Transport: a.client.Transport}
+	client.CheckRedirect = func(r *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errTooManyRedirects
+		}
+		if n := len(via); n > 0 && !sameOrigin(via[n-1].URL, r.URL) {
+			r.Header.Del("Authorization")
+			r.Header.Del("Cookie")
+		}
+		return nil
+	}
+	resp, derr := client.Do(req.WithContext(ctx))
+	if derr != nil {
+		// A deadline is reported as its own kind rather than left to be recognised
+		// from the message: the caller has to raise TimeoutError for it and
+		// NetworkError for everything else, and that is a decision, not a string.
+		if ctx.Err() == context.DeadlineExceeded {
+			return a.syncFailure(derr.Error(), true)
+		}
+		return a.syncError(derr.Error())
+	}
+	defer resp.Body.Close()
+	final := url
+	if resp.Request != nil && resp.Request.URL != nil {
+		final = resp.Request.URL.String()
+	}
+	return a.syncResponse(resp, final)
+}
+
+// syncResponse turns a finished round-trip into the plain object the guest
+// reads. The body is read HERE, not handed over as a stream: a synchronous
+// caller has no way to read one.
+func (a *fetchAPI) syncResponse(resp *http.Response, finalURL string) (spidermonkey.Value, error) {
+	data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxSyncBody+1))
+	if rerr != nil {
+		return a.syncError(rerr.Error())
+	}
+	if len(data) > maxSyncBody {
+		return a.syncError(fmt.Sprintf("response body exceeds %d bytes", maxSyncBody))
+	}
+	out, err := a.js.NewObject()
+	if err != nil {
+		return nil, err
+	}
+	pairs := make([]any, 0, len(resp.Header))
+	for name, values := range resp.Header {
+		for _, v := range values {
+			pairs = append(pairs, []any{name, v})
+		}
+	}
+	if err := out.Set("status", spidermonkey.ValueOf(float64(resp.StatusCode))); err != nil {
+		return nil, err
+	}
+	if err := out.Set("statusText", spidermonkey.ValueOf(statusTextOf(resp))); err != nil {
+		return nil, err
+	}
+	if err := out.Set("url", spidermonkey.ValueOf(finalURL)); err != nil {
+		return nil, err
+	}
+	if err := out.Set("headers", spidermonkey.ValueOf(pairs)); err != nil {
+		return nil, err
+	}
+	u8, err := a.js.NewBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	serr := out.Set("body", u8)
+	u8.Free()
+	if serr != nil {
+		return nil, serr
+	}
+	return out, nil
+}
+
+// statusTextOf is the reason phrase the server sent, which is not always the
+// canonical one for the code — a test that sets its own is checking exactly
+// that it survives.
+func statusTextOf(resp *http.Response) string {
+	if _, phrase, ok := strings.Cut(resp.Status, " "); ok {
+		return phrase
+	}
+	return http.StatusText(resp.StatusCode)
+}
+
+func (a *fetchAPI) syncError(message string) (spidermonkey.Value, error) {
+	return a.syncFailure(message, false)
+}
+
+func (a *fetchAPI) syncFailure(message string, timedOut bool) (spidermonkey.Value, error) {
+	out, err := a.js.NewObject()
+	if err != nil {
+		return nil, err
+	}
+	if err := out.Set("error", spidermonkey.ValueOf(message)); err != nil {
+		return nil, err
+	}
+	if timedOut {
+		if err := out.Set("timedOut", spidermonkey.ValueOf(true)); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// ------------------------- fetch() of a data: URL.
+//
+// A data URL carries its own body, so there is no request to make and no
+// permission to check — which is also why it must be handled before the HTTP
+// path rather than inside it. Without this, `fetch("data:…")` failed at the
+// transport and the whole WPT fetch/data-urls directory scored 2 of 154.
+
+// defaultDataMIME is what a data URL means when it names no type, per the
+// WHATWG data-url processor.
+const defaultDataMIME = "text/plain;charset=US-ASCII"
+
+// parseDataURL splits a data: URL into its MIME type and decoded body.
+func parseDataURL(raw string) (mime string, body []byte, err error) {
+	rest, ok := cutSchemePrefix(raw, "data:")
+	if !ok {
+		return "", nil, fmt.Errorf("not a data URL")
+	}
+	// The FIRST comma separates the metadata from the data; a comma inside the
+	// data is content, not a separator.
+	head, data, ok := strings.Cut(rest, ",")
+	if !ok {
+		return "", nil, fmt.Errorf("data URL has no comma")
+	}
+	head = strings.TrimSpace(head)
+	isBase64 := false
+	// ";base64" must be the LAST parameter, matched case-insensitively, and its
+	// trailing whitespace is ignored.
+	if i := strings.LastIndex(strings.ToLower(head), ";base64"); i >= 0 &&
+		strings.TrimSpace(head[i+len(";base64"):]) == "" {
+		isBase64 = true
+		head = head[:i]
+	}
+	// A type that begins with ";" is a parameter list with no type, and gets
+	// "text/plain" — and ONLY that. The charset is not a default: it belongs to
+	// the fallback below, for a type that does not parse at all. Prepending the
+	// whole default here gave "text/plain;charset=US-ASCII;charset=x" for
+	// ";charset=x", where the caller's charset is the one that counts.
+	if strings.HasPrefix(head, ";") {
+		head = "text/plain" + head
+	}
+	// The Content-Type is the PARSED type serialized back, not the raw text:
+	// that is what lowercases it, normalizes the whitespace around parameters
+	// and drops malformed ones. A type that does not parse falls back to the
+	// default rather than being passed through.
+	if m, ok := parseMIMEType(head); ok {
+		head = m.String()
+	} else {
+		head = defaultDataMIME
+	}
+
+	// The data segment is percent-encoded regardless of base64.
+	decoded, uerr := url.PathUnescape(data)
+	if uerr != nil {
+		// A stray "%" is data, not an error, in a data URL.
+		decoded = data
+	}
+	if !isBase64 {
+		return head, []byte(decoded), nil
+	}
+	// Forgiving base64: whitespace is stripped, padding is optional.
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '\f':
+			return -1
+		}
+		return r
+	}, decoded)
+	if n := len(cleaned) % 4; n == 1 {
+		return "", nil, fmt.Errorf("invalid base64 in data URL")
+	} else if n != 0 {
+		cleaned += strings.Repeat("=", 4-n)
+	}
+	out, berr := base64.StdEncoding.DecodeString(cleaned)
+	if berr != nil {
+		// Accept the URL-safe alphabet too, as browsers do.
+		out, berr = base64.URLEncoding.DecodeString(cleaned)
+		if berr != nil {
+			return "", nil, fmt.Errorf("invalid base64 in data URL")
+		}
+	}
+	return head, out, nil
+}
+
+func cutSchemePrefix(raw, scheme string) (string, bool) {
+	if len(raw) < len(scheme) || !strings.EqualFold(raw[:len(scheme)], scheme) {
+		return "", false
+	}
+	return raw[len(scheme):], true
+}
+
+// dataResponse turns a data: URL into the response fetch resolves with: always
+// 200 OK, the URL's own media type, and its decoded bytes.
+func dataResponse(raw, method string) (*http.Response, error) {
+	mime, body, err := parseDataURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	u, uerr := url.Parse(raw)
+	if uerr != nil {
+		return nil, fmt.Errorf("invalid data URL")
+	}
+	h := http.Header{}
+	h.Set("Content-Type", mime)
+	// A HEAD gets the headers and no body, as it would over HTTP.
+	rc := io.NopCloser(strings.NewReader(string(body)))
+	length := int64(len(body))
+	if strings.EqualFold(method, "HEAD") {
+		rc = io.NopCloser(strings.NewReader(""))
+	}
+	return &http.Response{
+		Status:        "200 OK",
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/1.1",
+		Header:        h,
+		Body:          rc,
+		ContentLength: length,
+		Request:       &http.Request{Method: method, URL: u},
+	}, nil
+}
+
+// ------------------------- the HTTP cache behind fetch's `cache` option.
+//
+// fetch does not define caching of its own — it defers to HTTP's, and then adds
+// six modes that say how much of it to obey. So this is RFC 9111's core
+// (freshness, revalidation, Vary) with the modes layered on top, as a
+// RoundTripper: that is where a cache belongs in Go, and it composes with the
+// permissive transport in the raw-fetch section without either knowing about
+// the other.
+//
+// What it deliberately does not do: range requests and 206 responses go
+// straight past it. A partial response is not the resource, and storing one as
+// though it were is how a cache starts returning truncated bodies.
+//
+// The store is per-installation and in memory, bounded by total body bytes with
+// the oldest entries evicted first. A cache with no ceiling is a memory leak
+// with a hit rate.
+
+// cacheMode is fetch's `cache` option.
+type cacheMode string
+
+const (
+	cacheDefault      cacheMode = "default"
+	cacheNoStore      cacheMode = "no-store"
+	cacheReload       cacheMode = "reload"
+	cacheNoCache      cacheMode = "no-cache"
+	cacheForceCache   cacheMode = "force-cache"
+	cacheOnlyIfCached cacheMode = "only-if-cached"
+)
+
+// cacheModeKey carries the mode from the fetch op to the transport. It travels
+// on the request context because the mode is a property of the fetch call, not
+// of the connection or the client.
+type cacheModeKey struct{}
+
+func withCacheMode(ctx context.Context, mode string) context.Context {
+	switch cacheMode(mode) {
+	case cacheNoStore, cacheReload, cacheNoCache, cacheForceCache, cacheOnlyIfCached:
+		return context.WithValue(ctx, cacheModeKey{}, cacheMode(mode))
+	}
+	return ctx
+}
+
+func cacheModeOf(req *http.Request) cacheMode {
+	if m, ok := req.Context().Value(cacheModeKey{}).(cacheMode); ok {
+		return m
+	}
+	return cacheDefault
+}
+
+// maxCacheBytes bounds the total stored body size.
+const maxCacheBytes = 32 << 20
+
+// cacheEntry is a stored response, byte for byte. The times are what freshness
+// is computed from: HTTP's age arithmetic needs to know when the request went
+// out and when the response came back, not just what the headers say.
+type cacheEntry struct {
+	status    int
+	header    http.Header
+	body      []byte
+	requested time.Time
+	received  time.Time
+	// varyKey is the request-header values the response said it varies by. An
+	// entry is only reusable for a request whose values match.
+	varyKey string
+	stored  time.Time
+}
+
+// responseCache stores, per primary key, one entry PER VARIANT: a response
+// with Vary: Foo selects on the request's Foo value, and storing a second
+// variant must not evict the first — a cache holds the variants side by side,
+// or Vary would make it useless for exactly the resources that use it.
+type responseCache struct {
+	mu      sync.Mutex
+	entries map[string][]*cacheEntry
+	bytes   int
+}
+
+func newResponseCache() *responseCache {
+	return &responseCache{entries: map[string][]*cacheEntry{}}
+}
+
+// key is the primary cache key: the method and the full URL. Vary is handled
+// separately, as a check on the entry rather than as part of the key, so that a
+// request can find the entry and then discover it does not apply.
+func cacheKey(req *http.Request) string { return req.Method + " " + req.URL.String() }
+
+// varyKeyFor builds the value an entry's Vary directive selects on. A Vary of
+// "*" never matches, which is the standard's way of saying "do not reuse this".
+func varyKeyFor(vary string, h http.Header) (string, bool) {
+	if vary == "" {
+		return "", true
+	}
+	var parts []string
+	for _, name := range strings.Split(vary, ",") {
+		name = strings.TrimSpace(name)
+		if name == "*" {
+			return "", false
+		}
+		parts = append(parts, name+"="+h.Get(name))
+	}
+	return strings.Join(parts, "\n"), true
+}
+
+func (c *responseCache) get(req *http.Request) *cacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.entries[cacheKey(req)] {
+		// Each variant's OWN Vary decides what it selects on; the header can
+		// differ between variants when the origin changed its mind.
+		want, ok := varyKeyFor(e.header.Get("Vary"), req.Header)
+		if ok && want == e.varyKey {
+			return e
+		}
+	}
+	return nil
+}
+
+func (c *responseCache) put(req *http.Request, e *cacheEntry) {
+	key, ok := varyKeyFor(e.header.Get("Vary"), req.Header)
+	if !ok {
+		return
+	}
+	e.varyKey = key
+	e.stored = time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pk := cacheKey(req)
+	variants := c.entries[pk]
+	replaced := false
+	for i, old := range variants {
+		if old.varyKey == e.varyKey {
+			c.bytes -= len(old.body)
+			variants[i] = e
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		variants = append(variants, e)
+	}
+	c.entries[pk] = variants
+	c.bytes += len(e.body)
+	// Evict oldest-first until under the ceiling.
+	for c.bytes > maxCacheBytes {
+		oldestKey, oldestIdx := "", -1
+		oldest := time.Now().Add(time.Hour)
+		for k, list := range c.entries {
+			for i, v := range list {
+				if v == e {
+					continue // never evict what was just stored
+				}
+				if v.stored.Before(oldest) {
+					oldestKey, oldestIdx, oldest = k, i, v.stored
+				}
+			}
+		}
+		if oldestIdx < 0 {
+			return
+		}
+		list := c.entries[oldestKey]
+		c.bytes -= len(list[oldestIdx].body)
+		list = append(list[:oldestIdx], list[oldestIdx+1:]...)
+		if len(list) == 0 {
+			delete(c.entries, oldestKey)
+		} else {
+			c.entries[oldestKey] = list
+		}
+	}
+}
+
+func (c *responseCache) reset() {
+	c.mu.Lock()
+	c.entries = map[string][]*cacheEntry{}
+	c.bytes = 0
+	c.mu.Unlock()
+}
+
+// ---------------------------------------------------------- freshness
+
+// directives parses a Cache-Control field into a map. A directive with no value
+// maps to the empty string, which is enough to test for its presence.
+func directives(h http.Header) map[string]string {
+	out := map[string]string{}
+	for _, v := range h.Values("Cache-Control") {
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			name, value, _ := strings.Cut(part, "=")
+			out[strings.ToLower(strings.TrimSpace(name))] = strings.Trim(strings.TrimSpace(value), `"`)
+		}
+	}
+	return out
+}
+
+// heuristicStatus lists the codes RFC 9111 calls heuristically cacheable: a
+// response with one of these and no explicit lifetime may still be assigned
+// one. Any other status gets a heuristic only when the response opts in with
+// Cache-Control: public.
+var heuristicStatus = map[int]bool{
+	200: true, 203: true, 204: true, 300: true, 301: true, 308: true,
+	404: true, 405: true, 410: true, 414: true, 501: true,
+}
+
+// hasExplicitLifetime reports whether the response states its own freshness.
+// s-maxage deliberately does not count: it addresses shared caches, and this
+// cache is a private one — it is fetch's own, serving a single user agent.
+func hasExplicitLifetime(h http.Header) bool {
+	if _, ok := directives(h)["max-age"]; ok {
+		return true
+	}
+	return h.Get("Expires") != ""
+}
+
+// freshnessLifetime is how long the response may be reused without asking:
+// max-age, then Expires, then — with nothing explicit — the heuristic the
+// standard suggests, one tenth of the time since Last-Modified. The heuristic
+// applies only where the standard allows one: a heuristically-cacheable status,
+// or an explicit Cache-Control: public.
+func (e *cacheEntry) freshnessLifetime() time.Duration {
+	cc := directives(e.header)
+	if v, ok := cc["max-age"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			return time.Duration(n) * time.Second
+		}
+	}
+	base := e.received
+	if d := e.header.Get("Date"); d != "" {
+		if dt, derr := http.ParseTime(d); derr == nil {
+			base = dt
+		}
+	}
+	if exp := e.header.Get("Expires"); exp != "" {
+		t, err := http.ParseTime(exp)
+		if err != nil || t.Before(base) {
+			// An unparseable or past Expires means already expired.
+			return 0
+		}
+		return t.Sub(base)
+	}
+	_, public := cc["public"]
+	if !heuristicStatus[e.status] && !public {
+		return 0
+	}
+	if lm := e.header.Get("Last-Modified"); lm != "" {
+		if t, err := http.ParseTime(lm); err == nil && base.After(t) {
+			return base.Sub(t) / 10
+		}
+	}
+	return 0
+}
+
+// freshened is this entry with the 304's headers layered over its own and its
+// clock restarted — a new value, because the stored one may be being served
+// concurrently and is treated as immutable once in the cache.
+func (e *cacheEntry) freshened(h http.Header, requested time.Time) *cacheEntry {
+	out := &cacheEntry{
+		status:    e.status,
+		header:    e.header.Clone(),
+		body:      e.body,
+		requested: requested,
+		received:  time.Now(),
+		varyKey:   e.varyKey,
+	}
+	for k, v := range h {
+		out.header[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+// age is how old the stored response is now, including any Age the server
+// reported when it arrived.
+func (e *cacheEntry) age(now time.Time) time.Duration {
+	var reported time.Duration
+	if a := e.header.Get("Age"); a != "" {
+		if n, err := strconv.Atoi(a); err == nil {
+			reported = time.Duration(n) * time.Second
+		}
+	}
+	return reported + now.Sub(e.received)
+}
+
+// storable reports whether a response may be kept at all. The status matters
+// only when the response says nothing about its own lifetime: an explicit
+// max-age or Expires makes any final status storable — the origin has said how
+// long it is good for — while without one only the heuristically-cacheable
+// statuses may be kept.
+func storable(req *http.Request, resp *http.Response) bool {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return false
+	}
+	// A partial response is not the resource. See the file comment.
+	if resp.StatusCode == http.StatusPartialContent || req.Header.Get("Range") != "" {
+		return false
+	}
+	if resp.StatusCode < 200 {
+		return false
+	}
+	if !hasExplicitLifetime(resp.Header) && !heuristicStatus[resp.StatusCode] {
+		// One more way in: a heuristic is allowed for any status that opts in
+		// with Cache-Control: public (see freshnessLifetime).
+		if _, public := directives(resp.Header)["public"]; !public {
+			return false
+		}
+	}
+	if _, ok := directives(resp.Header)["no-store"]; ok {
+		return false
+	}
+	// Cache-Control: private is NOT a reason to refuse. It forbids SHARED
+	// caches; this cache is a private one — it belongs to the single user agent
+	// doing the fetching, which is exactly who private admits.
+	return true
+}
+
+// ------------------------------------------------------- the transport
+
+type cachingTransport struct {
+	next  http.RoundTripper
+	cache *responseCache
+
+	// revalidating holds the cache keys with a background revalidation already
+	// in flight, so a burst of requests inside the stale-while-revalidate window
+	// costs one origin request rather than one each.
+	revalidatingMu sync.Mutex
+	revalidating   map[string]bool
+}
+
+// staleWhileRevalidate reads the response's RFC 5861 window, if it granted one.
+func staleWhileRevalidate(h http.Header) (time.Duration, bool) {
+	v, ok := directives(h)["stale-while-revalidate"]
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
+}
+
+// revalidateInBackground refreshes a stale entry without making the caller
+// wait. The request is rebuilt free of the caller's context — the caller may
+// be gone before the origin answers, and this revalidation is the cache's
+// business, not the caller's — but bounded, so an origin that never answers
+// cannot accumulate goroutines.
+func (t *cachingTransport) revalidateInBackground(req *http.Request, entry *cacheEntry) {
+	key := cacheKey(req)
+	t.revalidatingMu.Lock()
+	if t.revalidating == nil {
+		t.revalidating = map[string]bool{}
+	}
+	if t.revalidating[key] {
+		t.revalidatingMu.Unlock()
+		return
+	}
+	t.revalidating[key] = true
+	t.revalidatingMu.Unlock()
+
+	out := req.Clone(context.Background())
+	out.Body = nil
+	if etag := entry.header.Get("ETag"); etag != "" {
+		out.Header.Set("If-None-Match", etag)
+	} else if lm := entry.header.Get("Last-Modified"); lm != "" {
+		out.Header.Set("If-Modified-Since", lm)
+	}
+	go func() {
+		defer func() {
+			t.revalidatingMu.Lock()
+			delete(t.revalidating, key)
+			t.revalidatingMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		requested := time.Now()
+		resp, err := t.next.RoundTrip(out.WithContext(ctx))
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotModified {
+			t.cache.put(req, entry.freshened(resp.Header, requested))
+			return
+		}
+		if !storable(req, resp) {
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxEntryBytes))
+		if err != nil {
+			return
+		}
+		t.cache.put(req, &cacheEntry{
+			status: resp.StatusCode, header: resp.Header.Clone(), body: body,
+			requested: requested, received: time.Now(),
+		})
+	}()
+}
+
+// serve turns a stored entry back into a response. The body is a fresh reader
+// over the stored bytes each time, so two callers cannot consume one another's.
+func (e *cacheEntry) serve(req *http.Request) *http.Response {
+	h := make(http.Header, len(e.header))
+	for k, v := range e.header {
+		h[k] = append([]string(nil), v...)
+	}
+	return &http.Response{
+		Status:        strconv.Itoa(e.status) + " " + http.StatusText(e.status),
+		StatusCode:    e.status,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        h,
+		Body:          io.NopCloser(bytes.NewReader(e.body)),
+		ContentLength: int64(len(e.body)),
+		Request:       req,
+	}
+}
+
+// addModeHeaders applies the request headers the mode implies. These are the
+// standard's own words: a reload says "no-cache" to everything in the path, and
+// a no-cache says "max-age=0", which is the difference between "do not use a
+// stored response" and "do not use one without checking".
+func addModeHeaders(req *http.Request, mode cacheMode) {
+	switch mode {
+	case cacheNoStore, cacheReload:
+		if req.Header.Get("Pragma") == "" {
+			req.Header.Set("Pragma", "no-cache")
+		}
+		if req.Header.Get("Cache-Control") == "" {
+			req.Header.Set("Cache-Control", "no-cache")
+		}
+	case cacheNoCache:
+		if req.Header.Get("Cache-Control") == "" {
+			req.Header.Set("Cache-Control", "max-age=0")
+		}
+	}
+}
+
+// conditionalHeaders are the request headers that make the request its own
+// validation. A request carrying one is asking the ORIGIN a question about the
+// resource's state, so the cache must not answer for it.
+var conditionalHeaders = []string{
+	"If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range",
+}
+
+func isConditional(h http.Header) bool {
+	for _, name := range conditionalHeaders {
+		if h.Get(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// reqDirectives is the caller's own Cache-Control (RFC 9111 §5.2.1) — the
+// header a page author writes on a fetch, distinct from fetch's cache MODE.
+// Both express constraints on the cache; the header is the finer instrument.
+type reqDirectives struct {
+	noCache, noStore, onlyIfCached bool
+	maxAge                         time.Duration
+	hasMaxAge                      bool
+	maxStale                       time.Duration
+	hasMaxStale, maxStaleAny       bool
+	minFresh                       time.Duration
+	hasMinFresh                    bool
+}
+
+func parseReqDirectives(h http.Header) reqDirectives {
+	var rd reqDirectives
+	cc := directives(h)
+	_, rd.noCache = cc["no-cache"]
+	_, rd.noStore = cc["no-store"]
+	_, rd.onlyIfCached = cc["only-if-cached"]
+	if v, ok := cc["max-age"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			rd.maxAge, rd.hasMaxAge = time.Duration(n)*time.Second, true
+		}
+	}
+	if v, ok := cc["max-stale"]; ok {
+		rd.hasMaxStale = true
+		if v == "" {
+			// max-stale with no value accepts any staleness at all.
+			rd.maxStaleAny = true
+		} else if n, err := strconv.Atoi(v); err == nil {
+			rd.maxStale = time.Duration(n) * time.Second
+		}
+	}
+	if v, ok := cc["min-fresh"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			rd.minFresh, rd.hasMinFresh = time.Duration(n)*time.Second, true
+		}
+	}
+	return rd
+}
+
+// usableWithoutValidation decides whether a stored entry may answer this
+// request directly. The response's own constraints come first (its no-cache,
+// its lifetime), then the request's: each directive can only make the cache
+// LESS willing, except max-stale, which widens the window for an entry that is
+// merely stale — never for one whose origin said must-revalidate.
+func usableWithoutValidation(e *cacheEntry, rd reqDirectives, now time.Time) bool {
+	cc := directives(e.header)
+	if _, ok := cc["no-cache"]; ok {
+		return false
+	}
+	age, lifetime := e.age(now), e.freshnessLifetime()
+	usable := age < lifetime
+	if rd.hasMaxAge && age > rd.maxAge {
+		usable = false
+	}
+	if rd.hasMinFresh && lifetime-age < rd.minFresh {
+		usable = false
+	}
+	if !usable && rd.hasMaxStale {
+		if _, must := cc["must-revalidate"]; !must && (rd.maxStaleAny || age-lifetime <= rd.maxStale) {
+			usable = true
+		}
+	}
+	return usable
+}
+
+// gatewayTimeout is the answer RFC 9111 gives an only-if-cached request that
+// nothing stored can satisfy: a synthesized 504, not a network attempt.
+func gatewayTimeout(req *http.Request) *http.Response {
+	return &http.Response{
+		Status:        "504 Gateway Timeout",
+		StatusCode:    http.StatusGatewayTimeout,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{},
+		Body:          io.NopCloser(bytes.NewReader(nil)),
+		ContentLength: 0,
+		Request:       req,
+	}
+}
+
+// invalidate drops the entries a successful unsafe request makes stale: the
+// request's own URL, and any same-origin Location / Content-Location target the
+// response names — those are the resources the origin just said it changed.
+func (c *responseCache) invalidate(req *http.Request, resp *http.Response) {
+	drop := func(u *url.URL) {
+		if u == nil || u.Hostname() != req.URL.Hostname() {
+			return
+		}
+		key := http.MethodGet + " " + u.String()
+		c.mu.Lock()
+		for _, old := range c.entries[key] {
+			c.bytes -= len(old.body)
+		}
+		delete(c.entries, key)
+		c.mu.Unlock()
+	}
+	drop(req.URL)
+	for _, name := range []string{"Location", "Content-Location"} {
+		if v := resp.Header.Get(name); v != "" {
+			if u, err := req.URL.Parse(v); err == nil {
+				drop(u)
+			}
+		}
+	}
+}
+
+func (t *cachingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	mode := cacheModeOf(req)
+	rd := parseReqDirectives(req.Header)
+	consult := mode != cacheNoStore && mode != cacheReload && !rd.noStore
+	store := mode != cacheNoStore && !rd.noStore
+	if isConditional(req.Header) {
+		// The caller wrote its own validator: it wants the origin's answer, and a
+		// stored response is not that answer.
+		consult, store = false, false
+	}
+
+	var entry *cacheEntry
+	if consult && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
+		entry = t.cache.get(req)
+	}
+	if entry != nil {
+		switch mode {
+		case cacheForceCache, cacheOnlyIfCached:
+			// Both take a stored response however stale it is; they differ only in
+			// what happens when there is none.
+			return entry.serve(req), nil
+		case cacheDefault:
+			// The request's own only-if-cached directive takes whatever is stored;
+			// its no-cache forbids answering without revalidating, whatever the
+			// entry's freshness.
+			if rd.onlyIfCached {
+				return entry.serve(req), nil
+			}
+			now := time.Now()
+			if !rd.noCache && usableWithoutValidation(entry, rd, now) {
+				return entry.serve(req), nil
+			}
+			// stale-while-revalidate (RFC 5861): within the window the response
+			// granted, a stale entry is served IMMEDIATELY and the revalidation
+			// happens behind the caller's back — that trade of staleness for
+			// latency is the whole point of the directive. Only when the request
+			// itself imposes no freshness demands of its own.
+			if !rd.noCache && !rd.hasMaxAge && !rd.hasMinFresh {
+				if swr, ok := staleWhileRevalidate(entry.header); ok &&
+					entry.age(now)-entry.freshnessLifetime() <= swr {
+					t.revalidateInBackground(req, entry)
+					return entry.serve(req), nil
+				}
+			}
+		}
+	}
+	if entry == nil && mode == cacheOnlyIfCached {
+		// The standard makes this a network error rather than an empty response:
+		// the caller asked for the cache and there is nothing there.
+		return nil, errOnlyIfCached
+	}
+	if entry == nil && rd.onlyIfCached && mode != cacheNoStore && mode != cacheReload {
+		// As a HEADER, only-if-cached answers differently than the fetch MODE
+		// does: HTTP's own rule is a synthesized 504, not an error.
+		return gatewayTimeout(req), nil
+	}
+
+	out := req.Clone(req.Context())
+	addModeHeaders(out, mode)
+	// A stale entry with a validator is revalidated rather than refetched, which
+	// is the whole economy of an HTTP cache: the server answers 304 and no body
+	// crosses the network.
+	if entry != nil && mode != cacheReload {
+		if etag := entry.header.Get("ETag"); etag != "" && out.Header.Get("If-None-Match") == "" {
+			out.Header.Set("If-None-Match", etag)
+		} else if lm := entry.header.Get("Last-Modified"); lm != "" && out.Header.Get("If-Modified-Since") == "" {
+			out.Header.Set("If-Modified-Since", lm)
+		}
+	}
+
+	requested := time.Now()
+	resp, err := t.next.RoundTrip(out)
+	if err != nil {
+		return nil, err
+	}
+	// A successful unsafe request invalidates what it changed: its own URL, and
+	// the Location / Content-Location resources the response names.
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+	default:
+		if resp.StatusCode < 400 {
+			t.cache.invalidate(req, resp)
+		}
+	}
+	if resp.StatusCode == http.StatusNotModified && entry != nil {
+		// Freshen the stored headers and serve the stored body. The response's
+		// own headers win where it sends them, since they are the newer word.
+		// The freshening builds a NEW entry rather than mutating the stored one:
+		// another request may be serving that entry's headers right now.
+		resp.Body.Close()
+		fresh := entry.freshened(resp.Header, requested)
+		if store {
+			t.cache.put(req, fresh)
+		}
+		return fresh.serve(req), nil
+	}
+	if !store || !storable(req, resp) {
+		return resp, nil
+	}
+	// The body is stored as the caller reads it, not read ahead of them. Reading
+	// it here first would turn every cacheable response into a buffered one, which
+	// is exactly what a streaming proxy must not do — and a cache is no reason for
+	// the first byte to wait for the last.
+	stored := &cacheEntry{
+		status:    resp.StatusCode,
+		header:    resp.Header.Clone(),
+		requested: requested,
+		received:  time.Now(),
+	}
+	resp.Body = &cacheFiller{
+		rc:    resp.Body,
+		limit: maxEntryBytes,
+		// The declared length is how completeness is recognised without an EOF: a
+		// consumer that reads exactly Content-Length bytes and closes never sees
+		// one, and that consumer is the common case here.
+		expect: resp.ContentLength,
+		done: func(body []byte) {
+			stored.body = body
+			t.cache.put(req, stored)
+		},
+	}
+	return resp, nil
+}
+
+// maxEntryBytes caps one stored body. A response larger than this streams
+// through unstored: holding it would evict everything else to cache one thing.
+const maxEntryBytes = maxCacheBytes / 4
+
+// cacheFiller copies what the caller reads into a buffer, and stores the entry
+// once the body has been read to its end. A body that errors, or outgrows the
+// cap, is simply not stored — the caller's read is unaffected either way.
+type cacheFiller struct {
+	rc     io.ReadCloser
+	buf    bytes.Buffer
+	limit  int
+	expect int64 // the declared Content-Length, or -1 when unknown
+	done   func([]byte)
+	giveUp bool
+	stored bool
+}
+
+// finish stores the body, once. A body that errored, outgrew the cap, or is
+// short of its declared length is not stored: half a response is not a response.
+func (f *cacheFiller) finish() {
+	if f.giveUp || f.stored {
+		return
+	}
+	f.stored = true
+	f.done(append([]byte(nil), f.buf.Bytes()...))
+}
+
+func (f *cacheFiller) Read(p []byte) (int, error) {
+	n, err := f.rc.Read(p)
+	if n > 0 && !f.giveUp {
+		if f.buf.Len()+n > f.limit {
+			f.giveUp = true
+			f.buf.Reset()
+		} else {
+			f.buf.Write(p[:n])
+		}
+	}
+	if err == io.EOF {
+		f.finish()
+	} else if err != nil {
+		f.giveUp = true
+	} else if f.expect >= 0 && int64(f.buf.Len()) >= f.expect {
+		// Every byte the response promised has arrived; a consumer that stops here
+		// never calls Read again.
+		f.finish()
+	}
+	return n, err
+}
+
+func (f *cacheFiller) Close() error {
+	if f.expect >= 0 && int64(f.buf.Len()) >= f.expect {
+		f.finish()
+	}
+	return f.rc.Close()
 }

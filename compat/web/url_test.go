@@ -1,174 +1,298 @@
-package web
-
-// The URL parser is checked directly against the Web Platform Tests' own data
-// files rather than only through the JavaScript surface. Those files ARE the
-// specification's test suite; running them here means a parser change is judged
-// by the standard in a second, not by a suite run in a minute, and it keeps the
-// host-side algorithm honest independently of the shell over it.
+package web_test
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
+	spidermonkey "github.com/goccy/go-spidermonkey"
 	"testing"
 )
 
-// urlCase mirrors one entry of url/resources/urltestdata.json. A "failure"
-// entry expects the parse to be rejected; every other entry lists the value of
-// each attribute of the resulting URL.
-type urlCase struct {
-	Input    string  `json:"input"`
-	Base     *string `json:"base"`
-	Failure  bool    `json:"failure"`
-	Relative *bool   `json:"relativeFlag"`
-	Href     string  `json:"href"`
-	Origin   *string `json:"origin"`
-	Protocol string  `json:"protocol"`
-	Username string  `json:"username"`
-	Password string  `json:"password"`
-	Host     string  `json:"host"`
-	Hostname string  `json:"hostname"`
-	Port     string  `json:"port"`
-	Pathname string  `json:"pathname"`
-	Search   string  `json:"search"`
-	Hash     string  `json:"hash"`
-}
+// TestURLPercentEncoding verifies the WHATWG basic URL parser percent-encodes
+// components on output per their encode sets and never double-encodes an
+// already-valid %XX escape.
+func TestURLPercentEncoding(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
 
-func suitePath(t *testing.T, rel string) string {
-	t.Helper()
-	p := filepath.Join("..", "..", "wpt", "suite", rel)
-	if _, err := os.Stat(p); err != nil {
-		t.Skipf("web-platform-tests checkout not present (%s); run `make wpt-fetch`", rel)
-	}
-	return p
-}
-
-func loadJSON(t *testing.T, rel string, into any) {
-	t.Helper()
-	b, err := os.ReadFile(suitePath(t, rel))
-	if err != nil {
-		t.Fatalf("read %s: %v", rel, err)
-	}
-	if err := json.Unmarshal(b, into); err != nil {
-		t.Fatalf("parse %s: %v", rel, err)
+	for _, tc := range [][2]string{
+		{`new URL("http://h/a b").href`, "http://h/a%20b"},
+		{`new URL("http://h/a b").pathname`, "/a%20b"},
+		{`new URL("http://h/p?a=b c#d e").href`, "http://h/p?a=b%20c#d%20e"},
+		{`new URL("http://h/a<b>{c}").pathname`, "/a%3Cb%3E%7Bc%7D"},
+		// Valid %XX escapes pass through untouched (no double-encoding).
+		{`new URL("http://h/%7Efoo").href`, "http://h/%7Efoo"},
+		{`new URL("http://h/p?q=%20x").search`, "?q=%20x"},
+		// Userinfo has the larger encode set.
+		{`new URL("http://u ser:p@h/").username`, "u%20ser"},
+		{`new URL("http://u^s:p|w@h/").username + "|" + new URL("http://u^s:p;w@h/").password`, "u%5Es|p%3Bw"},
+		{`new URL("http://u ser:p@h/").href`, "http://u%20ser:p@h/"},
+		// Non-ASCII is percent-encoded in path/query/fragment.
+		{`new URL("http://h/caf\u00e9").pathname`, "/caf%C3%A9"},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
+		}
 	}
 }
 
-func TestURLParserAgainstWPTData(t *testing.T) {
-	// The file mixes comment strings in among the case objects.
-	var raw []json.RawMessage
-	loadJSON(t, "url/resources/urltestdata.json", &raw)
+// TestURLControlCharStripping verifies ASCII tab/CR/LF are removed anywhere in
+// the input and C0-control/space is trimmed from both ends before parsing.
+func TestURLControlCharStripping(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
 
-	var pass, fail int
-	for _, entry := range raw {
-		var comment string
-		if json.Unmarshal(entry, &comment) == nil {
-			continue
-		}
-		var c urlCase
-		if err := json.Unmarshal(entry, &c); err != nil {
-			t.Fatalf("case: %v", err)
-		}
-		var base *urlRecord
-		if c.Base != nil {
-			b, err := parseURL(*c.Base, nil, nil, 0, false)
-			if err != nil {
-				// A case whose base does not parse is a case about the base.
-				if !c.Failure {
-					t.Errorf("base %q did not parse (input %q)", *c.Base, c.Input)
-					fail++
-				} else {
-					pass++
-				}
-				continue
-			}
-			base = b
-		}
-		u, err := parseURL(c.Input, base, nil, 0, false)
-		if c.Failure {
-			if err == nil {
-				t.Errorf("input %q base %v: parsed to %q, want failure", c.Input, c.Base, u.href())
-				fail++
-			} else {
-				pass++
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("input %q base %v: %v", c.Input, c.Base, err)
-			fail++
-			continue
-		}
-		got := u.components()
-		bad := false
-		for attr, want := range map[string]string{
-			"href": c.Href, "protocol": c.Protocol, "username": c.Username,
-			"password": c.Password, "host": c.Host, "hostname": c.Hostname,
-			"port": c.Port, "pathname": c.Pathname, "search": c.Search, "hash": c.Hash,
-		} {
-			if got[attr] != want {
-				t.Errorf("input %q base %v: %s = %q, want %q", c.Input, c.Base, attr, got[attr], want)
-				bad = true
-			}
-		}
-		if c.Origin != nil && got["origin"] != *c.Origin {
-			t.Errorf("input %q base %v: origin = %q, want %q", c.Input, c.Base, got["origin"], *c.Origin)
-			bad = true
-		}
-		if bad {
-			fail++
-		} else {
-			pass++
+	for _, tc := range [][2]string{
+		{`new URL("http://h/a\tb\nc").pathname`, "/abc"},
+		{`new URL("ht\ttp://h/x").href`, "http://h/x"},
+		{`new URL("  http://h/x  ").href`, "http://h/x"},
+		{`new URL("\u0000\u0001http://h/x\u0000").href`, "http://h/x"},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
 		}
 	}
-	t.Logf("urltestdata: %d/%d cases pass", pass, pass+fail)
 }
 
-// setterCase mirrors one entry of url/resources/setters_tests.json.
-type setterCase struct {
-	Href     string            `json:"href"`
-	New      string            `json:"new_value"`
-	Expected map[string]string `json:"expected"`
-	Comment  string            `json:"comment"`
-}
+// TestURLBackslashIsSlashForSpecialSchemes verifies "\" acts as "/" in special
+// scheme URLs — both as the authority terminator (the classic host-spoofing
+// vector) and inside paths — while non-special schemes keep it literal.
+func TestURLBackslashIsSlashForSpecialSchemes(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
 
-func TestURLSettersAgainstWPTData(t *testing.T) {
-	var file map[string]json.RawMessage
-	loadJSON(t, "url/resources/setters_tests.json", &file)
-
-	var pass, fail int
-	for attr, raw := range file {
-		if attr == "comment" {
-			continue
-		}
-		if _, ok := setterStates[attr]; !ok && attr != "href" {
-			continue
-		}
-		var cases []setterCase
-		if err := json.Unmarshal(raw, &cases); err != nil {
-			t.Fatalf("%s: %v", attr, err)
-		}
-		for _, c := range cases {
-			u, err := parseURL(c.Href, nil, nil, 0, false)
-			if err != nil {
-				t.Errorf("%s: href %q did not parse: %v", attr, c.Href, err)
-				fail++
-				continue
-			}
-			got := applySetter(u, attr, c.New)
-			bad := false
-			for k, want := range c.Expected {
-				if got[k] != want {
-					t.Errorf("%s on %q = %q: %s = %q, want %q", attr, c.Href, c.New, k, got[k], want)
-					bad = true
-				}
-			}
-			if bad {
-				fail++
-			} else {
-				pass++
-			}
+	for _, tc := range [][2]string{
+		{`new URL("http://h\\evil.com/x").hostname`, "h"},
+		{`new URL("http://h\\evil.com/x").pathname`, "/evil.com/x"},
+		{`new URL("https://h/a\\b").pathname`, "/a/b"},
+		{`new URL("\\d", "http://h/a/b").href`, "http://h/d"},
+		{`new URL("\\\\other.io\\p", "https://h/a").href`, "https://other.io/p"},
+		// Non-special schemes keep the backslash literal ("\" is not in the
+		// WHATWG path percent-encode set).
+		{`new URL("git-x://h/a\\b").pathname`, `/a\b`},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
 		}
 	}
-	t.Logf("setters_tests: %d/%d cases pass", pass, pass+fail)
+}
+
+// TestURLIPv4Normalization verifies dotted-decimal canonicalization of hosts
+// that end in a number: leading zeros (octal), hex parts, and fewer than four
+// parts all normalize; out-of-range addresses are invalid URLs.
+func TestURLIPv4Normalization(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	for _, tc := range [][2]string{
+		{`new URL("http://192.168.000.001/").hostname`, "192.168.0.1"},
+		{`new URL("http://0x7f.1/").hostname`, "127.0.0.1"},
+		{`new URL("http://127.1/").hostname`, "127.0.0.1"},
+		{`new URL("http://2130706433/").hostname`, "127.0.0.1"},
+		{`new URL("http://0x7f000001/").hostname`, "127.0.0.1"},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
+		}
+	}
+	for _, bad := range []string{
+		`new URL("http://999.1.1.1/")`,   // part > 255
+		`new URL("http://1.2.3.4.5/")`,   // 5 parts, ends in a number
+		`new URL("http://1.2.3.4444/")`,  // last part out of range
+		`new URL("http://0x100000000/")`, // whole address out of range
+	} {
+		if got := evalString(t, js, `(() => { try { `+bad+`; return "no-throw"; } catch (e) { return e instanceof TypeError ? "TypeError" : "other"; } })()`); got != "TypeError" {
+			t.Errorf("%s: got %q, want TypeError", bad, got)
+		}
+	}
+}
+
+// TestURLHostPunycode verifies non-ASCII hostnames come out IDNA-encoded
+// (lowercase + NFC + RFC 3492 punycode) in hostname/href.
+func TestURLHostPunycode(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	for _, tc := range [][2]string{
+		{`new URL("http://ma\u00f1ana.com/").hostname`, "xn--maana-pta.com"},
+		{`new URL("http://MA\u00d1ANA.com/x").href`, "http://xn--maana-pta.com/x"},
+		// NFC: "n" + combining tilde composes to U+00F1 first.
+		{`new URL("http://man\u0303ana.com/").hostname`, "xn--maana-pta.com"},
+		{`new URL("http://B\u00dcCHER.de/").hostname`, "xn--bcher-kva.de"},
+		{`new URL("HTTP://EXAMPLE.COM:80/").href`, "http://example.com/"},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
+		}
+	}
+}
+
+// TestURLPathNormalization verifies "." and ".." segments (including %2e
+// escapes) resolve while empty segments are preserved.
+func TestURLPathNormalization(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	for _, tc := range [][2]string{
+		{`new URL("http://h/a/./b/../c").pathname`, "/a/c"},
+		{`new URL("http://h/a/%2e%2e/b").pathname`, "/b"},
+		{`new URL("http://h/a/%2E/b").pathname`, "/a/b"},
+		{`new URL("http://h//x").pathname`, "//x"},
+		{`new URL("http://h/a/..").pathname`, "/"},
+		{`new URL("http://h/a/b/.").pathname`, "/a/b/"},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
+		}
+	}
+}
+
+// TestURLFileHostParsing verifies file: URLs keep the WHATWG file-host rules:
+// "file:///p" has an EMPTY host (the third slash starts the path, unlike
+// http's ignore-extra-slashes rule) and a "localhost" host normalizes to "".
+func TestURLFileHostParsing(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	for _, tc := range [][2]string{
+		{`new URL("file:///tmp/x").hostname + "|" + new URL("file:///tmp/x").pathname`, "|/tmp/x"},
+		{`new URL("file://localhost/tmp/x").href`, "file:///tmp/x"},
+		{`new URL("file://host.example/x").hostname`, "host.example"},
+		{`new URL("file:/tmp/x").href`, "file:///tmp/x"},
+		{`new URL("http:///x").hostname`, "x"}, // http DOES skip extra slashes
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
+		}
+	}
+}
+
+// TestURLSettersCanonicalize verifies the component setters run through the
+// same encode/parse pipeline as the constructor.
+func TestURLSettersCanonicalize(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	for _, tc := range [][2]string{
+		{`(() => { const u = new URL("http://h/"); u.pathname = "/a b"; return u.href; })()`, "http://h/a%20b"},
+		{`(() => { const u = new URL("http://h/"); u.pathname = "a\\b"; return u.pathname; })()`, "/a/b"},
+		{`(() => { const u = new URL("http://h/"); u.search = "a=b c"; return u.search; })()`, "?a=b%20c"},
+		{`(() => { const u = new URL("http://h/"); u.hash = "d e"; return u.hash; })()`, "#d%20e"},
+		{`(() => { const u = new URL("http://h/"); u.username = "u u"; return u.href; })()`, "http://u%20u@h/"},
+		{`(() => { const u = new URL("http://h/"); u.hostname = "192.168.000.001"; return u.hostname; })()`, "192.168.0.1"},
+		{`(() => { const u = new URL("http://h/"); u.hostname = "MA\u00d1ANA.com"; return u.hostname; })()`, "xn--maana-pta.com"},
+		// Invalid host assignment is ignored (WHATWG setter semantics).
+		{`(() => { const u = new URL("http://h/"); u.hostname = "999.1.1.1"; return u.hostname; })()`, "h"},
+		{`(() => { const u = new URL("http://h:8080/"); u.host = "G.com:443"; return u.host; })()`, "g.com:443"},
+		{`(() => { const u = new URL("HTTPS://h/"); u.protocol = "HTTP"; return u.href; })()`, "http://h/"},
+		// pathname setter must not treat "?"/"#" as terminators.
+		{`(() => { const u = new URL("http://h/"); u.pathname = "/a?b#c"; return u.pathname; })()`, "/a%3Fb%23c"},
+	} {
+		if got := evalString(t, js, tc[0]); got != tc[1] {
+			t.Errorf("%s = %q, want %q", tc[0], got, tc[1])
+		}
+	}
+}
+
+// TestURLSearchParamsStayLinkedAfterEncoding verifies searchParams round-trips
+// still work with the encoding pipeline in place.
+func TestURLSearchParamsStayLinkedAfterEncoding(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+
+	if got := evalString(t, js, `
+		const u = new URL("http://h/p?a=b c");
+		const before = u.searchParams.get("a");
+		u.searchParams.set("a", "x y");
+		[before, u.searchParams.get("a"), u.href].join("|")
+	`); got != "b c|x y|http://h/p?a=x+y" {
+		t.Errorf("searchParams round-trip = %q", got)
+	}
+}
+
+// URL protocol setter follows the WHATWG scheme-state override rules: the
+// change is silently refused when the current scheme is file: with an empty
+// host (http URLs require a host we don't have), when switching between
+// special and non-special schemes, and when the new scheme is file: but the
+// URL carries credentials or a port. Regression: file:///tmp/x with
+// u.protocol = "http:" produced a corrupt href.
+func TestURLProtocolSetterSchemeOverrideRules(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	eval(t, js, `
+		globalThis.__c = {};
+		{
+			// file: with an EMPTY host cannot change scheme.
+			const u = new URL("file:///tmp/x");
+			u.protocol = "http:";
+			__c.fileEmptyHost = u.href;
+		}
+		{
+			// file: WITH a host may switch to another special scheme.
+			const u = new URL("file://host/x");
+			u.protocol = "http:";
+			__c.fileWithHost = u.href;
+		}
+		{
+			// special <-> non-special is still refused.
+			const u = new URL("http://example.com/");
+			u.protocol = "foo:";
+			__c.specialToNon = u.href;
+		}
+		{
+			// http <-> https (both special) still allowed.
+			const u = new URL("http://example.com/");
+			u.protocol = "https:";
+			__c.httpToHttps = u.href;
+		}
+		{
+			// credentials block a switch TO file:.
+			const u = new URL("http://user:pass@example.com/p");
+			u.protocol = "file:";
+			__c.credsToFile = u.href;
+		}
+		{
+			// a non-null port blocks a switch TO file:.
+			const u = new URL("http://example.com:8080/p");
+			u.protocol = "file:";
+			__c.portToFile = u.href;
+		}
+	`)
+	for expr, want := range map[string]string{
+		"__c.fileEmptyHost": "file:///tmp/x",
+		"__c.fileWithHost":  "http://host/x",
+		"__c.specialToNon":  "http://example.com/",
+		"__c.httpToHttps":   "https://example.com/",
+		"__c.credsToFile":   "http://user:pass@example.com/p",
+		"__c.portToFile":    "http://example.com:8080/p",
+	} {
+		if got := evalString(t, js, expr); got != want {
+			t.Errorf("%s = %q, want %q", expr, got, want)
+		}
+	}
+}
+
+// file:-scheme relative references resolve against a file: base per the
+// WHATWG file/file-slash states: "file:x" against "file:///dir/y" is
+// file:///dir/x (base directory + relative path), "file:/x" is rooted, and
+// a bare "file:" keeps the base path (and query when none is supplied).
+// Regression: the base path was ignored, yielding file:///x.
+func TestURLFileSchemeRelativeReference(t *testing.T) {
+	js, _ := newWeb(t, spidermonkey.Config{})
+	eval(t, js, `
+		globalThis.__c = {};
+		__c.rel = new URL("file:x", "file:///dir/y").href;
+		__c.relNested = new URL("file:sub/z", "file:///a/b/c").href;
+		__c.relDot = new URL("file:../up.txt", "file:///a/b/c").href;
+		__c.rooted = new URL("file:/abs", "file:///dir/y").href;
+		__c.bare = new URL("file:", "file:///dir/y?q=1").href;
+		__c.queryOnly = new URL("file:?fresh=1", "file:///dir/y?q=1").href;
+		__c.hostKept = new URL("file:x", "file://host/dir/y").href;
+		__c.authority = new URL("file://other/p", "file:///dir/y").href;
+		__c.noBase = new URL("file:x").href;
+		__c.schemeless = new URL("z.txt", "file:///dir/y").href;
+	`)
+	for expr, want := range map[string]string{
+		"__c.rel":        "file:///dir/x",
+		"__c.relNested":  "file:///a/b/sub/z",
+		"__c.relDot":     "file:///a/up.txt",
+		"__c.rooted":     "file:///abs",
+		"__c.bare":       "file:///dir/y?q=1",
+		"__c.queryOnly":  "file:///dir/y?fresh=1",
+		"__c.hostKept":   "file://host/dir/x",
+		"__c.authority":  "file://other/p",
+		"__c.noBase":     "file:///x",
+		"__c.schemeless": "file:///dir/z.txt",
+	} {
+		if got := evalString(t, js, expr); got != want {
+			t.Errorf("%s = %q, want %q", expr, got, want)
+		}
+	}
 }
