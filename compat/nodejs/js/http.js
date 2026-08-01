@@ -685,6 +685,9 @@
 			this._timeoutTimer = null;
 			// Node: options.timeout arms the idle timeout at request creation.
 			if (cb) this.once("response", cb);
+			// 'close' waits for the round trip, not for the request body (see
+			// emitClose in streams.js).
+			this._closeOnRoundTrip = true;
 			// The client socket exists once the request is actually SENT: a
 			// request that is destroyed (or never ends) must not leave a
 			// socket and its idle timer behind — two hundred abandoned
@@ -713,13 +716,22 @@
 				res.statusCode = r.status;
 				res.statusMessage = r.statusText;
 				idleTimeoutTouch(this); // response headers arrived = activity
+				this._responded = true;
 				res._timeoutPeer = this; // body chunks keep resetting the request's idle timer
 				// The body streams in via __node_http_client_body chunks (routed by
 				// id), so 'response' fires on the headers — a streaming/SSE endpoint
 				// works and the whole body is never buffered in host memory.
 				const id = r.id;
 				res._read = () => ops.http_client_body_resume(id);
+				// The request's own 'close' follows the response's — the round
+				// trip is what a ClientRequest closes over (see _closeOnRoundTrip).
 				res.once("close", () => {
+					const req = res._timeoutPeer;
+					if (req && !req._closeEmitted) {
+						req._closeOnRoundTrip = false;
+						req._closeEmitted = true;
+						req.emit("close");
+					}
 					if (openClientResponses.get(id) === res) {
 						openClientResponses.delete(id);
 						// If the consumer abandoned the body early, stop the host pump.
@@ -789,6 +801,7 @@
 			// round-trip (otherwise an aborted or unconsumed response leaves the host
 			// body pump parked and the event loop never idles).
 			assignClientSocket(this);
+			this._started = true;
 			this._reqId = ops.http_client_req(this.method, this._url, JSON.stringify(this._headers), body, this._agentConfig(), onResponse, onError);
 			callback();
 		}
@@ -805,6 +818,17 @@
 		}
 		_destroy(err, cb) {
 			idleTimeoutClear(this);
+			// No response ever arrived to chain the round-trip close from, so
+			// the destroy IS the end of the round trip.
+			this._closeOnRoundTrip = false;
+			// Destroying a request whose response never came is a connection
+			// that hung up — Node reports it, and callers (timeout handlers
+			// above all) listen for exactly this.
+			if (!err && this._started && !this._responded) {
+				const hangup = new Error("socket hang up");
+				hangup.code = "ECONNRESET";
+				process.nextTick(() => { if (this.listenerCount("error") > 0) this.emit("error", hangup); });
+			}
 			// Cancel the round-trip so an aborted/unconsumed response releases the
 			// host body pump (which the base Writable.destroy invokes exactly once).
 			if (this._reqId !== undefined && this._reqId !== null) {
@@ -837,7 +861,18 @@
 	// 'connect' the tick after. The timeout OPTION arms at assignment; an
 	// explicit setTimeout() during connect waits for it (see setTimeout).
 	function assignClientSocket(req) {
-		if (req.socket || req.destroyed) return;
+		if (req.socket || req._socketPending || req.destroyed) return;
+		// On a TICK: end() runs _final synchronously, so assigning here and
+		// now would emit 'socket' before the caller — get(...) returns, THEN
+		// the listener is attached — could ever hear it.
+		req._socketPending = true;
+		process.nextTick(() => {
+			req._socketPending = false;
+			if (req.socket || req.destroyed) return;
+			assignClientSocketNow(req);
+		});
+	}
+	function assignClientSocketNow(req) {
 		const sock = makeSocket();
 		sock.connecting = true;
 		sock.on("timeout", () => req.emit("timeout"));

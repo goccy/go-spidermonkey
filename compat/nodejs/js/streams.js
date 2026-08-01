@@ -96,6 +96,11 @@
 	// path) must not slip 'close' out before the deferred 'finish'.
 	function emitClose(self) {
 		if (self._closeEmitted) return;
+		// An HTTP ClientRequest finishes its writable half as soon as the body
+		// is sent, but its 'close' means the ROUND TRIP is over — the response
+		// completed, or the request was destroyed. It says so with this flag,
+		// and emits its own close at those points.
+		if (self._closeOnRoundTrip && !(self._ws && self._ws.destroyed)) return;
 		const rs = self._rs, ws = self._ws;
 		const rDone = !rs || rs.endEmitted || rs.destroyed;
 		const wDone = !ws || ws.finishEmitted || ws.destroyed;
