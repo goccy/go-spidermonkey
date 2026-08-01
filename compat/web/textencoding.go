@@ -77,6 +77,12 @@ func (a *Web) opTextDecode(cfg spidermonkey.Config, args []spidermonkey.Value) (
 	if cm, ok := enc.(*charmap.Charmap); ok {
 		return decodeSingleByte(cm, data, fatal), nil
 	}
+	// ISO-8859-8-I is ISO-8859-8 with a different name — the "I" is about
+	// bidi ordering, not bytes — but htmlindex hands it back wrapped in an
+	// internal type, so the charmap assertion above cannot see it.
+	if name, _ := htmlindex.Name(enc); name == "iso-8859-8-i" {
+		return decodeSingleByte(charmap.ISO8859_8, data, fatal), nil
+	}
 
 	dec := enc.NewDecoder()
 	if fatal {
