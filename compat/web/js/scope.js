@@ -116,6 +116,16 @@
 	if (!isWorker) {
 		for (const name of WORKER_ONLY) delete globalThis[name];
 		globalScopeClass("Window");
+		// A window global refers to ITSELF as window — and as frames, parent,
+		// top and (through WindowProxy semantics this runtime does not need)
+		// its own self — so a document-side script that says window.x works.
+		for (const alias of ["window", "frames", "parent", "top"]) {
+			if (!(alias in globalThis)) {
+				Object.defineProperty(globalThis, alias, {
+					get: () => globalThis, enumerable: true, configurable: true,
+				});
+			}
+		}
 		return;
 	}
 

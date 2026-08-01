@@ -151,7 +151,12 @@ var alwaysInstalled = []string{
 // different global — but they are enumerated here so that every global this
 // package installs is accounted for somewhere. See js/scope.js.
 var scopeGlobals = map[Scope][]string{
-	ScopeWindow:          {"Window", "Location", "Navigator"},
+	ScopeWindow: {
+		"Window", "Location", "Navigator",
+		// A window's self-references: window IS the global, and so are the
+		// frame-tree accessors when there is no frame tree.
+		"window", "frames", "parent", "top",
+	},
 	ScopeDedicatedWorker: {"WorkerGlobalScope", "DedicatedWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "postMessage", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},
 	ScopeSharedWorker:    {"WorkerGlobalScope", "SharedWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},
 	ScopeServiceWorker:   {"WorkerGlobalScope", "ServiceWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},

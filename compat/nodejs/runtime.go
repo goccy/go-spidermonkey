@@ -166,6 +166,15 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Node has no `window` — and half the npm registry decides whether it is
+	// in a browser by exactly that: `typeof window !== "undefined"`. The web
+	// layer's window scope defines the self-aliases; a Node global must not
+	// answer to any of them, or every isomorphic package takes the browser
+	// branch and dies on the first window.location.
+	if _, err := js.Eval(context.Background(),
+		`delete globalThis.window; delete globalThis.frames; delete globalThis.parent; delete globalThis.top;`); err != nil {
+		return nil, err
+	}
 	// Snapshot AFTER compat/web has installed and fixed up its own globals, so
 	// this layer only hides the ones it adds itself.
 	preexisting, err := web.SnapshotGlobals(js)

@@ -266,6 +266,12 @@ func newWorker(cfg PoolConfig) (*worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A Workers global is a ServiceWorker-shaped scope: `self`, never
+	// `window` — and code sniffs the difference (see compat/nodejs).
+	if _, err := js.Eval(context.Background(),
+		`delete globalThis.window; delete globalThis.frames; delete globalThis.parent; delete globalThis.top;`); err != nil {
+		return nil, err
+	}
 	wk := &worker{js: js, web: w}
 	if cfg.Loader != nil {
 		js.SetModuleLoader(cfg.Loader)
