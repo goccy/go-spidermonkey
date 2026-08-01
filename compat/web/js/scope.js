@@ -126,6 +126,71 @@
 				});
 			}
 		}
+		// window.postMessage with no other window to reach: the target is this
+		// window itself, which is real behaviour (a window CAN message itself)
+		// and everything a frameless runtime can honestly offer. Serialization
+		// happens at call time, delivery in a later task, per the spec's order.
+		if (typeof globalThis.postMessage !== "function" &&
+			typeof globalThis.structuredClone === "function" &&
+			typeof globalThis.MessageEvent === "function") {
+			Object.defineProperty(globalThis, "postMessage", {
+				value: function postMessage(message, targetOriginOrOptions, transfer) {
+					if (arguments.length < 1) {
+						throw new TypeError("postMessage: a message is required");
+					}
+					let targetOrigin = "/";
+					if (typeof targetOriginOrOptions === "string") {
+						targetOrigin = targetOriginOrOptions;
+						transfer = [...(transfer ?? [])];
+					} else if (targetOriginOrOptions !== undefined && targetOriginOrOptions !== null) {
+						if (typeof targetOriginOrOptions !== "object") {
+							throw new TypeError("postMessage: options must be an object");
+						}
+						targetOrigin = String(targetOriginOrOptions.targetOrigin ?? "/");
+						transfer = [...(targetOriginOrOptions.transfer ?? [])];
+					} else {
+						transfer = [...(transfer ?? [])];
+					}
+					const here = globalThis.location;
+					let deliver = true;
+					if (targetOrigin !== "*" && targetOrigin !== "/") {
+						let parsed;
+						try {
+							parsed = new URL(targetOrigin);
+						} catch {
+							throw new DOMException(
+								`postMessage: invalid targetOrigin "${targetOrigin}"`, "SyntaxError");
+						}
+						deliver = here !== undefined && parsed.origin === here.origin;
+					}
+					const data = globalThis.structuredClone(message, { transfer });
+					if (!deliver) return;
+					globalThis.setTimeout(() => {
+						const ev = new MessageEvent("message", {
+							data, origin: here === undefined ? "" : here.origin, source: globalThis,
+						});
+						globalThis.__dispatch_trusted(globalThis, ev);
+					}, 0);
+				},
+				writable: true, enumerable: true, configurable: true,
+			});
+			// The matching handler attributes, [TreatNonCallableAsNull] like every
+			// other one.
+			const windowHandlers = {};
+			for (const type of ["message", "messageerror"]) {
+				if (("on" + type) in globalThis) continue;
+				Object.defineProperty(globalThis, "on" + type, {
+					get() { return windowHandlers[type] ?? null; },
+					set(fn) {
+						const prev = windowHandlers[type];
+						if (prev) globalThis.removeEventListener(type, prev);
+						windowHandlers[type] = typeof fn === "function" ? fn : null;
+						if (windowHandlers[type]) globalThis.addEventListener(type, windowHandlers[type]);
+					},
+					configurable: true, enumerable: true,
+				});
+			}
+		}
 		return;
 	}
 

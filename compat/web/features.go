@@ -160,6 +160,9 @@ var scopeGlobals = map[Scope][]string{
 		// A window's self-references: window IS the global, and so are the
 		// frame-tree accessors when there is no frame tree.
 		"window", "frames", "parent", "top",
+		// A window can message itself; with no frame tree there is no one
+		// else to reach, and self-delivery is what postMessage means here.
+		"postMessage", "onmessage", "onmessageerror",
 	},
 	ScopeDedicatedWorker: {"WorkerGlobalScope", "DedicatedWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "postMessage", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},
 	ScopeSharedWorker:    {"WorkerGlobalScope", "SharedWorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "close", "onmessage", "onmessageerror", "onconnect", "onlanguagechange", "onoffline", "ononline"},

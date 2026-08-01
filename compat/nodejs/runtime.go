@@ -172,7 +172,8 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	// answer to any of them, or every isomorphic package takes the browser
 	// branch and dies on the first window.location.
 	if _, err := js.Eval(context.Background(),
-		`delete globalThis.window; delete globalThis.frames; delete globalThis.parent; delete globalThis.top;`); err != nil {
+		`for (const g of ["window", "frames", "parent", "top",
+			"postMessage", "onmessage", "onmessageerror"]) delete globalThis[g];`); err != nil {
 		return nil, err
 	}
 	// Snapshot AFTER compat/web has installed and fixed up its own globals, so
