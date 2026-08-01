@@ -108,15 +108,16 @@ func TestStructuredCloneFull(t *testing.T) {
 		t.Errorf("structuredClone function = %s", got)
 	}
 	// Error objects clone their (non-enumerable) message/name and subtype,
-	// rather than collapsing to an empty {}.
+	// rather than collapsing to an empty {} — and [[ErrorData]] serialization
+	// deliberately DROPS every other own property.
 	if got := evalString(t, js, `(() => {
 		const e = new TypeError("boom");
 		e.detail = { code: 42 };
 		const c = structuredClone(e);
 		return [
-			c instanceof TypeError, c.name, c.message, c.detail.code,
+			c instanceof TypeError, c.name, c.message, "detail" in c,
 		].join("|")
-	})()`); got != "true|TypeError|boom|42" {
+	})()`); got != "true|TypeError|boom|false" {
 		t.Errorf("structuredClone Error = %s", got)
 	}
 }

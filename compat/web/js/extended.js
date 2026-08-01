@@ -493,10 +493,8 @@
 			if (value.name !== out.name) { try { out.name = value.name; } catch (_e) { /* read-only name */ } }
 			out.stack = value.stack;
 			if ("cause" in value) out.cause = fullClone(value.cause, seen);
-			for (const k of Object.keys(value)) {
-				if (k === "message" || k === "stack" || k === "cause") continue;
-				out[k] = fullClone(value[k], seen);
-			}
+			// NOTHING else: [[ErrorData]] serializes name, message, stack and
+			// cause, and deliberately drops every other own property.
 			return out;
 		}
 
