@@ -85,6 +85,32 @@ func (p *selParser) parseList(nested bool) ([][]selStep, error) {
 	}
 }
 
+// parseRelativeList parses :has()'s argument: each complex selector may open
+// with a combinator, recorded on its FIRST step (" " when none is written).
+func (p *selParser) parseRelativeList() ([][]selStep, error) {
+	var list [][]selStep
+	for {
+		p.skipSpace()
+		lead := " "
+		if p.i < len(p.s) && (p.s[p.i] == '>' || p.s[p.i] == '+' || p.s[p.i] == '~') {
+			lead = string(p.s[p.i])
+			p.i++
+		}
+		c, err := p.parseComplex(true)
+		if err != nil {
+			return nil, err
+		}
+		c[0].C = lead
+		list = append(list, c)
+		p.skipSpace()
+		if p.i < len(p.s) && p.s[p.i] == ',' {
+			p.i++
+			continue
+		}
+		return list, nil
+	}
+}
+
 func (p *selParser) parseComplex(nested bool) ([]selStep, error) {
 	p.skipSpace()
 	first, err := p.parseCompound()
@@ -239,6 +265,8 @@ var simplePseudos = map[string]bool{
 	// no interaction state to consult.
 	"hover": true, "active": true, "focus": true,
 	"focus-within": true, "focus-visible": true, "target": true,
+	// Constraint validation, answered from attribute state (see the matcher).
+	"valid": true, "invalid": true, "required": true, "optional": true,
 }
 
 func (p *selParser) parsePseudo() (selPseudo, error) {
@@ -250,6 +278,24 @@ func (p *selParser) parsePseudo() (selPseudo, error) {
 	ps.N = strings.ToLower(name)
 	hasArgs := p.i < len(p.s) && p.s[p.i] == '('
 	switch ps.N {
+	case "has":
+		// :has takes RELATIVE selectors — a leading combinator anchors the
+		// argument to the element itself.
+		if !hasArgs {
+			return ps, fmt.Errorf(":has needs arguments")
+		}
+		p.i++
+		list, err := p.parseRelativeList()
+		if err != nil {
+			return ps, err
+		}
+		ps.L = list
+		p.skipSpace()
+		if p.i >= len(p.s) || p.s[p.i] != ')' {
+			return ps, fmt.Errorf("expected )")
+		}
+		p.i++
+		return ps, nil
 	case "not", "is", "where":
 		if !hasArgs {
 			return ps, fmt.Errorf(":%s needs arguments", ps.N)

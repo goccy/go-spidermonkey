@@ -178,7 +178,7 @@
 			// The matching handler attributes, [TreatNonCallableAsNull] like every
 			// other one.
 			const windowHandlers = {};
-			for (const type of ["message", "messageerror"]) {
+			for (const type of ["message", "messageerror", "load", "error"]) {
 				if (("on" + type) in globalThis) continue;
 				Object.defineProperty(globalThis, "on" + type, {
 					get() { return windowHandlers[type] ?? null; },

@@ -123,6 +123,17 @@ func Expand(root string, paths []string) ([]Case, error) {
 		if err != nil {
 			return nil, err
 		}
+		if strings.HasSuffix(p, ".html") || strings.HasSuffix(p, ".htm") {
+			ht := parseHTMLTest(string(b))
+			variants := ht.variants
+			if len(variants) == 0 {
+				variants = []string{""}
+			}
+			for _, v := range variants {
+				out = append(out, Case{Path: p, Scope: "window", Variant: v})
+			}
+			continue
+		}
 		m := parseMeta(string(b))
 		variants := m.variant
 		if len(variants) == 0 {
@@ -298,16 +309,17 @@ func scopeFor(scope string) web.Scope {
 
 // collector installs the completion callback that carries the per-subtest
 // verdicts back to the host as JSON on a global.
-const collector = `
+func collectorFor(explicitDone bool) string {
+	return `
 (function () {
   const H = ` + harnessStatusNamesJSFrag + `;
   const S = ` + subtestStatusNamesJSFrag + `;
-  // Completion is EXPLICIT in every scope. Without a document, testharness
-  // detects a shell environment, whose harness completes the moment no test
-  // is pending — which, while a file's synchronous tests are still being
-  // declared one statement apart, is after the FIRST of them. Every test
-  // declared after that vanished without failing anything. The runner
-  // appends the done() call for the scopes whose wrapper would have it.
+  // For the SCRIPT forms completion is explicit: their browser wrappers end
+  // in done(), and this runner appends the same call — without it, a file's
+  // synchronous tests still being declared one statement apart would complete
+  // the harness after the FIRST of them. An .html page instead completes the
+  // way a browser page does, on load with no pending tests, so explicit_done
+  // is off there.
   // output: false — with the DOM module installed, testharness sees a real
   // window environment and would render its results into the document; this
   // runner reads them through the completion callback instead.
@@ -315,7 +327,7 @@ const collector = `
   // (10s, before any META: timeout=long is knowable from here), which a
   // 12-second synchronous test tripped. The HOST enforces the per-file
   // timeout; testharness must not race it.
-  setup({ explicit_done: true, output: false, explicit_timeout: true });
+  setup({ explicit_done: ` + fmt.Sprintf("%t", explicitDone) + `, output: false, explicit_timeout: true });
   add_completion_callback(function (tests, status) {
     try {
     globalThis.__wpt_result = JSON.stringify({
@@ -340,6 +352,7 @@ const collector = `
   });
 })();
 `
+}
 
 // importScriptsShimFor satisfies the call a classic-worker test makes for the
 // scripts the harness has already loaded (see importedScripts), and THROWS for
@@ -361,6 +374,15 @@ func importScriptsShimFor(loaded []string) string {
   };
 })();
 `
+}
+
+// step is one evaluation of a run: a prelude, the harness, a script, or a
+// piece of runner glue. A module step goes through EvalModule under `spec`.
+type step struct {
+	name   string
+	src    string
+	module bool
+	spec   string
 }
 
 // Run executes one .any.js test file and returns its per-subtest verdicts.
@@ -407,6 +429,11 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	}
 	src := substituteWPT(rel, srcBytes, opts.SubVars)
 	m := parseMeta(string(src))
+	var ht htmlTest
+	if strings.HasSuffix(rel, ".html") || strings.HasSuffix(rel, ".htm") {
+		ht = parseHTMLTest(string(src))
+		m.long = ht.long
+	}
 	if m.long {
 		timeout *= 2
 	}
@@ -476,15 +503,18 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	// prelude, the harness, the completion collector, the META scripts, then
 	// the test itself. They run as separate evaluations so a syntax error in
 	// one is reported against that file.
-	steps := []struct{ name, src string }{{"<prelude>", preludeFor(base, rel+c.Variant, c.Scope)}}
+	steps := []step{{name: "<prelude>", src: preludeFor(base, rel+c.Variant, c.Scope)}}
 	harness, err := os.ReadFile(path.Join(opts.Root, "resources/testharness.js"))
 	if err != nil {
 		res.Harness, res.Message = string(StatusError), "testharness.js: "+err.Error()
 		return res
 	}
+	isHTML := strings.HasSuffix(rel, ".html") || strings.HasSuffix(rel, ".htm")
 	steps = append(steps,
-		struct{ name, src string }{"resources/testharness.js", string(harness)},
-		struct{ name, src string }{"<collector>", collector},
+		step{name: "resources/testharness.js", src: string(harness)},
+		// An .html page completes the way a browser page does — on load, with
+		// no pending tests — while the script forms end in an explicit done().
+		step{name: "<collector>", src: collectorFor(!isHTML)},
 	)
 	scripts := m.scripts
 	if strings.HasSuffix(rel, ".worker.js") {
@@ -492,8 +522,8 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 		// META directives; those files are loaded here, and the call is defined so
 		// that anything NOT pre-loaded is reported rather than silently skipped.
 		imported := importedScripts(string(src))
-		steps = append(steps, struct{ name, src string }{
-			"<importScripts>", importScriptsShimFor(append(imported, "/resources/testharness.js"))})
+		steps = append(steps, step{name: "<importScripts>",
+			src: importScriptsShimFor(append(imported, "/resources/testharness.js"))})
 		scripts = append(imported, scripts...)
 	} else if c.Scope != "" && c.Scope != "window" {
 		// A worker-scope .any.js reaches a browser as a generated wrapper that
@@ -501,8 +531,8 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 		// already loaded here, but the CALL has to exist: importScripts is part of
 		// the worker surface, and a test that uses it directly (workers/ has
 		// several) must not fail on its absence.
-		steps = append(steps, struct{ name, src string }{
-			"<importScripts>", importScriptsShimFor([]string{"/resources/testharness.js"})})
+		steps = append(steps, step{name: "<importScripts>",
+			src: importScriptsShimFor([]string{"/resources/testharness.js"})})
 	}
 	for _, s := range scripts {
 		p := resolveScript(rel, s)
@@ -511,21 +541,50 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 			res.Harness, res.Message = string(StatusError), "META script "+s+": "+err.Error()
 			return res
 		}
-		steps = append(steps, struct{ name, src string }{p, string(substituteWPT(p, b, opts.SubVars))})
+		steps = append(steps, step{name: p, src: string(substituteWPT(p, b, opts.SubVars))})
 	}
-	steps = append(steps, struct{ name, src string }{rel, string(src)})
+	if isHTML {
+		// The page itself: the parsed tree replaces the about:blank document,
+		// then the page's scripts run in document order — which is a browser
+		// with every script deferred, the shape testharness pages are written
+		// for. Scripts the checkout cannot supply behave like a failed fetch:
+		// the browser fires the script's error event and the page goes on.
+		docJSON, _ := json.Marshal(string(src))
+		steps = append(steps, step{name: "<document>", src: `(() => {
+	const doc = new DOMParser().parseFromString(` + string(docJSON) + `, "text/html");
+	while (document.firstChild) document.removeChild(document.firstChild);
+	for (const k of [...doc.childNodes]) document.appendChild(document.adoptNode(k));
+})();`})
+		for i, sc := range ht.scripts {
+			if sc.src != "" {
+				p := resolveScript(rel, sc.src)
+				b, err := os.ReadFile(path.Join(opts.Root, p))
+				if err != nil {
+					steps = append(steps, step{name: "<missing " + sc.src + ">", src: ";"})
+					continue
+				}
+				steps = append(steps, step{name: p, src: string(substituteWPT(p, b, opts.SubVars)),
+					module: sc.module, spec: p})
+				continue
+			}
+			steps = append(steps, step{name: fmt.Sprintf("<script %d>", i+1), src: sc.text,
+				module: sc.module, spec: path.Dir(rel) + fmt.Sprintf("/__inline_module_%d.js", i+1)})
+		}
+	} else {
+		steps = append(steps, step{name: rel, src: string(src)})
+	}
 	if c.Scope == "window" {
 		// A window test environment completes only after the window's load
 		// event; there is no loader here, so the runner IS the loader and
 		// says so once the file's synchronous code has run.
-		steps = append(steps, struct{ name, src string }{"<load>",
-			`globalThis.dispatchEvent(new Event("load"));`})
+		steps = append(steps, step{name: "<load>",
+			src: `globalThis.dispatchEvent(new Event("load"));`})
 	}
-	if !strings.HasSuffix(rel, ".worker.js") {
+	if !strings.HasSuffix(rel, ".worker.js") && !isHTML {
 		// ...and the wrapper ends with done(), in EVERY scope: the collector
 		// forces explicit completion (see its comment), and a browser's
 		// generated .any.js wrappers end with done() the same way.
-		steps = append(steps, struct{ name, src string }{"<done>", "done();"})
+		steps = append(steps, step{name: "<done>", src: "done();"})
 	}
 	// The guest-side watchdog. explicit_timeout disarmed testharness's own
 	// (it fires at 10s regardless of META: timeout=long), so a file whose
@@ -539,10 +598,27 @@ func runOnce(ctx context.Context, opts Options, c Case) FileResult {
 	if m.long {
 		watchdogMS = 60000
 	}
-	steps = append(steps, struct{ name, src string }{"<watchdog>",
-		fmt.Sprintf("setTimeout(() => timeout(), %d);", watchdogMS)})
+	steps = append(steps, step{name: "<watchdog>",
+		src: fmt.Sprintf("setTimeout(() => timeout(), %d);", watchdogMS)})
 
 	for _, st := range steps {
+		if st.module {
+			// A <script type=module> — its imports resolve against the
+			// specifier, which is the script's own suite path.
+			mr, err := js.EvalModule(ctx, st.spec, st.src)
+			if err != nil {
+				res.Harness = string(StatusError)
+				res.Message = st.name + ": " + err.Error()
+				res.Took = time.Since(start)
+				return res
+			}
+			if mr.Error != nil {
+				// A throwing module is a page error, not a harness error: the
+				// browser reports it and the page (and its other scripts) go on.
+				fmt.Fprintf(out, "module %s: %v\n", st.name, mr.Error)
+			}
+			continue
+		}
 		r, err := js.Eval(ctx, st.src)
 		if err != nil {
 			res.Harness = string(StatusError)
@@ -633,9 +709,12 @@ func importedScripts(src string) []string {
 	return out
 }
 
-// List walks dir and returns every runnable test file, suite-relative.
-// Only the script forms — .any.js, .worker.js and .window.js — can run
-// without a browser.
+// List walks dir and returns every runnable test file, suite-relative: the
+// script forms — .any.js, .worker.js, .window.js — plus the .html testharness
+// pages the DOM module can host. An .html file is classified by content, the
+// way the upstream manifest does it: only a page that pulls in
+// resources/testharness.js has a harness to report to (reftests, crash tests
+// and manual tests do not).
 func List(root string, dirs []string) ([]string, error) {
 	var out []string
 	for _, d := range dirs {
@@ -649,6 +728,16 @@ func List(root string, dirs []string) ([]string, error) {
 			if strings.HasSuffix(p, ".any.js") || strings.HasSuffix(p, ".worker.js") ||
 				strings.HasSuffix(p, ".window.js") {
 				out = append(out, p)
+			}
+			// The .html form is gated until its expectations baseline lands:
+			// listing ~15,000 new cases without one would fail every run.
+			// TODO(dom stage 2): drop the gate with the baseline refresh.
+			if os.Getenv("WPT_HTML") != "" &&
+				(strings.HasSuffix(p, ".html") || strings.HasSuffix(p, ".htm")) {
+				b, err := os.ReadFile(path.Join(root, p))
+				if err == nil && isHTMLTestFile(p, b) {
+					out = append(out, p)
+				}
 			}
 			return nil
 		})

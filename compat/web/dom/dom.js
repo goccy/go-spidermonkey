@@ -669,12 +669,14 @@
 				default: throw domError(`"${position}" is not an insertion position`, "SyntaxError");
 			}
 		}
-		matches(selectors) { return matchesSelector(this, compileSelector(selectors), null); }
+		matches(selectors) { return matchesSelector(this, compileSelector(selectors), this); }
 		webkitMatchesSelector(selectors) { return this.matches(selectors); }
 		closest(selectors) {
+			// :scope inside closest() means the element closest() was called
+			// on, whichever ancestor is being tried.
 			const ast = compileSelector(selectors);
 			for (let n = this; n instanceof Element; n = n._parent) {
-				if (matchesSelector(n, ast, null)) return n;
+				if (matchesSelector(n, ast, this)) return n;
 			}
 			return null;
 		}
@@ -1466,6 +1468,61 @@
 		const i = sibs.indexOf(el);
 		return fromEnd ? sibs.length - i : i + 1;
 	}
+	// The constraint-validation state, from the attributes — all the state a
+	// renderless runtime has. An input/textarea is invalid when required and
+	// empty; a select when required and its chosen option's value is empty; a
+	// fieldset (or form) when any submittable descendant is invalid.
+	function elementInvalid(el) {
+		if (el.hasAttribute("disabled")) return false;
+		switch (el._local) {
+			case "input":
+				return el.hasAttribute("required") && !(el.getAttribute("value") ?? "");
+			case "textarea":
+				return el.hasAttribute("required") && el.textContent === "";
+			case "select": {
+				if (!el.hasAttribute("required")) return false;
+				const options = [...elementDescendants(el)].filter((o) => o._local === "option");
+				const chosen = options.find((o) => o.hasAttribute("selected")) ?? options[0];
+				if (!chosen) return true;
+				return (chosen.getAttribute("value") ?? chosen.textContent) === "";
+			}
+			case "fieldset": case "form": {
+				for (const d of elementDescendants(el)) {
+					if (["input", "textarea", "select"].includes(d._local) && elementInvalid(d)) return true;
+				}
+				return false;
+			}
+			default:
+				return null; // not a candidate: matches neither :valid nor :invalid
+		}
+	}
+
+	// :has(relative-list): does any element, taken relative to el, match? The
+	// relative complex is evaluated as if prefixed by an anchor at el — which
+	// is NOT the same thing as :scope: a ":has(> :scope)" argument anchors at
+	// the candidate while its :scope still means the outer scoping root, so
+	// the anchor is its own (internal) pseudo, carried on a stack because
+	// :has can nest through :is/:not.
+	const anchorStack = [];
+	function hasMatch(el, list, scope) {
+		anchorStack.push(el);
+		try {
+			for (const complex of list) {
+				const anchored = [{ c: "", s: { p: [{ n: "__anchor" }] } },
+					{ c: complex[0].c || " ", s: complex[0].s }, ...complex.slice(1)];
+				const root = el.getRootNode();
+				const space = root instanceof Element || root instanceof Document || root instanceof DocumentFragment
+					? elementDescendants(root) : elementDescendants(el);
+				for (const x of space) {
+					if (matchComplex(x, anchored, anchored.length - 1, scope)) return true;
+				}
+			}
+			return false;
+		} finally {
+			anchorStack.pop();
+		}
+	}
+
 	function matchCompound(el, c, scope) {
 		if (c.t && c.t !== "*") {
 			if (el._ns === HTML_NS ? el._local !== c.t : el._local.toLowerCase() !== c.t) return false;
@@ -1509,6 +1566,16 @@
 					case "empty": if (el._kids.length > 0) return false; break;
 					case "scope": if (scope ? el !== scope : el !== (el._owner?.documentElement ?? null)) return false; break;
 					case "not": if (matchesSelector(el, ps.l, scope)) return false; break;
+					case "has": if (!hasMatch(el, ps.l, scope)) return false; break;
+					case "__anchor": if (el !== anchorStack[anchorStack.length - 1]) return false; break;
+					case "valid": if (elementInvalid(el) !== false) return false; break;
+					case "invalid": if (elementInvalid(el) !== true) return false; break;
+					case "required":
+						if (!["input", "textarea", "select"].includes(el._local) || !el.hasAttribute("required")) return false;
+						break;
+					case "optional":
+						if (!["input", "textarea", "select"].includes(el._local) || el.hasAttribute("required")) return false;
+						break;
 					case "is": case "where": if (!matchesSelector(el, ps.l, scope)) return false; break;
 					// The form-state pseudo-classes read the attribute state,
 					// which is all the state a renderless runtime has.

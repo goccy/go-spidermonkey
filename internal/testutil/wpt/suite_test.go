@@ -42,10 +42,12 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -196,13 +198,26 @@ func TestWPTSuite(t *testing.T) {
 
 	jobs := make(chan wpt.Case)
 	results := make(chan wpt.FileResult, workers)
+	// An abandoned call's goroutine keeps spinning inside translated wasm code
+	// the scheduler cannot preempt (see the nodetest driver for the long form);
+	// grant the scheduler a replacement P per abandonment, within a cap.
+	var extraProcs atomic.Int32
+	grantProc := func() {
+		if extraProcs.Add(1) <= 16 {
+			runtime.GOMAXPROCS(runtime.GOMAXPROCS(0) + 1)
+		}
+	}
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for c := range jobs {
-				results <- wpt.Run(context.Background(), opts, c)
+				r := wpt.Run(context.Background(), opts, c)
+				if r.Harness == string(wpt.StatusError) && strings.Contains(r.Message, "deadline exceeded") {
+					grantProc()
+				}
+				results <- r
 			}
 		}()
 	}
