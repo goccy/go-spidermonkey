@@ -400,7 +400,7 @@
  "fetch/orb/tentative/status.sub.any.js": "10/10 subtests fail (637473ec1ae0)",
  "fetch/orb/tentative/status.sub.any.js [dedicatedworker]": "2/2 subtests fail (0c61eafd57e8)",
  "fetch/orb/tentative/unknown-mime-type.sub.any.js": "2/7 subtests fail (ed9ad9630079)",
- "fetch/origin/assorted.window.js": "43/43 subtests fail (52f5fcdf5592)",
+ "fetch/origin/assorted.window.js": "15/43 subtests fail (a968e6a00c28)",
  "fetch/range/general.any.js": "2/7 subtests fail (9025de491d1a)",
  "fetch/range/general.any.js [dedicatedworker]": "2/7 subtests fail (9025de491d1a)",
  "fetch/range/general.window.js": "TIMEOUT: no completion callback fired",

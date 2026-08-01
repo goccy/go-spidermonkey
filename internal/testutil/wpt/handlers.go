@@ -83,6 +83,8 @@ func handlerFor(rel string) wptHandler {
 		return preflightHandler
 	case "fetch/api/resources/redirect.py":
 		return redirectHandler
+	case "fetch/origin/resources/redirect-and-stash.py":
+		return redirectAndStashHandler
 	case "common/redirect.py":
 		return commonRedirectHandler
 	case "xhr/resources/parse-headers.py":
@@ -315,6 +317,57 @@ func corsWildcard(w http.ResponseWriter) {
 // stashPutHandler stores the request body under the query's key; stashTake
 // reads it back once. Together they let a test observe a request whose
 // response it never sees.
+// redirectAndStashHandler ports fetch/origin/resources/redirect-and-stash.py:
+// every hit records the request's Origin header (or its absence) under the
+// stash key, ?location redirects with 308, and ?dump replies with the JSON
+// list recorded so far — taking it, as wptserve's stash does.
+func redirectAndStashHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	q := r.URL.Query()
+	key := q.Get("stash")
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = "no Origin header"
+	}
+	prev, ok := st.take(key)
+	if q.Has("dump") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if !ok {
+			io.WriteString(w, "null")
+		} else {
+			io.WriteString(w, prev)
+		}
+		return true
+	}
+	var list []string
+	if ok {
+		if err := json.Unmarshal([]byte(prev), &list); err != nil {
+			list = nil
+		}
+	}
+	list = append(list, origin)
+	b, _ := json.Marshal(list)
+	st.put(key, string(b))
+	if q.Has("location") {
+		loc := q.Get("location")
+		if q.Has("dummyJS") {
+			loc += "&dummyJS"
+		}
+		w.Header().Set("Location", loc)
+		w.WriteHeader(308)
+		return true
+	}
+	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(http.StatusOK)
+	if q.Has("dummyJS") {
+		io.WriteString(w, "console.log('dummy JS')")
+	} else {
+		io.WriteString(w, "<meta charset=utf-8>\n<body><script>parent.postMessage('loaded','*')</script></body>")
+	}
+	return true
+}
+
 func stashPutHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
 	corsWildcard(w)
 	if r.Method == http.MethodOptions {
