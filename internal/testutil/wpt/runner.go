@@ -135,6 +135,11 @@ func Expand(root string, paths []string) ([]Case, error) {
 		if strings.HasSuffix(p, ".worker.js") {
 			scopes = []string{"dedicatedworker"}
 		}
+		// A .window.js file is the document-side counterpart: one scope, the
+		// window, whatever a META global line might say.
+		if strings.HasSuffix(p, ".window.js") {
+			scopes = []string{"window"}
+		}
 		for _, scope := range scopes {
 			for _, v := range variants {
 				out = append(out, Case{Path: p, Scope: scope, Variant: v})
@@ -587,7 +592,8 @@ func importedScripts(src string) []string {
 }
 
 // List walks dir and returns every runnable test file, suite-relative.
-// Only the .any.js / .worker.js forms can run without a browser.
+// Only the script forms — .any.js, .worker.js and .window.js — can run
+// without a browser.
 func List(root string, dirs []string) ([]string, error) {
 	var out []string
 	for _, d := range dirs {
@@ -598,7 +604,8 @@ func List(root string, dirs []string) ([]string, error) {
 			if e.IsDir() {
 				return nil
 			}
-			if strings.HasSuffix(p, ".any.js") || strings.HasSuffix(p, ".worker.js") {
+			if strings.HasSuffix(p, ".any.js") || strings.HasSuffix(p, ".worker.js") ||
+				strings.HasSuffix(p, ".window.js") {
 				out = append(out, p)
 			}
 			return nil
