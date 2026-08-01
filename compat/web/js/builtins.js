@@ -3182,4 +3182,94 @@
 		}
 		return fd;
 	}
+
+	// ------------------------------------------------------------ fetchLater
+	// The Deferred Fetch API (https://whatpr.org/fetch/1647.html): register a
+	// request to be sent later — after activateAfter, or when the document is
+	// destroyed. This runtime has no document teardown to hook, so a request
+	// with no activateAfter simply never fires; one WITH it really is sent.
+	// The 64 KiB per-reporting-origin quota is what most of the suite is about:
+	// the URL, the headers and the body all count against it, and exceeding it
+	// is a QuotaExceededError carrying the requested/quota pair.
+	(() => {
+		const QUOTA = 64 * 1024;
+		const used = new Map(); // origin -> bytes reserved by pending requests
+		const trustworthy = (u) => {
+			if (u.protocol === "https:") return true;
+			if (u.protocol !== "http:") return false;
+			const h = u.hostname;
+			return h === "localhost" || h === "127.0.0.1" || h === "[::1]" ||
+				h.endsWith(".localhost");
+		};
+		globalThis.fetchLater = function fetchLater(input, init) {
+			if (arguments.length < 1) {
+				throw new TypeError("fetchLater: a request is required");
+			}
+			init = init === null || init === undefined ? {} : init;
+			// activateAfter validates before anything else observable.
+			const after = init.activateAfter;
+			if (after !== undefined && after !== null && Number(after) < 0) {
+				throw new RangeError("fetchLater: activateAfter must be non-negative");
+			}
+			// Request normalizes the URL, method, headers and body exactly the
+			// way fetch would — and throws the same TypeErrors.
+			const req = new Request(input, init);
+			const url = new URL(req.url);
+			if (!trustworthy(url)) {
+				throw new TypeError(`fetchLater: ${url.protocol} URLs must be potentially trustworthy`);
+			}
+			if (req._bodyStream) {
+				throw new TypeError("fetchLater: a deferred request cannot have a streaming body");
+			}
+			if (init.signal && init.signal.aborted) {
+				throw new DOMException("The operation was aborted.", "AbortError");
+			}
+			// The quota: URL + headers + body + referrer, against the request
+			// URL's origin.
+			let cost = url.href.length;
+			for (const [k, v] of req.headers) cost += k.length + v.length;
+			if (req._body) cost += req._body.byteLength;
+			if (typeof init.referrer === "string") cost += init.referrer.length;
+			const origin = url.origin;
+			const have = used.get(origin) || 0;
+			if (have + cost > QUOTA) {
+				throw new QuotaExceededError(
+					"fetchLater: the deferred-fetch quota for " + origin + " is exhausted",
+					{ requested: cost, quota: QUOTA });
+			}
+			used.set(origin, have + cost);
+			let activated = false;
+			let done = false;
+			const release = () => {
+				if (done) return;
+				done = true;
+				used.set(origin, Math.max(0, (used.get(origin) || 0) - cost));
+			};
+			const send = () => {
+				if (done) return;
+				release();
+				activated = true;
+				globalThis.fetch(req).catch(() => { /* fire and forget */ });
+			};
+			if (after !== undefined && after !== null) {
+				const id = globalThis.setTimeout(send, Number(after));
+				if (init.signal) {
+					init.signal.addEventListener("abort", () => {
+						globalThis.clearTimeout(id);
+						release();
+					});
+				}
+			} else if (init.signal) {
+				init.signal.addEventListener("abort", release);
+			}
+			const result = {};
+			Object.defineProperty(result, "activated", {
+				get: () => activated, enumerable: true, configurable: true,
+			});
+			Object.defineProperty(result, Symbol.toStringTag, {
+				value: "FetchLaterResult", configurable: true,
+			});
+			return result;
+		};
+	})();
 })();

@@ -85,6 +85,10 @@ func handlerFor(rel string) wptHandler {
 		return redirectHandler
 	case "fetch/origin/resources/redirect-and-stash.py":
 		return redirectAndStashHandler
+	case "fetch/fetch-later/resources/set_beacon.py":
+		return setBeaconHandler
+	case "fetch/fetch-later/resources/get_beacon.py":
+		return getBeaconHandler
 	case "common/redirect.py":
 		return commonRedirectHandler
 	case "xhr/resources/parse-headers.py":
@@ -380,6 +384,78 @@ func corpRedirectHandler(_ *stash, w http.ResponseWriter, r *http.Request) bool 
 	}
 	w.Header().Set("Location", q.Get("redirectTo"))
 	w.WriteHeader(http.StatusFound)
+	return true
+}
+
+// setBeaconHandler and getBeaconHandler port the fetch-later beacon store:
+// set_beacon.py appends the request's payload to a per-uuid list, get_beacon.py
+// reads the list back (without consuming it) as {"data": [...]}.
+func setBeaconHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	q := r.URL.Query()
+	uuid := q.Get("uuid")
+	if uuid == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "Must provide a UUID to store beacon data")
+		return true
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Headers", "content-type")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	// The stored value is JSON: a list of nullable strings, so a GET beacon
+	// records null and a POST records its (possibly payload=-prefixed) body.
+	var data any
+	if r.Method == http.MethodPost {
+		body, _ := io.ReadAll(r.Body)
+		text := string(body)
+		if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
+			if err := r.ParseMultipartForm(1 << 20); err == nil {
+				if v, ok := r.MultipartForm.Value["payload"]; ok && len(v) > 0 {
+					data = v[0]
+				}
+			}
+		} else if text != "" {
+			if i := strings.Index(text, "payload="); i == 0 {
+				text = text[len("payload="):]
+			}
+			data = text
+		}
+	}
+	key := "beacon_data:" + uuid
+	var list []any
+	if prev, ok := st.take(key); ok {
+		if err := json.Unmarshal([]byte(prev), &list); err != nil {
+			list = nil
+		}
+	}
+	list = append(list, data)
+	b, _ := json.Marshal(list)
+	st.put(key, string(b))
+	w.WriteHeader(http.StatusOK)
+	return true
+}
+
+func getBeaconHandler(st *stash, w http.ResponseWriter, r *http.Request) bool {
+	uuid := r.URL.Query().Get("uuid")
+	if uuid == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, "Must provide a UUID to store beacon data")
+		return true
+	}
+	key := "beacon_data:" + uuid
+	list := "[]"
+	if prev, ok := st.take(key); ok {
+		list = prev
+		st.put(key, prev) // read without consuming
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, `{"data": `+list+`}`)
 	return true
 }
 

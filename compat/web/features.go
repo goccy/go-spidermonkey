@@ -33,6 +33,7 @@ const (
 	FeatureURL             Feature = "url"
 	FeatureURLPattern      Feature = "urlpattern"
 	FeatureOrigin          Feature = "origin"
+	FeatureFetchLater      Feature = "fetch-later"
 	FeatureEvents          Feature = "events"
 	FeatureStreams         Feature = "streams"
 	FeatureCompression     Feature = "compression"
@@ -114,6 +115,9 @@ var featureGlobals = map[Feature][]string{
 	},
 	FeatureCompression: {"CompressionStream", "DecompressionStream"},
 	FeatureFetch:       {"fetch", "Headers", "Request", "Response"},
+	// Deferred fetch is fetch's, but its own feature: no other runtime has it,
+	// and it is [Exposed=Window] only — scope.js strips it from workers.
+	FeatureFetchLater: {"fetchLater"},
 	// The Cache API speaks fetch's vocabulary but is not part of it: the Minimum
 	// Common API does not require it, and the runtimes that have it have it as
 	// an addition.

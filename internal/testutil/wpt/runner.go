@@ -251,6 +251,7 @@ delete globalThis.Lock;
 delete globalThis.LockManager;
 delete Object.getPrototypeOf(globalThis.navigator).locks;
 delete globalThis.navigator.locks;
+delete globalThis.fetchLater;
 `
 	}
 	return secureGate + `

@@ -197,7 +197,7 @@
 
 	// And the reverse: interfaces that are [Exposed=Window] only. A worker has
 	// no localStorage — storage reaches a worker through other APIs.
-	for (const name of ["Storage", "localStorage", "sessionStorage", "StorageEvent"]) {
+	for (const name of ["Storage", "localStorage", "sessionStorage", "StorageEvent", "fetchLater"]) {
 		delete globalThis[name];
 	}
 
