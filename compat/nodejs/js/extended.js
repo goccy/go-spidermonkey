@@ -706,12 +706,26 @@
 			globalThis.__node_inspect_max_bytes = v;
 		},
 	});
+	const requireBytesArg = (input, name) => {
+		if (!ArrayBuffer.isView(input) && !(input instanceof ArrayBuffer) &&
+			!(typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer)) {
+			throw Object.assign(new TypeError(`The "${name}" argument must be an instance of ArrayBuffer, Buffer, or TypedArray.`),
+				{ code: "ERR_INVALID_ARG_TYPE" });
+		}
+		const buf = ArrayBuffer.isView(input) ? input.buffer : input;
+		if (buf instanceof ArrayBuffer && buf.detached) {
+			throw Object.assign(new Error("Cannot validate on a detached buffer"),
+				{ code: "ERR_INVALID_STATE" });
+		}
+	};
 	bufferMod.isAscii = (input) => {
+		requireBytesArg(input, "input");
 		const u8 = input instanceof Uint8Array ? input : new Uint8Array(input);
 		for (const b of u8) if (b > 0x7f) return false;
 		return true;
 	};
 	bufferMod.isUtf8 = (input) => {
+		requireBytesArg(input, "input");
 		const u8 = input instanceof Uint8Array ? input : new Uint8Array(input);
 		try {
 			new TextDecoder("utf-8", { fatal: true }).decode(u8);

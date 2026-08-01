@@ -1516,7 +1516,19 @@
 	core.dgram = {
 		Socket: Dgram,
 		createSocket: (type, listener) => {
-			const t = typeof type === "object" ? type.type : type;
+			const t = typeof type === "object" && type !== null ? type.type : type;
+			if (t !== "udp4" && t !== "udp6") {
+				throw Object.assign(new TypeError("Bad socket type specified. Valid types are: udp4, udp6"),
+					{ code: "ERR_SOCKET_BAD_TYPE" });
+			}
+			if (typeof type === "object" && type !== null) {
+				for (const k of ["recvBufferSize", "sendBufferSize"]) {
+					if (type[k] !== undefined && typeof type[k] !== "number") {
+						throw Object.assign(new TypeError(`The "options.${k}" property must be of type number.`),
+							{ code: "ERR_INVALID_ARG_TYPE" });
+					}
+				}
+			}
 			const s = new Dgram(t);
 			if (typeof listener === "function") s.on("message", listener);
 			else if (type && typeof type.recvBufferSize === "undefined" && typeof listener === "function") s.on("message", listener);
@@ -1672,6 +1684,14 @@
 			if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
 				throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.'),
 					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (typeof value !== "number") {
+				throw Object.assign(new TypeError('The "value" argument must be of type number.'),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+				throw Object.assign(new RangeError(`The value of "value" is out of range. It must be >= 0 && <= 4294967295. Received ${value}`),
+					{ code: "ERR_OUT_OF_RANGE" });
 			}
 			const bytes = typeof data === "string" ? Buffer.from(data, "utf8") : data;
 			let crc = (~value) >>> 0;
@@ -2257,6 +2277,19 @@
 			lookup: dnsLookup,
 			resolve(host, type, cb) {
 				if (typeof type === "function") { cb = type; type = "A"; }
+				if (typeof host !== "string") {
+					const recv = host === null || host === undefined ? `Received ${host}`
+						: typeof host === "object" ? `Received an instance of ${host.constructor ? host.constructor.name : "Object"}`
+						: `Received type ${typeof host} (${String(host)})`;
+					// resolve() and the rrtype helpers call it "name"; lookup
+					// calls it "hostname".
+					throw Object.assign(new TypeError(`The "name" argument must be of type string. ${recv}`),
+						{ code: "ERR_INVALID_ARG_TYPE" });
+				}
+				if (typeof cb !== "function") {
+					throw Object.assign(new TypeError('The "callback" argument must be of type function.'),
+						{ code: "ERR_INVALID_ARG_TYPE" });
+				}
 				const t = String(type).toUpperCase();
 				if (!RRTYPES.includes(t)) {
 					throw Object.assign(new TypeError(`Unknown type: ${type}`), { code: "ERR_INVALID_ARG_VALUE" });
@@ -2296,7 +2329,13 @@
 		for (const [k, v] of Object.entries(obj)) {
 			if (typeof v !== "function" || k.startsWith("_")) { out[k] = v; continue; }
 			if (k === "setServers" || k === "getServers" || k === "cancel" || k === "setLocalAddress") { out[k] = v; continue; }
-			out[k] = (...args) => new Promise((resolve, reject) => {
+			out[k] = (...args) => {
+				// The callback method runs OUTSIDE the promise executor so its
+				// synchronous argument validation throws synchronously — which
+				// is what Node's promises API does — while runtime failures
+				// still arrive as rejections.
+				let resolve, reject;
+				const p = new Promise((res, rej) => { resolve = res; reject = rej; });
 				v(...args, (err, ...rest) => {
 					if (err) return reject(err);
 					// dns.promises.lookup resolves with { address, family }; every
@@ -2304,7 +2343,8 @@
 					if (k === "lookup" && rest.length > 1) return resolve({ address: rest[0], family: rest[1] });
 					resolve(rest[0]);
 				});
-			});
+				return p;
+			};
 		}
 		return out;
 	}

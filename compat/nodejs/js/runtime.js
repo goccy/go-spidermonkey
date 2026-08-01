@@ -241,6 +241,31 @@
 		// with a previous reading it returns the delta (Node's contract). Values
 		// are best-effort from the host (monotonic in elapsed time).
 		cpuUsage: (prev) => {
+			if (prev !== undefined && (prev === null || typeof prev !== "object")) {
+				const recv = prev === null ? " Received null"
+					: ` Received type ${typeof prev} (${typeof prev === "string" ? `'${prev}'` : String(prev)})`;
+				throw Object.assign(new TypeError(`The "prevValue" argument must be of type object.${recv}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			if (prev) {
+				// Wrong TYPE first (user, then system), then the range.
+				for (const k of ["user", "system"]) {
+					if (typeof prev[k] !== "number") {
+						const v = prev[k];
+						const recv = v === null || v === undefined ? `Received ${v}`
+							: typeof v === "object" ? "Received an instance of Object"
+							: `Received type ${typeof v} (${typeof v === "string" ? `'${v}'` : String(v)})`;
+						throw Object.assign(new TypeError(`The "prevValue.${k}" property must be of type number. ${recv}`),
+							{ code: "ERR_INVALID_ARG_TYPE" });
+					}
+				}
+				for (const k of ["user", "system"]) {
+					if (prev[k] < 0 || !Number.isFinite(prev[k])) {
+						throw Object.assign(new RangeError(`The property 'prevValue.${k}' is invalid. Received ${prev[k]}`),
+							{ code: "ERR_INVALID_ARG_VALUE" });
+					}
+				}
+			}
 			const u = ops.proc_cpuusage();
 			if (prev && typeof prev === "object") {
 				return { user: u.user - (prev.user || 0), system: u.system - (prev.system || 0) };
@@ -454,7 +479,16 @@
 		}
 		toJSON() { return { type: "Buffer", data: [...this] }; }
 		slice(start, end) { return this.subarray(start, end); } // Node slice shares memory
-		equals(other) { return compareBytes(this, other) === 0; }
+		equals(other) {
+			if (!(other instanceof Uint8Array)) {
+				const recv = other === null || other === undefined ? `Received ${other}`
+					: typeof other === "object" ? `Received an instance of ${other.constructor ? other.constructor.name : "Object"}`
+					: `Received type ${typeof other} (${typeof other === "string" ? `'${other}'` : String(other)})`;
+				throw Object.assign(new TypeError(`The "otherBuffer" argument must be an instance of Buffer or Uint8Array. ${recv}`),
+					{ code: "ERR_INVALID_ARG_TYPE" });
+			}
+			return compareBytes(this, other) === 0;
+		}
 		compare(other, targetStart, targetEnd, sourceStart, sourceEnd) {
 			if (!ArrayBuffer.isView(other)) throw argTypeError("target", "Buffer or Uint8Array", other);
 			targetStart = requireIndex("targetStart", targetStart, other.length) ?? 0;
