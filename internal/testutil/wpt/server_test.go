@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goccy/go-spidermonkey/wpt"
+	"github.com/goccy/go-spidermonkey/internal/testutil/wpt"
 )
 
 // The suite's own server expands `{{name}}` variables in ".sub." files, and

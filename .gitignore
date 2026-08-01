@@ -39,7 +39,7 @@ bench/testdata/octane/
 # The checkouts themselves (the trailing slash does not cover a symlink, which
 # is how a local checkout is often wired in).
 nodetest/suite
-wpt/suite
+internal/testutil/wpt/suite
 babeltest/suite
 # babeltest/package.json is GENERATED from the pinned checkout by
 # scripts/babel-suite-deps.sh; `make babeltest-fetch` writes it.

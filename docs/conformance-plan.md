@@ -22,7 +22,7 @@ runtime implements the API. A directory where everything fails is the point.
 
 ## Where it stands
 
-Measured with the harness in `wpt/`, which expands each source file into the
+Measured with the harness in `internal/testutil/wpt/`, which expands each source file into the
 cases a browser runs (scope × variant). Two rates are reported and only one is
 worth quoting: WebCryptoAPI declares over 70% of every subtest in the corpus,
 so the subtest rate barely moves when a whole API lands. CLEAN CASES — cases

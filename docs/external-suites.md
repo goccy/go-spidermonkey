@@ -8,7 +8,7 @@ than tests written here:
 | suite | what it measures | run it |
 |---|---|---|
 | [nodetest](../nodetest) | `compat/nodejs`, against the Node.js project's own test suite | `make nodetest` |
-| [wpt](../wpt) | `compat/web`, against the Web Platform Tests | `make wpt` |
+| [wpt](../internal/testutil/wpt) | `compat/web`, against the Web Platform Tests | `make wpt` |
 | [babeltest](../babeltest) | the whole stack, against Babel's fixture corpus | `make babeltest` |
 | [test262](../test262) | the engine (ECMA-262) | `make test262` |
 
@@ -185,7 +185,7 @@ framework has already printed its verdict.
 
 Only the `.any.js` / `.worker.js` forms can run without a browser, and only the
 directories whose APIs `compat/web` provides are in the default set
-(`wpt/suite_test.go`, `DefaultDirs`) — a DOM-dependent directory would produce
+(`internal/testutil/wpt/suite_test.go`, `DefaultDirs`) — a DOM-dependent directory would produce
 nothing but noise.
 
 - The suite's own `testharness.js` drives each file in its **shell environment**.

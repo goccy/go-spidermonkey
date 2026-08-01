@@ -47,7 +47,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/goccy/go-spidermonkey/wpt"
+	"github.com/goccy/go-spidermonkey/internal/testutil/wpt"
 )
 
 const (

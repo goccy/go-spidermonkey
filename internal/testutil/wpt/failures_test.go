@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goccy/go-spidermonkey/wpt"
+	"github.com/goccy/go-spidermonkey/internal/testutil/wpt"
 )
 
 // TestWPTFailureBuckets groups the failing subtests of a directory by their

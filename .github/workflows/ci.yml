@@ -78,7 +78,7 @@ jobs:
       - name: Cache the pinned WPT checkout
         uses: actions/cache@v4
         with:
-          path: wpt/suite
+          path: internal/testutil/wpt/suite
           key: wpt-${{ hashFiles('Makefile') }}
       - run: make wpt
 

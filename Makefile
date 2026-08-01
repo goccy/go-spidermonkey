@@ -114,13 +114,13 @@ nodetest: nodetest-fetch
 		i=$$((i + 1)); \
 	done; exit $$fail
 
-## wpt-fetch: check out the pinned web-platform-tests tree into wpt/suite.
+## wpt-fetch: check out the pinned web-platform-tests tree into internal/testutil/wpt/suite.
 wpt-fetch:
-	./scripts/fetch-suite.sh $(WPT_SUITE_REPO) $(WPT_SUITE_REV) wpt/suite $(WPT_SUITE_DIRS)
+	./scripts/fetch-suite.sh $(WPT_SUITE_REPO) $(WPT_SUITE_REV) internal/testutil/wpt/suite $(WPT_SUITE_DIRS)
 
 ## wpt: run the Web Platform Tests against compat/web. Judged per subtest.
 wpt: wpt-fetch
-	WPT=1 go test ./wpt/ -run TestWPTSuite -v -timeout 2h
+	WPT=1 go test ./internal/testutil/wpt/ -run TestWPTSuite -v -timeout 2h
 
 ## babeltest-fetch: check out Babel's fixture corpus and install the matching
 ## @babel/* packages the fixtures are run through.
