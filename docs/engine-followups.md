@@ -191,21 +191,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   off the module NAMESPACE — a missing property is simply undefined — which
   needs no source inspection and no engine change. See `reexportShim`.
 
-## 4. Import attributes are invisible to the module loader
-
-- **Symptom:** an attribute-less JSON import (`import x from "./a.json"`, with
-  no `with { type: "json" }`) cannot report Node's `ERR_IMPORT_ATTRIBUTE_MISSING`
-  and surfaces as a confusing SyntaxError instead.
-- **Root cause:** the engine implements the `type: "json"` attribute itself and
-  JSON-parses whatever the loader returns, but the loader signature
-  (`func(cfg, specifier, referrer)`) is never told which form the import used.
-  It therefore cannot distinguish a JSON import from a JavaScript one. The
-  compat layer keeps both cases SAFE by validating the bytes before handing them
-  over (see `jsonModuleSource`), but it cannot make the error message right.
-- **Engine fix needed:** pass the import attributes through to the host module
-  loader.
-
-## 5. A long multi-instance run stops making progress
+## 4. A long multi-instance run stops making progress
 
 - **Symptom:** running the Node.js suite in one process, after some hundreds to
   thousands of tests, every goroutine is parked, the process sits at no CPU, and
@@ -227,7 +213,7 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Mitigation meanwhile:** `NODETEST_SHARD=i/n` spreads the suite over separate
   processes, bounding a stall to one shard.
 
-## 6. Temporal's non-ISO calendars lag the ICU data behind them
+## 5. Temporal's non-ISO calendars lag the ICU data behind them
 
 - **Symptom:** 258 of the 328 expected `intl402` failures are Temporal, and all
   of them are its calendar layer. `Intl` itself is fine — ICU has the data and
@@ -260,7 +246,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   the Temporal implementation are what needs correcting — the ICU data they read
   from is already present and already right.
 
-## 7. `async_hooks`: a store cannot outlive the call that established it
+## 6. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.
@@ -298,7 +284,7 @@ it is what makes **dynamic SSR fail on Next.js 15**.
 - **Engine fix needed:** expose async-context (host-defined async op) hooks from
   the engine so continuations can be associated with their originating context.
 
-## 8. WebAssembly: the subsystem is compiled in, but no backend can run it
+## 7. WebAssembly: the subsystem is compiled in, but no backend can run it
 
 ECMA-429 (the WinterTC Minimum Common Web API) makes the `WebAssembly`
 namespace REQUIRED, so this is a conformance gap, not an optional feature.
@@ -343,65 +329,3 @@ The realistic paths, in order of plausibility:
 2. **A wasm interpreter tier upstream** (what "PBL for wasm" would be). Does
    not exist; not something this repo can carry as a patch.
 
-## 9. Exhausting `MaxMemoryBytes` is a hard fault, not an error
-
-- **Symptom:** a guest that allocates past `Config.MaxMemoryBytes` kills the
-  PROCESS with `unexpected fault address 0x...ff8` / `fatal error: fault`
-  (SIGSEGV inside `spidermonkeywasm2go/p0.Fn...`), instead of the engine
-  reporting an out-of-memory condition the embedding can turn into a JS error
-  or a failed `Eval`.
-- **How it was found:** implementing the WebAssembly JS API host-side. An early
-  version copied every live `WebAssembly.Memory` across every boundary
-  crossing, and `wasm/jsapi/bad-imports.js` constructs a 16 MiB Memory purely
-  as a wrong-type argument, then instantiates 200 more modules — several
-  gigabytes of guest garbage through a 512 MiB budget. Raising the budget to
-  3 GiB made the same file pass 212 subtests cleanly, which is what identified
-  exhaustion as the cause; the compat-side waste was then fixed properly (only
-  an instance's OWN memories are synced).
-- **Why it matters beyond that bug:** a host cannot defend against this. The
-  budget exists so a runaway guest is contained, and a contained guest must
-  leave the process alive — that is the whole point of the cap. Any embedding
-  running untrusted code has to treat "allocates a lot" as a crash today.
-- **Engine fix needed:** the allocator path that grows linear memory must fail
-  when the growth would exceed the configured maximum, and that failure must
-  reach SpiderMonkey as an allocation failure (the OOM path it already has),
-  rather than being attempted and faulting on the guard page.
-
-## 10. An agent cannot call a host function
-
-- **Symptom:** an agent's realm has exactly one host-provided global,
-  `__agent__`. A `Worker` therefore cannot have any of the APIs this compat
-  layer implements host-side — `URL`, `TextDecoder`, `crypto.subtle`, `fetch`,
-  the whole of `compat/web`'s Go half — because reaching them from inside a
-  worker is not possible at all. compat/nodejs's worker glue reimplements a
-  subset of its environment in pure JavaScript for exactly this reason, and a
-  `compat/web` Worker has to do the same.
-- **What was tried, and why each fails.** The generic host-function table IS
-  reachable from `hostEnv.dispatch`, which agent keys already go through, so the
-  gap looked like a prelude detail. It is not:
-  1. `agentPrelude` deletes `__agent_call__` before the adapter glue runs, so
-     nothing in an agent can reach the channel. Fixable here.
-  2. The channel itself **coerces every argument to a number**. Passing
-     `("echo", "x", 1)` arrives as `[1, 0]` — the strings became zero. So no
-     name, no string argument and no string result can cross. NOT fixable
-     here: the coercion is in the native `__agent_call__`.
-  3. The clone transport cannot substitute. A clone handle is a number, but
-     `JsCloneRead` must run on the READER's thread — the host reads an agent's
-     clone on the main thread, and mints one for an agent on the main thread
-     (see `Agents.Send` / `handlePost`). A synchronous call from an agent
-     goroutine has no main thread to borrow.
-  4. The ordinary `Func` path could not be used even if the arguments arrived
-     intact: it decodes object handles against the MAIN interpreter and takes
-     that interpreter's invoke lock, neither of which an agent shares. An agent
-     registry has to be its own thing, carrying primitives only.
-- **Engine fix needed:** let `__agent_call__` carry string arguments and return
-  a string, for a key namespace reserved for agent host calls. That alone is
-  enough: a composite can travel as JSON and bytes as a latin-1 string, by a
-  convention the compat layer owns, and the handler then runs on the agent's own
-  goroutine touching nothing of the main interpreter.
-- **A second design, if strings are hard.** Share one SharedArrayBuffer with
-  the agent at spawn and have the host capture its backing byte range ONCE on
-  the main thread; afterwards both sides can read and write those bytes from any
-  thread, and the numeric channel only has to carry a length. This needs a way
-  to obtain a SharedArrayBuffer's address and length from Go, which the bytes
-  bridge does not currently expose.
