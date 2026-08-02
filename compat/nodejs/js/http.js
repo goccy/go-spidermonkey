@@ -688,11 +688,14 @@
 			// 'close' waits for the round trip, not for the request body (see
 			// emitClose in streams.js).
 			this._closeOnRoundTrip = true;
-			// The client socket exists once the request is actually SENT: a
-			// request that is destroyed (or never ends) must not leave a
-			// socket and its idle timer behind — two hundred abandoned
-			// requests did exactly that and exhausted the heap.
+			// The socket is assigned when the request needs one: it is sent, a
+			// timeout is armed on it, or something listens for the socket
+			// (see assignClientSocket's callers). Minting one for every
+			// request that is merely CONSTRUCTED — the shape Node has, since
+			// it connects eagerly — kept two hundred abandoned requests and
+			// their multi-megabyte options alive at once.
 			this._timeoutOption = o.timeout;
+			if (o.timeout) assignClientSocket(this);
 		}
 		setHeader(name, value) { this._headers[name] = value; return this; }
 		getHeader(name) { return this._headers[name]; }
@@ -851,7 +854,12 @@
 				else socket.setTimeout(ms);
 			};
 			if (this.socket) arm(this.socket);
-			else this.once("socket", arm);
+			else {
+				(this._pendingSocketTimeouts ??= []).push(arm);
+				// A timeout needs a socket to live on: arming one is a reason
+				// to assign it, even before the request is sent.
+				assignClientSocket(this);
+			}
 			return this;
 		}
 	}
