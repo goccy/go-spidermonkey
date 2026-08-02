@@ -291,6 +291,20 @@ it is what makes **dynamic SSR fail on Next.js 15**.
   or every agent turns into a spin. This is the most load-bearing machinery in
   the runtime — every promise in every realm — so it wants its own change with
   its own verification, not a ride-along in a batch.
+- **Attempted and reverted (2026-08-02), with one hard-won fact:** a
+  `HostJobQueue : JS::JobQueue` implementing the seven virtuals, installed on
+  the main context with `JS::SetJobQueue` in place of
+  `js::UseInternalJobQueues` (agents left on the internal queue), COMPILES and
+  links but stops promise jobs from running at all — `Promise.resolve().then()`
+  and `await` continuations never fire, with the drain sites converted to
+  `queue->runJobs(cx)` and reached. So `SetJobQueue` alone is not equivalent to
+  `UseInternalJobQueues`: something else that call arranges (the engine-side
+  dispatch wiring the internal queue owns, most likely) is still required, and
+  the next attempt should start by finding what, rather than by writing the
+  queue again. Each experiment costs a full wasm rebuild, so instrument first:
+  count `enqueuePromiseJob` calls and report them through an existing bridge
+  result, and check whether the engine enqueues at all before debugging the
+  drain.
 
 ## 6. WebAssembly: the subsystem is compiled in, but no backend can run it
 
