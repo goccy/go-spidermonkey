@@ -46,6 +46,9 @@ var httpJS string
 //go:embed js/extended.js
 var extendedJS string
 
+//go:embed js/cjslexer.js
+var cjsLexerJS string
+
 // Options configures Install.
 type Options struct {
 	// Argv becomes process.argv. Empty means ["node", "main"].
@@ -208,7 +211,7 @@ func Install(js *spidermonkey.JS, opts ...Options) (*Runtime, error) {
 	}
 
 	ctx := context.Background()
-	for _, src := range []string{runtimeJS, corelibsJS, streamsJS, extrasJS, httpJS, extendedJS, `delete globalThis.__node_ops;`} {
+	for _, src := range []string{runtimeJS, corelibsJS, streamsJS, extrasJS, httpJS, extendedJS, cjsLexerJS, `delete globalThis.__node_ops;`} {
 		r, err := js.Eval(ctx, src)
 		if err != nil {
 			return nil, fmt.Errorf("nodejs: evaluating builtins: %w", err)
