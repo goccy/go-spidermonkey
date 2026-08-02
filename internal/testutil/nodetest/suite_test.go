@@ -211,12 +211,12 @@ func TestNodeSuite(t *testing.T) {
 	inFlight := map[string]time.Time{}
 	jobs := make(chan string)
 	results := make(chan nodetest.Result, workers)
-	// An abandoned call's goroutine keeps SPINNING inside translated wasm code
-	// the scheduler cannot preempt, so each abandonment can pin one P for the
-	// rest of the process. Granting the scheduler a replacement P keeps the
-	// other workers running; the cap bounds a pathological shard. The real fix
-	// is engine-side (docs/engine-followups.md: the stack-quota check the
-	// interrupt relies on is a no-op under translation).
+	// An abandoned call's goroutine keeps running inside translated wasm code
+	// that the scheduler may not be able to preempt, so each abandonment can
+	// cost a P. Granting a replacement is a cheap hedge, not a diagnosis: what
+	// actually happens during the long stalls is still unmeasured (see
+	// docs/engine-followups.md, "A long multi-instance run stops making
+	// progress"), and the last attempt to catch one did not reproduce it.
 	var extraProcs atomic.Int32
 	grantProc := func() {
 		if extraProcs.Add(1) <= 16 {

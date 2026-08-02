@@ -187,10 +187,19 @@ NO symptom — no error, no log line, memory simply unchanged:
   is a hypothesis, not a measurement: the resource has not been identified, and
   nothing in the dump names it. Lowering the worker count delays it rather than
   preventing it.
-- **Next step:** run under `GODEBUG=schedtrace=1000` through a stall and see
-  whether the scheduler has runnable work it is not running; if it does, the
-  problem is below this repository (wasm2go's thread/lock discipline), and if it
-  does not, the abandoned goroutines are holding something this repository owns.
+- **Measured (2026-08-02), inconclusive:** the shard that had stalled twice for
+  22 minutes was re-run under `GODEBUG=schedtrace=2000` and FINISHED IN 72
+  SECONDS — the stall did not reproduce, so the decisive observation is still
+  missing. The trace of that healthy run shows all-idle snapshots
+  (`idleprocs=14/14`, `runqueue=0`) whenever every worker happens to be waiting
+  on I/O, which means an all-idle snapshot is NOT by itself evidence of a
+  deadlock: a stalled run has to be caught in the act and compared against the
+  goroutine dump taken at the same moment.
+- **Next step:** keep the schedtrace running across many shards until a stall
+  is caught, then read the dump for who holds the instance invoke lock. If the
+  scheduler has runnable work it is not running, the problem is below this
+  repository (wasm2go's thread/lock discipline); if it does not, the abandoned
+  goroutines are holding something this repository owns.
 - **Mitigation meanwhile:** `NODETEST_SHARD=i/n` spreads the suite over separate
   processes, bounding a stall to one shard.
 
@@ -262,8 +271,26 @@ it is what makes **dynamic SSR fail on Next.js 15**.
   deferring the restore to the next macrotask breaks nested `run()` — the queued
   restores run FIFO where correctness needs LIFO. Both trade a documented
   limitation for an undocumented wrong answer.
-- **Engine fix needed:** expose async-context (host-defined async op) hooks from
-  the engine so continuations can be associated with their originating context.
+- **Engine fix needed:** expose async-context hooks so continuations can be
+  associated with their originating context.
+- **The seam exists (identified 2026-08-02), and it is `JS::JobQueue`.** An
+  embedding that installs its own queue with `JS::SetJobQueue` gets exactly the
+  two callbacks this needs: `getHostDefinedData` runs when a job callback is
+  MADE (HostMakeJobCallback step 5 — where the current async context should be
+  captured), and `enqueuePromiseJob` receives that object back when the job is
+  queued, so `runJobs` can enter the captured context around each job. Six
+  virtuals to implement (`getHostDefinedData`, `getHostDefinedGlobal`,
+  `enqueuePromiseJob`, `runJobs`, `empty`, `isDrainingStopped`,
+  `saveJobQueue`), and js.cc has only one `js::UseInternalJobQueues` and four
+  `js::RunJobs` call sites to convert.
+- **The constraint that makes it a project rather than a patch:** the internal
+  queue's `js::RunJobs` BLOCKS on an internal condvar while the engine holds
+  outstanding off-thread promise work, and the agent loop depends on exactly
+  that to park a pending `Atomics.waitAsync` (js.cc, the agent thread's drain
+  loop says so in a comment). A replacement queue must reproduce that blocking
+  or every agent turns into a spin. This is the most load-bearing machinery in
+  the runtime — every promise in every realm — so it wants its own change with
+  its own verification, not a ride-along in a batch.
 
 ## 6. WebAssembly: the subsystem is compiled in, but no backend can run it
 

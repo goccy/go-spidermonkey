@@ -198,9 +198,9 @@ func TestWPTSuite(t *testing.T) {
 
 	jobs := make(chan wpt.Case)
 	results := make(chan wpt.FileResult, workers)
-	// An abandoned call's goroutine keeps spinning inside translated wasm code
-	// the scheduler cannot preempt (see the nodetest driver for the long form);
-	// grant the scheduler a replacement P per abandonment, within a cap.
+	// An abandoned call's goroutine keeps running inside translated wasm code
+	// the scheduler may not preempt (see the nodetest driver); granting a
+	// replacement P per abandonment is a hedge, within a cap.
 	var extraProcs atomic.Int32
 	grantProc := func() {
 		if extraProcs.Add(1) <= 16 {
