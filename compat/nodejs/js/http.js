@@ -301,6 +301,19 @@
 			if (handler) this.on("request", handler);
 			this.listening = false;
 			this.timeout = 0;
+			// The connection-lifetime knobs Node exposes as properties, taken
+			// from the options bag and readable/writable afterwards. The
+			// header/request deadlines need a per-connection parser to enforce
+			// (there is none here — the host parses), so they are carried and
+			// reported rather than applied; keepAliveTimeout is honoured by the
+			// pool, and maxHeadersCount/maxRequestsPerSocket by the host.
+			const o = options && typeof options === "object" ? options : {};
+			this.headersTimeout = o.headersTimeout ?? 60000;
+			this.requestTimeout = o.requestTimeout ?? 300000;
+			this.keepAliveTimeout = o.keepAliveTimeout ?? 5000;
+			this.connectionsCheckingInterval = o.connectionsCheckingInterval ?? 30000;
+			this.maxHeadersCount = o.maxHeadersCount ?? null;
+			this.maxRequestsPerSocket = o.maxRequestsPerSocket ?? 0;
 			// Node lets a caller substitute its own request/response classes, and
 			// several tests do exactly that to observe the objects the server
 			// builds. Ignoring the option silently gave them the base classes.
@@ -555,6 +568,14 @@
 			this.maxSockets = options.maxSockets ?? Infinity;
 			this.maxFreeSockets = options.maxFreeSockets ?? 256;
 			this.maxTotalSockets = options.maxTotalSockets ?? Infinity;
+			// The safety margin subtracted from a server's advertised
+			// Keep-Alive timeout before this agent reuses a socket. Node
+			// falls back to 1000ms for anything not a finite positive number.
+			{
+				const b = options.agentKeepAliveTimeoutBuffer;
+				this.agentKeepAliveTimeoutBuffer =
+					typeof b === "number" && Number.isFinite(b) && b > 0 ? b : 1000;
+			}
 			this._agentId = ++__nextAgentId;
 			// Node exposes these bookkeeping maps; keep empty shapes for compat.
 			this.requests = {}; this.sockets = {}; this.freeSockets = {};
