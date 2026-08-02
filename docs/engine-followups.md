@@ -172,26 +172,7 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Root cause:** a wasi-threads / agent structured-clone race in the engine.
 - **Engine fix needed:** fix the race in the engine's agent clone transport.
 
-## 3. A module-loader heuristic no module compile can answer
-
-- **Symptom:** the module loader still extracts a CommonJS module's export names
-  by matching source text. This is the load-bearing exception to the "no
-  heuristics" rule.
-- **`cjs_exports.go`** asks which string keys a CommonJS module would end up
-  putting on `module.exports` — `exports.foo = …`,
-  `Object.defineProperty(exports, …)`, `module.exports = {…}`. None of that is
-  ESM syntax; it is ordinary script code whose result is only knowable by
-  RUNNING the module, which the loader (synchronous and re-entrancy-locked)
-  cannot do. Removing it needs either a script-AST introspection primitive or a
-  `cjs-module-lexer` equivalent in C++ — module introspection does not reach it.
-- **`hasDefaultExport` is CLOSED.** It used to grep a target module for
-  "export default" to decide whether a re-export shim should forward one; that
-  was wrong in both directions (@babel/parser mentions the phrase in an error
-  message, so every import of it failed to link). The shim now reads the default
-  off the module NAMESPACE — a missing property is simply undefined — which
-  needs no source inspection and no engine change. See `reexportShim`.
-
-## 4. A long multi-instance run stops making progress
+## 3. A long multi-instance run stops making progress
 
 - **Symptom:** running the Node.js suite in one process, after some hundreds to
   thousands of tests, every goroutine is parked, the process sits at no CPU, and
@@ -213,7 +194,7 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Mitigation meanwhile:** `NODETEST_SHARD=i/n` spreads the suite over separate
   processes, bounding a stall to one shard.
 
-## 5. Temporal's non-ISO calendars lag the ICU data behind them
+## 4. Temporal's non-ISO calendars lag the ICU data behind them
 
 - **Symptom:** 258 of the 328 expected `intl402` failures are Temporal, and all
   of them are its calendar layer. `Intl` itself is fine — ICU has the data and
@@ -246,7 +227,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   the Temporal implementation are what needs correcting — the ICU data they read
   from is already present and already right.
 
-## 6. `async_hooks`: a store cannot outlive the call that established it
+## 5. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.
@@ -284,7 +265,7 @@ it is what makes **dynamic SSR fail on Next.js 15**.
 - **Engine fix needed:** expose async-context (host-defined async op) hooks from
   the engine so continuations can be associated with their originating context.
 
-## 7. WebAssembly: the subsystem is compiled in, but no backend can run it
+## 6. WebAssembly: the subsystem is compiled in, but no backend can run it
 
 ECMA-429 (the WinterTC Minimum Common Web API) makes the `WebAssembly`
 namespace REQUIRED, so this is a conformance gap, not an optional feature.
