@@ -205,21 +205,7 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Engine fix needed:** pass the import attributes through to the host module
   loader.
 
-## 5. `require()` of an ES module (require(esm) — synchronous module evaluation)
-
-- **Symptom:** `require()` of an ESM-only package throws "import declarations
-  may only appear at top level of a module". Node >= 22 supports requiring a
-  synchronous ES module, and modern packages rely on it — Babel loads every one
-  of its (ESM) plugins through `require()` first, so `@babel/core` cannot
-  resolve a plugin by name at all on this runtime.
-- **Root cause:** there is no synchronous path from CJS into a module graph. The
-  engine's dynamic import is asynchronous, and the module loader cannot re-enter
-  the interpreter to instantiate and evaluate a graph mid-call.
-- **Engine fix needed:** a synchronous instantiate-and-evaluate entry point the
-  host can call re-entrantly from a host function, or a bridge primitive that
-  evaluates a module graph and returns its namespace.
-
-## 6. A long multi-instance run stops making progress
+## 5. A long multi-instance run stops making progress
 
 - **Symptom:** running the Node.js suite in one process, after some hundreds to
   thousands of tests, every goroutine is parked, the process sits at no CPU, and
@@ -241,7 +227,7 @@ NO symptom — no error, no log line, memory simply unchanged:
 - **Mitigation meanwhile:** `NODETEST_SHARD=i/n` spreads the suite over separate
   processes, bounding a stall to one shard.
 
-## 7. Temporal's non-ISO calendars lag the ICU data behind them
+## 6. Temporal's non-ISO calendars lag the ICU data behind them
 
 - **Symptom:** 258 of the 328 expected `intl402` failures are Temporal, and all
   of them are its calendar layer. `Intl` itself is fine — ICU has the data and
@@ -274,7 +260,7 @@ NO symptom — no error, no log line, memory simply unchanged:
   the Temporal implementation are what needs correcting — the ICU data they read
   from is already present and already right.
 
-## 8. `async_hooks`: a store cannot outlive the call that established it
+## 7. `async_hooks`: a store cannot outlive the call that established it
 
 This is the item with the widest blast radius, and it stopped being theoretical:
 it is what makes **dynamic SSR fail on Next.js 15**.
@@ -312,7 +298,7 @@ it is what makes **dynamic SSR fail on Next.js 15**.
 - **Engine fix needed:** expose async-context (host-defined async op) hooks from
   the engine so continuations can be associated with their originating context.
 
-## 9. WebAssembly: the subsystem is compiled in, but no backend can run it
+## 8. WebAssembly: the subsystem is compiled in, but no backend can run it
 
 ECMA-429 (the WinterTC Minimum Common Web API) makes the `WebAssembly`
 namespace REQUIRED, so this is a conformance gap, not an optional feature.
@@ -357,7 +343,7 @@ The realistic paths, in order of plausibility:
 2. **A wasm interpreter tier upstream** (what "PBL for wasm" would be). Does
    not exist; not something this repo can carry as a patch.
 
-## 10. Exhausting `MaxMemoryBytes` is a hard fault, not an error
+## 9. Exhausting `MaxMemoryBytes` is a hard fault, not an error
 
 - **Symptom:** a guest that allocates past `Config.MaxMemoryBytes` kills the
   PROCESS with `unexpected fault address 0x...ff8` / `fatal error: fault`
@@ -381,7 +367,7 @@ The realistic paths, in order of plausibility:
   reach SpiderMonkey as an allocation failure (the OOM path it already has),
   rather than being attempted and faulting on the guard page.
 
-## 11. An agent cannot call a host function
+## 10. An agent cannot call a host function
 
 - **Symptom:** an agent's realm has exactly one host-provided global,
   `__agent__`. A `Worker` therefore cannot have any of the APIs this compat
