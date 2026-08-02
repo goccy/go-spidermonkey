@@ -2785,9 +2785,13 @@
 		return r.core ? r.core : "/" + r.path;
 	};
 	Module.prototype.require = function require(request) {
-		const resolved = Module._resolveFilename(request, this);
-		if (!resolved.startsWith("/")) return globalThis.__node_core(resolved);
-		return loadCJSPath(resolved.slice(1));
+		const parentPath = String(this && this.filename || "main.js").replace(/^\//, "");
+		const r = ops.node_resolve(String(request), parentPath);
+		if (isErr(r)) throw requireError(request, r.message);
+		if (r.core) return globalThis.__node_core(r.core);
+		// An ES module reached through require() is evaluated as one.
+		if (r.kind === "esm") return loadESMPath(r.path);
+		return loadCJSPath(r.path);
 	};
 	Module.createRequire = (from) => {
 		// Node accepts a path, a file: URL string, or a URL object
@@ -2820,6 +2824,25 @@
 	Module.findSourceMap = () => undefined;
 	Module.Module = Module;
 	core.module = Module;
+
+	// require() of an ES module (Node >= 22): the host evaluates the module
+	// graph re-entrantly — it is on the guest's own stack, in a host function
+	// this call is inside — and hands back its namespace. What require()
+	// returns is that namespace, with the `default` export ALSO reachable as
+	// module.exports.default, which is how a CJS caller of an ESM package
+	// reaches a default export.
+	function loadESMPath(fsPath) {
+		const absPath = "/" + fsPath;
+		const cached = requireCache[absPath];
+		if (cached) return cached.exports;
+		const ns = ops.node_require_esm(fsPath);
+		if (isErr(ns)) throw requireError(fsPath, `Cannot load module '${fsPath}': ${ns.message}`);
+		const module = new Module(absPath);
+		module.exports = ns;
+		module.loaded = true;
+		requireCache[absPath] = module;
+		return ns;
+	}
 
 	function loadCJSPath(fsPath) {
 		// Key the cache by the ABSOLUTE filename, exactly what

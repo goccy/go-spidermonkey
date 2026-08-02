@@ -17,7 +17,7 @@ func (js *JS) EvalModule(ctx context.Context, specifier, src string) (ModuleResu
 	if err != nil {
 		return ModuleResult{}, err
 	}
-	return parseModuleResult(raw)
+	return parseModuleResultFor(js, raw)
 }
 
 // ModuleLoader resolves a module specifier to its source. It receives the

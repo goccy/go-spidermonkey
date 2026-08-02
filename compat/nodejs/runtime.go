@@ -506,27 +506,28 @@ func canonicalESMShim(canonical string, src []byte) string {
 
 func (rt *Runtime) ops() map[string]spidermonkey.Func {
 	table := map[string]spidermonkey.Func{
-		"node_env":        rt.opEnv,
-		"node_argv":       rt.opArgv,
-		"node_platform":   rt.opPlatform,
-		"raw_write":       rt.opRawWrite,
-		"immediate_set":   rt.opImmediateSet,
-		"immediate_clear": rt.opImmediateClear,
-		"loop_ref":        rt.opLoopRef,
-		"node_exit":       rt.opNodeExit,
-		"node_resolve":    rt.opResolve,
-		"node_read":       rt.opRead,
-		"fs_read_file":    rt.opFSReadFile,
-		"fs_write_file":   rt.opFSWriteFile,
-		"fs_stat":         rt.opFSStat,
-		"fs_readdir":      rt.opFSReaddir,
-		"fs_mkdir":        rt.opFSMkdir,
-		"fs_remove":       rt.opFSRemove,
-		"fs_rename":       rt.opFSRename,
-		"fs_exists":       rt.opFSExists,
-		"release_pending": rt.opReleasePending,
-		"crypto_hash":     rt.opCryptoHash,
-		"crypto_hmac":     rt.opCryptoHMAC,
+		"node_env":         rt.opEnv,
+		"node_argv":        rt.opArgv,
+		"node_platform":    rt.opPlatform,
+		"raw_write":        rt.opRawWrite,
+		"immediate_set":    rt.opImmediateSet,
+		"immediate_clear":  rt.opImmediateClear,
+		"loop_ref":         rt.opLoopRef,
+		"node_exit":        rt.opNodeExit,
+		"node_resolve":     rt.opResolve,
+		"node_read":        rt.opRead,
+		"node_require_esm": rt.opRequireESM,
+		"fs_read_file":     rt.opFSReadFile,
+		"fs_write_file":    rt.opFSWriteFile,
+		"fs_stat":          rt.opFSStat,
+		"fs_readdir":       rt.opFSReaddir,
+		"fs_mkdir":         rt.opFSMkdir,
+		"fs_remove":        rt.opFSRemove,
+		"fs_rename":        rt.opFSRename,
+		"fs_exists":        rt.opFSExists,
+		"release_pending":  rt.opReleasePending,
+		"crypto_hash":      rt.opCryptoHash,
+		"crypto_hmac":      rt.opCryptoHMAC,
 	}
 	for _, group := range []map[string]spidermonkey.Func{
 		rt.httpOps(), rt.zlibOps(), rt.crypto2Ops(), rt.crypto3Ops(), rt.netOps(), rt.fsExtraOps(), rt.dgramOps(), rt.dnsOps(), rt.ipcOps(), rt.workerOps(), rt.childOps(), rt.tlsOps(), rt.ioOps(), rt.sysOps(),
@@ -651,6 +652,36 @@ func (rt *Runtime) opResolve(cfg spidermonkey.Config, args []spidermonkey.Value)
 		kind = "json"
 	}
 	return spidermonkey.ValueOf(map[string]any{"path": r.Path, "kind": kind}), nil
+}
+
+// opRequireESM evaluates an ES module and returns its namespace — the engine
+// side of Node's require(esm). It runs RE-ENTRANTLY: the guest is paused inside
+// this host call, and EvalModule continues on the same wasm stack (the invoke
+// lock is released for the duration by the host-call dispatcher), which is what
+// makes a synchronous require() of a module graph possible at all.
+func (rt *Runtime) opRequireESM(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("node_require_esm: path required")
+	}
+	p := guestPath(args[0].String())
+	src, err := readModuleFile(cfg, p)
+	if err != nil {
+		return fsErrValue(err), nil
+	}
+	// The specifier is the module's own path, so its imports resolve against
+	// it exactly as they would had it been imported rather than required.
+	r, err := rt.js.EvalModule(context.Background(), "/"+p, string(src))
+	if err != nil {
+		return spidermonkey.ValueOf(map[string]any{"code": "ERR_REQUIRE_ESM", "message": err.Error()}), nil
+	}
+	if r.Error != nil {
+		return spidermonkey.ValueOf(map[string]any{"code": "ERR_REQUIRE_ESM", "message": r.Error.Error()}), nil
+	}
+	if r.Namespace == nil {
+		return spidermonkey.ValueOf(map[string]any{"code": "ERR_REQUIRE_ESM",
+			"message": "module produced no namespace: " + p}), nil
+	}
+	return r.Namespace, nil
 }
 
 func (rt *Runtime) opRead(cfg spidermonkey.Config, args []spidermonkey.Value) (spidermonkey.Value, error) {

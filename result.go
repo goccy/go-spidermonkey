@@ -34,14 +34,17 @@ type Result struct {
 }
 
 // ModuleResult is the outcome of running an ES module with EvalModule. A module
-// has NO completion value — its output is its side effects and (in future) its
-// exports — so there is no Value field.
+// has no completion value — its output is its side effects and its exports —
+// so there is no Value field; the exports arrive as Namespace.
 type ModuleResult struct {
 	// Error is non-nil when the module threw, failed to compile, failed to
 	// resolve an import, or was interrupted.
 	Error error
-	// Namespace will hold the module's exports once surfaced.
-	// Namespace *Object
+	// Namespace is the module's namespace object — its exports, one property
+	// per export name. Nil when the module failed, and (rarely) when the
+	// engine could not produce a namespace for a module that did evaluate.
+	// The caller owns it and should Free it when done.
+	Namespace *Object
 }
 
 // envelope is the JSON shape the bridge returns for both scripts and modules.
@@ -49,6 +52,8 @@ type envelope struct {
 	Ok     bool   `json:"ok"`
 	Result string `json:"result"`
 	Error  string `json:"error"`
+	// Namespace is a module namespace object handle (module evaluation only).
+	Namespace uint64 `json:"namespace"`
 }
 
 func parseEnvelope(raw string) (envelope, error) {
@@ -90,4 +95,18 @@ func parseModuleResult(raw string) (ModuleResult, error) {
 		return ModuleResult{}, err
 	}
 	return ModuleResult{Error: jsErr(e)}, nil
+}
+
+// parseModuleResultFor is parseModuleResult with the interpreter the namespace
+// handle belongs to, so the exports come back as a usable Object.
+func parseModuleResultFor(js *JS, raw string) (ModuleResult, error) {
+	e, err := parseEnvelope(raw)
+	if err != nil {
+		return ModuleResult{}, err
+	}
+	out := ModuleResult{Error: jsErr(e)}
+	if out.Error == nil && e.Namespace != 0 {
+		out.Namespace = &Object{js: js, handle: e.Namespace}
+	}
+	return out, nil
 }
