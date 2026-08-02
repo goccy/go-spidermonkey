@@ -69,6 +69,14 @@ const (
 	AgentNowKey = "\x00agent-now"
 	// AgentExitKey: args [id]; the agent's thread is ending. Reply ignored.
 	AgentExitKey = "\x00agent-exit"
+
+	// AgentHostCallKey: args [id, name, payload]. The generic table: an agent
+	// names a host function the embedding registered and passes it one string.
+	// It exists because the reserved channels above are a fixed vocabulary,
+	// and an embedding's own worker needs its own verbs — a Worker's fetch, a
+	// Worker's console. The reply is 'R' + the function's string result, or
+	// 'E' + a message.
+	AgentHostCallKey = "\x00agent-host-call"
 )
 
 // Method IDs of the bridge service (service 0). An ID is the RPC's index in

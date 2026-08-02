@@ -25,6 +25,33 @@ func (js *JS) EvalModule(ctx context.Context, specifier, src string) (ModuleResu
 // the importing module (referrer).
 type ModuleLoader func(cfg Config, specifier, referrer string) (string, error)
 
+// ModuleType is what an import ASKED for through its import attributes:
+// ModuleTypeJSON for `with { type: "json" }`, ModuleTypeUnknown for an import
+// that wrote no attribute at all. The distinction is not cosmetic — Node
+// requires the attribute for a JSON module and reports
+// ERR_IMPORT_ATTRIBUTE_MISSING without it — and it cannot be recovered from
+// the specifier, which is why it travels with the load request.
+type ModuleType string
+
+const (
+	ModuleTypeUnknown    ModuleType = "unknown"
+	ModuleTypeJavaScript ModuleType = "js"
+	ModuleTypeJSON       ModuleType = "json"
+)
+
+// ModuleRequest is everything the engine knows about one import: what to load,
+// who imported it, and what type the import declared.
+type ModuleRequest struct {
+	Specifier string
+	Referrer  string
+	Type      ModuleType
+}
+
+// ModuleLoaderFor resolves a module the way ModuleLoader does, with the
+// import's declared type available. Install it with SetModuleLoaderFor; a
+// loader installed this way supersedes the plain one.
+type ModuleLoaderFor func(cfg Config, req ModuleRequest) (string, error)
+
 // SetModuleLoader installs the fallback loader — the one consulted when no
 // resolver registered with RegisterModuleResolver matches the specifier. It
 // is called on a registry miss and returns the module's source. It replaces
@@ -32,6 +59,13 @@ type ModuleLoader func(cfg Config, specifier, referrer string) (string, error)
 // then fall back to the "module not registered" failure).
 func (js *JS) SetModuleLoader(loader ModuleLoader) {
 	js.env.loader = loader
+}
+
+// SetModuleLoaderFor installs the fallback loader in its richer form, which
+// also receives the import's declared type (see ModuleRequest). It replaces
+// any loader set with SetModuleLoader.
+func (js *JS) SetModuleLoaderFor(loader ModuleLoaderFor) {
+	js.env.loaderFor = loader
 }
 
 // RegisterModuleResolver installs loader for module specifiers beginning with

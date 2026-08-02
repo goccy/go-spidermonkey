@@ -50,6 +50,7 @@ type hostEnv struct {
 	cfg       Config
 	funcs     map[string]Func
 	loader    ModuleLoader     // fallback when no prefix resolver matches
+	loaderFor ModuleLoaderFor  // the same, with the import's declared type
 	resolvers []prefixResolver // sorted longest-prefix-first
 
 	stashMu sync.Mutex
@@ -157,6 +158,23 @@ func (e *hostEnv) dispatch(key string, argsJSON []byte) []byte {
 		return []byte{'R'}
 	case internal.AgentNowKey:
 		return []byte("R" + strconv.FormatFloat(monotonicMs(), 'f', 3, 64))
+	case internal.AgentHostCallKey:
+		// [id, name, payload]: the id is a number, the rest are strings — the
+		// shape the engine can carry now that agent calls are not
+		// number-only.
+		var raw []any
+		if err := json.Unmarshal(argsJSON, &raw); err != nil || len(raw) < 2 {
+			return append([]byte{'E'}, "agent host call: want [id, name, payload?]"...)
+		}
+		idF, _ := raw[0].(float64)
+		name, _ := raw[1].(string)
+		payload := ""
+		if len(raw) > 2 {
+			payload, _ = raw[2].(string)
+		}
+		// The agent's goroutine is the caller, so the interpreter lock is not
+		// held for it: the function runs directly.
+		return e.js.Agents().handleHostCall(uint64(idF), name, payload)
 	case internal.AgentExitKey:
 		args, err := parseAgentArgs(argsJSON, 1)
 		if err != nil {
@@ -251,14 +269,33 @@ func (e *hostEnv) dispatchModuleLoad(argsJSON []byte) []byte {
 	var a []string
 	_ = json.Unmarshal(argsJSON, &a)
 	spec, ref := "", ""
+	typ := ModuleTypeUnknown
 	if len(a) > 0 {
 		spec = a[0]
 	}
 	if len(a) > 1 {
 		ref = a[1]
 	}
+	// The third argument is the import's declared type. An engine that predates
+	// it sends two, and the request then reports ModuleTypeUnknown — which is
+	// also what an attribute-less import means, so the absent case reads the
+	// same either way.
+	if len(a) > 2 {
+		switch ModuleType(a[2]) {
+		case ModuleTypeJSON:
+			typ = ModuleTypeJSON
+		case ModuleTypeJavaScript:
+			typ = ModuleTypeJavaScript
+		}
+	}
 	// Longest registered prefix wins; the fallback loader takes the rest.
 	load := e.loader
+	if e.loaderFor != nil {
+		lf := e.loaderFor
+		load = func(cfg Config, specifier, referrer string) (string, error) {
+			return lf(cfg, ModuleRequest{Specifier: specifier, Referrer: referrer, Type: typ})
+		}
+	}
 	for _, r := range e.resolvers {
 		if strings.HasPrefix(spec, r.prefix) {
 			load = r.load

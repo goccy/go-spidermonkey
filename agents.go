@@ -35,12 +35,13 @@ type Agents struct {
 	mu        sync.Mutex
 	cond      *sync.Cond // signalled on Broadcast, Send, exit, and close
 	closed    bool
-	broadcast uint64              // latched clone handle; 0 = none yet
-	inboxes   map[uint64][]uint64 // agent id -> its FIFO of clone handles (Send)
-	posts     []postedMessage     // agent -> host queue, with sender, in order
-	orphaned  []uint64            // clones for exited agents, freed by close()
-	alive     map[uint64]bool     // spawned and not yet exited
-	exited    map[uint64]bool     // exit events that raced ahead of Spawn's return
+	broadcast uint64               // latched clone handle; 0 = none yet
+	inboxes   map[uint64][]uint64  // agent id -> its FIFO of clone handles (Send)
+	posts     []postedMessage      // agent -> host queue, with sender, in order
+	orphaned  []uint64             // clones for exited agents, freed by close()
+	alive     map[uint64]bool      // spawned and not yet exited
+	hostFuncs map[string]AgentFunc // the embedding's own agent-callable verbs
+	exited    map[uint64]bool      // exit events that raced ahead of Spawn's return
 }
 
 // postedMessage is one agent->host message plus the id of the agent that sent
@@ -94,6 +95,10 @@ const agentPrelude = `(() => {
 		sleep: (ms) => { ok(call("agent-sleep", ms)); },
 		leaving: () => leave(),
 		monotonicNow: () => Number(ok(call("agent-now"))),
+		// The embedding's own verbs (Agents.Register): a name and one string
+		// in, one string out. This is how a worker reaches host facilities
+		// the fixed channels above do not name.
+		host: (name, payload) => ok(call("agent-host-call", String(name), payload === undefined ? "" : String(payload))),
 	};
 })();
 `
@@ -335,6 +340,39 @@ func (a *Agents) handleExit(id uint64) []byte {
 	}
 	a.mu.Unlock()
 	return []byte{'R'}
+}
+
+// AgentFunc is a host function an agent may call by name through
+// Agents.Register. It runs on the AGENT's goroutine, with no access to the
+// main interpreter — strings in, string out, which is the whole contract a
+// worker thread can honour across the boundary.
+type AgentFunc func(id AgentID, payload string) (string, error)
+
+// Register makes fn callable from any agent as
+// __agent_call__("agent-host-call", name, payload). Registering the same name
+// twice replaces the earlier function.
+func (a *Agents) Register(name string, fn AgentFunc) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.hostFuncs == nil {
+		a.hostFuncs = map[string]AgentFunc{}
+	}
+	a.hostFuncs[name] = fn
+}
+
+// handleHostCall dispatches one agent host call by name.
+func (a *Agents) handleHostCall(id uint64, name, payload string) []byte {
+	a.mu.Lock()
+	fn := a.hostFuncs[name]
+	a.mu.Unlock()
+	if fn == nil {
+		return append([]byte{'E'}, ("no agent host function named " + name)...)
+	}
+	out, err := fn(AgentID(id), payload)
+	if err != nil {
+		return append([]byte{'E'}, err.Error()...)
+	}
+	return append([]byte{'R'}, out...)
 }
 
 // parseAgentArgs decodes the reserved-key JSON argument arrays ([id] or
