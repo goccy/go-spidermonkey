@@ -3,6 +3,6 @@
   "private": true,
   "description": "compat/cfworkers flagship: the unmodified Hono framework through the instance pool",
   "dependencies": {
-    "hono": "^4.12.31"
+    "hono": "^4.12.34"
   }
 }
